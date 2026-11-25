@@ -345,6 +345,92 @@ def test_apply_removes_when_unchanged_with_verify():
     print("✓ 未变更时正常删除（verify 通过）")
 
 
+def test_plan_folds_case_and_edge_whitespace():
+    """备份保真的「Shanghai」/「 上海 」与手输同一路线可被去重命令清理。"""
+    store = _Store(
+        [
+            _trip("t1", destination="Shanghai"),
+            _trip("t2", destination="shanghai"),
+            _trip("t3", destination=" 上海 ", origin=" 北京 "),
+            _trip("t4", destination="上海", origin="北京"),
+        ]
+    )
+    plan = plan_trip_dedupe(store)
+    assert plan["groups_with_duplicates"] == 2, plan
+    assert plan["duplicate_entries"] == [("t1", "t2"), ("t3", "t4")], plan
+    removed, failure = apply_trip_dedupe(
+        store, plan["duplicate_entries"], plan["verify"]
+    )
+    assert (removed, failure) == (2, None), (removed, failure)
+    assert store.deleted == ["t2", "t4"], store.deleted
+    print("✓ 去重身份折叠首尾空白与大小写")
+
+
+def test_plan_does_not_fold_internal_whitespace():
+    """路线内部的空格与换行仍是两条不同路线（只折叠首尾与大小写）。"""
+    store = _Store(
+        [
+            _trip("t1", destination="北京 上海"),
+            _trip("t2", destination="北京\n上海"),
+        ]
+    )
+    plan = plan_trip_dedupe(store)
+    assert plan["duplicate_entries"] == [], plan
+    print("✓ 内部空白不折叠")
+
+
+def test_plan_ignores_rows_without_destination():
+    """缺目的地的行不参与去重（与存储层写入去重同口径）。"""
+    store = _Store(
+        [
+            _trip("t1", destination=""),
+            _trip("t2", destination=None),
+            _trip("t3", destination="上海"),
+            _trip("t4", destination="上海"),
+        ]
+    )
+    plan = plan_trip_dedupe(store)
+    assert plan["duplicate_entries"] == [("t3", "t4")], plan
+    assert plan["groups_with_duplicates"] == 1, plan
+    print("✓ 缺目的地的行不参与去重")
+
+
+def test_plan_groups_blank_end_with_missing_end():
+    """返程为空白串与缺省返程归为同一身份（先归一再回退出发日）。"""
+    store = _Store(
+        [
+            _trip("t1", start="2026-01-05", end="   "),
+            _trip("t2", start="2026-01-05", end=None),
+        ]
+    )
+    plan = plan_trip_dedupe(store)
+    assert plan["duplicate_entries"] == [("t1", "t2")], plan
+    print("✓ 空白返程与缺省返程同身份")
+
+
+def test_plan_skips_empty_trip_id_rows():
+    """空 trip_id 的行无法被删除接口定位：不进入计划，dry-run 不虚报。"""
+    store = _Store([_trip(""), _trip("")])
+    plan = plan_trip_dedupe(store)
+    assert plan["duplicate_entries"] == [], plan
+    assert plan["duplicates"] == [], plan
+    assert plan["groups_with_duplicates"] == 0, plan
+    removed, failure = apply_trip_dedupe(
+        store, plan["duplicate_entries"], plan["verify"]
+    )
+    assert (removed, failure) == (0, None), (removed, failure)
+    print("✓ 空 trip_id 行不进入去重计划")
+
+
+def test_plan_skips_reload_without_candidates():
+    """没有重复候选时不整份重载存储（聊天历史不再被无谓解析）。"""
+    store = _Store([_trip("t1"), _trip("t2", destination="杭州")])
+    plan = plan_trip_dedupe(store)
+    assert plan["duplicate_entries"] == [], plan
+    assert store.reloads == 0, store.reloads
+    print("✓ 无重复时不重载存储")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -368,4 +454,10 @@ if __name__ == "__main__":
     test_apply_skips_trip_edited_after_plan()
     test_apply_skips_group_when_kept_changed()
     test_apply_removes_when_unchanged_with_verify()
+    test_plan_folds_case_and_edge_whitespace()
+    test_plan_does_not_fold_internal_whitespace()
+    test_plan_ignores_rows_without_destination()
+    test_plan_groups_blank_end_with_missing_end()
+    test_plan_skips_empty_trip_id_rows()
+    test_plan_skips_reload_without_candidates()
     print("\n全部通过")

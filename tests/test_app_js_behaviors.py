@@ -88,6 +88,10 @@ def test_frontend_render_helpers():
     assert results["highlight_dotted"] == "<mark>İstanbul</mark> 出差", (
         "İ 关键字按原文长度命中并高亮"
     )
+    # 斜杠日期与后端 trip_interval 的身份口径一致：徽标不能只在后端有
+    assert results["date_unpadded"] == "2026-01-05", results["date_unpadded"]
+    assert results["date_slash"] == "2026-03-12", results["date_slash"]
+    assert results["date_bad"] is None, results["date_bad"]
     assert results["highlight_plain"] == "no match here", "无命中时返回转义原文"
     assert results["highlight_meta"] == "<mark>a+b</mark> (x)", (
         "正则元字符按字面匹配，不能被当成模式"

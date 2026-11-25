@@ -40,12 +40,27 @@ logger = logging.getLogger(__name__)
 
 
 def _trip_date_is_valid(value: object) -> bool:
-    """行程出发日期是否为可解析的 YYYY-MM-DD（常去目的地统计口径）。"""
+    """行程出发日期是否为可解析的 YYYY-MM-DD（常去目的地统计口径）。
+
+    常去目的地是存储维护的累计计数，只按严格 ISO 日期计入（备份保真
+    保留的斜杠旧格式不计入，修正日期后自然补计）；读取侧的冲突 / 状态 /
+    travel_summary 走 trip_interval 的身份口径，两者分工不同。
+    """
     try:
         datetime.strptime(str(value or ""), "%Y-%m-%d")
     except ValueError:
         return False
     return True
+
+
+def _trip_date_value(value: object) -> datetime | None:
+    """按身份口径解析行程日期（补零 / 斜杠归一）；不可解析返回 None。"""
+    from utils.trip_import import normalize_identity_date
+
+    try:
+        return datetime.strptime(normalize_identity_date(value), "%Y-%m-%d")
+    except ValueError:
+        return None
 
 
 def _session_id_matches(message: dict[str, Any], session_id: str) -> bool:
@@ -2317,7 +2332,11 @@ class LongTermMemory:
 
     @_locked_mutation
     def save_trip_history(
-        self, trip_info: dict[str, Any], *, max_total: int | None = None
+        self,
+        trip_info: dict[str, Any],
+        *,
+        max_total: int | None = None,
+        created_out: list[bool] | None = None,
     ) -> str:
         """保存行程历史，返回 trip_id。
 
@@ -2325,7 +2344,9 @@ class LongTermMemory:
         更新既有记录而不是追加，避免行程 / 统计 / 日历重复。
         ``max_total`` 给出时在写锁内拒绝「新建」超过上限（去重更新不受
         影响）：调用方在锁外先读长度再写的检查挡不住并发创建，越限后
-        /api/export 会因条数上限永久 413。
+        /api/export 会因条数上限永久 413。``created_out`` 给出时把写锁内
+        确定的「新增（True）/ 更新（False）」追加进去：调用方按锁外长度
+        差判断会被窗口内其它写入污染，误报已添加 / 已更新。
         """
         if max_total is None:
             # 主写入路径（编排器 / 面板之外的调用方）不传参也要拦截：
@@ -2344,6 +2365,9 @@ class LongTermMemory:
                 raise ValueError(f"行程数量已达上限（{max_total}），请先删除旧行程")
         trip_id, created = self._apply_trip_locked(trip_info)
         self._persist()
+        if created_out is not None:
+            # 持久化成功后才登记：落盘失败抛错时不误报结果
+            created_out.append(created)
         if created:
             logger.info(f"Saved trip history: {trip_id}")
         else:
@@ -2595,7 +2619,7 @@ class LongTermMemory:
         落盘一次；复核与删除也因此不可被并发写者穿插（verify→delete 的
         TOCTOU 窗口关闭）。返回 ``(删除数, 失败原因或 None)``。
         """
-        from utils.trip_import import trip_identity
+        from utils.trip_import import dedupe_identity
 
         trips = self.data.get("trip_history", [])
         removed = 0
@@ -2604,12 +2628,12 @@ class LongTermMemory:
             trip_id = str(target.get("trip_id"))
             if not trip_id:
                 continue
-            want = trip_identity(target)
+            want = dedupe_identity(target)
             matches = [
                 index
                 for index, trip in enumerate(trips)
                 if str(trip.get("trip_id")) == trip_id
-                and trip_identity(trip) == want
+                and dedupe_identity(trip) == want
             ]
             if not matches:
                 skipped += 1
@@ -2617,7 +2641,7 @@ class LongTermMemory:
             kept_id = str(target.get("kept_id") or "")
             if kept_id and not any(
                 str(trip.get("trip_id")) == kept_id
-                and trip_identity(trip) == want
+                and dedupe_identity(trip) == want
                 for trip in trips
             ):
                 skipped += 1
@@ -2650,6 +2674,18 @@ class LongTermMemory:
             if str(trip.get("trip_id", "")) != str(trip_id):
                 continue
             merged = {**trip, **fields}
+            # 端点侧校验基于锁外快照：分端并发更新（Web / CLI 各持旧
+            # 快照）可能各自通过校验、合并后落成「返程早于出发」的倒置
+            # 行程。写锁内按合并结果复核（脏日期不参与，保持容错）
+            if "start_date" in fields or "end_date" in fields:
+                merged_start = _trip_date_value(merged.get("start_date"))
+                merged_end = _trip_date_value(merged.get("end_date"))
+                if (
+                    merged_start is not None
+                    and merged_end is not None
+                    and merged_end < merged_start
+                ):
+                    raise ValueError("结束日期不能早于出发日期")
             same = self._find_same_trip(merged)
             if same is not None and same is not trip:
                 raise ValueError("已存在相同行程（同路线 + 同起止日期）")

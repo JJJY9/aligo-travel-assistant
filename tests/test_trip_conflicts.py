@@ -270,6 +270,121 @@ def test_trip_interval_warns_once_per_bad_value(caplog):
     print("✓ 脏日期警告按值去重（不同值仍逐类告警）")
 
 
+def test_trip_interval_parses_identity_dates():
+    """备份保真保留的斜杠 / 未补零 / 全角数字日期按身份口径参与区间解析。"""
+    from utils.trip_conflicts import trip_state_label
+
+    slash = {
+        "trip_id": "t-slash",
+        "destination": "杭州",
+        "start_date": "2026/03/12",
+        "end_date": "2026/3/14",
+    }
+    interval = trip_interval(slash)
+    assert interval is not None, interval
+    assert interval[0].date() == date(2026, 3, 12)
+    assert interval[1].date() == date(2026, 3, 14)
+
+    # 出发补零、返程斜杠：返程不能被静默截成出发当日
+    mixed = {
+        "trip_id": "t-mixed",
+        "start_date": "2026-01-01",
+        "end_date": "2026/01/10",
+    }
+    mixed_interval = trip_interval(mixed)
+    assert mixed_interval is not None
+    assert mixed_interval[1].date() == date(2026, 1, 10)
+
+    # 全角数字经身份归一为等价 ASCII 日期
+    full = {"trip_id": "t-full", "start_date": "２０２６-０３-１２"}
+    full_interval = trip_interval(full)
+    assert full_interval is not None
+    assert full_interval[0].date() == date(2026, 3, 12)
+    assert full_interval[0].date() == full_interval[1].date()
+
+    # 非真实日历日仍按无日期处理
+    assert trip_interval({"start_date": "2026-02-30"}) is None
+
+    # 状态徽标 / 统计与区间同口径
+    assert trip_state_label(slash, today=date(2026, 3, 13)) == "进行中"
+    from utils.travel_stats import summarize_travel
+
+    summary = summarize_travel([slash], today=date(2026, 1, 1))
+    assert summary["cities"] == 1, summary
+    assert summary["total_days"] == 3, summary
+    print("✓ 斜杠 / 全角日期按身份口径参与区间、状态与统计")
+
+
+def test_slash_dates_overlap_detected():
+    """斜杠日期的行程与 ISO 行程的真实重叠不能被漏报。"""
+    slash_trip = {
+        "trip_id": "a",
+        "origin": "北京",
+        "destination": "杭州",
+        "start_date": "2026/03/12",
+        "end_date": "2026-03-14",
+    }
+    iso_trip = {
+        "trip_id": "b",
+        "origin": "北京",
+        "destination": "南京",
+        "start_date": "2026-03-13",
+        "end_date": "2026-03-14",
+    }
+    views = trips_with_conflicts([slash_trip, iso_trip])
+    assert views[0]["conflict_count"] == 1, views[0]
+    assert views[1]["conflict_count"] == 1, views[1]
+    assert [item["trip_id"] for item in views[0]["conflicts"]] == ["b"]
+    print("✓ 斜杠日期行程参与日期重叠检测")
+
+
+def test_conflict_order_uses_parsed_slash_dates():
+    """斜杠日期按真实日期排序（不能因解析失败被排到最前）。"""
+    target = {
+        "trip_id": "target",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-01-01",
+        "end_date": "2026-03-31",
+    }
+    early = {
+        "trip_id": "early",
+        "origin": "北京",
+        "destination": "杭州",
+        "start_date": "2026/1/2",
+        "end_date": "2026/1/3",
+    }
+    late = {
+        "trip_id": "late",
+        "origin": "北京",
+        "destination": "南京",
+        "start_date": "2026-1-15",
+        "end_date": "2026-1-16",
+    }
+    views = trips_with_conflicts([target, early, late])
+    order = [item["trip_id"] for item in views[0]["conflicts"]]
+    assert order == ["early", "late"], order
+    print("✓ 冲突排序对斜杠日期按真实日期生效")
+
+
+def test_unparsable_start_warns_once(caplog):
+    """非法出发日期（非真实日历日）按无日期处理，但同值只告警一次。"""
+    import logging
+
+    from utils import trip_conflicts as module
+
+    module._WARNED_TRIP_ISSUES.clear()
+    trip = {"trip_id": "t-bad-start", "start_date": "2026-02-30"}
+    with caplog.at_level(logging.WARNING, logger="utils.trip_conflicts"):
+        for _ in range(3):
+            assert module.trip_interval(trip) is None
+    messages = [record.getMessage() for record in caplog.records]
+    hits = [m for m in messages if "出发日期无法解析" in m]
+    assert len(hits) == 1, messages
+    module._WARNED_TRIP_ISSUES.clear()
+    print("✓ 非法出发日期按无日期处理且同值只告警一次")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -291,6 +406,9 @@ if __name__ == "__main__":
     test_conflicts_capped_with_exact_count()
     test_find_saved_trip_normalizes_identity_fields()
     test_find_saved_trip_distinguishes_origin()
+    test_trip_interval_parses_identity_dates()
+    test_slash_dates_overlap_detected()
+    test_conflict_order_uses_parsed_slash_dates()
     # 日志断言用例：直跑用 caplog 替身真正执行
     import _caplog_shim
 
@@ -299,6 +417,7 @@ if __name__ == "__main__":
         test_inverted_date_range_is_logged(_shim)
         # 此前漏登记：同一文件的另一个日志用例在直跑时从未执行
         test_trip_interval_warns_once_per_bad_value(_shim)
+        test_unparsable_start_warns_once(_shim)
     finally:
         _shim.close()
     print("\n全部通过")

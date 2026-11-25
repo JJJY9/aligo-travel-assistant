@@ -52,12 +52,25 @@ _PREF_VERSION_TTL_SEC = 86400
 
 
 def _trip_start_is_valid(value: Any) -> bool:
-    """行程出发日期是否为可解析的 YYYY-MM-DD（与 JSON 后端同一统计口径）。"""
+    """行程出发日期是否为可解析的 YYYY-MM-DD（与 JSON 后端同一统计口径）。
+
+    常去目的地计数只认严格 ISO 日期（备份保真的斜杠旧格式不计入）。
+    """
     try:
         datetime.strptime(str(value or ""), "%Y-%m-%d")
     except ValueError:
         return False
     return True
+
+
+def _trip_date_value(value: object) -> datetime | None:
+    """按身份口径解析行程日期（补零 / 斜杠归一）；不可解析返回 None。"""
+    from utils.trip_import import normalize_identity_date
+
+    try:
+        return datetime.strptime(normalize_identity_date(value), "%Y-%m-%d")
+    except ValueError:
+        return None
 
 
 # 行程路线身份投影的控制字符集：与 utils.console.strip_terminal_controls
@@ -67,13 +80,34 @@ _TRIP_ROUTE_CONTROL_CHARS = "".join(
     chr(code) for code in (*range(0x01, 0x09), *range(0x0B, 0x20), *range(0x7F, 0xA0))
 )
 # 与 utils.trip_export.normalize_identity_text 同一投影的 SQL 形式：CRLF /
-# CR → LF、U+2028 / U+2029 → 空格、剥离控制字符。Python 侧入参已按投影
-# 清洗，DB 里的存量行可能没洗过——两侧不投影会让「同一行程」在候选查询
-# 里被漏掉，重复插入（JSON 后端在 Python 侧比对，不受影响）
+# CR → LF、U+2028 / U+2029 → 空格、剥离控制字符、折叠首尾空白。Python 侧
+# 入参已按投影清洗，DB 里的存量行可能没洗过——两侧不投影会让「同一行程」
+# 在候选查询里被漏掉，重复插入（JSON 后端在 Python 侧比对，不受影响）。
+# 首尾空白与 Python str.strip() 同一字符集（含 C0 分隔符、NBSP、全角空格），
+# 否则备份保真保留的「 上海」这类行在 SQL 候选查询里永远命中不了。
+_TRIP_ROUTE_EDGE_SPACES_SQL = "||".join(
+    f"chr({code})"
+    for code in (
+        *range(0x09, 0x0E),
+        *range(0x1C, 0x20),
+        0x20,
+        0x85,
+        0xA0,
+        0x1680,
+        *range(0x2000, 0x200B),
+        0x2028,
+        0x2029,
+        0x202F,
+        0x205F,
+        0x3000,
+    )
+)
 _TRIP_ROUTE_KEY_SQL_TEMPLATE = (
-    "translate("
+    "btrim(translate("
     "replace(replace(REPLACE(REPLACE({column}, E'\\r\\n', E'\\n'), "
-    "E'\\r', E'\\n'), chr(8232), ' '), chr(8233), ' '), %s, '')"
+    "E'\\r', E'\\n'), chr(8232), ' '), chr(8233), ' '), %s, ''), "
+    + _TRIP_ROUTE_EDGE_SPACES_SQL
+    + ")"
 )
 
 
@@ -1784,12 +1818,17 @@ class PostgresLongTermMemory:
     # ---------- 历史行程 ----------
 
     def save_trip_history(
-        self, trip_info: dict[str, Any], *, max_total: int | None = None
+        self,
+        trip_info: dict[str, Any],
+        *,
+        max_total: int | None = None,
+        created_out: list[bool] | None = None,
     ) -> str:
         """保存行程历史，返回 trip_id；同路线 + 同起止日期视为重复记录，更新而不是新增。
 
         ``max_total`` 给出时在会话级 advisory lock 内拒绝新建超过上限
-        （调用方锁外先读再写的检查挡不住并发创建）。
+        （调用方锁外先读再写的检查挡不住并发创建）。``created_out`` 给出
+        时把锁内确定的「新增 / 更新」追加进去（与 JSON 后端同口径）。
         """
         self._ensure_trip_uid_column()
         # 与 JSON 后端同口径：未提供目的时原样保存（None），不写默认值
@@ -1807,7 +1846,9 @@ class PostgresLongTermMemory:
         with self._advisory_lock(f"aligo-trip-{self.user_id}"):
             if max_total is not None:
                 self._enforce_trip_cap_locked(trip_info, destination, max_total)
-            return self._save_trip_history_locked(trip_info, purpose, destination)
+            return self._save_trip_history_locked(
+                trip_info, purpose, destination, created_out=created_out
+            )
 
     def _enforce_trip_cap_locked(
         self, trip_info: dict[str, Any], destination: Any, max_total: int
@@ -1859,6 +1900,8 @@ class PostgresLongTermMemory:
         trip_info: dict[str, Any],
         purpose: str | None,
         destination: Any,
+        *,
+        created_out: list[bool] | None = None,
     ) -> str:
         start_conn = getattr(self, "_conn", None)
         start_date = str(trip_info.get("start_date") or "")
@@ -1943,6 +1986,10 @@ class PostgresLongTermMemory:
                         (trip_id, existing[0]),
                         replay_safe=False,
                     )
+                if created_out is not None:
+                    # UPDATE 提交成功后才登记「更新」：重连 / 重放失败
+                    # 路径不登记，调用方按既有失败语义处理
+                    created_out.append(False)
                 return trip_id
 
         trip_number = self._next_trip_number()
@@ -1975,6 +2022,8 @@ class PostgresLongTermMemory:
             ),
             replay_safe=False,
         )
+        if created_out is not None:
+            created_out.append(True)
         return trip_id
 
     def _next_trip_number(self) -> int:
@@ -2068,7 +2117,7 @@ class PostgresLongTermMemory:
         被按 id 删掉）。连接中途重建时中止本批（已删除的保留），调用方
         重试即可。返回 ``(删除数, 失败原因或 None)``。
         """
-        from utils.trip_import import trip_identity
+        from utils.trip_import import dedupe_identity
 
         if not targets:
             return 0, None
@@ -2097,17 +2146,19 @@ class PostgresLongTermMemory:
                     trip_id = str(target.get("trip_id") or "")
                     if not trip_id:
                         continue
-                    want = trip_identity(target)
+                    want = dedupe_identity(target)
                     matches = [
                         row
                         for row in working
-                        if row["trip_id"] == trip_id and trip_identity(row) == want
+                        if row["trip_id"] == trip_id
+                        and dedupe_identity(row) == want
                     ]
                     if not matches:
                         continue
                     kept_id = str(target.get("kept_id") or "")
                     if kept_id and not any(
-                        row["trip_id"] == kept_id and trip_identity(row) == want
+                        row["trip_id"] == kept_id
+                        and dedupe_identity(row) == want
                         for row in working
                     ):
                         continue
@@ -2161,6 +2212,18 @@ class PostgresLongTermMemory:
                 "end_date": row[4],
             }
             merged = {**current, **fields}
+            # 端点侧校验基于锁外快照：分端并发更新（Web / CLI 各持旧
+            # 快照）可能各自通过校验、合并后落成「返程早于出发」的倒置
+            # 行程。advisory lock 内按合并结果复核（脏日期不参与）
+            if "start_date" in fields or "end_date" in fields:
+                merged_start = _trip_date_value(merged.get("start_date"))
+                merged_end = _trip_date_value(merged.get("end_date"))
+                if (
+                    merged_start is not None
+                    and merged_end is not None
+                    and merged_end < merged_start
+                ):
+                    raise ValueError("结束日期不能早于出发日期")
             # 与 JSON 后端 / 导出旧公式同一投影比较（身份归一会把
             # 2026-1-5 与 2026-01-05 视为相同，但旧公式哈希的是原文）
             uid_inputs_changed = legacy_uid_inputs(merged) != legacy_uid_inputs(current)

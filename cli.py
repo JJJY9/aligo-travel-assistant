@@ -6030,8 +6030,9 @@ def run_trip_add_standalone(
         }
         if purpose:
             record["purpose"] = purpose
+        created_flag: list[bool] = []
         try:
-            trip_id = store.save_trip_history(record)
+            trip_id = store.save_trip_history(record, created_out=created_flag)
         except ValueError as exc:
             # 上限等用户可修正问题：原样给出可执行提示（不加通用前缀）
             return _fail(str(exc))
@@ -6047,7 +6048,9 @@ def run_trip_add_standalone(
         if callable(close):
             close()
 
-    created = len(trips) > before
+    # 写锁内确定的「新增 / 更新」优先：锁外按长度差判断会被窗口内其它
+    # 进程的增删污染（假存储不支持 created_out 时退回长度差）
+    created = created_flag[0] if created_flag else len(trips) > before
     # 按「id + 关键字段」定位本次保存的那条并按身份排除：历史里存在重复
     # trip_id 时，按 id 整条排除会连带隐藏其它行程的真实重叠
     saved_record = find_saved_trip(trips, trip_id, record)

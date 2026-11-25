@@ -16,6 +16,7 @@ from typing import Any
 import logging
 
 from utils.trip_import import (
+    dedupe_identity,
     normalize_identity_date,
     normalize_identity_text,
     trip_identity,
@@ -33,7 +34,7 @@ def _identity(trip: dict[str, Any]) -> tuple[str, str, str, str] | None:
         normalize_identity_text(trip.get("origin")),
         normalize_identity_text(trip.get("destination")),
         start_date,
-        normalize_identity_date(trip.get("end_date") or start_date),
+        normalize_identity_date(trip.get("end_date")) or start_date,
     )
 
 
@@ -61,24 +62,47 @@ def plan_trip_dedupe(store: Any) -> dict[str, Any]:
     """
     trips = store.get_trip_history(limit=None)
     trip_ids = [str(trip.get("trip_id")) for trip in trips]
+    # 每行身份只算一次：5000 行时分组 / 歧义 / 无日期 / 复核四处各算一遍
+    # 是 4 倍的身份投影开销（实测约 0.4s 纯重复计算）
+    identities = [_identity(trip) for trip in trips]
     groups: dict[tuple[str, str, str, str], list[str]] = {}
-    for trip, trip_id in zip(trips, trip_ids):
-        key = _identity(trip)
-        if key is None:
+    for trip, trip_id, key in zip(trips, trip_ids, identities):
+        if not trip_id:
+            # 空 trip_id（显式 ""）的行无法被任何删除接口定位：不参与分组，
+            # 保证计划里的重复数 / dry-run 与实际可删除数一致
             continue
-        groups.setdefault(key, []).append(trip_id)
+        if key is None or not trip.get("destination"):
+            # 与存储层写入去重同口径：缺出发日期或目的地为空的行不参与
+            # 去重（JSON _find_same_trip / PG _key 同样要求 destination
+            # 真值），否则会把存储层认为「不同」的行当作重复删除
+            continue
+        origin, destination, start_date, end_date = key
+        # 组键在存储身份上再折叠路线大小写：备份保真保留的「 上海」/
+        # 「Shanghai」与面板后写的同一路线只差首尾空白 / 大小写，存储
+        # 写入去重按原文比对永远命中不了，只有去重命令能清理
+        groups.setdefault(
+            (
+                origin.casefold(),
+                destination.casefold(),
+                start_date,
+                end_date,
+            ),
+            [],
+        ).append(trip_id)
     by_id: dict[str, dict[str, Any]] = {}
-    for trip, trip_id in zip(trips, trip_ids):
+    identity_by_id: dict[str, tuple[str, str, str, str] | None] = {}
+    for trip, trip_id, key in zip(trips, trip_ids, identities):
         by_id[trip_id] = trip
+        identity_by_id[trip_id] = key
 
     # 同一 trip_id 出现在多条不同行程里时，delete_trip 可能删错行：
     # 这类 id 不自动处理，提示人工清理。缺出发日期的行无法按身份归组：
     # 同 id 且内容完全相同（同路线 / 返程）的裸重复行按同一条处理（可
     # 自动清理，见下方 dateless_groups），内容不同才算歧义——与存储层
-    # 按行数判断歧义的口径一致
+    # 按行数判断歧义的口径一致。歧义标记保持原始身份（不折叠大小写）：
+    # 只差大小写的同 id 行仍交给人工，不自动删改用户写法不同的数据
     id_groups: dict[str, set[Any]] = {}
-    for trip, trip_id in zip(trips, trip_ids):
-        trip_key = _identity(trip)
+    for trip, trip_id, trip_key in zip(trips, trip_ids, identities):
         marker: Any = (
             trip_key
             if trip_key is not None
@@ -91,43 +115,61 @@ def plan_trip_dedupe(store: Any) -> dict[str, Any]:
     # 产生内容完全相同的两行，delete_duplicate_trip 按行数可安全删除后插入
     # 的一条，不能让它们卡在「歧义」死角（所有按 id 的操作都会 409）
     dateless_groups: dict[str, dict[tuple[str, str, str, str], list[int]]] = {}
-    for index, (trip, trip_id) in enumerate(zip(trips, trip_ids)):
-        if _identity(trip) is not None:
+    for index, (trip, trip_id, key) in enumerate(zip(trips, trip_ids, identities)):
+        if key is not None or not trip_id:
             continue
         dateless_groups.setdefault(trip_id, {}).setdefault(
             trip_identity(trip), []
         ).append(index)
 
-    # 删除前重新读取：若某组保留的那条已被并发删除，跳过该组，避免把
-    # 仅剩的副本也删掉。JSON 后端的 get_trip_history 返回进程启动时的
-    # 快照，必须先 reload，否则复核永远是「未变化」
-    reload = getattr(store, "reload", None)
-    if callable(reload):
-        reload()
-    fresh_ids = {
-        str(trip.get("trip_id"))
-        for trip in store.get_trip_history(limit=None)
-    }
+    # 没有任何候选组时不必整份重载存储（JSON 后端的 reload 会把包括
+    # 最多 20 万条聊天历史在内的记忆文件重新解析一遍）：没有候选就没有
+    # 可过滤的条目，fresh_ids 在本分支用不到
+    has_candidates = any(len(group) > 1 for group in groups.values()) or any(
+        len(indices) > 1
+        for by_content in dateless_groups.values()
+        for indices in by_content.values()
+    )
+    fresh_ids: set[str] = set()
+    if has_candidates:
+        # 删除前重新读取：若某组保留的那条已被并发删除，跳过该组，避免把
+        # 仅剩的副本也删掉。JSON 后端的 get_trip_history 返回进程启动时的
+        # 快照，必须先 reload，否则复核永远是「未变化」
+        reload = getattr(store, "reload", None)
+        if callable(reload):
+            reload()
+        fresh_ids = {
+            str(trip.get("trip_id"))
+            for trip in store.get_trip_history(limit=None)
+        }
 
-    duplicate_entries = [
-        (group[0], trip_id)
-        for group in groups.values()
-        for trip_id in group[1:]
-        if group[0] in fresh_ids and trip_id not in ambiguous
-    ]
-    for trip_id, by_content in dateless_groups.items():
-        if trip_id in ambiguous or trip_id not in fresh_ids:
-            continue
-        for indices in by_content.values():
-            if len(indices) > 1:
-                duplicate_entries.extend([(trip_id, trip_id)] * (len(indices) - 1))
+    # 空 trip_id（显式 ""）的行无法被任何删除接口定位：计划侧就跳过，
+    # 保证 dry-run 的 would_remove / duplicates 与执行端删除数一致，
+    # 不再出现「计划 N 条、执行删 0 条却报成功」的假象
+    duplicate_entries: list[tuple[str, str]] = []
+    if has_candidates:
+        duplicate_entries = [
+            (group[0], trip_id)
+            for group in groups.values()
+            for trip_id in group[1:]
+            if group[0]
+            and trip_id
+            and group[0] in fresh_ids
+            and trip_id not in ambiguous
+        ]
+        for trip_id, by_content in dateless_groups.items():
+            if not trip_id or trip_id in ambiguous or trip_id not in fresh_ids:
+                continue
+            for indices in by_content.values():
+                if len(indices) > 1:
+                    duplicate_entries.extend([(trip_id, trip_id)] * (len(indices) - 1))
 
     # 执行时按「计划时的身份」复核：计划生成后条目被编辑成别的行程
     # （或保留项被删除）时不能再按 id 盲删
     verify: list[dict[str, str]] = []
     for kept_id, trip_id in duplicate_entries:
         trip_row = by_id.get(trip_id) or {}
-        ident = _identity(trip_row)
+        ident = identity_by_id.get(trip_id)
         if ident is not None:
             origin, destination, start_date, end_date = ident
         else:
@@ -229,7 +271,7 @@ def apply_trip_dedupe(
                 reload = getattr(store, "reload", None)
                 if callable(reload):
                     reload()
-                expected_identity = trip_identity(
+                expected_identity = dedupe_identity(
                     {
                         "origin": expected[0],
                         "destination": expected[1],
@@ -246,8 +288,8 @@ def apply_trip_dedupe(
                 if (
                     kept_row is None
                     or target_row is None
-                    or trip_identity(kept_row) != expected_identity
-                    or trip_identity(target_row) != expected_identity
+                    or dedupe_identity(kept_row) != expected_identity
+                    or dedupe_identity(target_row) != expected_identity
                 ):
                     logger.warning(
                         "去重跳过 %s：计划生成后行程已变更或保留项已删除",

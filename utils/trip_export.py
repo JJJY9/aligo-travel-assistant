@@ -81,8 +81,12 @@ def normalize_identity_text(value: Any) -> str:
     剥离控制字符 / 把 U+2028 / U+2029 换成空格。存储去重、导入预览与去重
     命令必须用同一口径，否则同一趟行程因换行 / 控制字符写法不同被当成
     两条记录（导入回导时重复新增，且去重命令清不掉）。
+
+    首尾空白只在身份键上折叠：CSV / 备份按保真保留原文（前后带空格的
+    「 上海」是真实存量形态），而 Web / CLI 写入会 strip——身份不 strip
+    的话同一趟行程永远不会被存储去重命中、trips-dedupe 也清不掉。
     """
-    return _identity_projection(str(value or ""))
+    return _identity_projection(str(value or "")).strip()
 
 
 def _needs_quote_guard(text: str) -> bool:

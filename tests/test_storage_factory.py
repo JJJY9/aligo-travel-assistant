@@ -2851,6 +2851,9 @@ def test_pg_trip_lookup_normalizes_identity_fields():
     # 与 Python 侧 normalize_identity_text 同一投影：CRLF/CR → LF、
     # U+2028/29 → 空格、剥离控制字符（JSON 后端在 Python 侧比对）
     assert "translate(" in sql and "chr(8232)" in sql and "chr(8233)" in sql
+    # 首尾空白与 Python str.strip() 同口径折叠（含空格 / 制表 / 全角空格）
+    assert "btrim(" in sql and "chr(9)" in sql and "chr(32)" in sql
+    assert "chr(12288)" in sql
     assert "REPLACE(REPLACE(destination" in sql
     assert "REPLACE(REPLACE(COALESCE(origin" in sql
     assert params == (
@@ -2967,8 +2970,8 @@ def test_json_legacy_trip_token_backfill_rules():
     assert token and normalized_uid_token(token) == token, (
         "日期原文改写必须触发一次性迁移（否则 UID 仍会变化）"
     )
-    # 真正的日期改动同样补发
-    assert store.update_trip(trip_id, {"start_date": "2026-12-08"})
+    # 真正的日期改动同样补发（保持不早于返程，写锁内会复核日期顺序）
+    assert store.update_trip(trip_id, {"start_date": "2026-12-06"})
     token = store.get_trip_history(limit=None)[0].get("uid_token")
     assert token and normalized_uid_token(token) == token, (
         "改动日期时必须补发 token（一次性迁移）"
@@ -3155,7 +3158,7 @@ def test_pg_update_trip_backfills_uid_token_only_on_uid_input_change():
     sql, _ = executed[-1]
     assert "uid_token" not in sql, "只改目的不得触发一次性 UID 迁移"
     executed.clear()
-    assert store.update_trip("trip_1", {"start_date": "2026-12-08"}) is True
+    assert store.update_trip("trip_1", {"start_date": "2026-12-06"}) is True
     sql, params = executed[-1]
     assert "uid_token = %s" in sql
     token = params[-2]
@@ -3172,7 +3175,7 @@ def test_pg_update_trip_backfills_uid_token_only_on_uid_input_change():
         )
     )
     executed.clear()
-    assert store.update_trip("trip_1", {"start_date": "2026-12-09"}) is True
+    assert store.update_trip("trip_1", {"start_date": "2026-12-04"}) is True
     assert "uid_token" not in executed[-1][0]
     # 未补零日期被面板重存为补零 ISO：旧公式原文已变，必须补发
     unpadded_row = (1, "北京", "上海", "2026-1-5", "2026-1-6", None)
@@ -5244,6 +5247,134 @@ def test_trip_update_and_conflict():
 
     assert memory.update_trip("trip_missing", {"purpose": "x"}) is False
     print("✓ 行程更新（字段 / 统计 / 清空日期 / 冲突拒绝）")
+
+
+def test_json_update_trip_rejects_inverted_race():
+    """分端并发更新：写锁内按合并结果复核，落库不能出现「返程早于出发」。"""
+    from context.long_term_memory import LongTermMemory
+
+    root = tempfile.mkdtemp()
+    store_a = LongTermMemory("u-inverted-race", root)
+    trip_id = store_a.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-01-01",
+            "end_date": "2026-01-10",
+        }
+    )
+    store_b = LongTermMemory("u-inverted-race", root)
+    assert store_a.update_trip(trip_id, {"end_date": "2026-01-15"}) is True
+    with pytest.raises(ValueError, match="结束日期不能早于出发日期"):
+        store_b.update_trip(trip_id, {"start_date": "2026-01-20"})
+    trip = store_a.get_trip_history(limit=None)[0]
+    assert trip["start_date"] == "2026-01-01", trip
+    assert trip["end_date"] == "2026-01-15", trip
+    print("✓ 并发更新不能落库倒置日期区间")
+
+
+def test_json_save_trip_history_reports_created_flag():
+    """created_out 在写锁内给出「新增 / 更新」（并发窗口不再污染判定）。"""
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-created-flag", tempfile.mkdtemp())
+    record = {
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-01-01",
+        "end_date": "2026-01-02",
+    }
+    flags: list[bool] = []
+    first = memory.save_trip_history(dict(record), created_out=flags)
+    assert flags == [True], flags
+    flags.clear()
+    second = memory.save_trip_history(dict(record), created_out=flags)
+    assert second == first
+    assert flags == [False], flags
+    assert len(memory.get_trip_history(limit=None)) == 1
+    print("✓ 单条保存从写锁内带出新增 / 更新标记")
+
+
+def test_json_trip_identity_folds_edge_whitespace():
+    """备份保真保留的首尾空白与手输同一路线按同一条保存（不再重复新增）。"""
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-trip-space", tempfile.mkdtemp())
+    first = memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": " 上海 ",
+            "start_date": "2026-03-01",
+            "end_date": "2026-03-02",
+        }
+    )
+    second = memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-03-01",
+            "end_date": "2026-03-02",
+        }
+    )
+    assert first == second
+    trips = memory.get_trip_history(limit=None)
+    assert len(trips) == 1, trips
+    print("✓ 身份口径折叠首尾空白（存储写入去重命中）")
+
+
+def test_json_dedupe_cleans_case_and_whitespace_variants():
+    """trips-dedupe 可清理只差大小写 / 首尾空白的旧重复（含批量复核路径）。"""
+    from context.long_term_memory import LongTermMemory
+    from utils.trip_dedupe import apply_trip_dedupe, plan_trip_dedupe
+
+    memory = LongTermMemory("u-dedupe-fold", tempfile.mkdtemp())
+    memory.data["trip_history"].extend(
+        [
+            {
+                "trip_id": "trip_1",
+                "origin": "北京",
+                "destination": "Shanghai",
+                "start_date": "2026-02-01",
+                "end_date": "2026-02-02",
+            },
+            {
+                "trip_id": "trip_2",
+                "origin": "北京",
+                "destination": "shanghai",
+                "start_date": "2026-02-01",
+                "end_date": "2026-02-02",
+            },
+            {
+                "trip_id": "trip_3",
+                "origin": "北京",
+                "destination": " 上海 ",
+                "start_date": "2026-02-03",
+                "end_date": "2026-02-04",
+            },
+            {
+                "trip_id": "trip_4",
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-02-03",
+                "end_date": "2026-02-04",
+            },
+        ]
+    )
+    memory._persist()
+    plan = plan_trip_dedupe(memory)
+    assert plan["duplicate_entries"] == [
+        ("trip_1", "trip_2"),
+        ("trip_3", "trip_4"),
+    ], plan
+    removed, failure = apply_trip_dedupe(
+        memory, plan["duplicate_entries"], plan["verify"]
+    )
+    assert (removed, failure) == (2, None), (removed, failure)
+    assert [trip["trip_id"] for trip in memory.get_trip_history(limit=None)] == [
+        "trip_1",
+        "trip_3",
+    ]
+    print("✓ 去重命令清理大小写 / 首尾空白变体（批量复核与删除同口径）")
 
 
 def test_trip_frequent_destinations_ignore_dirty_dates():

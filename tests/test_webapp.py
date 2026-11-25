@@ -2990,6 +2990,10 @@ def test_destructive_endpoints_503_while_pg_cooling_down(monkeypatch):
     response = client.delete(f"/api/trips/trip_1?user_id={user_id}")
     assert response.status_code == 503, response.text
 
+    # 行程列表与状态 / 导出同口径：冷却期不能静默展示回退 JSON
+    response = client.get(f"/api/trips?user_id={user_id}")
+    assert response.status_code == 503, response.text
+
     response = client.delete(f"/api/preferences/home_location?user_id={user_id}")
     assert response.status_code == 503, response.text
 
@@ -6388,7 +6392,7 @@ def test_create_trip_write_failure_maps_503(monkeypatch):
         def get_trip_history(self, limit=None):
             return []
 
-        def save_trip_history(self, trip):
+        def save_trip_history(self, trip, **kwargs):
             raise MemoryPersistenceError("disk full")
 
         def close(self):
@@ -7438,6 +7442,127 @@ def test_create_trip_api():
         _cleanup(user_id)
 
 
+def test_create_trip_preserves_purpose_on_duplicate_submit():
+    """重复提交同一行程（未提供目的）不能把用户改过的目的重置为「出差」。"""
+    user_id = _unique_user("web_test_trip_purpose")
+    client = _client()
+    base = {
+        "user_id": user_id,
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-02",
+    }
+    try:
+        first = client.post("/api/trips", json={**base, "purpose": "探亲"})
+        assert first.status_code == 201, first.text
+        assert first.json()["created"] is True
+
+        # 未提供目的且命中既有行程：保留原目的
+        second = client.post("/api/trips", json=base)
+        assert second.status_code == 201, second.text
+        assert second.json()["created"] is False
+        trips = client.get("/api/trips", params={"user_id": user_id}).json()["trips"]
+        assert trips[0]["purpose"] == "探亲", trips
+
+        # 全新路线未提供目的：仍落默认「出差」
+        third = client.post(
+            "/api/trips",
+            json={
+                **base,
+                "destination": "杭州",
+                "start_date": "2026-12-05",
+                "end_date": "2026-12-06",
+            },
+        )
+        assert third.status_code == 201, third.text
+        assert third.json()["created"] is True
+        trips = client.get("/api/trips", params={"user_id": user_id}).json()["trips"]
+        purposes = {trip["destination"]: trip.get("purpose") for trip in trips}
+        assert purposes["杭州"] == "出差", purposes
+
+        # 显式提供目的仍按用户输入覆盖
+        fourth = client.post("/api/trips", json={**base, "purpose": "出差"})
+        assert fourth.status_code == 201, fourth.text
+        trips = client.get("/api/trips", params={"user_id": user_id}).json()["trips"]
+        assert trips[0]["purpose"] == "出差", trips
+        print("✓ 重复提交保留目的，新行程默认「出差」")
+    finally:
+        _cleanup(user_id)
+
+
+def test_create_trip_created_flag_uses_write_lock_result(monkeypatch):
+    """锁外窗口里的其它新增不能把「更新」误报为「新增」。"""
+    from context.storage import create_long_term_memory
+    from webapp import server as server_module
+
+    user_id = _unique_user("web_test_trip_created_flag")
+    store = create_long_term_memory(user_id, str(MEMORY_DIR))
+    store.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+            "purpose": "会议",
+        }
+    )
+
+    class _RacyStore:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def get_trip_history(self, limit=None):
+            return self.inner.get_trip_history(limit=limit)
+
+        def save_trip_history(self, record, *, max_total=None, created_out=None):
+            # 模拟窗口里另一进程先插入无关行程：长度差口径会误判为新增
+            self.inner.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "杭州",
+                    "start_date": "2027-01-01",
+                    "end_date": "2027-01-02",
+                }
+            )
+            return self.inner.save_trip_history(
+                record, max_total=max_total, created_out=created_out
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "_open_long_term",
+        lambda uid, strict=False, **kwargs: _RacyStore(store),
+    )
+    client = _client()
+    try:
+        response = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-02",
+            },
+        )
+        assert response.status_code == 201, response.text
+        assert response.json()["created"] is False, response.json()
+        # 未提供目的且命中既有行程：目的不被重置
+        trips = store.get_trip_history(limit=None)
+        kept = next(trip for trip in trips if trip["destination"] == "上海")
+        assert kept["purpose"] == "会议", kept
+        print("✓ created 取自写锁内结果（并发窗口不误报）")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+        _cleanup(user_id)
+
+
 def test_update_trip_api():
     user_id = _unique_user("web_test_update_trip")
     client = _client()
@@ -8288,13 +8413,14 @@ def test_next_trip_prefers_ongoing():
                     "start_date": (today + timedelta(days=10)).isoformat(),
                 }
             )
-            # 非 ISO 结束日期不能按字符串比较成「进行中」，按单日处理
+            # 非法结束日期（非真实日历日）不能按字符串比较成「进行中」，
+            # 按单日处理；斜杠日期是合法身份口径，不再属于此分支
             store.save_trip_history(
                 {
                     "origin": "北京",
                     "destination": "广州",
                     "start_date": (today - timedelta(days=5)).isoformat(),
-                    "end_date": "2026/12/31",
+                    "end_date": "2026-13-40",
                 }
             )
         finally:
@@ -9684,7 +9810,7 @@ def test_half_open_breaker_recovers_through_chat_endpoint():
 
 
 def test_trip_export_uses_strict_store(monkeypatch):
-    """行程导出 / 日历用 strict 打开：PG 故障期不能把回退 JSON 当成功。"""
+    """行程列表 / 导出 / 日历用 strict 打开：PG 故障期不能把回退 JSON 当成功。"""
     from webapp import server as server_module
 
     captured = []
@@ -9707,14 +9833,18 @@ def test_trip_export_uses_strict_store(monkeypatch):
         client.get("/api/trips/export", params={"user_id": user_id}).status_code
         == 200
     )
+    # 列表读与状态 / 导出 / CLI 同一口径：故障期不回退 JSON
+    assert (
+        client.get("/api/trips", params={"user_id": user_id}).status_code == 200
+    )
     assert (
         client.get(
             "/api/trips/trip_1/calendar", params={"user_id": user_id}
         ).status_code
         == 404
     )
-    assert [strict for _, strict in captured] == [True, True], captured
-    print("✓ 行程导出 / 日历使用 strict 打开长期记忆")
+    assert [strict for _, strict in captured] == [True, True, True], captured
+    print("✓ 行程列表 / 导出 / 日历使用 strict 打开长期记忆")
 
 
 def test_daemon_import_executor_is_not_joined_at_exit():

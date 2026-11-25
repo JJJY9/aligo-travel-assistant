@@ -1021,6 +1021,7 @@ class ItineraryPlanningAgent(AgentBase):
         schedule_section = ""
         must_see = plan_requirements.get("must_see") or []
         duration_days = plan_requirements.get("duration_days")
+        unscheduled: list[str] = []
         if must_see and isinstance(duration_days, int) and duration_days > 0:
             from utils.itinerary_solver import (
                 render_schedule,
@@ -1029,8 +1030,11 @@ class ItineraryPlanningAgent(AgentBase):
 
             schedule = schedule_must_see(must_see, duration_days)
             schedule_text = render_schedule(schedule)
+            unscheduled = [
+                str(name) for name in (schedule.get("unscheduled") or [])
+            ]
             if schedule_text:
-                if schedule.get("unscheduled"):
+                if unscheduled:
                     # 求解器已判定默认时间窗放不下：不能再要求「必须覆盖
                     # 全部必去项」，否则模型会把未安排项硬塞进同一天
                     header = (
@@ -1082,11 +1086,23 @@ class ItineraryPlanningAgent(AgentBase):
 
             # v2.0 行程校验：从用户需求与事项收集结果提取约束，做五项
             # 确定性检查（天数 / 时间冲突 / 预算 / 必去项 / 费用复核）；
-            # 未通过时带原因重生成，仍失败则保留问题列表随结果返回
+            # 未通过时带原因重生成，仍失败则保留问题列表随结果返回。
+            # 求解器已判定放不下的必去项不再要求校验覆盖：prompt 里明确
+            # 「请勿硬塞、告知用户增加天数」，校验却仍强制 must_see 会与
+            # 修复提示互相矛盾，并把模型逼回硬塞同一天
             from utils.itinerary_validation import validate_itinerary
 
+            validation_requirements = plan_requirements
+            if unscheduled:
+                excluded = {name.strip().casefold() for name in unscheduled}
+                validation_requirements = dict(plan_requirements)
+                validation_requirements["must_see"] = [
+                    name
+                    for name in (plan_requirements.get("must_see") or [])
+                    if str(name).strip().casefold() not in excluded
+                ]
             plan_issues = validate_itinerary(
-                result.get("itinerary"), plan_requirements
+                result.get("itinerary"), validation_requirements
             )
             repair_enabled, repair_attempts = _plan_repair_settings()
             if plan_issues and repair_enabled:
@@ -1102,7 +1118,7 @@ class ItineraryPlanningAgent(AgentBase):
                     if repaired is None:
                         break
                     repaired_issues = validate_itinerary(
-                        repaired.get("itinerary"), plan_requirements
+                        repaired.get("itinerary"), validation_requirements
                     )
                     if not repaired_issues:
                         result = repaired
