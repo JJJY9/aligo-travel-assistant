@@ -99,6 +99,32 @@ def test_weather_stale_note(monkeypatch):
     print("✓ stale 数据在 CLI 中标注")
 
 
+def test_weather_text_strips_terminal_controls(monkeypatch):
+    """上游返回的城市名 / 日期含控制字符时，CLI 文本输出必须净化。"""
+    poisoned = {
+        **_FORECAST,
+        "city": "北京\x1b]0;spoof\x07",
+        "daily": [
+            {
+                "date": "2026-11-05\n伪造行",
+                "description": "晴\x1b[31m",
+                "min": 5,
+                "max": 15,
+            }
+        ],
+    }
+    _patch_fetch(monkeypatch, result=poisoned)
+    code, output = _run()
+    assert code == 0
+    assert "\x1b" not in output and "\x07" not in output
+    assert "伪造行" in output
+    lines = output.splitlines()
+    assert not any(line.strip() == "伪造行" for line in lines), (
+        "换行不能伪造额外的列表行"
+    )
+    print("✓ 天气文本输出剥离终端控制字符")
+
+
 def test_main_dispatch(monkeypatch):
     _patch_fetch(monkeypatch, result=dict(_FORECAST))
     monkeypatch.setattr(sys, "argv", ["cli.py", "weather", "北京"])
@@ -139,6 +165,7 @@ if __name__ == "__main__":
         test_weather_failure,
         test_weather_failure_json,
         test_weather_stale_note,
+        test_weather_text_strips_terminal_controls,
         test_main_dispatch,
         test_main_dispatch_uppercase_json,
         test_main_dispatch_usage,

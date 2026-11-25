@@ -214,6 +214,45 @@ def test_extra_skill_unwraps_fenced_json_envelope():
     print("✓ 扩展技能解包围栏 JSON 信封")
 
 
+def test_extra_skill_unwraps_envelope_with_surrounding_text():
+    """围栏 / 裸 JSON 信封前后夹带说明文字时同样取正文。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    envelope = json.dumps(
+        {"status": "success", "budget_advice": "夹文正文"},
+        ensure_ascii=False,
+    )
+    wrappers = [
+        "好的，以下是预算建议：\n```json\n" + envelope + "\n```",
+        "```json\n" + envelope + "\n```\n希望对你有帮助。",
+        "建议如下：\n```json\n" + envelope + "\n```\n如需调整请告诉我。",
+        "以下是 JSON：" + envelope,
+        "完成。",
+    ]
+    agent = agent_class(model=None)
+    assert agent._unwrap_answer(wrappers[0]) == "夹文正文"
+    assert agent._unwrap_answer(wrappers[1]) == "夹文正文"
+    assert agent._unwrap_answer(wrappers[2]) == "夹文正文"
+    assert agent._unwrap_answer(wrappers[3]) == "夹文正文"
+    # 不含信封的正文原样返回
+    assert agent._unwrap_answer(wrappers[4]) == "完成。"
+    # 正文里带一个非信封的示例块（无 result_key / answer 等键）时不误伤
+    example = '建议：\n```json\n{"sample": 1}\n```\n以上。'
+    assert agent._unwrap_answer(example) == example
+    print("✓ 夹文信封 / 裸 JSON 信封正确解包")
+
+
+def test_extra_skill_unwraps_nested_data_envelope():
+    """{"status": "success", "data": {"answer": ...}} 的嵌套信封取正文。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    envelope = json.dumps(
+        {"status": "success", "data": {"answer": "嵌套正文"}},
+        ensure_ascii=False,
+    )
+    agent = agent_class(model=None)
+    assert agent._unwrap_answer(envelope) == "嵌套正文"
+    print("✓ 嵌套 data 信封解包")
+
+
 def test_extra_skill_prompt_neutralizes_user_query():
     """用户问题单独插值处也要中和数据块分隔符。"""
     agent_class = _load("trip-budget", "TripBudgetAgent")
@@ -388,6 +427,8 @@ if __name__ == "__main__":
     test_extra_skill_prompt_combines_skill_md_and_system_prompt()
     test_extra_skill_unwraps_json_envelope()
     test_extra_skill_unwraps_fenced_json_envelope()
+    test_extra_skill_unwraps_envelope_with_surrounding_text()
+    test_extra_skill_unwraps_nested_data_envelope()
     test_extra_skill_prompt_neutralizes_user_query()
     test_extra_skill_long_context_keeps_json_structure()
     test_extra_skill_long_dialogue_keeps_previous_results()

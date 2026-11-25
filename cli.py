@@ -1336,17 +1336,10 @@ class AligoCLI:
         return has_output
 
     def _get_agent_display_name(self, agent_name: str) -> str:
-        """获取智能体的显示名称"""
-        # 与 README / LazyAgentRegistry 保持一致，仅保留已存在的 6 个子智能体
-        agent_display_names = {
-            "event_collection": "事项收集",
-            "preference": "偏好管理",
-            "itinerary_planning": "行程规划",
-            "information_query": "信息查询",
-            "rag_knowledge": "知识库查询",
-            "memory_query": "记忆查询",
-        }
-        return agent_display_names.get(agent_name, agent_name)
+        """获取智能体的显示名称（与 Web / 历史渲染共用一份映射）。"""
+        from utils.result_formatter import display_name
+
+        return display_name(agent_name)
 
     def show_status(self):
         """显示当前状态"""
@@ -2137,7 +2130,7 @@ def run_weather_standalone(city: str, as_json: bool = False) -> int:
                 )
             )
         else:
-            print(f"天气查询失败：{exc}")
+            print(f"天气查询失败：{_plain_safe(exc)}")
         return 1
 
     if as_json:
@@ -2145,11 +2138,12 @@ def run_weather_standalone(city: str, as_json: bool = False) -> int:
         return 0
 
     def _temp(value: object) -> str:
-        return "?" if value is None else str(value)
+        return "?" if value is None else _single_line_safe(value)
 
     current = data.get("current") or {}
     print(
-        f"{data.get('city') or city} 当前天气：{current.get('description') or '未知'}，"
+        f"{_single_line_safe(data.get('city') or city)} 当前天气："
+        f"{_single_line_safe(current.get('description') or '未知')}，"
         f"气温 {_temp(current.get('temperature'))}°C，"
         f"湿度 {_temp(current.get('humidity'))}%"
     )
@@ -2158,7 +2152,8 @@ def run_weather_standalone(city: str, as_json: bool = False) -> int:
         print("未来几天：")
         for day in daily:
             print(
-                f"  {day.get('date')}: {day.get('description') or '未知'}，"
+                f"  {_single_line_safe(day.get('date'))}: "
+                f"{_single_line_safe(day.get('description') or '未知')}，"
                 f"{_temp(day.get('min'))}~{_temp(day.get('max'))}°C"
             )
     if data.get("stale"):

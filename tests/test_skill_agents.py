@@ -697,6 +697,73 @@ def test_weather_city_handles_relative_time_and_action_words():
     print("✓ 时间词 / 动作词 / 交通方式不影响城市提取")
 
 
+def test_weather_city_extraction_word_level_rejection():
+    """问句词按完整词拦截：多/什 是合法城市用字，不能按单字丢弃。"""
+    agent_class = _load_skill("query-info", "InformationQueryAgent")
+    agent = object.__new__(agent_class)
+    assert agent._extract_city_from_query("多伦多天气怎么样") == "多伦多"
+    assert agent._extract_city_from_query("多哈天气") == "多哈"
+    assert agent._extract_city_from_query("从北京去多哈的天气") == "多哈"
+    assert agent._extract_city_from_query("什邡天气怎么样") == "什邡"
+    assert agent._extract_city_from_query("北京到喀什天气怎么样") == "喀什"
+    # 时间短语不是城市
+    assert agent._extract_city_from_query("帮我查一下出发当天的天气") == ""
+    assert agent._extract_city_from_query("当天天气怎么样") == ""
+    # 真问句词仍被拦截
+    assert agent._extract_city_from_query("去哪里玩天气") == ""
+    print("✓ 问句词词级拦截：多伦多/喀什可用、时间短语仍被拒绝")
+
+
+def test_weather_city_prefers_explicit_clause_city():
+    """天气分句显式给出城市时，优先于行程目的地（多分句问句）。"""
+    agent_class = _load_skill("query-info", "InformationQueryAgent")
+    agent = object.__new__(agent_class)
+    assert (
+        agent._extract_city_from_query("从上海出发去北京，杭州天气怎么样")
+        == "杭州"
+    )
+    assert agent._extract_city_from_query("北京到上海，杭州天气怎么样") == "杭州"
+    assert (
+        agent._extract_city_from_query("从上海去北京出差，顺便问下杭州的天气")
+        == "杭州"
+    )
+    # 单分句行程问句仍取目的地
+    assert agent._extract_city_from_query("从北京去纽约，天气怎么样") == "纽约"
+    print("✓ 天气分句显式城市优先于行程目的地")
+
+
+def test_weather_query_synonyms_and_english_anchor():
+    """口语化天气问法与英文问句的城市提取。"""
+    agent_class = _load_skill("query-info", "InformationQueryAgent")
+    agent = object.__new__(agent_class)
+    for query in (
+        "北京今天多少度",
+        "上海几度",
+        "杭州热不热",
+        "三亚有雨吗",
+        "深圳湿度多少",
+        "London temperature",
+    ):
+        assert agent._is_weather_query(query) is True, query
+    assert agent._is_weather_query("推荐一款湿度计") is False
+    assert agent._extract_city_from_query("我在上海，北京多少度") == "北京"
+    assert agent._extract_city_from_query("伦敦下雪吗") == "伦敦"
+    # 英文问句：以天气词为锚点，句首问候 / 星期名不当城市
+    assert agent._extract_city_from_query("What's the weather in Paris?") == "Paris"
+    assert agent._extract_city_from_query("Hi, weather in Paris?") == "Paris"
+    assert (
+        agent._extract_city_from_query("Please tell me the weather in Rome")
+        == "Rome"
+    )
+    assert agent._extract_city_from_query("Weather in Tokyo on Friday") == "Tokyo"
+    assert agent._extract_city_from_query("How is the weather in Tokyo?") == "Tokyo"
+    assert (
+        agent._extract_city_from_query("What is the weather in New York?")
+        == "New York"
+    )
+    print("✓ 口语问法 / 英文锚点提取正常")
+
+
 def test_all_search_backends_fail_reports_error(monkeypatch):
     """三个搜索后端全部抛错时如实返回搜索失败，不能伪装成未找到结果。"""
     module = _load_skill_module("query-info")

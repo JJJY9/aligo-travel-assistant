@@ -2811,6 +2811,19 @@ def _enforce_kb_rate_limit(
     }
 
 
+def _weather_rate_headers(
+    state: AligoWebApp, request: Request
+) -> dict[str, str]:
+    """天气接口的额度头（只读状态，不消费额度、不拦截）。"""
+    client = _rate_identity(_client_host(request))
+    remaining, reset = state.weather_limiter.status(client)
+    return {
+        "X-RateLimit-Limit": str(state.weather_limiter.limit),
+        "X-RateLimit-Remaining": str(remaining),
+        "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
+    }
+
+
 def _enforce_weather_rate_limit(
     state: AligoWebApp, request: Request
 ) -> dict[str, str]:
@@ -2825,12 +2838,7 @@ def _enforce_weather_rate_limit(
         raise _rate_limited_exception(
             request, "天气查询过于频繁", state.weather_limiter.limit, retry_after
         )
-    remaining, reset = state.weather_limiter.status(client)
-    return {
-        "X-RateLimit-Limit": str(state.weather_limiter.limit),
-        "X-RateLimit-Remaining": str(remaining),
-        "X-RateLimit-Reset": str(max(1, math.ceil(reset))),
-    }
+    return _weather_rate_headers(state, request)
 
 
 def _enforce_read_rate_limit(
@@ -4448,7 +4456,15 @@ def create_app(model: Any = None) -> FastAPI:
         # 循环线程上，否则一次网络等待会阻塞同进程的所有请求
         cached = await asyncio.to_thread(peek_cached_weather, name)
         if cached is not None:
-            return JSONResponse(content=jsonable_encoder(cached))
+            # 缓存命中不消耗额度，但同一端点的 200 应保持同一形状：附带
+            # 当前剩余额度的只读头（status() 在 Redis 后端是同步 EVAL，
+            # 同样不能放在事件循环线程上）
+            headers = await asyncio.to_thread(
+                _weather_rate_headers, state, request
+            )
+            return JSONResponse(
+                content=jsonable_encoder(cached), headers=headers
+            )
         headers = await asyncio.to_thread(
             _enforce_weather_rate_limit, state, request
         )

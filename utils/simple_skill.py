@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from agentscope.agent import AgentBase
@@ -223,29 +224,39 @@ class SimplePromptSkill(AgentBase):
         return text
 
     def _unwrap_answer(self, text: str) -> str:
-        """模型按提示返回 JSON 信封时取正文，不把整个 JSON 当答案。"""
+        """模型按提示返回 JSON 信封时取正文，不把整个 JSON 当答案。
+
+        模型常把信封包在 ```json 围栏里，并在前后加「好的，以下是建议：」
+        这类串词：只在文本恰为裸 JSON / 首尾行恰为围栏时解包会把围栏 +
+        JSON 原样展示给用户。这里对文本里出现的每个围栏块与首个 ``{`` 到
+        末个 ``}`` 的片段都尝试解包，全部失败才原样返回。
+        """
         stripped = text.strip()
-        # 模型常把 JSON 包在 ```json 围栏里：先剥围栏再判断信封，
-        # 否则用户会看到整段围栏 + JSON 而不是建议正文
-        if stripped.startswith("```"):
-            lines = stripped.splitlines()
-            if lines and lines[0].strip().startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].strip().startswith("```"):
-                lines = lines[:-1]
-            stripped = "\n".join(lines).strip()
-        if not (stripped.startswith("{") and stripped.endswith("}")):
-            return text
-        try:
-            data = json.loads(stripped)
-        except (json.JSONDecodeError, ValueError):
-            return text
-        if not isinstance(data, dict):
-            return text
-        for key in (self.result_key, *_ENVELOPE_KEYS):
-            value = data.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+        candidates: list[str] = [
+            match.group(1).strip()
+            for match in re.finditer(r"```[^\n`]*\n?(.*?)```", stripped, re.S)
+        ]
+        if "{" in stripped and "}" in stripped:
+            candidates.append(
+                stripped[stripped.index("{"): stripped.rfind("}") + 1]
+            )
+        candidates.append(stripped)
+        for candidate in candidates:
+            if not (candidate.startswith("{") and candidate.endswith("}")):
+                continue
+            try:
+                data = json.loads(candidate)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            for source in (data, data.get("data")):
+                if not isinstance(source, dict):
+                    continue
+                for key in (self.result_key, *_ENVELOPE_KEYS):
+                    value = source.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
         return text
 
     def _build_prompt(self, x: Msg | list[Msg]) -> str:

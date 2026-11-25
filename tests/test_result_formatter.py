@@ -888,6 +888,24 @@ def test_itinerary_validation_warning_rendered():
     print("✓ 行程校验未通过时渲染警告")
 
 
+def test_extra_skills_have_chinese_display_names():
+    """六个 v2.0 simple 技能在失败块 / 历史渲染里显示中文名而不是目录名。"""
+    from utils.result_formatter import display_name
+
+    for skill in (
+        "trip-budget",
+        "packing-list",
+        "travel-checklist",
+        "local-transport",
+        "safety-tips",
+        "trip-notes",
+    ):
+        assert display_name(skill) != skill, skill
+    # 未知名称保持原样
+    assert display_name("unknown_agent") == "unknown_agent"
+    print("✓ 扩展技能具备中文显示名")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -921,6 +939,7 @@ if __name__ == "__main__":
     test_event_collection_missing_non_list()
     test_object_results_are_normalized()
     test_itinerary_validation_warning_rendered()
+    test_extra_skills_have_chinese_display_names()
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_render_agent_exception_falls_back(_mp)

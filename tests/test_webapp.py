@@ -1003,6 +1003,44 @@ def test_weather_rate_limit(monkeypatch):
     print("✓ /api/weather 按 IP 独立限流（空白城市不耗额度）")
 
 
+def test_weather_cache_hit_reports_rate_headers(monkeypatch):
+    """缓存命中的 200 也带额度头，且不消耗额度（同一端点 200 形状一致）。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    payload = {"city": "北京", "current": {"description": "晴"}, "daily": []}
+    monkeypatch.setattr(
+        server_module, "peek_cached_weather", lambda name: dict(payload)
+    )
+    calls = []
+    monkeypatch.setattr(
+        server_module,
+        "fetch_weather",
+        lambda city: calls.append(city) or dict(payload),
+    )
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    app.state.aligo.weather_limiter = RateLimiter(limit=2, window_sec=60)
+    client = TestClient(app)
+
+    first = client.get("/api/weather", params={"city": "北京"})
+    assert first.status_code == 200
+    assert first.headers["x-ratelimit-limit"] == "2"
+    assert first.headers["x-ratelimit-remaining"] == "2", "缓存命中不消耗额度"
+    assert "x-ratelimit-reset" in first.headers
+
+    second = client.get("/api/weather", params={"city": "北京"})
+    assert second.headers["x-ratelimit-remaining"] == "2"
+    assert calls == [], "缓存命中不能访问上游"
+
+    # 缓存失效后的真实请求仍可使用完整额度（并附带递减后的额度头）
+    monkeypatch.setattr(server_module, "peek_cached_weather", lambda name: None)
+    third = client.get("/api/weather", params={"city": "北京"})
+    assert third.status_code == 200
+    assert third.headers["x-ratelimit-remaining"] == "1"
+    assert calls == ["北京"]
+    print("✓ /api/weather 缓存命中附带额度头且不消耗额度")
+
+
 def test_weather_endpoint_uses_dedicated_executor(monkeypatch):
     """天气请求必须真的跑在专用线程池里：慢上游不会阻塞事件循环。
 

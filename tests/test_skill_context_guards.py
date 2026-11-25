@@ -314,7 +314,11 @@ def test_web_search_unwraps_duckduckgo_redirect_links(monkeypatch):
 
 
 def test_search_summary_failure_is_reported(monkeypatch):
-    """摘要模型失败不能伪装成 query_success=True 的空摘要。"""
+    """摘要模型失败不能伪装成 query_success=True 的空摘要。
+
+    摘要模型属 LLM 通道：5xx / 超时 / 401 等必须原样穿透给编排层退避
+    重试与熔断记账，不能在 _web_search 里折叠成字符串错误。
+    """
     module_globals = InformationQueryAgent._web_search.__globals__
     monkeypatch.setitem(module_globals, "DDGS", _FakeDDGS)
     monkeypatch.setitem(module_globals, "DDGS_AVAILABLE", True)
@@ -340,10 +344,11 @@ def test_search_summary_failure_is_reported(monkeypatch):
     monkeypatch.setitem(
         module_globals, "extract_json_from_async_response", _fake_extract
     )
-    result = asyncio.run(agent._web_search("住宿"))
-    assert result["query_success"] is False, result
-    assert "timeout" in result["results"]["error"], result
-    print("✓ 摘要模型失败按搜索失败上报，保留瞬时错误文本")
+    import pytest
+
+    with pytest.raises(TimeoutError, match="summary model timeout"):
+        asyncio.run(agent._web_search("住宿"))
+    print("✓ 摘要模型瞬时故障原样穿透，交给编排层重试 / 熔断记账")
 
 
 def test_user_metadata_missing_parts_stripped_and_neutralized(monkeypatch):
