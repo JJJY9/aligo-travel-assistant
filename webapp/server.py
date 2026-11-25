@@ -238,6 +238,15 @@ _BASE_SECURITY_HEADERS = [
     (b"referrer-policy", b"no-referrer"),
     (b"permissions-policy", b"camera=(), microphone=(), geolocation=()"),
 ]
+# HSTS 默认不发送：应用自身不终止 TLS（uvicorn proxy_headers=False），且
+# 无条件 HSTS 会把同一主机名下的其它明文端口（本机其它服务）一起锁出
+# 浏览器。README / SECURITY.md 要求 TLS 反向代理自行下发 HSTS；应用侧
+# 兜底由部署者显式设置 ALIGO_HSTS_MAX_AGE（秒，0 = 关闭）。
+# 浏览器只在 HTTPS 响应上采纳该头，回环明文部署不受影响。
+try:
+    _HSTS_MAX_AGE = max(0, int(os.environ.get("ALIGO_HSTS_MAX_AGE", "0") or 0))
+except ValueError:
+    _HSTS_MAX_AGE = 0
 _SECURITY_HEADERS = _BASE_SECURITY_HEADERS + [
     (
         b"content-security-policy",
@@ -272,8 +281,19 @@ def _security_headers_for(
     if docs_enabled and (
         path in ("/docs", "/redoc") or path.startswith(("/docs/", "/redoc/"))
     ):
-        return _DOCS_SECURITY_HEADERS
-    return _SECURITY_HEADERS
+        headers = _DOCS_SECURITY_HEADERS
+    else:
+        headers = _SECURITY_HEADERS
+    if _HSTS_MAX_AGE > 0:
+        # 显式开启时才下发（含 404 / 405 等错误路径）；不加
+        # includeSubDomains / preload，避免锁死同主机名的其它明文子域
+        headers = headers + [
+            (
+                b"strict-transport-security",
+                f"max-age={_HSTS_MAX_AGE}".encode("latin-1"),
+            )
+        ]
+    return headers
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -851,10 +871,49 @@ class BodySizeLimitMiddleware:
             await send_413()
 
 
+def _accepts_gzip(accept_encoding: str) -> bool:
+    """按 RFC 9110 §12.5.3 解析 Accept-Encoding，判断 gzip 是否可接受。
+
+    Starlette ``GZipMiddleware`` 只做大小写敏感的子串判断：``gzip;q=0``
+    （显式拒绝）会被压缩、``GZIP``（合法写法）反而不压缩。这里按语法
+    解析：编码名大小写不敏感，``q=0`` 表示不可接受，``*`` 通配未显式
+    列出的编码；缺失 / 全无匹配视为只接受 identity。
+    """
+    explicit: float | None = None
+    wildcard: float | None = None
+    for part in str(accept_encoding or "").split(","):
+        token, _, params = part.strip().partition(";")
+        coding = token.strip().lower()
+        if not coding:
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            name, _, value = param.partition("=")
+            if name.strip().lower() != "q":
+                continue
+            try:
+                quality = float(value.strip())
+            except ValueError:
+                quality = 0.0
+            quality = min(max(quality, 0.0), 1.0)
+        if coding in ("gzip", "x-gzip"):
+            explicit = quality
+        elif coding == "*":
+            wildcard = quality
+    if explicit is not None:
+        return explicit > 0
+    if wildcard is not None:
+        return wildcard > 0
+    return False
+
+
 class SelectiveGZipMiddleware:
     """对除 SSE 流以外的响应启用 gzip。
 
     SSE 需要逐事件即时送达，压缩会引入缓冲并破坏实时进度，因此按路径排除。
+    Accept-Encoding 显式拒绝 gzip（``gzip;q=0``、``identity``、缺失）时
+    直接走未压缩路径，但仍经过 ``GZipMiddleware`` 以便保留
+    ``Vary: Accept-Encoding``（缓存代理按它区分编码）。
     """
 
     def __init__(self, app: Any, minimum_size: int = 1024) -> None:
@@ -862,9 +921,28 @@ class SelectiveGZipMiddleware:
         self.compressed_app = GZipMiddleware(app, minimum_size=minimum_size)
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
-        if scope.get("type") == "http" and _route_path(scope) == "/api/chat/stream":
+        if scope.get("type") != "http":
+            await self.compressed_app(scope, receive, send)
+            return
+        if _route_path(scope) == "/api/chat/stream":
             await self.app(scope, receive, send)
             return
+        encodings = ",".join(
+            value.decode("latin-1")
+            for key, value in scope.get("headers") or []
+            if key.lower() == b"accept-encoding"
+        )
+        # 统一改写成规范的小写 gzip / identity：Starlette 的子串判断大小写
+        # 敏感（GZIP 不压缩、gzip;q=0 却压缩），语义已在上方按 RFC 解析。
+        # 原地改写 scope（不能复制）：外层 RequestContextMiddleware 依赖
+        # 路由对同一 scope 写入的 scope["route"] 计算指标路径，复制会让
+        # 指标全部退化为 __unmatched__。
+        canonical = b"gzip" if _accepts_gzip(encodings) else b"identity"
+        scope["headers"] = [
+            (key, value)
+            for key, value in scope.get("headers") or []
+            if key.lower() != b"accept-encoding"
+        ] + [(b"accept-encoding", canonical)]
         await self.compressed_app(scope, receive, send)
 
 
@@ -1553,6 +1631,12 @@ class AligoWebApp:
         # 导入排队上限（1 执行 + 1 等待）：执行器队列无界，并发大备份
         # （各可达 64MB）会在排队期间常驻内存直到 OOM，排队已满时按 503 背压
         self.import_queue_slots = threading.BoundedSemaphore(2)
+        # 同一来源 IP 的并发导入（备份恢复 / 行程导入）上限为 1：慢速上传
+        # （声明 Content-Length 后几乎不发送请求体）会把仅 2 个的全局导入
+        # 槽位占满到 300 秒读体超时，期间所有用户的导入都 503；按来源限制
+        # 并发后，单个 IP 最多占 1 槽，无法独占全部槽位
+        self._import_inflight: dict[str, int] = {}
+        self._import_inflight_lock = threading.Lock()
         # 正在恢复备份的用户：恢复在导入执行器线程里逐条写库，导出若在
         # 写入期间读取会得到半截快照（用户会把它当成完整备份保存）。导出
         # 入口与读完快照时都检查该标记，命中返回 409。执行器线程写标记，
@@ -2187,6 +2271,85 @@ class AligoWebApp:
                 return exists
         return remaining is not None
 
+    def recently_deleted_many(
+        self, user_id: str, session_ids: Any
+    ) -> set[str]:
+        """批量版 :meth:`is_recently_deleted`：一次流水线代替逐键 EXISTS。
+
+        备份恢复按会话整批查询墓碑（备份可含数十万个互不相同的会话 ID）；
+        逐键 EXISTS 意味着同等数量的串行网络往返，单个请求即可占用全局
+        导入槽数分钟。本地墓碑语义与单键一致（命中即返回 True，并尽力
+        补写共享墓碑）；其余 ID 按 500 个一批 ``pipeline().exists``，
+        后端故障时按 ``_tombstone_failed`` 降级并回退进程内结论。
+        """
+        ids = list(dict.fromkeys(sid for sid in session_ids if sid))
+        if not ids:
+            return set()
+        # 测试替身 / 子类覆盖了单键实现时按逐键语义执行（批量是纯优化，
+        # 不能绕过被替换的行为）
+        single = self.is_recently_deleted
+        if getattr(single, "__func__", None) is not AligoWebApp.is_recently_deleted:
+            return {sid for sid in ids if single(user_id, sid)}
+        self._maybe_replay_pending()
+        now = time.monotonic()
+        deleted: set[str] = set()
+        shared_heal: list[tuple[str, str, float]] = []
+        pending: list[str] = []
+        with self._tombstone_lock:
+            for session_id in ids:
+                key = self._session_key(user_id, session_id)
+                entry = self._deleted_sessions.get(key)
+                if entry is None:
+                    pending.append(session_id)
+                    continue
+                created, token = entry
+                elapsed = now - created
+                if elapsed <= self.tombstone_ttl_sec:
+                    deleted.add(session_id)
+                    shared_heal.append(
+                        (session_id, token, self.tombstone_ttl_sec - elapsed)
+                    )
+                else:
+                    self._deleted_sessions.pop(key, None)
+                    pending.append(session_id)
+        client = self._shared_tombstones()
+        if client is None:
+            return deleted
+        try:
+            for session_id, token, remaining in shared_heal:
+                # 与单键路径同一自愈语义：本地墓碑仍有效时顺带补写共享
+                # 墓碑（首次写入失败后），NX 不覆盖其它实例已有的墓碑
+                client.set(
+                    self._deleted_key(user_id, session_id),
+                    token,
+                    nx=True,
+                    ex=max(1, int(remaining)),
+                )
+            if pending:
+                pipeline_factory = getattr(client, "pipeline", None)
+                if callable(pipeline_factory):
+                    chunk_size = 500
+                    for start in range(0, len(pending), chunk_size):
+                        chunk = pending[start : start + chunk_size]
+                        pipe = pipeline_factory(transaction=False)
+                        for session_id in chunk:
+                            pipe.exists(self._deleted_key(user_id, session_id))
+                        for session_id, found in zip(chunk, pipe.execute()):
+                            if found:
+                                deleted.add(session_id)
+                else:
+                    # 测试桩 / 精简客户端没有 pipeline：退回逐键 EXISTS
+                    # （仍在同一异常语义内，失败整体降级）
+                    for session_id in pending:
+                        if client.exists(self._deleted_key(user_id, session_id)):
+                            deleted.add(session_id)
+        except Exception as exc:  # noqa: BLE001 - 读失败时回退进程内墓碑
+            self._tombstone_failed(exc, "批量读取")
+            return deleted
+        self._tombstones_shared = True
+        self._tombstone_retry_at = 0.0
+        return deleted
+
     def close_all(self) -> None:
         """关闭所有会话（进程退出时调用）。"""
         with self._sessions_lock:
@@ -2223,6 +2386,24 @@ class AligoWebApp:
             lock = asyncio.Lock()
             self.locks[user_id] = lock
         return lock
+
+    def try_begin_import(self, client: str) -> bool:
+        """登记一个占导入槽的请求；同一来源已有导入在途时返回 False。
+
+        同 IP 并发导入上限为 1（见 ``__init__`` 中的槽位说明）：慢速上传
+        无法用两个连接独占全部全局槽位。登记必须在读请求体之前完成，
+        释放放在占用全局槽位的同一 ``finally`` 里。
+        """
+        key = client or "unknown"
+        with self._import_inflight_lock:
+            if self._import_inflight.get(key):
+                return False
+            self._import_inflight[key] = 1
+            return True
+
+    def end_import(self, client: str) -> None:
+        with self._import_inflight_lock:
+            self._import_inflight.pop(client or "unknown", None)
 
     def begin_user_import(self, user_id: str) -> None:
         """标记该用户开始恢复备份并推进恢复纪元（写入前调用）。"""
@@ -2377,7 +2558,7 @@ _XFF_WARN_INTERVAL_SEC = 60.0
 
 
 def _warn_unparsable_forwarded_hop(request: Request, candidate: str) -> None:
-    """XFF 末跳不是合法 IP 时告警（进程内 ≤1 条/分钟，经日志脱敏截断）。"""
+    """XFF 第 N 跳不是合法 IP 时告警（进程内 ≤1 条/分钟，经日志脱敏截断）。"""
     global _xff_warn_last
     now = time.monotonic()
     with _xff_warn_lock:
@@ -2385,29 +2566,66 @@ def _warn_unparsable_forwarded_hop(request: Request, candidate: str) -> None:
             return
         _xff_warn_last = now
     logger.warning(
-        "TRUST_PROXY_HEADERS=1 但 X-Forwarded-For 末跳不是合法 IP（%r），"
-        "已回退 TCP 对端 %s；请让最近一跳代理写入裸 IP 或 [IPv6]/IP:port",
+        "TRUST_PROXY_HEADERS=1 但 X-Forwarded-For 第 N 跳不是合法 IP（%r），"
+        "已回退 TCP 对端 %s；请让最近一跳代理写入裸 IP 或 [IPv6]/IP:port"
+        "（层数由 TRUST_PROXY_HOPS 配置）",
         _safe_log_text(candidate)[:64],
         request.client.host if request.client else "unknown",
     )
+
+
+def _warn_short_forwarded_chain(request: Request, length: int, hops: int) -> None:
+    """XFF 链长不足 TRUST_PROXY_HOPS 时告警（进程内 ≤1 条/分钟）。"""
+    global _xff_warn_last
+    now = time.monotonic()
+    with _xff_warn_lock:
+        if now - _xff_warn_last < _XFF_WARN_INTERVAL_SEC:
+            return
+        _xff_warn_last = now
+    logger.warning(
+        "TRUST_PROXY_HOPS=%d 但 X-Forwarded-For 只有 %d 跳，"
+        "已回退 TCP 对端 %s；请让每一层代理都按标准追加 XFF，"
+        "或把 TRUST_PROXY_HOPS 调回实际的代理层数",
+        hops,
+        length,
+        request.client.host if request.client else "unknown",
+    )
+
+
+def _trust_proxy_hops() -> int:
+    """可信代理层数（TRUST_PROXY_HOPS，默认 1）：XFF 取倒数第 N 跳。
+
+    CDN → nginx → 应用这类多层部署里，nginx 以
+    ``$proxy_add_x_forwarded_for`` 追加的是 CDN 出口地址，恒定「取末跳」
+    会让所有客户端共用同一个限流桶（一个客户端即可打满全站额度）。
+    1..8 之外的配置按 1 处理（只取末跳，与旧行为一致）。
+    """
+    try:
+        hops = int(RATE_LIMIT_CONFIG.get("trust_proxy_hops", 1))
+    except (TypeError, ValueError):
+        return 1
+    if not 1 <= hops <= 8:
+        return 1
+    return hops
 
 
 def _client_host(request: Request) -> str:
     """限流使用的客户端地址。
 
     默认取 TCP 对端地址。部署在反向代理后面时设置 ``TRUST_PROXY_HEADERS=1``，
-    改为取 ``X-Forwarded-For`` 的**最后一跳**地址（代理按标准写法追加真实
-    客户端地址，如 nginx ``$proxy_add_x_forwarded_for``）；且只信任来自
-    ``TRUSTED_PROXY_CIDRS``（默认仅回环）的对端写入的 XFF——否则任意可达
-    对端可自选限流身份。末跳接受裸 IP、``[IPv6]`` / ``[IPv6]:port`` 与
-    ``IP:port``（端口剥离）；无法解析时回退 TCP 对端并告警。取最后一个值
-    而不是第一个：客户端自带的伪造值只会出现在更前面，轮换它不能获得新桶。
+    改为取 ``X-Forwarded-For`` 的倒数第 ``TRUST_PROXY_HOPS`` 跳地址（默认
+    1 = 直接对端代理追加的真实客户端，如 nginx
+    ``$proxy_add_x_forwarded_for``）；且只信任来自 ``TRUSTED_PROXY_CIDRS``
+    （默认仅回环）的对端写入的 XFF——否则任意可达对端可自选限流身份。
+    末跳接受裸 IP、``[IPv6]`` / ``[IPv6]:port`` 与 ``IP:port``（端口剥离）；
+    无法解析或链长不足时回退 TCP 对端并告警。取倒数第几跳而不是第一个：
+    客户端自带的伪造值只会出现在更前面，轮换它不能获得新桶。
     """
     peer = request.client.host if request.client else ""
     if RATE_LIMIT_CONFIG.get("trust_proxy_headers"):
         # 代理可能以多条独立头行追加（RFC 7230：多个同名头行等价于按
         # 顺序逗号拼接），只读第一行会把客户端自带的 XFF 当成实际值——
-        # 逐请求更换即可获得新桶 / 污染他人桶。合并全部头行后取最后一跳
+        # 逐请求更换即可获得新桶 / 污染他人桶。合并全部头行后按层数取跳。
         getlist = getattr(request.headers, "getlist", None)
         if callable(getlist):
             values = getlist("x-forwarded-for")
@@ -2419,7 +2637,14 @@ def _client_host(request: Request) -> str:
                 # 非可信对端的 XFF 一律忽略：任意可达客户端不能自选身份
                 _warn_untrusted_forwarded(request, peer)
             else:
-                candidate = forwarded.split(",")[-1].strip()
+                hops = _trust_proxy_hops()
+                parts = [part.strip() for part in forwarded.split(",")]
+                if len(parts) < hops:
+                    # 链长不足：配置的代理层数与实际不符，不能拿更早的
+                    # 一跳冒充客户端（那可能是客户端自带的伪造值）
+                    _warn_short_forwarded_chain(request, len(parts), hops)
+                    return peer or "unknown"
+                candidate = parts[-hops]
                 host = _last_hop_address(candidate)
                 if host:
                     return host[:64]
@@ -6691,7 +6916,19 @@ def create_app(model: Any = None) -> FastAPI:
         保存是 O(N²) 且持用户锁：不能占用共享线程池，也不能并发跑多份。
         """
         response.headers.update(_enforce_import_rate_limit(state, request))
+        # 同一来源的并发导入上限为 1：两个慢速上传就能占满全局槽位到读体
+        # 超时，期间所有用户的导入都 503
+        import_client = _rate_identity(_client_host(request))
+        if not state.try_begin_import(import_client):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "该来源已有导入任务在处理，请稍后再试"
+                    f"（请求 ID：{_request_id(request)}）"
+                ),
+            )
         if not state.import_queue_slots.acquire(blocking=False):
+            state.end_import(import_client)
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -6745,6 +6982,7 @@ def create_app(model: Any = None) -> FastAPI:
                 raise _storage_failure("导入行程失败", exc) from exc
         finally:
             state.import_queue_slots.release()
+            state.end_import(import_client)
         if not result["rows"]:
             # CSV 标「第N行」（物理行号）、ICS 标「事件N」（事件序号）：
             # 与 CLI / 前端共用同一 helper，不能让 ICS 的错误丢掉序号
@@ -7033,7 +7271,8 @@ def create_app(model: Any = None) -> FastAPI:
         将删除的条目。判定 / 复核 / 删除与 CLI 共用 ``utils.trip_dedupe``，
         两条入口不会漂移。破坏性操作走 strict 打开：PostgreSQL 配置了但
         不可用时 503，不在回退 JSON 上「清理成功」；全量扫描按读取限流桶
-        限速（与列表 / 导出同额度）。
+        限速（与列表 / 导出同额度），真实删除（``dry_run=False``）另按
+        写桶约束——它与其它写接口一样会整段重写行程。
 
         整个「计划 + 执行」持用户锁：并发的两个去重请求（双标签页 / 超时
         重试）不能各自基于同一快照各删一次（同 id 副本会被删光）。
@@ -7042,6 +7281,11 @@ def create_app(model: Any = None) -> FastAPI:
         dry_run = payload.dry_run
         # async 端点：Redis 限流（eval）是阻塞网络 I/O，必须走线程池——
         # 裸调用会在 Redis 慢 / 黑洞时占住事件循环，冻结所有请求与 SSE 心跳
+        if not dry_run:
+            # 真实去重会批量删除行程（破坏性写）：同样受写桶约束；dry_run
+            # 只做全量扫描，按读桶限速即可。先查写桶再查读桶：被写限拒绝
+            # 的请求不消耗读额度
+            await asyncio.to_thread(_enforce_write_rate_limit, state, request)
         response.headers.update(
             await asyncio.to_thread(_enforce_read_rate_limit, state, request)
         )
@@ -7406,7 +7650,20 @@ def create_app(model: Any = None) -> FastAPI:
             raise
         # 排队背压：单 worker + 无界队列会让并发大备份（各 64MB）全部
         # 驻留内存直到 OOM；已有一个导入在跑 / 排队时直接 503，不读请求体
+        # 同一来源的并发导入上限为 1：两个慢速上传就能占满两个全局槽位
+        # 到读体超时，期间所有用户的导入都 503
+        import_client = _rate_identity(_client_host(request))
+        if not state.try_begin_import(import_client):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "该来源已有导入任务在处理，请稍后再试"
+                    f"（请求 ID：{_request_id(request)}）"
+                ),
+                headers={"Connection": "close"},
+            )
         if not state.import_queue_slots.acquire(blocking=False):
+            state.end_import(import_client)
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -7515,15 +7772,11 @@ def create_app(model: Any = None) -> FastAPI:
                 sessions_dropped_in_queue: set[str] = set()
 
                 if unique_sessions:
-                    # 按会话而不是按消息查询（配置 Redis 时每条消息一次 EXISTS
-                    # 意味着数十万次线程跳转与网络往返），且整批放在一次
-                    # to_thread 里完成
+                    # 按会话而不是按消息查询，并走批量流水线（配置 Redis 时
+                    # 逐键 EXISTS 意味着数十万次串行网络往返），整批放在
+                    # 一次 to_thread 里完成
                     deleted_sessions = await asyncio.to_thread(
-                        lambda: {
-                            session_id
-                            for session_id in unique_sessions
-                            if state.is_recently_deleted(user_id, session_id)
-                        }
+                        state.recently_deleted_many, user_id, unique_sessions
                     )
                 else:
                     deleted_sessions = set()
@@ -7552,11 +7805,9 @@ def create_app(model: Any = None) -> FastAPI:
                             for trip in sections["trips"]
                             if trip.get("session_id")
                         }
-                        late_deleted = {
-                            session_id
-                            for session_id in recheck_sessions
-                            if state.is_recently_deleted(user_id, session_id)
-                        }
+                        late_deleted = state.recently_deleted_many(
+                            user_id, recheck_sessions
+                        )
                         if late_deleted:
                             for session_id in sorted(late_deleted):
                                 errors.append(
@@ -7687,14 +7938,14 @@ def create_app(model: Any = None) -> FastAPI:
                         # 某个会话：最后再查一次墓碑并整会话回滚，避免迟到的
                         # 删除被恢复写回。若删除发生在本次检查之后，它自己的
                         # DELETE 会再次清掉已插入的行，不会被复活。
-                        late_deleted = {
-                            session_id
-                            for session_id in active_sessions
-                            if session_id not in sessions_dropped_in_queue
-                            and state.is_recently_deleted(
-                                user_id, session_id
-                            )
-                        }
+                        late_deleted = state.recently_deleted_many(
+                            user_id,
+                            [
+                                session_id
+                                for session_id in active_sessions
+                                if session_id not in sessions_dropped_in_queue
+                            ],
+                        )
                         rolled_back_sessions: set[str] = set()
                         for session_id in sorted(late_deleted):
                             try:
@@ -7815,6 +8066,19 @@ def create_app(model: Any = None) -> FastAPI:
             }
         finally:
             state.import_queue_slots.release()
+            state.end_import(import_client)
+
+    # RFC 9110 §9.3.2：支持 GET 的资源必须支持 HEAD（与 GET 同头、无 body）。
+    # FastAPI 的 APIRoute 只登记显式方法，HEAD 探测（HAProxy / uptime 监控 /
+    # curl -I）此前全部 405；这里给所有 GET 路由补上 HEAD。SSE 端点除外：
+    # HEAD 会触发一次完整生成再丢弃 body，没有探测价值。
+    for _route in app.routes:
+        _methods = getattr(_route, "methods", None)
+        if not _methods or "GET" not in _methods or "HEAD" in _methods:
+            continue
+        if getattr(_route, "path", "") == "/api/chat/stream":
+            continue
+        _methods.add("HEAD")
 
     return app
 

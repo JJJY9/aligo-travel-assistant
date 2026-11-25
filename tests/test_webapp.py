@@ -16307,6 +16307,278 @@ def test_cached_session_protected_during_quarantine_probe(monkeypatch):
     print("✓ 探测窗口内缓存命中被占住（不被容量回收驱逐）")
 
 
+def test_head_supported_on_get_routes():
+    """RFC 9110 §9.3.2：GET 资源必须支持 HEAD（SSE 端点除外）。
+
+    健康检查 / HAProxy / uptime 监控常用 HEAD 探测，此前全部 405 并带
+    Allow: GET；HEAD 响应必须与 GET 同状态同头、无 body。"""
+    client = _client()
+    for path in ("/", "/api/health", "/api/metrics", "/metrics"):
+        head = client.head(path)
+        assert head.status_code == 200, (path, head.status_code)
+        assert head.content == b"", path
+        get = client.get(path)
+        assert get.status_code == 200, path
+        assert (
+            head.headers.get("content-type") == get.headers.get("content-type")
+        ), (path, head.headers.get("content-type"), get.headers.get("content-type"))
+        assert head.headers.get("x-content-type-options") == "nosniff", path
+    # SSE 生成代价高且需要逐事件送达：HEAD 不适用（保持 405 而不是触发一次生成）
+    assert client.head("/api/chat/stream").status_code == 405
+    print("✓ HEAD 与 GET 同状态同头、无 body（SSE 除外）")
+
+
+def test_gzip_accept_encoding_rfc_semantics():
+    """Accept-Encoding 按 RFC 9110 解析：q=0 拒绝、大小写不敏感、* 通配。
+
+    Starlette GZipMiddleware 只做大小写敏感子串判断（gzip;q=0 被压缩、
+    GZIP 不压缩），应用层改为按语法解析后再交给中间件。"""
+    client = _client()
+    cases = [
+        ("gzip", True),
+        ("GZIP", True),
+        ("GZip;q=1", True),
+        ("gzip;q=0.5", True),
+        ("gzip;q=0", False),
+        ("gzip;q=0.0", False),
+        ("identity, gzip;q=0", False),
+        ("*;q=1", True),
+        ("*;q=0", False),
+        ("br", False),
+        ("", False),
+    ]
+    for header, expect in cases:
+        response = client.get("/", headers={"Accept-Encoding": header})
+        assert response.status_code == 200, header
+        got = response.headers.get("content-encoding") == "gzip"
+        assert got is expect, (header, response.headers.get("content-encoding"))
+    print("✓ Accept-Encoding 按 q 值 / 大小写 / 通配语义压缩")
+
+
+def test_recently_deleted_many_batches_redis_exists():
+    """批量墓碑查询：本地墓碑自愈补写、共享 EXISTS 按 ≤500 一批流水线。"""
+
+    class _Pipeline:
+        def __init__(self, store, log):
+            self.store = store
+            self.log = log
+            self.keys = []
+
+        def exists(self, key):
+            self.keys.append(key)
+
+        def execute(self):
+            self.log.append(list(self.keys))
+            return [int(key in self.store.data) for key in self.keys]
+
+    class _FakeRedis:
+        def __init__(self):
+            self.data = {"aligo:deleted:u-batch:s-dead": "tok"}
+            self.batches = []
+
+        def set(self, key, value, nx=False, ex=None):
+            if nx and key in self.data:
+                return None
+            self.data[key] = value
+            return True
+
+        def pipeline(self, transaction=False):
+            return _Pipeline(self, self.batches)
+
+    client = _client()
+    state = client.app.state.aligo
+    shared = _FakeRedis()
+    state._redis_client = shared
+    state._tombstones_shared = True
+    # 本地墓碑（共享写入曾失败）：命中后应返回 True 并补写共享墓碑
+    key = state._session_key("u-batch", "s-local")
+    state._deleted_sessions[key] = (time.monotonic(), "tok-local")
+    ids = ["s-local"] + [f"s{i}" for i in range(1200)] + ["s-dead"]
+    try:
+        deleted = state.recently_deleted_many("u-batch", ids)
+        assert deleted == {"s-local", "s-dead"}, deleted
+        assert shared.data.get("aligo:deleted:u-batch:s-local") == "tok-local"
+        assert shared.batches, "共享查询应走流水线而不是逐键 EXISTS"
+        assert all(len(batch) <= 500 for batch in shared.batches), shared.batches
+        # 1201 个待查（s-dead + 1200 个未见本地墓碑）
+        assert sum(len(batch) for batch in shared.batches) == 1201
+        # 空输入不产生 Redis 往返
+        assert state.recently_deleted_many("u-batch", []) == set()
+    finally:
+        state._deleted_sessions.pop(key, None)
+        state._redis_client = None
+        state._tombstones_shared = False
+    print("✓ 批量墓碑查询走流水线（本地自愈 + 500/批）")
+
+
+def test_dedupe_destructive_consumes_write_bucket(monkeypatch):
+    """真实去重（dry_run=False）是破坏性批量写：必须同时占用写桶。"""
+    from webapp import server as server_module
+
+    seen = []
+    monkeypatch.setattr(
+        server_module,
+        "_enforce_write_rate_limit",
+        lambda state, request: seen.append("write"),
+    )
+    client = _client()
+    user_id = _unique_user("web_dedupe_write")
+    try:
+        dry = client.post(
+            "/api/trips/dedupe", json={"user_id": user_id, "dry_run": True}
+        )
+        assert dry.status_code == 200, dry.text[:300]
+        assert seen == [], "dry_run 只做全量扫描，不应消耗写桶"
+        real = client.post(
+            "/api/trips/dedupe", json={"user_id": user_id, "dry_run": False}
+        )
+        assert real.status_code == 200, real.text[:300]
+        assert seen == ["write"]
+    finally:
+        _cleanup(user_id)
+    print("✓ 真实去重占用写桶，dry_run 只占读桶")
+
+
+def test_import_same_source_concurrent_guard():
+    """同一来源 IP 的并发导入上限为 1：慢速上传不能独占全部全局槽位。"""
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_import_inflight")
+    # TestClient 的 TCP 对端固定为 "testclient"
+    assert state.try_begin_import("testclient") is True
+    try:
+        response = client.post(
+            "/api/import",
+            params={"user_id": user_id},
+            json={
+                "backup": {
+                    "chat_history": [
+                        {
+                            "role": "user",
+                            "content": "导入守卫测试",
+                            "timestamp": "2026-11-01T09:00:00",
+                            "session_id": "s-inflight",
+                        }
+                    ]
+                }
+            },
+        )
+        assert response.status_code == 503, response.text[:300]
+        assert "该来源已有导入任务在处理" in response.json()["detail"]
+        trips = client.post(
+            "/api/trips/import",
+            params={"user_id": user_id},
+            json={"content": "a"},
+        )
+        assert trips.status_code == 503, trips.text[:300]
+        assert "该来源已有导入任务在处理" in trips.json()["detail"]
+        assert state.import_queue_slots.acquire(blocking=False) is True, (
+            "被来源守卫拒绝的请求不能泄漏全局槽位"
+        )
+        state.import_queue_slots.release()
+    finally:
+        state.end_import("testclient")
+    try:
+        ok = client.post(
+            "/api/import",
+            params={"user_id": user_id},
+            json={
+                "backup": {
+                    "chat_history": [
+                        {
+                            "role": "user",
+                            "content": "导入守卫测试",
+                            "timestamp": "2026-11-01T09:00:00",
+                            "session_id": "s-inflight",
+                        }
+                    ]
+                }
+            },
+        )
+        assert ok.status_code == 200, ok.text[:300]
+        # 正常结束后登记必须被释放
+        assert state.try_begin_import("testclient") is True
+        state.end_import("testclient")
+    finally:
+        _cleanup(user_id)
+    print("✓ 同来源并发导入被 503 拒绝且不泄漏槽位")
+
+
+def test_trust_proxy_hops_multi_layer(monkeypatch):
+    """多层可信代理：TRUST_PROXY_HOPS 取倒数第 N 跳。
+
+    恒取末跳时 CDN 出口地址成为全站共享限流身份（一个客户端即可打满
+    所有人的额度）；按层数取真实客户端地址后互不影响，链长不足回退
+    TCP 对端而不是采信客户端可伪造的前缀。"""
+    from config import RATE_LIMIT_CONFIG
+    from utils.rate_limit import RateLimiter
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    monkeypatch.setitem(RATE_LIMIT_CONFIG, "trust_proxy_headers", True)
+    monkeypatch.setitem(
+        RATE_LIMIT_CONFIG, "trusted_proxy_cidrs", "127.0.0.1/32"
+    )
+    client = TestClient(app, client=("127.0.0.1", 50000))
+    users = []
+
+    def _chat(tag, xff):
+        user = _unique_user(f"web_test_hops_{tag}")
+        users.append(user)
+        return client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user, "session_id": f"h-{tag}"},
+            headers={"X-Forwarded-For": xff},
+        )
+
+    try:
+        # 默认层数 1：末跳（CDN 出口）是身份——不同真实客户端互相打满
+        monkeypatch.setitem(RATE_LIMIT_CONFIG, "trust_proxy_hops", 1)
+        state.ip_limiter = RateLimiter(limit=1, window_sec=60)
+        assert _chat("h1", "203.0.113.7, 198.51.100.9").status_code == 200
+        assert _chat("h2", "203.0.113.8, 198.51.100.9").status_code == 429
+        # 层数 2：倒数第二跳是真实客户端，出口不再决定身份
+        monkeypatch.setitem(RATE_LIMIT_CONFIG, "trust_proxy_hops", 2)
+        state.ip_limiter = RateLimiter(limit=1, window_sec=60)
+        assert _chat("h3", "203.0.113.7, 198.51.100.9").status_code == 200
+        assert _chat("h4", "203.0.113.8, 198.51.100.9").status_code == 200
+        assert _chat("h5", "203.0.113.7, 198.51.100.9").status_code == 429
+        # 链长不足（配置 3 跳但只有 2 项）：回退 TCP 对端桶
+        monkeypatch.setitem(RATE_LIMIT_CONFIG, "trust_proxy_hops", 3)
+        state.ip_limiter = RateLimiter(limit=1, window_sec=60)
+        assert _chat("h6", "203.0.113.7, 198.51.100.9").status_code == 200
+        assert _chat("h7", "203.0.113.99, 198.51.100.9").status_code == 429
+    finally:
+        for user in users:
+            _cleanup(user)
+    print("✓ TRUST_PROXY_HOPS 多跳取址（默认末跳、链长不足回退）")
+
+
+def test_hsts_header_opt_in(monkeypatch):
+    """HSTS 默认关闭；ALIGO_HSTS_MAX_AGE 显式开启后全部响应（含 404）附加。
+
+    应用自身不终止 TLS，无条件 HSTS 会锁死同主机名其它明文服务，因此
+    只做显式开关；开启时错误页同样下发（不能只保护 200）。"""
+    from webapp import server as server_module
+
+    client = _client()
+    plain = client.get("/api/health")
+    assert plain.headers.get("strict-transport-security") is None
+    monkeypatch.setattr(server_module, "_HSTS_MAX_AGE", 31536000)
+    enabled = client.get("/api/health")
+    assert (
+        enabled.headers.get("strict-transport-security")
+        == "max-age=31536000"
+    ), enabled.headers
+    missing = client.get("/definitely-not-a-page")
+    assert missing.status_code == 404
+    assert (
+        missing.headers.get("strict-transport-security")
+        == "max-age=31536000"
+    ), missing.headers
+    print("✓ HSTS 显式开启后覆盖全部响应（含 404）")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理
