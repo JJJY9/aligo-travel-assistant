@@ -694,14 +694,15 @@ def test_kb_user_switch_warns_on_unsaved_draft():
 
 
 def test_trip_export_quality_toasts():
-    """行程导出：返程截断 / 回导会被跳过的数据必须 toast，缺头不得误报。"""
+    """行程导出：返程截断 / 跳过 / 回导会被跳过的数据合并成一次可见提示。"""
     results = _run_harness("tripExportQuality")
     toasts = results["toasts"]
-    assert len(toasts) == 2, toasts
+    assert len(toasts) == 1, toasts
+    assert "缺少出发日期" in toasts[0], toasts
     assert "返程日期无法解析" in toasts[0] and "单日" in toasts[0], toasts
-    assert "会被跳过" in toasts[1], toasts
+    assert "会被跳过" in toasts[0], toasts
     assert results["quiet"] == [], results["quiet"]
-    print("✓ 行程导出质量提示 toast")
+    print("✓ 行程导出质量提示合并为一次 toast")
 
 
 def test_trip_import_ics_preview_labels_and_timezone():
@@ -810,7 +811,8 @@ def test_panel_fixes_cursor_stale_session_and_import_batches():
     cursor = data["sessions_cursor"]
     assert "offset=50" in cursor["first_url"], cursor
     assert "offset=100" in cursor["second_url"], cursor
-    assert cursor["offset"] == 100, cursor
+    assert "offset=0" in cursor["third_url"], "空页需按已加载数量从 0 重取整窗"
+    assert cursor["offset"] == 75, cursor
     assert cursor["count"] == 75, cursor
 
     stale = data["stale_session"]
@@ -1090,6 +1092,41 @@ def test_upcoming_weather_normalizes_unpadded_start_date():
 _DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
+def test_user_switch_clears_preference_cache():
+    """切换用户必须清空 preferenceLatest：新用户追加列表型偏好不能带上
+    上一用户的品牌（跨账号数据污染）。"""
+    results = _run_harness("userSwitchPreferenceCache")
+    assert results["cached_before"] == ["汉庭"], results
+    assert results["cleared_size"] == 0, "切换用户后偏好缓存必须清空"
+    assert results["user_id"] == "user-b"
+    bodies = results["put_bodies"]
+    assert len(bodies) == 1, bodies
+    assert bodies[0]["user_id"] == "user-b", bodies
+    assert bodies[0]["value"] == ["如家"], bodies
+    print("✓ 切换用户清空偏好缓存，列表追加不跨账号合并")
+
+
+def test_stop_reconcile_deferred_until_next_turn_ends():
+    """停止对账被新回合 busy 短路时保留登记，回合结束后补跑并静默重载。"""
+    results = _run_harness("stopReconcileQueue")
+    assert results["first"] == "deferred", results
+    assert results["pending_after_deferred"] == 1, "被跳过的对账不能丢登记"
+    assert any("/api/sessions/s1" in url for url in results["urls"]), results
+    assert results["opens"] == ["s1"], "已落库的回合要静默重载历史"
+    assert results["pending_after_flush"] == 0, results
+    print("✓ 停止对账延期到下一回合结束后补跑")
+
+
+def test_open_session_guards_deleting_and_unknown_empty():
+    """删除在途的会话拒绝打开；陈旧引用指向已删除会话不切走当前对话。"""
+    results = _run_harness("openSessionGuards")
+    assert results["deleting_requests"] == 0, "删除在途时不能发起详情请求"
+    assert results["session_id"] == "A", "未知空会话不能把当前对话切走"
+    assert results["new_session_calls"] == 0, results
+    assert any("已不存在或还没有消息" in item for item in results["toasts"]), results
+    print("✓ openSession 删除在途 / 未知空会话守卫")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -1167,4 +1204,7 @@ if __name__ == "__main__":
     test_silent_reload_preserves_scroll()
     test_silent_reload_shows_appended_messages_and_keeps_expansion()
     test_sse_stream_parsing_robustness()
+    test_user_switch_clears_preference_cache()
+    test_stop_reconcile_deferred_until_next_turn_ends()
+    test_open_session_guards_deleting_and_unknown_empty()
     print("\n全部通过")

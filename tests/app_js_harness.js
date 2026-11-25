@@ -1170,10 +1170,18 @@ async function scenarioPanelFixes(source) {
     await tick();
     const secondUrl = String(env.__requests[1].args[0]);
     env.__requests[1].resolve({ sessions: [], total: 110 });
+    await tick();
+    // 空页但 total 仍大于已显示数量：从 0 重取整窗，不能永久卡在 99/100
+    const thirdUrl = String(env.__requests[2].args[0]);
+    const reloaded = [];
+    for (let i = 0; i < 75; i += 1) reloaded.push({ session_id: "r" + i, title: "r" + i });
+    env.__requests[2].resolve({ sessions: reloaded, total: 110 });
+    await tick();
     await second;
     results.sessions_cursor = {
       first_url: url,
       second_url: secondUrl,
+      third_url: thirdUrl,
       offset: runIn(env, "state.sessionsOffset"),
       count: runIn(env, "state.sessions.length"),
     };
@@ -3196,7 +3204,7 @@ async function scenarioTripExportQuality(source) {
     `);
   };
   mockDownload({
-    "x-aligo-export-skipped": "0",
+    "x-aligo-export-skipped": "1",
     "x-aligo-export-truncated-end": "2",
     "x-aligo-export-unimportable": "1",
     "content-disposition": 'attachment; filename="aligo_u_trips.ics"',
@@ -3481,6 +3489,117 @@ async function scenarioKbPendingCancel(source) {
   return { duringEval, afterCancel, final };
 }
 
+async function scenarioUserSwitchPreferenceCache(source) {
+  // 切换用户必须清空 preferenceLatest：否则列表型偏好把上一用户的品牌
+  // 合并进新用户的保存请求（跨账号数据污染）
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    document.querySelector = () => null;
+    globalThis.__putBodies = [];
+    getJSON = (url, options) => {
+      if (options && options.method === "PUT") {
+        __putBodies.push(JSON.parse(options.body));
+        return Promise.resolve({});
+      }
+      return Promise.resolve({ sessions: [], total: 0 });
+    };
+    state.userId = "user-a";
+    state.status = { preferences: { hotel_brands: ["汉庭"] } };
+    renderOverview();
+  `);
+  const cachedBefore = run(
+    "preferenceLatest.get('hotel_brands') ? preferenceLatest.get('hotel_brands').slice() : null"
+  );
+  run('els.userIdInput.value = "user-b";');
+  await run("saveUser()");
+  await tick();
+  const clearedSize = run("preferenceLatest.size");
+  // 新用户 B 没有酒店偏好：追加「如家」不能带上 A 的「汉庭」
+  run(`
+    state.status = { preferences: {} };
+    renderOverview();
+    els.prefType.value = "hotel_brands";
+    els.prefValue.value = "如家";
+  `);
+  await run("addPreference({ preventDefault() {} })");
+  await tick();
+  return {
+    cached_before: cachedBefore,
+    cleared_size: clearedSize,
+    put_bodies: run("__putBodies.slice()"),
+    user_id: run("state.userId"),
+  };
+}
+
+async function scenarioStopReconcileQueue(source) {
+  // 停止后立刻再发消息：对账被新回合的 busy 短路时必须保留登记，
+  // 新回合结束后补跑；已落库则静默重载而不是永远停在「已停止生成」
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    document.querySelector = () => null;
+    state.userId = "u1";
+    state.sessionId = "s1";
+    state.busy = false;
+    sessionLoadToken = 5;
+    globalThis.__opens = [];
+    globalThis.__req = [];
+    openSession = (id) => { __opens.push(id); return Promise.resolve(true); };
+    getJSON = (url) => new Promise((resolve) => { __req.push({ url, resolve }); });
+    rememberStoppedTurn("s1", "Q1", "t1", "已停止");
+  `);
+  // 新回合在跑：对账立即 deferred，登记保留
+  run("state.busy = true;");
+  const first = await run('reconcileStoppedTurn("s1", "Q1", 5, "t1")');
+  const pendingAfterDeferred = run("state.pendingStoppedTurns.length");
+  // 新回合结束：flush 补跑，服务端已落库 → 静默重载
+  run("state.busy = false;");
+  const flush = run("flushPendingStoppedTurns()");
+  await tick();
+  const urls = run("__req.map((item) => item.url)");
+  run(
+    '__req[0].resolve({ messages: [{ role: "user", content: "Q1" }, { role: "assistant", content: "A1", meta: { client_turn_id: "t1" } }] });'
+  );
+  await flush;
+  return {
+    first,
+    pending_after_deferred: pendingAfterDeferred,
+    urls,
+    opens: run("__opens.slice()"),
+    pending_after_flush: run("state.pendingStoppedTurns.length"),
+  };
+}
+
+async function scenarioOpenSessionGuards(source) {
+  // 删除在途的会话不能再打开；陈旧引用指向已删除会话时不能把当前对话切走
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    document.querySelector = () => null;
+    state.userId = "u1";
+    state.sessionId = "A";
+    state.sessions = [{ session_id: "X", title: "x" }];
+    globalThis.__newSessionCalls = 0;
+    newSession = () => { __newSessionCalls += 1; };
+    getJSON = (url) => new Promise((resolve) => { __requests.push({ args: [url], resolve }); });
+  `);
+  run("state.deletingSessions.add('D');");
+  await run("openSession('D')");
+  const deletingRequests = run("__requests.length");
+  run("state.deletingSessions.delete('D');");
+  const promise = run("openSession('deletedY')");
+  await tick();
+  run("__requests[0].resolve({ messages: [] });");
+  await promise;
+  return {
+    deleting_requests: deletingRequests,
+    session_id: run("state.sessionId"),
+    new_session_calls: run("__newSessionCalls"),
+    toasts: run("__toasts.slice()"),
+  };
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -3595,6 +3714,12 @@ async function main() {
     payload = await scenarioTripDedupeUnknown(source);
   } else if (scenario === "kbPendingCancel") {
     payload = await scenarioKbPendingCancel(source);
+  } else if (scenario === "userSwitchPreferenceCache") {
+    payload = await scenarioUserSwitchPreferenceCache(source);
+  } else if (scenario === "stopReconcileQueue") {
+    payload = await scenarioStopReconcileQueue(source);
+  } else if (scenario === "openSessionGuards") {
+    payload = await scenarioOpenSessionGuards(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

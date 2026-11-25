@@ -104,6 +104,9 @@ const state = {
   health: null,
   busy: false,
   controller: null,
+  // 停止 / 连接中断的回合登记：对账被新回合的 busy / token 推进跳过时
+  // 保留登记，由新回合结束后的 flushPendingStoppedTurns 补跑
+  pendingStoppedTurns: [],
   lastUserText: "",
   kbItems: [],
   // 列表区当前渲染的是语义检索结果（kbItems 只属于关键词列表）：
@@ -132,6 +135,7 @@ const state = {
   kbLoadedCategory: null,
   kbListFailed: false,
   kbComposing: false,
+  historyComposing: false,
   kbSemanticQuery: "",
   tripEditingId: null,
   tripsExpanded: false,
@@ -1264,7 +1268,10 @@ async function deleteLastTurn(expect, turnId = "") {
 }
 
 async function retryFailed(node, text) {
-  if (state.busy) return;
+  if (state.busy) {
+    toast("请等待当前回复完成");
+    return;
+  }
   if (!state.ready) {
     toast("页面正在载入，请稍候…");
     return;
@@ -1347,7 +1354,10 @@ function confirmDiscardPendingEdit(action) {
 }
 
 async function regenerate(node, text) {
-  if (state.busy) return;
+  if (state.busy) {
+    toast("请等待当前回复完成");
+    return;
+  }
   if (!state.ready) {
     // 初始化未完成时 sendMessage 会拒绝，先删后弃会让这一轮消失
     toast("页面正在载入，请稍候…");
@@ -1499,13 +1509,17 @@ async function downloadFromApi(url, fallbackName) {
     if (!response.ok) {
       throw new Error(await errorMessage(response));
     }
+    // 同一响应的质量告警合并成一次 toast：逐个 toast 会在同一任务内
+    // 互相覆盖，用户只能看到最后一条（例如「缺出发日期」被「返程日期
+    // 无法解析」盖掉）
+    const notices = [];
     // ICS 导出会跳过缺少出发日期的行程：响应头带跳过条数，不能静默
     // 给出少行程的日历文件
     const skippedTrips = Number(
       response.headers.get("x-aligo-export-skipped") || 0,
     );
     if (skippedTrips > 0) {
-      toast(`有 ${skippedTrips} 条行程缺少出发日期，未包含在日历中`);
+      notices.push(`有 ${skippedTrips} 条行程缺少出发日期，未包含在日历中`);
     }
     // 返程日期无法解析的行程按单日导出（日历里会少几天）：CLI 有同等
     // 提示，面板不能静默截断
@@ -1513,7 +1527,7 @@ async function downloadFromApi(url, fallbackName) {
       response.headers.get("x-aligo-export-truncated-end") || 0,
     );
     if (truncatedEnd > 0) {
-      toast(`有 ${truncatedEnd} 条行程的返程日期无法解析，日历按单日导出`);
+      notices.push(`有 ${truncatedEnd} 条行程的返程日期无法解析，日历按单日导出`);
     }
     // 回导自检：文件里存在导入端会整行 / 整事件拒绝的数据（日期非法 /
     // 倒置、字段超长），别等迁移 / 恢复时才发现行程变少
@@ -1521,7 +1535,7 @@ async function downloadFromApi(url, fallbackName) {
       response.headers.get("x-aligo-export-unimportable") || 0,
     );
     if (unimportable > 0) {
-      toast(
+      notices.push(
         `导出文件有 ${unimportable} 项在重新导入时会被跳过（日期非法 / 倒置、字段超长等），请先修正后再迁移`,
       );
     }
@@ -1530,11 +1544,11 @@ async function downloadFromApi(url, fallbackName) {
     const overImportLimit =
       response.headers.get("x-aligo-export-over-limit") || "";
     if (overImportLimit === "cli") {
-      toast(
+      notices.push(
         "导出文件超过 CLI 单次导入上限（500 万字符），回导会被整份拒绝，请拆分或用 JSON 备份恢复",
       );
     } else if (overImportLimit) {
-      toast(
+      notices.push(
         "导出文件超过面板导入上限（50 万字符 / 2MB），面板回导会被拒收，请用 CLI 导入或 JSON 备份恢复",
       );
     }
@@ -1544,7 +1558,7 @@ async function downloadFromApi(url, fallbackName) {
       response.headers.get("x-knowledge-skipped") || 0,
     );
     if (skippedKnowledge > 0) {
-      toast(
+      notices.push(
         `备份中有 ${skippedKnowledge} 条知识片段无法恢复，恢复时会跳过`,
       );
     }
@@ -1553,12 +1567,13 @@ async function downloadFromApi(url, fallbackName) {
     // 两种处置不同（清理知识库 vs 稍后重试）
     const omittedKnowledge = response.headers.get("x-knowledge-omitted") || "";
     if (omittedKnowledge) {
-      toast(
+      notices.push(
         omittedKnowledge === "planning-failed"
           ? "知识库暂时无法核对分片体积，本次备份不含知识片段（用户数据仍可恢复；稍后重试可得到含知识的备份）"
           : "知识库整体超出导出上限，本次备份不含知识片段（用户数据仍可恢复）",
       );
     }
+    if (notices.length) toast(notices.join("；"));
     const blob = await response.blob();
     const disposition = response.headers.get("content-disposition") || "";
     const match = /filename\*?=(?:UTF-8'')?"?([^";]+)"?/i.exec(disposition);
@@ -2106,6 +2121,9 @@ async function _runUserBackupImport(file, targetUser) {
     toast("用户已切换，已取消恢复备份");
     return;
   }
+  // 读取 / 解析期间面板被关闭（Esc / 遮罩 / 关闭按钮，大备份可达数秒）：
+  // 不再弹确认，更不能在看不见的界面里写库（与行程 / 知识导入同口径）
+  if (els.memorySheet.hidden) return;
   const source = backup.user_id ? `（来自 ${backup.user_id}）` : "";
   const knowledgeNote = counts.knowledge
     ? `\n知识片段 ${counts.knowledge} 条将合并到共享知识库。`
@@ -2920,8 +2938,11 @@ async function loadSessions(query = state.searchQuery, options = {}) {
       updateArchivedToggle();
       // 搜索框里仍是这次失败的新词时同步回滚：否则可见查询与实际过滤
       // （归档切换 / 加载更多 / 高亮）长期分叉，用户会把旧结果当成新词结果。
-      // 只在输入框仍等于本次请求词时改写，避免覆盖请求期间新输入的草稿。
+      // 只在输入框仍等于本次请求词时改写，避免覆盖请求期间新输入的草稿；
+      // 输入法合成期间绝不改写（会打断 / 提交 IME 组合，compositionend
+      // 会重新调度搜索，可见词与 state.searchQuery 自然收敛）
       if (
+        !state.historyComposing &&
         els.historySearch &&
         els.historySearch.value.trim() === String(query || "").trim() &&
         els.historySearch.value !== state.searchQuery
@@ -2995,7 +3016,8 @@ async function loadMoreSessions() {
       return;
     }
     const seen = new Set(state.sessions.map((session) => session.session_id));
-    for (const session of data.sessions || []) {
+    const fetched = data.sessions || [];
+    for (const session of fetched) {
       if (!seen.has(session.session_id)) {
         seen.add(session.session_id);
         state.sessions.push(session);
@@ -3003,13 +3025,20 @@ async function loadMoreSessions() {
     }
     // 游标按「取回的条数」前进：头部并发插入时本页可能与已显示内容重叠
     // （去重跳过），但窗口必须继续向前，否则「加载更多」永远停在原地
-    state.sessionsOffset += (data.sessions || []).length;
+    state.sessionsOffset += fetched.length;
     // total=0 是合法值（其它标签页 / CLI 已删光）：真值判断会把它当缺失
     if (Number.isFinite(totalNum)) state.sessionTotal = totalNum;
-    if (totalNum === 0 && !(data.sessions || []).length) {
+    if (totalNum === 0 && !fetched.length) {
       // 服务端确认该查询下已无会话：陈旧行不能继续算「共 N 条」
       state.sessions = [];
       state.sessionsOffset = 0;
+    } else if (!fetched.length && state.sessions.length < state.sessionTotal) {
+      // 空页但 total 仍大于已显示数量：其它标签页 / CLI 把未加载的靠后
+      // 会话移到列表头部（total 不变），offset 窗口已被推过服务端行尾，
+      // 被移动的会话不会再落入任何后续窗口——按已加载数量从 0 重取整窗，
+      // 否则「加载更多」永久停在 N-1/N 且该会话不可见
+      await loadSessions(state.searchQuery, { silentFailure: true });
+      return;
     }
     renderHistory();
   } catch (error) {
@@ -3023,6 +3052,13 @@ async function loadMoreSessions() {
 async function openSession(sessionId, options = {}) {
   if (state.busy) {
     if (!options.silent) toast("请等待当前回复完成");
+    return;
+  }
+  // 正在删除的会话不能再打开：DELETE 在途期间发出的详情 GET 会读到删除前
+  // 的消息，可能在 DELETE 成功、侧栏行已移除之后才返回，把已删除会话
+  // 写回当前状态
+  if (state.deletingSessions.has(sessionId)) {
+    if (!options.silent) toast("会话正在删除");
     return;
   }
   // 行内编辑中的草稿只存在于 DOM：切换会话会整段重建消息区、草稿静默丢失。
@@ -3065,6 +3101,14 @@ async function openSession(sessionId, options = {}) {
         state.sessionsOffset = Math.max(0, state.sessionsOffset - 1);
         renderHistory();
         toast("这个会话已不存在，已从列表移除");
+        return;
+      }
+      if (sessionId !== state.sessionId) {
+        // 目标不是当前对话（陈旧的状态卡片 / 行程行指向已删除会话）：
+        // 不能按「新会话」把用户正在看的对话切走；刷新状态卡即可清掉
+        // 服务端已删除的陈旧引用
+        if (!options.silent) toast("这个会话已不存在或还没有消息");
+        refreshStatus().catch(() => {});
         return;
       }
       if (!options.silent) toast("这个会话还没有消息");
@@ -3416,6 +3460,14 @@ async function deleteSession(sessionId) {
       `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
       { method: "DELETE" },
     );
+    // 入口只作废了删除开始前的加载；DELETE 在途期间新发起的加载若已越过
+    // 入口检查（守卫上线前、或删除完成后立刻点击），成功后再作废一次，
+    // 避免详情响应迟到把已删除会话写回
+    if (state.sessionLoadingId === sessionId) {
+      sessionLoadToken += 1;
+      state.sessionLoading = false;
+      state.sessionLoadingId = null;
+    }
     if (state.sessionId === sessionId) {
       // 不用 newSession()：它会自增会话加载序号，把正在进行的其它会话
       // 切换一并作废
@@ -3553,6 +3605,13 @@ async function sendMessage(text, options = {}) {
   assistant.root.dataset.turnId = turnId;
   assistant.root.dataset.idempotencyKey = idempotencyKey;
   let terminal = null;
+  // 首字节之前没有心跳可依：服务端排队等对话锁最多 50s，给 90s 上限，
+  // 防止链路黑洞时 fetch 永不 settle、busy 永久为真
+  let headerTimedOut = false;
+  const headerTimer = setTimeout(() => {
+    headerTimedOut = true;
+    if (state.controller) state.controller.abort();
+  }, 90000);
   try {
     const response = await fetch("/api/chat/stream", {
       method: "POST",
@@ -3566,6 +3625,7 @@ async function sendMessage(text, options = {}) {
       }),
       signal: state.controller.signal,
     });
+    clearTimeout(headerTimer);
     if (!response.ok) {
       const detail = await errorMessage(response);
       if (response.status === 404) {
@@ -3589,6 +3649,11 @@ async function sendMessage(text, options = {}) {
     // 圆点变色同时更新文案：只改 class 会让顶栏在连接异常后仍显示「在线」
     els.healthText.textContent = terminal === "error" ? "回答出错" : "在线";
   } catch (error) {
+    // 响应头阶段的看门狗触发的 abort 不是用户点「停止」：按连接超时处理，
+    // 不能显示成「已停止生成」并跳过对账
+    if (headerTimedOut && error && error.name === "AbortError") {
+      error = new Error("连接超时，未能开始接收回答");
+    }
     if (error.name === "AbortError") {
       // 服务端已发过 done / error 后再中止（停止按钮晚点、切换会话）：
       // 保留已完成的回答，不能改成「已停止」
@@ -3604,6 +3669,7 @@ async function sendMessage(text, options = {}) {
         const sessionId = state.sessionId;
         if (sessionId) {
           const token = sessionLoadToken;
+          rememberStoppedTurn(sessionId, message, turnId, "已停止");
           setTimeout(
             () => reconcileStoppedTurn(sessionId, message, token, turnId),
             600,
@@ -3644,6 +3710,7 @@ async function sendMessage(text, options = {}) {
       const sessionId = state.sessionId;
       if (sessionId) {
         const token = sessionLoadToken;
+        rememberStoppedTurn(sessionId, message, turnId, "连接中断");
         setTimeout(
           () =>
             reconcileStoppedTurn(
@@ -3661,6 +3728,7 @@ async function sendMessage(text, options = {}) {
       }
     }
   } finally {
+    clearTimeout(headerTimer);
     state.controller = null;
     // 成功完成（done）才把本轮提问视为已写入服务端历史；停止 / 失败 / 中断
     // 的提问没有落库，标记后不再显示「编辑」入口
@@ -3687,6 +3755,10 @@ async function sendMessage(text, options = {}) {
     await refreshSessionsAfterTurn();
     // refreshStatus 内部会在偏好编辑框存在时跳过渲染（编辑结束后补刷新）
     refreshStatus();
+    // 上一轮停止 / 中断的对账可能被本回合的 busy / token 推进跳过：
+    // 回合结束后补跑，否则已落库的回合永远停在「已停止生成」，未落库的
+    // 提问也没有任何恢复入口
+    flushPendingStoppedTurns().catch(() => {});
   }
 }
 
@@ -3709,19 +3781,95 @@ ${draftNow}`;
   resizeInput();
 }
 
+function rememberStoppedTurn(sessionId, message, turnId, reason) {
+  // 停止 / 连接中断的回合先登记：对账可能在窗口内被新回合的 busy / token
+  // 变化跳过，登记保留到有新结论为止
+  if (!sessionId || !turnId) return;
+  if (
+    state.pendingStoppedTurns.some(
+      (item) => item.sessionId === sessionId && item.turnId === turnId,
+    )
+  ) {
+    return;
+  }
+  state.pendingStoppedTurns.push({ sessionId, message, turnId, reason });
+}
+
+function forgetStoppedTurn(sessionId, turnId) {
+  state.pendingStoppedTurns = state.pendingStoppedTurns.filter(
+    (item) => !(item.sessionId === sessionId && item.turnId === turnId),
+  );
+}
+
+/* 新回合结束后补跑被跳过的停止对账：已落库则静默重载一致的历史，未落库
+   则把提问放回输入框（与草稿合并）。不在 busy / 加载 / 编辑中执行。 */
+async function flushPendingStoppedTurns() {
+  if (!state.pendingStoppedTurns.length) return;
+  if (state.busy || state.sessionLoading) return;
+  if (
+    document.querySelector(".user-edit-input") ||
+    document.querySelector(".pref-input") ||
+    document.querySelector(".hi-input")
+  ) {
+    return;
+  }
+  // 会话已切换：旧会话的登记不能再打扰当前界面
+  state.pendingStoppedTurns = state.pendingStoppedTurns.filter(
+    (item) => item.sessionId === state.sessionId,
+  );
+  for (const item of state.pendingStoppedTurns.slice()) {
+    if (state.busy || state.sessionLoading) return;
+    await reconcileStoppedTurn(
+      item.sessionId,
+      item.message,
+      sessionLoadToken,
+      item.turnId,
+      item.reason,
+    ).catch(() => {});
+  }
+}
+
 async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = "已停止") {
+  // 返回值区分「同一会话有新回合在跑、等结束后补跑」（deferred，保留登记）
+  // 与「已有结论」（含会话已切换 / 编辑中放弃）：只有前者保留待对账登记
+  const status = await reconcileStoppedTurnImpl(
+    sessionId,
+    message,
+    token,
+    turnId,
+    reason,
+  );
+  if (status !== "deferred") {
+    forgetStoppedTurn(sessionId, turnId);
+    // 用户已切走：其它会话的登记不再有意义
+    state.pendingStoppedTurns = state.pendingStoppedTurns.filter(
+      (item) => item.sessionId === state.sessionId,
+    );
+  }
+  return status;
+}
+
+async function reconcileStoppedTurnImpl(sessionId, message, token, turnId, reason = "已停止") {
   if (!message) return;
   // 本函数自己会调用 openSession（它自增 sessionLoadToken）：只认启动时
   // 捕获的 token 会让 openSession 之后的检查恒假——最终确认与回填输入
   // 变成死代码，提问文本在消息区被清空后没有任何副本
   let expectedToken = token;
+  const sameSession = () => sessionId === state.sessionId;
+  const editingNow = () =>
+    Boolean(
+      document.querySelector(".user-edit-input") ||
+        document.querySelector(".pref-input") ||
+        document.querySelector(".hi-input"),
+    );
+  // 同一会话有新回合在跑（busy）或 token 被推进（新发送 / 静默重载）：
+  // 现在不能动界面，但登记要保留，由 flushPendingStoppedTurns 补跑
+  const shouldDefer = () =>
+    sameSession() &&
+    !editingNow() &&
+    (state.busy || expectedToken !== sessionLoadToken);
   const canSync = () =>
-    sessionId === state.sessionId &&
-    !state.busy &&
-    expectedToken === sessionLoadToken &&
-    !document.querySelector(".user-edit-input") &&
-    !document.querySelector(".pref-input") &&
-    !document.querySelector(".hi-input");
+    sameSession() && !state.busy && expectedToken === sessionLoadToken && !editingNow();
   const isPersisted = (messages) => {
     if (turnId) {
       // 精确匹配：助手消息的 _meta 带着本轮唯一的 client_turn_id。
@@ -3745,7 +3893,7 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
   // 必须覆盖它，前 4 次 700ms 快速命中，之后放慢到 1.5s 直到 ~12 秒
   let sawValidResponse = false;
   for (let attempt = 0; attempt < 10; attempt += 1) {
-    if (!canSync()) return;
+    if (!canSync()) return shouldDefer() ? "deferred" : "done";
     let data = null;
     try {
       data = await getJSON(
@@ -3759,7 +3907,7 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
     sawValidResponse = sawValidResponse || Boolean(
       data && Array.isArray(data.messages),
     );
-    if (!canSync()) return;
+    if (!canSync()) return shouldDefer() ? "deferred" : "done";
     if (data && Array.isArray(data.messages)) {
       const messages = data.messages;
       if (isPersisted(messages)) {
@@ -3814,7 +3962,7 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
           // 确认请求超时 / 失败：落库结果未知
           confirmUnknown = true;
         }
-        if (!canSync()) return;
+        if (!canSync()) return shouldDefer() ? "deferred" : "done";
         if (confirmUnknown) {
           // openSession 的重新拉取可能已渲染出刚落库的一轮：把提问塞回
           // 输入框会让用户重发、历史出现两条相同问答——只提示未知
@@ -3833,7 +3981,7 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
   // 判定期内始终拿不到有效响应（连续超时 / 服务不可达）：落库结果未知。
   // 不把提问塞回输入框——服务端 drain 可能已经落库，诱导重发会产生重复
   // 问答；期间用户可能已切换会话 / 用户，也要避免写进新的输入框
-  if (!canSync()) return;
+  if (!canSync()) return shouldDefer() ? "deferred" : "done";
   if (!sawValidResponse) {
     toast(`${reason}，暂未确认保存结果，请稍后刷新查看，避免重复发送`);
     return;
@@ -3844,49 +3992,78 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
   );
 }
 
+// 服务端每 15s 发一次 ": keep-alive"：任意字节（含注释行）都会完成本轮
+// read 并重置计时。连续 45s（3 个心跳周期）一个字节都没有，说明链路半开
+// （移动网络切换 / 休眠唤醒 / NAT 空闲超时），read() 可能永不 settle——
+// 没有看门狗时 busy 永久为真，界面卡在生成中且无法发送
+const STREAM_IDLE_TIMEOUT_MS = 45000;
+
+function readWithIdleTimeout(reader) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("连接长时间无响应，已中断"));
+    }, STREAM_IDLE_TIMEOUT_MS);
+    reader.read().then(
+      (result) => {
+        clearTimeout(timer);
+        resolve(result);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function readEventStream(body, onEvent) {
   if (!body) throw new Error("浏览器不支持流式响应");
   const reader = body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+  try {
+    while (true) {
+      const { done, value } = await readWithIdleTimeout(reader);
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
 
-    // 代理 / 标准 SSE 服务可能使用 CRLF 分帧：先归一化（跨 chunk 的
-    // \r\n 在下次追加后会合成完整序列再被替换），否则 indexOf("\n\n")
-    // 永远命中不了、整条流在 EOF 时被当作「连接意外中断」
-    buffer = buffer.replace(/\r\n/g, "\n");
+      // 代理 / 标准 SSE 服务可能使用 CRLF 分帧：先归一化（跨 chunk 的
+      // \r\n 在下次追加后会合成完整序列再被替换），否则 indexOf("\n\n")
+      // 永远命中不了、整条流在 EOF 时被当作「连接意外中断」
+      buffer = buffer.replace(/\r\n/g, "\n");
 
-    let boundary = buffer.indexOf("\n\n");
-    while (boundary >= 0) {
-      const chunk = buffer.slice(0, boundary);
-      buffer = buffer.slice(boundary + 2);
-      // SSE 规范：同一事件的多个 data: 行按行拼接后再解析；注释行忽略
-      const dataLines = [];
-      chunk.split("\n").forEach((line) => {
-        if (!line || line.startsWith(":")) return;
-        const colon = line.indexOf(":");
-        const field = colon === -1 ? line : line.slice(0, colon);
-        if (field !== "data") return;
-        let payload = colon === -1 ? "" : line.slice(colon + 1);
-        if (payload.startsWith(" ")) payload = payload.slice(1);
-        dataLines.push(payload);
-      });
-      if (dataLines.length) {
-        let event = null;
-        try {
-          event = JSON.parse(dataLines.join("\n"));
-        } catch {
-          event = null; // 忽略无法解析的事件
+      let boundary = buffer.indexOf("\n\n");
+      while (boundary >= 0) {
+        const chunk = buffer.slice(0, boundary);
+        buffer = buffer.slice(boundary + 2);
+        // SSE 规范：同一事件的多个 data: 行按行拼接后再解析；注释行忽略
+        const dataLines = [];
+        chunk.split("\n").forEach((line) => {
+          if (!line || line.startsWith(":")) return;
+          const colon = line.indexOf(":");
+          const field = colon === -1 ? line : line.slice(0, colon);
+          if (field !== "data") return;
+          let payload = colon === -1 ? "" : line.slice(colon + 1);
+          if (payload.startsWith(" ")) payload = payload.slice(1);
+          dataLines.push(payload);
+        });
+        if (dataLines.length) {
+          let event = null;
+          try {
+            event = JSON.parse(dataLines.join("\n"));
+          } catch {
+            event = null; // 忽略无法解析的事件
+          }
+          // 非对象帧（如 data: null）不再交给 handleStreamEvent 触发 TypeError
+          if (event && typeof event === "object") onEvent(event);
         }
-        // 非对象帧（如 data: null）不再交给 handleStreamEvent 触发 TypeError
-        if (event && typeof event === "object") onEvent(event);
+        boundary = buffer.indexOf("\n\n");
       }
-      boundary = buffer.indexOf("\n\n");
     }
+  } finally {
+    // 超时 / 中途异常时释放底层连接（测试替身可能只有 read，没有 cancel）
+    if (typeof reader.cancel === "function") reader.cancel().catch(() => {});
   }
 }
 
@@ -4182,6 +4359,10 @@ async function refreshStatus(options = {}) {
   if (!preferenceEditActive()) {
     renderOverview();
     state.statusStale = false;
+  } else {
+    // 本次刷新被跳过：数据已写入 state.status 但未渲染，标记过期，
+    // 由编辑结束的保存 / 取消 / 未修改回车路径补齐
+    state.statusStale = true;
   }
 }
 
@@ -5023,6 +5204,13 @@ function startEditPreference(row, type, currentValue) {
       // 的派生值写回，未修改的偏好被静默改写
       settled = true;
       if (input.isConnected) input.replaceWith(valueEl);
+      // 编辑期间被 refreshStatus 跳过的渲染不会自己补：未修改回车不发
+      // 请求也不刷新，结束时按过期标记重建一次，否则本轮新增的偏好 /
+      // 行程在面板上一直不可见
+      if (state.statusStale) {
+        state.statusStale = false;
+        renderOverview();
+      }
       focusRowEdit();
       return;
     }
@@ -5052,18 +5240,24 @@ function startEditPreference(row, type, currentValue) {
       input.focus();
       return;
     }
+    // 响应返回前可能已切换用户：旧用户的偏好在切换后 resolve 不能把值
+    // 写回已清空的 preferenceLatest（否则新用户再次追加列表型偏好时会
+    // 把它合并进自己的保存请求）
+    const requestUserId = state.userId;
     try {
       await getJSON(`/api/preferences/${encodeURIComponent(type)}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ user_id: state.userId, value }),
+        body: JSON.stringify({ user_id: requestUserId, value }),
       });
       toast("偏好已更新");
       // 先把行内显示改成新值再撤掉编辑框：状态请求慢时不能长时间显示旧值，
       // 否则用户以为没保存成功，再次编辑会把旧值 PUT 回去。最新值同时写入
       // preferenceLatest：刷新失败时再次点「编辑」也必须回填新值
-      preferenceLatest.set(type, value);
-      valueEl.textContent = formatPreferenceValue(value);
+      if (state.userId === requestUserId) {
+        preferenceLatest.set(type, value);
+        valueEl.textContent = formatPreferenceValue(value);
+      }
       if (input.isConnected) input.replaceWith(valueEl);
       // 静默：失败时「刷新数据概览失败」不能覆盖刚显示的保存成功提示
       await refreshStatus({ silentFailure: true });
@@ -5080,8 +5274,10 @@ function startEditPreference(row, type, currentValue) {
           `保存结果未知：${error.message}；服务端可能已保存，已按新值显示，` +
             "请稍后刷新确认",
         );
-        preferenceLatest.set(type, value);
-        valueEl.textContent = formatPreferenceValue(value);
+        if (state.userId === requestUserId) {
+          preferenceLatest.set(type, value);
+          valueEl.textContent = formatPreferenceValue(value);
+        }
         if (input.isConnected) input.replaceWith(valueEl);
         await refreshStatus({ silentFailure: true });
         focusRowEdit();
@@ -5644,6 +5840,7 @@ async function runSemanticSearch({ silent = false } = {}) {
   // refreshKnowledgeDocuments 会静默重跑当前语义检索，而不是启动关键词
   // 刷新（自增序列）把本次结果静默作废
   const wasSemanticMode = state.kbSemanticMode;
+  const previousSemanticQuery = state.kbSemanticQuery;
   state.kbSemanticMode = true;
   state.kbSemanticQuery = query;
   els.kbSemantic.disabled = true;
@@ -5651,6 +5848,14 @@ async function runSemanticSearch({ silent = false } = {}) {
   // 语义检索期间隐藏「加载更多」：它属于关键词列表，点击结果不应掺入语义视图
   els.kbMore.hidden = true;
   els.kbMore.disabled = true;
+  // 已渲染的列表先整体搬进 Fragment 暂存：检索失败（429 / 503 / 模型缺失）
+  // 时放回，不能把用户正在看的列表换成一行错误文本（与关键词刷新
+  // 「失败保留已渲染列表」同口径）
+  let stashed = null;
+  if (!silent && els.kbList.firstChild) {
+    stashed = document.createDocumentFragment();
+    while (els.kbList.firstChild) stashed.appendChild(els.kbList.firstChild);
+  }
   if (!silent) els.kbList.textContent = "语义检索中…（首次使用需加载向量模型）";
   try {
     const data = await getJSON(
@@ -5668,8 +5873,16 @@ async function runSemanticSearch({ silent = false } = {}) {
       state.kbQuery = els.kbSearch.value.trim();
       toast(`语义结果刷新失败：${error.message}`);
       await refreshKnowledgeDocuments();
+    } else if (stashed) {
+      // 失败恢复暂存列表：语义模式与否沿用检索前的状态，错误改用 toast，
+      // 面板不会只剩一行错误文本、失去返回关键词列表的入口
+      state.kbSemanticMode = wasSemanticMode;
+      state.kbSemanticQuery = previousSemanticQuery;
+      els.kbList.appendChild(stashed);
+      updateKnowledgeMore();
+      toast(error.message);
     } else {
-      // 首次检索失败：撤销预置的语义模式，面板留在关键词列表
+      // 首次检索失败且没有已渲染内容：撤销预置的语义模式，显示错误文本
       if (!wasSemanticMode) state.kbSemanticMode = false;
       els.kbList.textContent = error.message;
     }
@@ -6055,7 +6268,11 @@ async function removeKnowledgeDocument(doc) {
       editingGroup === String(metadata.group || "");
     // 整组删除时，正在编辑的可能是同组的另一分片：同样要退出编辑态
     if (state.kbEditingId === docId || deletesEditingGroup) resetKnowledgeForm();
-    await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
+    await Promise.all([
+      refreshKnowledge(),
+      // 收尾刷新的 429 / 写锁 503 不能覆盖刚显示的成功提示（与导入同口径）
+      refreshKnowledgeDocuments({ silentFailure: true }),
+    ]);
     els.kbList.focus();
   } else if (button) {
     button.disabled = false;
@@ -6290,7 +6507,11 @@ async function addKnowledgeDocument(event) {
     if (els.kbContent.value.trim() === content) els.kbContent.value = "";
     if (els.kbCategory.value.trim() === category) els.kbCategory.value = "";
     if (state.kbEditingId === editingId) resetKnowledgeForm({ clear: false });
-    await Promise.all([refreshKnowledge(), refreshKnowledgeDocuments()]);
+    await Promise.all([
+      refreshKnowledge(),
+      // 收尾刷新的 429 / 写锁 503 不能覆盖刚显示的成功提示（与导入同口径）
+      refreshKnowledgeDocuments({ silentFailure: true }),
+    ]);
   } catch (error) {
     if (error && error.status === 409) {
       // 并发编辑冲突：刷新列表让用户看到库内最新内容；保留表单草稿
@@ -6762,6 +6983,7 @@ async function saveUser() {
     state.partialHistory = false;
     state.renderedStart = null;
     state.retiredThreadVisible = false;
+    state.pendingStoppedTurns = [];
     safeStorageRemove("session", "aligo.sessionId");
     syncSessionControls();
     setConversationTitle("新对话");
@@ -6770,9 +6992,12 @@ async function saveUser() {
     state.showArchived = false;
     state.archivedCount = 0;
     updateArchivedToggle(0);
-    // 清掉上一个用户遗留的行程 / 知识编辑状态，避免提交到新用户
+    // 清掉上一个用户遗留的行程 / 知识 / 偏好编辑状态与最新值缓存，避免提交到新用户
     resetTripForm();
     state.tripLatest.clear();
+    // 列表型偏好（酒店 / 航司）追加时以该缓存为「既有值」：不清理会把
+    // 上一用户的品牌静默合并进新用户的保存请求
+    preferenceLatest.clear();
     els.tripForm.hidden = true;
     resetKnowledgeForm();
     resetPreferenceForm();
@@ -6929,10 +7154,28 @@ function bindEvents() {
     newSession();
   });
 
-  els.historySearch.addEventListener("input", () => {
+  const scheduleHistorySearch = () => {
     clearTimeout(searchTimer);
-    const value = els.historySearch.value;
-    searchTimer = setTimeout(() => loadSessions(value, { reset: true }), 250);
+    // 合成期间的 preedit 拼音不是用户意图：不调度；compositionend 会补
+    if (state.historyComposing) return;
+    searchTimer = setTimeout(() => {
+      // 定时器触发时再复查合成状态并读当时的输入值（调度时的值可能
+      // 已被继续输入的候选词取代）
+      if (state.historyComposing) return;
+      loadSessions(els.historySearch.value, { reset: true });
+    }, 250);
+  };
+  els.historySearch.addEventListener("input", (event) => {
+    // 输入法合成期间不发请求：合成结束再由 compositionend 触发
+    if (event.isComposing) return;
+    scheduleHistorySearch();
+  });
+  els.historySearch.addEventListener("compositionstart", () => {
+    state.historyComposing = true;
+  });
+  els.historySearch.addEventListener("compositionend", () => {
+    state.historyComposing = false;
+    scheduleHistorySearch();
   });
   els.historySearch.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.isComposing) {
