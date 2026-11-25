@@ -184,6 +184,10 @@ def test_names_resolve_case_insensitively(monkeypatch):
     assert registry._resolve_agent_name("Itinerary_Planning") == "plan-trip", (
         "遗留标准名同样大小写不敏感"
     )
+    # 连字符 ↔ 下划线变体（模型按 JSON snake_case 习惯输出）
+    assert registry._resolve_agent_name("plan_trip") == "plan-trip"
+    assert registry._resolve_agent_name("event_collection") == "event-collection"
+    assert registry._resolve_agent_name("itinerary-planning") == "plan-trip"
     assert "Plan-Trip" in registry
     agent = registry["PLAN-TRIP"]
     assert agent is not None

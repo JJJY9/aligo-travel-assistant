@@ -372,6 +372,8 @@ function scenarioRender(source) {
   return {
     escape_html: invoke("escapeHtml", "<b>\"&'"),
     highlight_dotted: invoke("highlightSnippet", "İstanbul 出差", "İstanbul"),
+    agent_display_mixed: invoke("agentDisplayName", "Trip-Budget"),
+    agent_display_unknown: invoke("agentDisplayName", "custom_agent"),
     highlight_plain: invoke("highlightSnippet", "no match here", "istanbul"),
     highlight_meta: invoke("highlightSnippet", "a+b (x)", "a+b"),
     fence_info: invoke(

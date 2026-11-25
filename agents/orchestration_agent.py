@@ -397,6 +397,13 @@ class OrchestrationAgent(AgentBase):
         # 检查点作用域（user:session，只存哈希）：会话删除时按它清理检查点
         self._checkpoint_scope: str | None = None
         self._checkpoint_store = None
+        # 检查点存储的单飞构造锁：首个回合并行批次会有多个协程同时进入
+        # _checkpoint_store_for_turn，非原子的 check-and-construct 会让它们
+        # 各建一个实例，实例级锁互不覆盖，同键 update_step 丢写
+        self._checkpoint_store_init_lock = threading.Lock()
+        # 本轮偏好 / 行程未能写入长期记忆的类型（只记类型名，不回显值）：
+        # 调用方据此在回复里提示「已更新」实际没有落库，避免用户以为保存成功
+        self._last_memory_write_failures: list[str] = []
 
     def register_agent(self, agent_name: str, agent: AgentBase):
         """注册子智能体"""
@@ -445,6 +452,8 @@ class OrchestrationAgent(AgentBase):
         # 行程与偏好（no_agents / 非法意图早退路径同样要先清空）
         self._deferred_memory = None
         self._deferred_epoch = None
+        # 记忆写入失败清单同样按轮清零：上一轮的失败不能出现在本轮回显里
+        self._last_memory_write_failures = []
         if x is None:
             return Msg(
                 name=self.name,
@@ -674,7 +683,17 @@ class OrchestrationAgent(AgentBase):
             waited = True
             await asyncio.shield(running)
         if epoch is not None and getattr(self, "_deferred_epoch", None) != epoch:
-            # 当前暂存负载属于另一轮：迟到的回调不能提前提交它
+            # 当前暂存负载属于另一轮：迟到的回调不能提前提交它。若此刻
+            # 确有新一轮负载，说明旧一轮的偏好 / 行程已在 reply 入口被
+            # 取代（落库超时后用户已开始下一轮）：丢失不可避免，但必须
+            # 留一条 warning，避免「有对话、无台账」的静默不一致
+            if getattr(self, "_deferred_memory", None):
+                logger.warning(
+                    "延迟记忆负载已被新一轮取代（纪元 %s != %s），"
+                    "上一轮的偏好 / 行程未写入",
+                    epoch,
+                    getattr(self, "_deferred_epoch", None),
+                )
             return False
         payload = getattr(self, "_deferred_memory", None)
         if not payload:
@@ -1002,19 +1021,38 @@ class OrchestrationAgent(AgentBase):
         if not getattr(self, "_checkpoint_key", None):
             return None
         store = getattr(self, "_checkpoint_store", None)
-        if store is None:
-            try:
+        if store is not None:
+            return store
+        # object.__new__ 构造的测试替身 / 旧版序列化实例可能没有该锁：补建。
+        # 赋值发生在任何 await 之前，同一事件循环上的并发调用都能看到它
+        if getattr(self, "_checkpoint_store_init_lock", None) is None:
+            self._checkpoint_store_init_lock = threading.Lock()
+
+        def _init_store():
+            # 构造包含目录创建 / 过期清理 / 旧根扫描，且必须单飞：并发的
+            # check-and-construct 会各自 new 一个 CheckpointStore，实例级
+            # threading.Lock 不互斥，同键 update_step 的后写者会用旧快照
+            # 覆盖先写者的已成功步骤（重试 / 重启续跑静默失效）
+            with self._checkpoint_store_init_lock:
+                existing = getattr(self, "_checkpoint_store", None)
+                if existing is not None:
+                    return existing
                 from utils.execution_checkpoint import CheckpointStore
 
                 # 不传显式 root：默认存储初始化时会清理旧 CWD / 包根目录
                 # 里已过 TTL 的检查点（显式 root 按测试 / 自定义部署语义
                 # 跳过清理，此前传默认路径让旧文件永远清不掉）
-                store = await asyncio.to_thread(CheckpointStore)
-            except Exception as exc:  # noqa: BLE001 - 检查点不可用不影响对话
-                logger.warning("初始化执行检查点失败，跳过持久化: %s", exc)
-                return None
-            self._checkpoint_store = store
-        return store
+                fresh = CheckpointStore()
+                self._checkpoint_store = fresh
+                return fresh
+
+        try:
+            # 目录创建 / 过期清理放到线程池，避免每个新会话首回合在事件
+            # 循环上阻塞其它用户请求
+            return await asyncio.to_thread(_init_store)
+        except Exception as exc:  # noqa: BLE001 - 检查点不可用不影响对话
+            logger.warning("初始化执行检查点失败，跳过持久化: %s", exc)
+            return None
 
     def clear_checkpoint(self) -> None:
         """整轮成功落库后丢弃本轮检查点。
@@ -1103,7 +1141,34 @@ class OrchestrationAgent(AgentBase):
                 # 持久化检查点里同一任务的已成功结果：直接复用
                 # （重启 / 失败重试场景）；旧格式状态缺 step_keys 视为
                 # 未命中重跑（安全方向）
+                logger.info("复用检查点中的已成功步骤：%s", canonical_name)
+                # 复用的智能体不会真正执行：新流（重试 / 重启）里必须补发
+                # 开始 / 完成事件，否则前端执行路线上它们一直停在 pending
+                self._emit(
+                    on_event, {"type": "agent_start", "agent_name": canonical_name}
+                )
+                self._emit(
+                    on_event,
+                    {
+                        "type": "agent_done",
+                        "agent_name": canonical_name,
+                        "status": cached.get("status", "success"),
+                        "message": cached.get("message", ""),
+                        "duration": cached.get("duration"),
+                    },
+                )
                 return cached
+            if (
+                isinstance(cached, dict)
+                and cached.get("status") == "success"
+                and task_digest
+                and isinstance(step_keys, dict)
+            ):
+                # 计划文本（reason / expected_output / priority）与检查点里
+                # 保存的摘要不一致：按未命中重跑是安全方向，但必须留痕——
+                # 跨请求重试时意图 LLM 重新生成的计划措辞常会漂移，用户为
+                # 已完成的子智能体再次付费不能完全静默（只记名称，不含原文）
+                logger.info("检查点步骤摘要不匹配，重新执行：%s", canonical_name)
         self._emit(on_event, {"type": "agent_start", "agent_name": canonical_name})
         started = time.perf_counter()
         result = await self._run_agent(
@@ -1162,6 +1227,16 @@ class OrchestrationAgent(AgentBase):
                     )
                 except Exception as exc:  # noqa: BLE001 - 检查点失败不阻断对话
                     logger.warning("保存执行检查点失败: %s", exc)
+                else:
+                    # 落盘期间可能刚被跨实例删除：删除方的按作用域清理扫描
+                    # 早于本次落盘时不会包含该文件。落盘后再复查一次——
+                    # 墓碑已写 ⇒ 这里补删刚写出的键；墓碑在本复查之后才写
+                    # ⇒ 删除方的扫描必能看到已存在的文件并清掉。两种时序都
+                    # 不会把含用户提问 / 行程的检查点留到 TTL
+                    if await asyncio.to_thread(self._session_deleted_now):
+                        await asyncio.to_thread(
+                            self.clear_checkpoint_key, checkpoint_key
+                        )
         return result
 
     async def _run_agent(
@@ -1495,6 +1570,7 @@ class OrchestrationAgent(AgentBase):
             # 超限值落库后该偏好在面板 / CLI 永远无法编辑：按条跳过并
             # 记录类型（值可能是隐私内容，不写日志），其余偏好照常写入
             logger.warning("跳过偏好（类型 %s）：%s", pref_type, problem)
+            self._last_memory_write_failures.append(str(pref_type))
             return
         if pref_action in {"append", "add", "追加"}:
             append_pref = getattr(
@@ -1574,11 +1650,21 @@ class OrchestrationAgent(AgentBase):
         """
         if not self.memory_manager:
             return
+        # 每轮重新统计：上一轮的失败不能带到本轮回复提示里
+        self._last_memory_write_failures = []
         long_term = getattr(self.memory_manager, "long_term", None)
         batch_factory = getattr(long_term, "write_batch", None)
         if callable(batch_factory):
-            with batch_factory():
-                self._apply_memory_updates(intention_data, results)
+            try:
+                with batch_factory():
+                    self._apply_memory_updates(intention_data, results)
+            except Exception:
+                # 批量落盘失败（磁盘满 / 写锁超时）：逐条失败的记录已在
+                # _apply_memory_updates 内部登记；整份落盘失败时已写入的
+                # 偏好 / 行程同样没有持久化，补登记后继续上抛
+                if not self._last_memory_write_failures:
+                    self._last_memory_write_failures.append("偏好/行程")
+                raise
             return
         self._apply_memory_updates(intention_data, results)
 
@@ -1636,6 +1722,7 @@ class OrchestrationAgent(AgentBase):
                                 type(exc).__name__,
                                 pref_type,
                             )
+                            self._last_memory_write_failures.append(pref_type)
 
                 # 旧格式兼容：preferences 是字典
                 elif isinstance(preferences_data, dict):
@@ -1659,6 +1746,9 @@ class OrchestrationAgent(AgentBase):
                                     "保存偏好失败（%s，类型 %s），继续处理其余结果",
                                     type(exc).__name__,
                                     pref_type,
+                                )
+                                self._last_memory_write_failures.append(
+                                    str(pref_type)
                                 )
 
             # 如果是行程规划智能体，保存行程到长期记忆
@@ -1897,5 +1987,6 @@ class OrchestrationAgent(AgentBase):
                                 "保存行程失败（%s），本轮回答照常返回",
                                 type(exc).__name__,
                             )
+                            self._last_memory_write_failures.append("行程")
 
         logger.info("Memory updated after orchestration")

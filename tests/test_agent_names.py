@@ -25,11 +25,16 @@ def test_canonical_agent_name_cases():
     assert canonical_agent_name(" preference ") == "preference"
     # 已是标准名保持原样，首尾空白剥离
     assert canonical_agent_name(" information_query ") == "information_query"
+    # v2 扩展技能（simple 技能）的大小写变体同样归一：结果名 / 显示名 /
+    # 用量统计都按小写目录名精确匹配
+    assert canonical_agent_name("Trip-Budget") == "trip-budget"
+    assert canonical_agent_name("Packing-List") == "packing-list"
+    assert canonical_agent_name("LOCAL-TRANSPORT") == "local-transport"
     # 未知名称原样保留
     assert canonical_agent_name("Greeting_Agent") == "Greeting_Agent"
     assert canonical_agent_name("") == ""
     assert canonical_agent_name(None) == ""
-    print("✓ 智能体名称归一（目录名 / 遗留名变体 / 未知名称）")
+    print("✓ 智能体名称归一（目录名 / 遗留名变体 / 扩展技能 / 未知名称）")
 
 
 if __name__ == "__main__":

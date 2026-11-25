@@ -501,6 +501,7 @@ class ConversationRuntime:
             # 回合用量重复记账（此前 done 在回滚之后才置位）
             settlement["done"] = True
             await self._request_staged_rollback(user_input, turn_state)
+        memory_commit_failed = False
         if committed is not False:
             # 整轮已落库（_meta.usage 已写入消息）：先标记结算，再提交延迟
             # 记忆——提交期间被取消（停止 / 断连）时，ask() 外层兜底不能把
@@ -522,10 +523,34 @@ class ConversationRuntime:
                         await asyncio.shield(pending_commit)
                 except Exception:  # noqa: BLE001 - 逐条写入已吞异常，这里兜底
                     logger.warning("提交延迟记忆写入失败", exc_info=True)
+                    memory_commit_failed = True
         # 成功落库（True / 旧的 None 语义）时 _meta.usage 已在消息里；
         # 否决分支已记账——本轮用量已有归宿
+        reply_text = result_to_markdown(result_data)
+        # 偏好 / 行程没有真正写进长期记忆时（逐条跳过：超限 / 上限 / 单条
+        # 写入失败，或整份延迟提交失败），回复不能仍宣称「已更新」——Web
+        # 此前与 CLI 口径分叉，用户以为已保存但面板 / 日历都看不到
+        memory_failures = [
+            str(item).strip()
+            for item in (
+                getattr(self.orchestrator, "_last_memory_write_failures", None)
+                or []
+            )
+            if str(item).strip()
+        ]
+        if memory_commit_failed:
+            memory_failures.append("偏好/行程")
+        if memory_failures:
+            deduped: list[str] = []
+            for label in memory_failures:
+                if label not in deduped:
+                    deduped.append(label)
+            reply_text += (
+                "\n\n> ⚠️ 偏好 / 行程写入记忆失败，可在面板核对或重试："
+                + "、".join(deduped)
+            )
         return {
-            "reply": result_to_markdown(result_data),
+            "reply": reply_text,
             "agents": agents,
             "usage": usage,
             "elapsed": elapsed,
@@ -965,21 +990,31 @@ class ConversationRuntime:
 
     @staticmethod
     def _normalized_schedule(schedule: list[Any]) -> list[dict[str, Any]]:
-        """进度事件的调度计划：统一名称、过滤空白项与非法优先级。"""
+        """进度事件的调度计划：统一名称、过滤空白项与非法优先级。
+
+        同一技能以目录名 / 标准名 / 大小写变体重复出现时按 canonical 名
+        去重（保留首次）：编排层执行前会同样去重，计划事件不能给前端多报
+        一个永远不会执行的 pending 步骤。
+        """
         normalized: list[dict[str, Any]] = []
+        seen_names: set[str] = set()
         for item in schedule:
             if not isinstance(item, dict):
                 continue
             name = str(item.get("agent_name") or "").strip()
             if not name:
                 continue
+            canonical = canonical_agent_name(name)
+            if canonical.casefold() in seen_names:
+                continue
+            seen_names.add(canonical.casefold())
             try:
                 priority = int(item.get("priority", 0))
             except (TypeError, ValueError, OverflowError):
                 priority = 0
             normalized.append(
                 {
-                    "agent_name": canonical_agent_name(name),
+                    "agent_name": canonical,
                     "priority": priority,
                     "reason": item.get("reason", ""),
                 }

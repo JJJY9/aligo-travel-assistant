@@ -1412,7 +1412,53 @@ def test_normalized_schedule_filters_invalid_entries():
     assert [item["priority"] for item in schedule] == [0, 2], schedule
     assert all(item["agent_name"] for item in schedule)
     assert schedule[1]["reason"] == "查询"
-    print("✓ 调度计划过滤非法条目")
+    # 同一技能的目录名 / 标准名 / 大小写变体只保留首个：编排层执行前
+    # 同样去重，计划事件不能多报永远不会执行的 pending 步骤
+    deduped = runtime._normalized_schedule(
+        [
+            {"agent_name": "plan-trip", "priority": 1},
+            {"agent_name": "itinerary_planning", "priority": 2},
+            {"agent_name": "Trip-Budget", "priority": 3},
+            {"agent_name": "trip-budget", "priority": 3},
+        ]
+    )
+    assert [item["agent_name"] for item in deduped] == [
+        "itinerary_planning",
+        "trip-budget",
+    ], deduped
+    print("✓ 调度计划过滤非法条目并按 canonical 名去重")
+
+
+def test_deferred_memory_failure_is_surfaced_in_reply():
+    """偏好 / 行程写入失败不能吞成「已更新」：Web 回复追加可见提示。"""
+    runtime, _ = _make_runtime()
+
+    class _FailingCommitOrch:
+        async def reply(self, intention, on_event=None, defer_memory=False):
+            return _Response(json.dumps({"results": []}, ensure_ascii=False))
+
+        async def commit_deferred_memory(self):
+            raise RuntimeError("disk full")
+
+    runtime.orchestrator = _FailingCommitOrch()
+    result = asyncio.run(runtime.ask("记住我住汉庭"))
+    assert result["persisted"] is True, "聊天消息已落库，persisted 语义不变"
+    assert "写入记忆失败" in result["reply"], result["reply"]
+
+    class _ListedFailureOrch:
+        _last_memory_write_failures = ["hotel_brands"]
+
+        async def reply(self, intention, on_event=None, defer_memory=False):
+            return _Response(json.dumps({"results": []}, ensure_ascii=False))
+
+        async def commit_deferred_memory(self):
+            return True
+
+    runtime.orchestrator = _ListedFailureOrch()
+    result = asyncio.run(runtime.ask("记住我住汉庭"))
+    assert "写入记忆失败" in result["reply"]
+    assert "hotel_brands" in result["reply"]
+    print("✓ 延迟记忆提交失败 / 逐条跳过都在回复中提示")
 
 
 def test_empty_short_term_backfills_current_session_history():
@@ -1985,6 +2031,7 @@ if __name__ == "__main__":
     finally:
         mp.undo()
     test_normalized_schedule_filters_invalid_entries()
+    test_deferred_memory_failure_is_surfaced_in_reply()
     test_epoch_snapshot_read_before_context_and_intent()
     test_intent_success_does_not_reset_breaker_failures()
     test_summary_output_with_surrogate_is_sanitized()

@@ -13,6 +13,7 @@ from utils.preference_values import (
     EXPLANATORY_PREF_KEYS,
     has_preference_value,
     is_manageable_pref_type,
+    preference_value_problem,
 )
 
 logger = logging.getLogger(__name__)
@@ -44,8 +45,9 @@ _PREF_NAMES = {
 
 
 def display_name(agent_name: str) -> str:
-    """智能体的中文显示名。"""
-    return _DISPLAY_NAMES.get(agent_name, agent_name)
+    """智能体的中文显示名（大小写不敏感，覆盖已落库的旧混合大小写历史）。"""
+    name = str(agent_name or "").strip().casefold()
+    return _DISPLAY_NAMES.get(name, agent_name)
 
 
 def preference_label(pref_type: str) -> str:
@@ -271,7 +273,10 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
                     pref_type in EXPLANATORY_PREF_KEYS
                     or not has_preference_value(value)
                     or not is_manageable_pref_type(pref_type)
+                    or preference_value_problem(value) is not None
                 ):
+                    # 序列化超限（>10000 字符）的值落库侧会跳过：回显同样
+                    # 不能宣称「已更新」，也不把超长值塞进回复
                     continue
                 name = preference_label(pref_type)
                 lines.append(f"- {name} **设置为** {_pref_value_text(value)}")
@@ -290,6 +295,10 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
                 value = pref.get("value", "")
                 if not is_manageable_pref_type(pref_type):
                     # 落库侧会跳过的键（不可哈希 / 含 "/" / 超长）不回显
+                    continue
+                if preference_value_problem(value) is not None:
+                    # 序列化超限同样不会写入长期记忆（_apply_single_preference
+                    # 跳过），回显不能宣称「已更新」
                     continue
                 # 与落库路径一致的 action 变体（Append / add / 追加）
                 action_raw = str(pref.get("action") or "replace").strip().lower()

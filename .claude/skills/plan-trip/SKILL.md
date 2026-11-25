@@ -19,7 +19,7 @@ description: Use this skill when the user wants to plan a trip or asks for itine
 
 ## 统一模型与异步
 
-- 先创建 `OpenAIChatModel`（来自 `config.LLM_CONFIG`），再传给各 Agent 的 **model** 参数（本项目无 `model_config_name`）。
+- 先通过 `config_agentscope.create_chat_model()` 创建模型（非流式 + `generate_kwargs` 口径，与 Web / CLI 一致），再传给各 Agent 的 **model** 参数（本项目无 `model_config_name`）。
 - 三个 Agent 的 `reply()` 都是 **async**，需 **await**。
 
 ## 调用示例（简化链式）
@@ -28,22 +28,16 @@ description: Use this skill when the user wants to plan a trip or asks for itine
 import asyncio
 import json
 from agentscope.message import Msg
-from agentscope.model import OpenAIChatModel
-from config_agentscope import init_agentscope
-from config import LLM_CONFIG
+from config_agentscope import create_chat_model, init_agentscope
 from agents.intention_agent import IntentionAgent
 from agents.event_collection_agent import EventCollectionAgent
 from agents.itinerary_planning_agent import ItineraryPlanningAgent
 
 async def plan_trip(user_query: str):
     init_agentscope()
-    model = OpenAIChatModel(
-        model_name=LLM_CONFIG["model_name"],
-        api_key=LLM_CONFIG["api_key"],
-        client_kwargs={"base_url": LLM_CONFIG["base_url"], "timeout": 60},
-        temperature=LLM_CONFIG.get("temperature", 0.7),
-        max_tokens=LLM_CONFIG.get("max_tokens", 2000),
-    )
+    # 与 Web / CLI 同一工厂（非流式 + generate_kwargs）；顶层
+    # temperature/max_tokens 会被 agentscope 1.0.16 静默忽略
+    model = create_chat_model()
     user_msg = Msg(name="user", content=user_query, role="user")
 
     # 1. 意图识别

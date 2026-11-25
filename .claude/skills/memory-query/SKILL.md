@@ -28,22 +28,26 @@ description: Use this skill when the user asks about their own history, past tri
 import asyncio
 import json
 from agentscope.message import Msg
-from agentscope.model import OpenAIChatModel
-from config_agentscope import init_agentscope
-from config import LLM_CONFIG
+from config_agentscope import create_chat_model, init_agentscope
 from context.memory_manager import MemoryManager
+from utils.paths import default_data_root
 from agents.memory_query_agent import MemoryQueryAgent
 
 async def memory_query(user_query: str, user_id: str = "default_user", session_id: str = "default"):
     init_agentscope()
-    model = OpenAIChatModel(
-        model_name=LLM_CONFIG["model_name"],
-        api_key=LLM_CONFIG["api_key"],
-        client_kwargs={"base_url": LLM_CONFIG["base_url"], "timeout": 60},
-        temperature=LLM_CONFIG.get("temperature", 0.7),
-        max_tokens=LLM_CONFIG.get("max_tokens", 2000),
+    # 与 Web / CLI 同一工厂：非流式（stream=False）+ generate_kwargs；
+    # 直接构造 OpenAIChatModel 并把 temperature/max_tokens 当顶层参数
+    # 会被 agentscope 1.0.16 静默忽略，默认 stream=True 在当前依赖组合下
+    # 首个流块即崩
+    model = create_chat_model()
+    # storage_path 必须与面板 / CLI / 导出同源（default_data_root()/memory）：
+    # 默认 data/memory 锚定包根，wheel 安装后写入的偏好 / 行程在面板不可见
+    memory_manager = MemoryManager(
+        user_id=user_id,
+        session_id=session_id,
+        llm_model=model,
+        storage_path=str(default_data_root() / "memory"),
     )
-    memory_manager = MemoryManager(user_id=user_id, session_id=session_id, llm_model=model)
     agent = MemoryQueryAgent(
         name="MemoryQueryAgent",
         model=model,

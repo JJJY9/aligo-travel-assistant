@@ -120,13 +120,24 @@ class LazyAgentRegistry:
         for name in self._skill_map:
             if name.casefold() == lowered:
                 return name
+        # 连字符 ↔ 下划线变体（模型按 JSON snake_case 习惯输出 trip_budget /
+        # plan_trip / packing_list）：目录名都是连字符形式，互换后也接受，
+        # 否则意图过滤之外直接调用注册器的路径仍会「未注册」
+        swapped = (
+            lowered.replace("_", "-")
+            if "_" in lowered
+            else lowered.replace("-", "_")
+        )
+        for name in self._skill_map:
+            if name.casefold() == swapped:
+                return name
 
         # 2. SKILL.md frontmatter name（意图 prompt 展示的可调度名）
         alias = self._name_aliases.get(agent_name)
         if alias in self._skill_map:
             return alias
         for alias_name, directory in self._name_aliases.items():
-            if alias_name.casefold() == lowered and directory in self._skill_map:
+            if alias_name.casefold() in (lowered, swapped) and directory in self._skill_map:
                 return directory
 
         # 3. 尝试遗留映射（标准名，大小写不敏感）
@@ -135,7 +146,7 @@ class LazyAgentRegistry:
             if skill_name in self._skill_map:
                 return skill_name
         for legacy_name, skill_name in self._legacy_mapping.items():
-            if legacy_name.casefold() == lowered and skill_name in self._skill_map:
+            if legacy_name.casefold() in (lowered, swapped) and skill_name in self._skill_map:
                 return skill_name
 
         return None

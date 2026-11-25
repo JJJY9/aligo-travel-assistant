@@ -16,6 +16,13 @@ const AGENT_NAMES = {
   "trip-notes": "差旅贴士",
 };
 
+// 大小写不敏感：历史消息的 _meta 可能保存了 Trip-Budget / Packing-List 等
+// 模型输出的混合大小写变体，精确键查找会退化为显示英文目录名
+function agentDisplayName(name) {
+  const key = String(name || "").trim().toLowerCase();
+  return AGENT_NAMES[key] || name;
+}
+
 const INTENT_NAMES = {
   trip_planning: "行程规划",
   travel_planning: "行程规划",
@@ -1150,7 +1157,7 @@ function renderHistoryTrace(meta) {
     const name = item.agent_name || "";
     const status = agentStatuses.get(name) === "error" ? "error" : "done";
     addStop(
-      AGENT_NAMES[name] || name,
+      agentDisplayName(name),
       item.reason ? clampText(item.reason, 48) : "",
       status,
       agentDurations.get(name),
@@ -1225,7 +1232,7 @@ function renderAssistantNode(markdown, options = {}) {
 function makeBadge(name, status) {
   const badge = document.createElement("span");
   badge.className = status === "error" ? "badge err" : "badge";
-  badge.textContent = `${status === "error" ? "✗" : "✓"} ${AGENT_NAMES[name] || name}`;
+  badge.textContent = `${status === "error" ? "✗" : "✓"} ${agentDisplayName(name)}`;
   return badge;
 }
 
@@ -2302,7 +2309,7 @@ function createTrace() {
       }
     }
     if (!stop) {
-      stop = upsertStop(`agent:${name}:extra`, AGENT_NAMES[name] || name, note, status);
+      stop = upsertStop(`agent:${name}:extra`, agentDisplayName(name), note, status);
     }
     stop.li.className = `stop ${status}`;
     if (note) {
@@ -2339,7 +2346,7 @@ function createTrace() {
       }
       schedule.forEach((item, index) => {
         const agentName = item.agent_name || "";
-        const label = AGENT_NAMES[agentName] || agentName;
+        const label = agentDisplayName(agentName);
         const note = item.reason ? clampText(item.reason, 48) : "";
         upsertStop(`agent:${agentName}:${index}`, label, note, "pending");
       });
@@ -4548,7 +4555,7 @@ function renderOverview() {
     topAgents.forEach((agent) => {
       const chip = document.createElement("span");
       chip.className = "badge";
-      chip.textContent = `${AGENT_NAMES[agent.name] || agent.name} ×${agent.count}`;
+      chip.textContent = `${agentDisplayName(agent.name)} ×${agent.count}`;
       els.usageAgents.appendChild(chip);
     });
   }

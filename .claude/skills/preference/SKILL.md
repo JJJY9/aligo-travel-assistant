@@ -29,22 +29,23 @@ description: Use this skill when the user states or updates their preferences, e
 import asyncio
 import json
 from agentscope.message import Msg
-from agentscope.model import OpenAIChatModel
-from config_agentscope import init_agentscope
-from config import LLM_CONFIG
+from config_agentscope import create_chat_model, init_agentscope
 from context.memory_manager import MemoryManager
+from utils.paths import default_data_root
 from agents.preference_agent import PreferenceAgent
 
 async def save_preference(user_query: str, user_id: str = "default_user", session_id: str = "default"):
     init_agentscope()
-    model = OpenAIChatModel(
-        model_name=LLM_CONFIG["model_name"],
-        api_key=LLM_CONFIG["api_key"],
-        client_kwargs={"base_url": LLM_CONFIG["base_url"], "timeout": 60},
-        temperature=LLM_CONFIG.get("temperature", 0.7),
-        max_tokens=LLM_CONFIG.get("max_tokens", 2000),
+    # 与 Web / CLI 同一工厂（非流式 + generate_kwargs）；顶层
+    # temperature/max_tokens 会被 agentscope 1.0.16 静默忽略
+    model = create_chat_model()
+    # storage_path 与面板 / CLI 同源，否则写入的偏好在面板不可见
+    memory_manager = MemoryManager(
+        user_id=user_id,
+        session_id=session_id,
+        llm_model=model,
+        storage_path=str(default_data_root() / "memory"),
     )
-    memory_manager = MemoryManager(user_id=user_id, session_id=session_id, llm_model=model)
     agent = PreferenceAgent(name="PreferenceAgent", model=model, memory_manager=memory_manager)
     user_msg = Msg(name="user", content=user_query, role="user")
     result = await agent.reply(user_msg)

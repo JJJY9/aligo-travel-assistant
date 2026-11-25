@@ -85,6 +85,10 @@ def test_frontend_render_helpers():
     assert results["escape_html"] == "&lt;b&gt;&quot;&amp;&#39;�", (
         "私用区占位符必须替换，避免被代码块占位恢复步骤当成注入"
     )
+    assert results["agent_display_mixed"] == "预算建议", (
+        "历史 _meta 的混合大小写技能名同样显示中文"
+    )
+    assert results["agent_display_unknown"] == "custom_agent"
     assert results["highlight_dotted"] == "<mark>İstanbul</mark> 出差", (
         "İ 关键字按原文长度命中并高亮"
     )

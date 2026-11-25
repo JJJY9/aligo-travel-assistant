@@ -18,6 +18,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
 from utils.access_log import MAX_LOG_TEXT, _safe_log_text
 from utils.log_redact import redact_secret
+from utils.preference_values import preference_prompt_lines
 from utils.json_parser import (
     decode_json_array_at,
     extract_json_from_async_response,
@@ -960,6 +961,17 @@ class ItineraryPlanningAgent(AgentBase):
             "user_query": user_query,
             "context": context_info,
         }
+        if user_preferences:
+            # 偏好已在 preferences_info 里按已知类型单独渲染；数据块里的
+            # 全量副本仍可达到存储上限（200 类型 × 10000 字符 ≈ 2MB），
+            # 原样塞进 prompt 会让每次规划都 context_length_exceeded。
+            # 这里换用共享预算文本（与意图侧同口径）：全部类型名保留
+            # （超出部分「值已省略」），模型不会把既有偏好误判为首次设置
+            bounded_context = dict(context_info) if isinstance(context_info, dict) else {}
+            bounded_context["user_preferences"] = "\n".join(
+                preference_prompt_lines(user_preferences)
+            )
+            all_info["context"] = bounded_context
 
         # 从 previous_results 中提取其他 agent 的数据。
         # 兼容编排器的嵌套结构 {"result": {"data": ...}} 与 SKILL.md 文档中的
