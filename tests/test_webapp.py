@@ -6635,6 +6635,60 @@ def test_trip_ics_uid_includes_content():
     print("✓ ICS UID 包含行程内容（复用 id 不覆盖旧事件）")
 
 
+def test_trip_calendar_uid_stable_after_edit():
+    """面板编辑行程后重新「加入日历」：UID 不变（客户端更新原事件）。"""
+    client = _client()
+    user_id = _unique_user("web_test_uid_stable")
+    try:
+        created = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-05",
+                "end_date": "2026-12-07",
+                "purpose": "会议",
+            },
+        )
+        assert created.status_code == 201, created.text
+        trip_id = created.json()["trip_id"]
+
+        def uid():
+            response = client.get(
+                f"/api/trips/{trip_id}/calendar",
+                params={"user_id": user_id},
+            )
+            assert response.status_code == 200, response.text
+            return next(
+                line
+                for line in response.text.splitlines()
+                if line.startswith("UID:")
+            )
+
+        before = uid()
+        edited = client.put(
+            f"/api/trips/{trip_id}",
+            json={
+                "user_id": user_id,
+                "start_date": "2026-12-09",
+                "end_date": "2026-12-11",
+                "destination": "杭州",
+            },
+        )
+        assert edited.status_code == 200, edited.text
+        assert uid() == before, "编辑日期 / 路线后日历 UID 必须保持不变"
+        purpose_only = client.put(
+            f"/api/trips/{trip_id}",
+            json={"user_id": user_id, "purpose": "休假"},
+        )
+        assert purpose_only.status_code == 200, purpose_only.text
+        assert uid() == before
+        print("✓ 面板编辑行程后日历 UID 保持稳定")
+    finally:
+        _cleanup(user_id)
+
+
 def test_ics_escape_handles_lone_cr():
     from utils.trip_export import _ics_escape, render_trip_ics
 

@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import tempfile
 import threading
@@ -2234,6 +2235,9 @@ class LongTermMemory:
             "timestamp": datetime.now().isoformat(),
             **trip_info
         }
+        # 不可变 UID 标识：发放在 **trip_info 之后，调用方传入的同名字段
+        # 不能覆盖；导出端据此生成稳定的日历 UID（编辑行程不换事件身份）
+        trip_record["uid_token"] = secrets.token_hex(8)
 
         self.data["trip_history"].append(trip_record)
 
@@ -2360,6 +2364,15 @@ class LongTermMemory:
                 # 已被删除 / 命中墓碑，需要清除关联）；键缺失保留原值
                 if "session_id" in row:
                     existing["session_id"] = row.get("session_id")
+                # 既有行没有 token 时继承备份里的合法 token（恢复后日历
+                # UID 与备份来源一致）；既有合法 token 一律不覆盖
+                from utils.trip_export import normalized_uid_token
+
+                incoming_token = normalized_uid_token(row.get("uid_token"))
+                if incoming_token and not normalized_uid_token(
+                    existing.get("uid_token")
+                ):
+                    existing["uid_token"] = incoming_token
                 existing["timestamp"] = (
                     row.get("timestamp") or datetime.now().isoformat()
                 )
@@ -2381,6 +2394,14 @@ class LongTermMemory:
             else:
                 record["trip_id"] = f"trip_{max_number}"
             used_trip_ids.add(str(record["trip_id"]))
+            # 备份里的 uid_token 合法时沿用（恢复后日历 UID 与备份一致）；
+            # 缺失 / 非法时补发。去重更新路径不刷新既有 token。
+            from utils.trip_export import normalized_uid_token
+
+            record["uid_token"] = (
+                normalized_uid_token(record.get("uid_token"))
+                or secrets.token_hex(8)
+            )
             stats["last_trip_number"] = max_number
             history.append(record)
             stats["total_trips"] = int(stats.get("total_trips", 0)) + 1
@@ -2568,11 +2589,24 @@ class LongTermMemory:
             if same is not None and same is not trip:
                 raise ValueError("已存在相同行程（同路线 + 同起止日期）")
 
+            from utils.trip_export import legacy_uid_inputs, normalized_uid_token
+
+            before_uid_inputs = legacy_uid_inputs(trip)
+
             old_destination = trip.get("destination")
             old_start = trip.get("start_date")
             for key in ("origin", "destination", "start_date", "end_date", "purpose"):
                 if key in fields:
                     trip[key] = fields[key]
+            # 历史行程没有 uid_token：只有本次真正改动了 UID 输入（路线 /
+            # 日期，且按旧公式的原文投影比较）才补发——这一刻旧公式本来
+            # 也会换 UID，属一次性迁移；只改目的 / 会话的编辑不补发
+            # （导出仍走旧公式，字节不变）
+            if (
+                not normalized_uid_token(trip.get("uid_token"))
+                and legacy_uid_inputs(trip) != before_uid_inputs
+            ):
+                trip["uid_token"] = secrets.token_hex(8)
             new_destination = trip.get("destination")
             new_start = trip.get("start_date")
             # 常去目的地按「出发日期可解析」计数（与批量保存 / 删除 / 迁移

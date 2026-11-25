@@ -402,6 +402,77 @@ def test_import_preserves_trip_text_whitespace():
     print("✓ 行程文本空白保真且重复恢复不新增")
 
 
+def test_merged_trip_rows_reserve_uid_token_for_size_estimate():
+    """恢复体积预演计入写入层补发的 uid_token（避免恢复后永久 413）。"""
+    from utils.user_import import _merged_trip_rows
+
+    rows = _merged_trip_rows(
+        [], [{"destination": "上海", "start_date": "2026-12-05"}]
+    )
+    assert rows[0].get("uid_token") == "0" * 16, "缺 token 的新行要预留 16 位"
+    keep = _merged_trip_rows(
+        [],
+        [
+            {
+                "destination": "杭州",
+                "start_date": "2026-12-06",
+                "uid_token": "0123456789abcdef",
+            }
+        ],
+    )
+    assert keep[0]["uid_token"] == "0123456789abcdef"
+    # 更新分支：既有行缺失 token 时继承备份值（与存储层一致）
+    merged = _merged_trip_rows(
+        [{"trip_id": "trip_1", "destination": "上海", "start_date": "2026-12-05"}],
+        [
+            {
+                "destination": "上海",
+                "start_date": "2026-12-05",
+                "uid_token": "0123456789abcdef",
+            }
+        ],
+    )
+    assert merged[0]["uid_token"] == "0123456789abcdef"
+    print("✓ 恢复体积预演预留 / 继承 uid_token")
+
+
+def test_parse_preserves_trip_uid_token():
+    """备份恢复保留合法 uid_token（日历 UID 不因换机而变），非法值丢弃。"""
+    from utils.trip_export import normalized_uid_token
+
+    payload = {
+        "trip_history": [
+            {
+                "destination": "上海",
+                "start_date": "2026-12-05",
+                "uid_token": "0123456789abcdef",
+            },
+            {
+                "destination": "杭州",
+                "start_date": "2026-12-06",
+                "uid_token": "BAD-TOKEN",
+            },
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert sections["trips"][0]["uid_token"] == "0123456789abcdef"
+    assert "uid_token" not in sections["trips"][1], "非法 token 必须丢弃"
+    store = _real_store("u-trip-token")
+    try:
+        import_user_data(store, sections)
+        by_destination = {
+            trip["destination"]: trip for trip in store.get_trip_history(limit=None)
+        }
+        assert by_destination["上海"]["uid_token"] == "0123456789abcdef"
+        issued = by_destination["杭州"].get("uid_token")
+        assert issued and normalized_uid_token(issued) == issued, (
+            "非法 / 缺失 token 由写入层补发"
+        )
+    finally:
+        store._close() if hasattr(store, "_close") else None
+    print("✓ 备份恢复保留合法 uid_token、非法值由写入层补发")
+
+
 def test_import_roundtrip_and_idempotent():
     sections, errors = parse_user_export(json.dumps(_export_payload(), ensure_ascii=False))
     store = _real_store()

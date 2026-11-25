@@ -145,6 +145,39 @@ def _ics_date(value: str) -> str | None:
         return None
 
 
+_UID_TOKEN_RE = re.compile(r"[0-9a-f]{16}")
+
+
+def normalized_uid_token(value: Any) -> str:
+    """行程的不可变 UID 标识（16 位小写十六进制）；非法 / 缺失返回空串。
+
+    日历客户端把 UID 当作事件身份：同一行程编辑日期 / 路线后重新导出
+    若换了 UID，客户端会新增一条事件而不是更新原事件。存储层为每条行程
+    发放一次 token 并永不改写，导出端据此生成稳定 UID；历史行程没有
+    token 时导出仍用旧的内容摘要公式（字节兼容），下一次真正改动日期 /
+    路线时由存储层补发。
+    """
+    text = str(value or "")
+    return text if _UID_TOKEN_RE.fullmatch(text) else ""
+
+
+def legacy_uid_inputs(trip: dict[str, Any]) -> tuple[str, str, str, str]:
+    """旧 UID 公式的四个内容输入（路线与起止日期，含空值占位回退）。
+
+    无 token 行程的 UID 由这些值的原文（``_clean_trip_value`` 投影）哈希
+    得到；存储层补发 token 前必须用**同一投影**比较新旧值——身份归一
+    （补零 / 斜杠日期）与原文不同，用身份值比较会漏判「2026-1-5 →
+    2026-01-05」这类改写（旧公式 UID 已变却不补发）并误判「空出发地 →
+    字面量出发地」（旧公式 UID 未变却补发）。
+    """
+    return (
+        _clean_trip_value(trip.get("origin") or "出发地"),
+        _clean_trip_value(trip.get("destination") or "目的地"),
+        _clean_trip_value(trip.get("start_date") or ""),
+        _clean_trip_value(trip.get("end_date") or ""),
+    )
+
+
 def _ics_escape(value: str) -> str:
     """按 RFC 5545 转义文本字段（含孤立的 CR，避免破坏行结构）。"""
     return (
@@ -250,21 +283,40 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
         f"{_clean_trip_value(trip.get('purpose'))}"
     )
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    # UID 同时包含行程内容：删除最新行程后 id 可能被复用，仅用 trip_id
-    # 会让新行程覆盖日历里已存在的旧事件
-    uid_source = ":".join(
-        [
-            # 全部经 _clean_trip_value：历史脏数据里的孤立代理项会让
-            # uid_source.encode("utf-8") 抛 UnicodeEncodeError（整个导出 500）
-            _clean_trip_value(user_id),
-            _clean_trip_value(trip.get("trip_id") or "trip"),
-            # 只用于摘要：转义后的值保证不会把换行带进 UID 行
-            _ics_escape(origin),
-            _ics_escape(destination),
-            _clean_trip_value(trip.get("start_date") or ""),
-            _clean_trip_value(trip.get("end_date") or ""),
-        ]
-    )
+    # UID 是日历客户端识别「同一条事件」的身份，必须对同一行程持久稳定：
+    # 存储层为每条行程发放一次不可变的 uid_token，编辑日期 / 路线后重新
+    # 导出仍是同一个 UID（客户端更新事件而不是新增）。历史行程没有 token
+    # 时退回旧的内容摘要公式：既有导出字节与 UID 完全不变（升级不会让
+    # 已加入日历的事件重复）；下次真正改动日期 / 路线时存储层补发 token。
+    token = normalized_uid_token(trip.get("uid_token"))
+    if token:
+        uid_source = ":".join(
+            [
+                _clean_trip_value(user_id),
+                _clean_trip_value(trip.get("trip_id") or "trip"),
+                token,
+            ]
+        )
+    else:
+        # 旧公式：同时包含行程内容（删除最新行程后 id 可能被复用，
+        # 仅用 trip_id 会让新行程覆盖日历里已存在的旧事件）。
+        # legacy_uid_inputs 与存储层补发 token 的判据共用同一投影
+        legacy_origin, legacy_destination, legacy_start, legacy_end = (
+            legacy_uid_inputs(trip)
+        )
+        uid_source = ":".join(
+            [
+                # 全部经 _clean_trip_value：历史脏数据里的孤立代理项会让
+                # uid_source.encode("utf-8") 抛 UnicodeEncodeError（整个导出 500）
+                _clean_trip_value(user_id),
+                _clean_trip_value(trip.get("trip_id") or "trip"),
+                # 只用于摘要：转义后的值保证不会把换行带进 UID 行
+                _ics_escape(legacy_origin),
+                _ics_escape(legacy_destination),
+                legacy_start,
+                legacy_end,
+            ]
+        )
     uid_digest = hashlib.sha1(uid_source.encode("utf-8")).hexdigest()[:16]
     uid = f"aligo-{uid_digest}@aligo.local"
 

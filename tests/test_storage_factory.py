@@ -2875,6 +2875,426 @@ def test_pg_trip_lookup_normalizes_identity_fields():
     print("✓ PostgreSQL 行程去重按身份口径归一路线")
 
 
+def test_json_trip_uid_token_lifecycle():
+    """JSON：新建行程发放 uid_token；编辑日期 / 路线后 UID 稳定不变。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+    from utils.trip_export import normalized_uid_token, render_trip_ics
+
+    def uid_of(trip):
+        text = render_trip_ics(trip, "u-uid")
+        return next(
+            line for line in text.replace("\r\n ", "").split("\r\n")
+            if line.startswith("UID:")
+        )
+
+    store = LongTermMemory("u-uid", tempfile.mkdtemp())
+    trip_id = store.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-05",
+            "end_date": "2026-12-07",
+            "purpose": "会议",
+        }
+    )
+    record = store.get_trip_history(limit=None)[0]
+    token = record.get("uid_token")
+    assert token and normalized_uid_token(token) == token
+    base_uid = uid_of(record)
+    assert store.update_trip(
+        trip_id, {"start_date": "2026-12-08", "end_date": "2026-12-10"}
+    )
+    updated = store.get_trip_history(limit=None)[0]
+    assert updated["uid_token"] == token, "编辑日期不得更换 uid_token"
+    assert uid_of(updated) == base_uid, "编辑日期后日历 UID 必须保持稳定"
+    # 同身份去重保存（只刷新目的 / 时间戳）也不得更换 token
+    store.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-08",
+            "end_date": "2026-12-10",
+            "purpose": "客户会议",
+        }
+    )
+    assert store.get_trip_history(limit=None)[0]["uid_token"] == token
+    print("✓ JSON 行程 uid_token 生命周期（发放在编辑后稳定）")
+
+
+def test_json_legacy_trip_token_backfill_rules():
+    """JSON：历史行只在旧 UID 公式输入真正变化时补发 token（原文投影）。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+    from utils.trip_export import normalized_uid_token
+
+    def make_legacy(user: str, **overrides):
+        store = LongTermMemory(user, tempfile.mkdtemp())
+        trip = {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-05",
+            "end_date": "2026-12-07",
+            "purpose": "会议",
+            **overrides,
+        }
+        trip_id = store.save_trip_history(trip)
+        store.data["trip_history"][0].pop("uid_token", None)
+        store._persist()
+        return store, trip_id
+
+    store, trip_id = make_legacy("u-uid-legacy")
+    assert store.update_trip(trip_id, {"purpose": "休假"})
+    assert "uid_token" not in store.get_trip_history(limit=None)[0], (
+        "只改目的不得触发一次性 UID 迁移"
+    )
+    # 空出发地 → 字面量「出发地」：旧公式回退同一占位，UID 不变，不补发
+    empty_store, empty_id = make_legacy("u-uid-legacy-empty", origin="")
+    assert empty_store.update_trip(empty_id, {"origin": "出发地"})
+    assert "uid_token" not in empty_store.get_trip_history(limit=None)[0], (
+        "旧公式 UID 未变时不得无谓补发"
+    )
+    # 未补零日期被面板重存为补零 ISO：旧公式输入改变，必须补发
+    unpadded_store, unpadded_id = make_legacy(
+        "u-uid-legacy-unpadded", start_date="2026-1-5"
+    )
+    assert unpadded_store.update_trip(
+        unpadded_id, {"start_date": "2026-01-05"}
+    )
+    token = unpadded_store.get_trip_history(limit=None)[0].get("uid_token")
+    assert token and normalized_uid_token(token) == token, (
+        "日期原文改写必须触发一次性迁移（否则 UID 仍会变化）"
+    )
+    # 真正的日期改动同样补发
+    assert store.update_trip(trip_id, {"start_date": "2026-12-08"})
+    token = store.get_trip_history(limit=None)[0].get("uid_token")
+    assert token and normalized_uid_token(token) == token, (
+        "改动日期时必须补发 token（一次性迁移）"
+    )
+    print("✓ JSON 历史行程按旧公式原文变化补发 token")
+
+
+def test_json_batch_update_inherits_backup_uid_token():
+    """JSON 批量恢复：既有历史行缺失 token 时继承备份里的合法 token。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+
+    store = LongTermMemory("u-uid-inherit", tempfile.mkdtemp())
+    store.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-05",
+            "end_date": "2026-12-07",
+            "purpose": "会议",
+        }
+    )
+    store.data["trip_history"][0].pop("uid_token", None)
+    store._persist()
+    token = "0123456789abcdef"
+    created, updated = store.save_trip_histories(
+        [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-05",
+                "end_date": "2026-12-07",
+                "uid_token": token,
+            }
+        ]
+    )
+    assert (created, updated) == (0, 1)
+    record = store.get_trip_history(limit=None)[0]
+    assert record["uid_token"] == token, "既有行缺失 token 时应继承备份值"
+    # 既有合法 token 不被备份覆盖
+    store.save_trip_histories(
+        [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-05",
+                "end_date": "2026-12-07",
+                "uid_token": "fedcba9876543210",
+            }
+        ]
+    )
+    assert store.get_trip_history(limit=None)[0]["uid_token"] == token
+    print("✓ JSON 批量更新继承备份 token（既有合法值不覆盖）")
+
+
+def test_json_save_trip_histories_preserves_or_issues_token():
+    """JSON 批量保存：备份里的合法 token 沿用，非法 / 缺失补发。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+    from utils.trip_export import normalized_uid_token
+
+    store = LongTermMemory("u-uid-batch", tempfile.mkdtemp())
+    good = "0123456789abcdef"
+    store.save_trip_histories(
+        [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-05",
+                "uid_token": good,
+            },
+            {
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": "2026-12-06",
+                "uid_token": "BAD-TOKEN",
+            },
+            {
+                "origin": "北京",
+                "destination": "广州",
+                "start_date": "2026-12-07",
+            },
+        ]
+    )
+    by_destination = {
+        trip["destination"]: trip for trip in store.get_trip_history(limit=None)
+    }
+    assert by_destination["上海"]["uid_token"] == good, "合法备份 token 必须沿用"
+    issued = by_destination["杭州"].get("uid_token")
+    assert issued and normalized_uid_token(issued) == issued
+    issued2 = by_destination["广州"].get("uid_token")
+    assert issued2 and normalized_uid_token(issued2) == issued2
+    print("✓ JSON 批量保存沿用 / 补发 uid_token")
+
+
+def test_pg_trip_uid_token_insert_and_history_mapping():
+    """PG：单条新增写入 uid_token；get_trip_history 按 JSON 同形返回。"""
+    import contextlib
+    from datetime import datetime as _datetime
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils.trip_export import normalized_uid_token
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store.dsn = "postgresql://uid-insert-test"
+    store._conn = object()
+    store._advisory_lock = lambda name: contextlib.nullcontext()
+    store._ensure_trip_uid_column = lambda: None
+    calls: list[tuple[str, object]] = []
+    store._fetchall = lambda sql, params: []
+    store._next_trip_number = lambda: 1
+    store._abort_if_reconnected = lambda conn: None
+    store._execute = lambda sql, params=None, **kwargs: calls.append((sql, params))
+    store._save_trip_history_locked(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-05",
+            "end_date": "2026-12-06",
+        },
+        None,
+        "上海",
+    )
+    sql, params = calls[-1]
+    assert "uid_token" in sql
+    token = params[-1]
+    assert normalized_uid_token(token) == token, params
+    # get_trip_history：token 只在该行有值时返回（与 JSON 同形）
+    store._fetchall = lambda sql, params: [
+        (
+            "trip_1",
+            "北京",
+            "上海",
+            "2026-12-05",
+            "2026-12-06",
+            None,
+            None,
+            token,
+            _datetime(2026, 1, 1, 9, 0, 0),
+        ),
+        (
+            "trip_2",
+            "北京",
+            "杭州",
+            "2026-12-07",
+            "2026-12-08",
+            None,
+            None,
+            None,
+            _datetime(2026, 1, 2, 9, 0, 0),
+        ),
+    ]
+    rows = store.get_trip_history(limit=None)
+    assert rows[0]["uid_token"] == token
+    assert "uid_token" not in rows[1], "历史行无 token 时保持旧形状"
+    print("✓ PG 单条新增与列表的 uid_token 口径")
+
+
+def test_pg_update_trip_backfills_uid_token_only_on_uid_input_change():
+    """PG：历史行只在改动路线 / 日期时补发 token，只改目的不补发。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+    from utils.trip_export import normalized_uid_token
+
+    legacy_row = (1, "北京", "上海", "2026-12-05", "2026-12-06", None)
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store.dsn = "postgresql://uid-update-test"
+    store._conn = object()
+    store._advisory_lock = lambda name: contextlib.nullcontext()
+    store._ensure_trip_uid_column = lambda: None
+    store._fetchone = lambda sql, params=None: legacy_row
+    store._fetchall = lambda sql, params: []
+    store._abort_if_reconnected = lambda conn: None
+    executed: list[tuple[str, object]] = []
+    store._execute = (
+        lambda sql, params=None, **kwargs: executed.append((sql, params))
+    )
+    assert store.update_trip("trip_1", {"purpose": "休假"}) is True
+    sql, _ = executed[-1]
+    assert "uid_token" not in sql, "只改目的不得触发一次性 UID 迁移"
+    executed.clear()
+    assert store.update_trip("trip_1", {"start_date": "2026-12-08"}) is True
+    sql, params = executed[-1]
+    assert "uid_token = %s" in sql
+    token = params[-2]
+    assert normalized_uid_token(token) == token, params
+    # 已有 token 的行不再补发
+    store._fetchone = (
+        lambda sql, params=None: (
+            1,
+            "北京",
+            "上海",
+            "2026-12-05",
+            "2026-12-06",
+            "0123456789abcdef",
+        )
+    )
+    executed.clear()
+    assert store.update_trip("trip_1", {"start_date": "2026-12-09"}) is True
+    assert "uid_token" not in executed[-1][0]
+    # 未补零日期被面板重存为补零 ISO：旧公式原文已变，必须补发
+    unpadded_row = (1, "北京", "上海", "2026-1-5", "2026-1-6", None)
+    store._fetchone = lambda sql, params=None: unpadded_row
+    executed.clear()
+    assert store.update_trip("trip_1", {"start_date": "2026-01-05"}) is True
+    sql, params = executed[-1]
+    assert "uid_token = %s" in sql, "日期原文改写必须触发一次性迁移"
+    assert normalized_uid_token(params[-2]) == params[-2]
+    print("✓ PG update_trip 按旧公式原文变化补发 token")
+
+
+def test_pg_batch_update_inherits_backup_uid_token():
+    """PG 批量恢复：既有行缺失 token 时 UPDATE 继承备份合法 token。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store.dsn = "postgresql://test"
+    store._conn = object()
+    store._advisory_lock = lambda name: contextlib.nullcontext()
+    store._ensure_trip_uid_column = lambda: None
+    existing = (
+        1,
+        "trip_1",
+        "北京",
+        "上海",
+        "2026-12-05",
+        "2026-12-07",
+        None,
+    )
+    store._fetchall = lambda sql, params: [existing]
+    store._fetchone = lambda sql, params=None: (1,)
+    store._abort_if_reconnected = lambda conn: None
+    executed: list[tuple[str, object]] = []
+    store._execute = (
+        lambda sql, params=None, **kwargs: executed.append((sql, params))
+    )
+    token = "0123456789abcdef"
+    created, updated = store.save_trip_histories(
+        [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-05",
+                "end_date": "2026-12-07",
+                "uid_token": token,
+            }
+        ]
+    )
+    assert (created, updated) == (0, 1)
+    sql, params = executed[-1]
+    assert "uid_token = %s" in sql, sql
+    assert token in params, params
+    # 既有合法 token 不覆盖：下一批同身份行不再带 uid_token 赋值
+    existing_with_token = (
+        1,
+        "trip_1",
+        "北京",
+        "上海",
+        "2026-12-05",
+        "2026-12-07",
+        token,
+    )
+    store._fetchall = lambda sql, params: [existing_with_token]
+    executed.clear()
+    store.save_trip_histories(
+        [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-05",
+                "end_date": "2026-12-07",
+                "uid_token": "fedcba9876543210",
+            }
+        ]
+    )
+    assert "uid_token" not in executed[-1][0]
+    print("✓ PG 批量更新继承备份 token（既有合法值不覆盖）")
+
+
+def test_pg_lazy_uid_column_migration():
+    """DDL 整批被跳过时，首次行程调用补建 uid_token 列（每 DSN 一次）。"""
+    from context import postgres_long_term_memory as pg_module
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    store = object.__new__(PostgresLongTermMemory)
+    store.user_id = "u1"
+    store.dsn = "postgresql://lazy-uid-column"
+    executed: list[str] = []
+    store._execute = lambda sql, params=None, **kwargs: executed.append(sql)
+    pg_module._SCHEMA_READY.discard(store.dsn)
+    pg_module._TRIP_UID_COLUMN_READY.discard(store.dsn)
+    try:
+        store._ensure_trip_uid_column()
+        assert len(executed) == 1 and "ADD COLUMN IF NOT EXISTS uid_token" in executed[0]
+        store._ensure_trip_uid_column()
+        assert len(executed) == 1, "同一 DSN 只需补建一次"
+        # 整批 schema 成功后无需再触碰 DDL
+        pg_module._SCHEMA_READY.add(store.dsn)
+        pg_module._TRIP_UID_COLUMN_READY.discard(store.dsn)
+        store._ensure_trip_uid_column()
+        assert len(executed) == 1
+    finally:
+        pg_module._SCHEMA_READY.discard(store.dsn)
+        pg_module._TRIP_UID_COLUMN_READY.discard(store.dsn)
+    # 行程方法入口确实会触发懒迁移
+    store2 = object.__new__(PostgresLongTermMemory)
+    store2.user_id = "u1"
+    store2.dsn = "postgresql://lazy-uid-column-2"
+    store2._ensure_trip_uid_column = lambda: pg_module._TRIP_UID_COLUMN_READY.add(
+        store2.dsn
+    )
+    store2._fetchall = lambda sql, params: []
+    store2.get_trip_history(limit=None)
+    assert store2.dsn in pg_module._TRIP_UID_COLUMN_READY
+    pg_module._TRIP_UID_COLUMN_READY.discard(store2.dsn)
+    print("✓ PG uid_token 列懒迁移（跳过 DDL 后自愈）")
+
+
 def test_pg_chat_summary_does_not_fetch_message_bodies():
     """PG 会话概览只查计数与 DISTINCT 会话，不整表取回消息正文。"""
     from context.postgres_long_term_memory import PostgresLongTermMemory
@@ -5427,8 +5847,8 @@ def test_pg_save_trip_histories_batches_with_one_index():
 
     store._advisory_lock = fake_lock
     history = [
-        (1, "trip_1", "北京", "上海", "2026-12-01", "2026-12-03"),
-        (2, "trip_2", "北京", "广州", "2026-12-10", "2026-12-11"),
+        (1, "trip_1", "北京", "上海", "2026-12-01", "2026-12-03", None),
+        (2, "trip_2", "北京", "广州", "2026-12-10", "2026-12-11", None),
     ]
     executed = []
     inserted_params = []
@@ -5490,6 +5910,9 @@ def test_pg_save_trip_histories_batches_with_one_index():
     assert inserts[0][1] == "trip_3"
     assert inserts[0][2] == "北京" and inserts[0][4] == "2026-12-20"
     assert inserts[0][6] == "会议"
+    from utils.trip_export import normalized_uid_token as _normalized_token
+
+    assert _normalized_token(inserts[0][8]) == inserts[0][8], "新行必须发放 uid_token"
     counters = [
         params
         for sql, params in executed

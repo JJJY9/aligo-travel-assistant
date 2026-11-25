@@ -26,6 +26,7 @@ from utils.errors import ImportVolumeError, MemoryPersistenceError
 from utils.identifiers import is_valid_web_session_id
 from utils.json_safe import MAX_JSON_DEPTH
 from utils.timestamps import localize_naive, parse_iso_datetime
+from utils.trip_export import normalized_uid_token
 from utils.trip_import import (
     _strict_date,
     normalize_identity_date,
@@ -1331,6 +1332,11 @@ def _merged_trip_rows(
             record["trip_id"] = f"trip_{max_number}"
         used_trip_ids.add(str(record["trip_id"]))
         record.setdefault("timestamp", fallback_timestamp)
+        # 写入层会给缺失 / 非法的 uid_token 补发 16 位标识（导出多出
+        # ~35 字节）：预演必须计入，否则 MAX_TOTAL_TRIPS 规模可累积
+        # 低估 ~175KB，让恢复后正好卡在 50MB 上限的账号过检、随后永久 413
+        if not normalized_uid_token(record.get("uid_token")):
+            record["uid_token"] = "0" * 16
         if include_empty_keys:
             # PostgreSQL 后端的导出行带 purpose / session_id 键（空值也
             # 序列化）；JSON 后端没有这两个键
@@ -1347,13 +1353,17 @@ def _merge_trip_row(
 ) -> dict[str, Any]:
     """导入层对同身份行程的更新语义（与 ``save_trip_histories`` 一致）：
     purpose 非 None 覆盖、session_id 键存在即覆盖（含显式 None）、时间戳
-    无条件刷新（``row.get("timestamp") or now``），其余字段保留。"""
+    无条件刷新（``row.get("timestamp") or now``），既有行缺失 uid_token 时
+    继承备份里的合法值（既有合法 token 不覆盖），其余字段保留。"""
     merged = dict(existing)
     purpose = incoming.get("purpose")
     if purpose is not None:
         merged["purpose"] = purpose
     if "session_id" in incoming:
         merged["session_id"] = incoming.get("session_id")
+    incoming_token = normalized_uid_token(incoming.get("uid_token"))
+    if incoming_token and not normalized_uid_token(merged.get("uid_token")):
+        merged["uid_token"] = incoming_token
     timestamp = incoming.get("timestamp")
     if timestamp:
         merged["timestamp"] = timestamp
@@ -1739,6 +1749,11 @@ def parse_user_export_data(
         record_timestamp = _normalize_timestamp(row.get("timestamp"))
         if record_timestamp:
             trip_record["timestamp"] = record_timestamp
+        # 不可变 UID 标识随备份恢复（日历事件身份不因换机而变）：
+        # 只接受 16 位小写十六进制，非法 / 缺失由写入层补发
+        uid_token = normalized_uid_token(row.get("uid_token"))
+        if uid_token:
+            trip_record["uid_token"] = uid_token
         trips.append(trip_record)
     sections["trips"] = trips
 

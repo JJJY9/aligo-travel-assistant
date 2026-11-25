@@ -399,6 +399,59 @@ def test_ics_9999_single_day_omits_dtend():
     print("✓ 9999-12-31 单日省略 DTEND，多日终点保留合法 DTEND")
 
 
+def test_ics_uid_stable_with_uid_token():
+    """有 uid_token 的行程：编辑日期 / 路线后 UID 不变（日历更新而非新增）。"""
+    token = "0123456789abcdef"
+    trip = {
+        "trip_id": "trip_7",
+        "uid_token": token,
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-05",
+        "end_date": "2026-12-07",
+    }
+
+    def uid_of(value):
+        text = render_trip_ics(value, "u1")
+        for line in text.replace("\r\n ", "").split("\r\n"):
+            if line.startswith("UID:"):
+                return line[4:]
+        raise AssertionError("缺少 UID 行")
+
+    base_uid = uid_of(trip)
+    for change in (
+        {"start_date": "2026-12-08", "end_date": "2026-12-10"},
+        {"origin": "杭州"},
+        {"destination": "广州"},
+        {"purpose": "休假"},
+    ):
+        assert uid_of({**trip, **change}) == base_uid, change
+    # 不同 token（同一 trip_id）必须得到不同 UID：删除后编号复用时不能
+    # 覆盖日历里已存在的旧事件
+    other_uid = uid_of({**trip, "uid_token": "fedcba9876543210"})
+    assert other_uid != base_uid
+    print("✓ 有 uid_token 的行程 UID 对内容编辑稳定")
+
+
+def test_ics_uid_without_token_keeps_legacy_formula():
+    """历史行程（无 token）UID 逐字保持旧公式：升级不改变导出字节。"""
+    trip = {
+        "trip_id": "trip_7",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-05",
+        "end_date": "2026-12-07",
+    }
+    text = render_trip_ics(trip, "u1")
+    # 旧公式（user:trip:origin:destination:start:end 的 sha1 前 16 位）
+    assert "UID:aligo-b263681c4cbdb96e@aligo.local" in text
+    # 非法 token（长度 / 字符不符）同样按旧公式处理
+    for bad in ("short", "0123456789ABCDEF", " " + "0" * 16, "0" * 15, "0" * 17):
+        bad_text = render_trip_ics({**trip, "uid_token": bad}, "u1")
+        assert "UID:aligo-b263681c4cbdb96e@aligo.local" in bad_text, bad
+    print("✓ 无 / 非法 uid_token 时 UID 保持旧公式（字节兼容）")
+
+
 def test_empty_calendar_has_placeholder_component():
     """空日历满足 RFC 5545「至少一个组件」：输出可被忽略的扩展组件。"""
     text = render_trips_ics([], "u1")
@@ -522,6 +575,8 @@ if __name__ == "__main__":
     finally:
         _shim.close()
     test_ics_slash_dates_parse_like_iso()
+    test_ics_uid_stable_with_uid_token()
+    test_ics_uid_without_token_keeps_legacy_formula()
     test_ics_9999_single_day_omits_dtend()
     test_empty_calendar_has_placeholder_component()
     test_csv_formula_guard_covers_newlines_and_leading_space()
