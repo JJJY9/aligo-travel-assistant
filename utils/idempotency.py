@@ -84,6 +84,31 @@ class IdempotencyCache:
         with self._lock:
             self._entries.clear()
 
+    def discard_session(self, user_id: str, session_id: str) -> None:
+        """清除某用户某会话的全部缓存条目（会话删除 / 删除最后一轮后调用）。
+
+        键里的 session_id 覆盖带会话 id 的请求；首条消息（无 session_id）
+        写在空串键下，载荷里带着服务端首次执行生成的会话 id，需一并清除。
+        否则删除会话 / 删除最后一轮后用同键重试会回放已删除的答案，客户端
+        以为已落库并继续使用一个已删除的会话。
+        """
+        uid = str(user_id or "").strip()
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        with self._lock:
+            doomed = [
+                key
+                for key, (_, payload) in self._entries.items()
+                if key[0] == uid
+                and (
+                    key[1] == sid
+                    or str(payload.get("session_id") or "").strip() == sid
+                )
+            ]
+            for key in doomed:
+                self._entries.pop(key, None)
+
     def __len__(self) -> int:
         with self._lock:
             return len(self._entries)

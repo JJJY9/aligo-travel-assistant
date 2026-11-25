@@ -566,6 +566,17 @@ def test_create_rate_limiter_passes_max_keys():
     print("✓ max_keys 透传（内存 / Redis 回退）")
 
 
+def test_refund_returns_one_slot():
+    """refund 归还一单位额度（锁内 503 分支不再白扣重试者的配额）。"""
+    limiter = RateLimiter(limit=1, window_sec=60)
+    assert limiter.check("u") is None
+    assert limiter.check("u") is not None
+    limiter.refund("u")
+    assert limiter.check("u") is None, "归还后应重新有额度"
+    limiter.refund("missing")
+    print("✓ refund 归还一单位限流额度")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -616,4 +627,5 @@ if __name__ == "__main__":
             _mp.undo()
     test_wrongtype_key_falls_back_without_degrading_bucket()
     test_create_rate_limiter_passes_max_keys()
+    test_refund_returns_one_slot()
     print("\n全部通过")

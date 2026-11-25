@@ -58,11 +58,13 @@ _WINDOWS_RESERVED_NAMES = frozenset(
 )
 
 
-# ID 会直接拼成 <user_id>.json 以及 .lock / 隔离备份名：POSIX 的单文件名
-# 上限是 NAME_MAX=255 字节（ext4 / XFS / APFS），64 个 4 字节字符（Deseret、
-# CJK 扩展 B 等）会得到 261 字节的文件名，写入必然 ENAMETOOLONG。按最长的
-# 派生名（mkstemp 前缀再加 14 字节）留足余量
-_MAX_ID_UTF8_BYTES = 240
+# ID 会直接拼成 <user_id>.json 以及 .lock / 隔离备份 / 迁移备份 / 导入锁等
+# 派生文件名：POSIX 的单文件名上限是 NAME_MAX=255 字节（ext4 / XFS / APFS）。
+# 不能只按主文件预算——最长的派生名是损坏隔离备份
+# `«id».json.corrupt-«20 位时间戳»-«pid»`（id + 42 字节，pid 按 7 位计），
+# 240 字节的合法 ID 在 POSIX 上会让导入锁 / 隔离 / 迁移全部 ENAMETOOLONG。
+# 取 210 = 255 - 42 - 3 字节余量，覆盖全族派生名。
+_MAX_ID_UTF8_BYTES = 210
 
 
 def is_valid_web_id(value: object, max_length: int = 64) -> bool:

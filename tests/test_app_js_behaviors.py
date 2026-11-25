@@ -126,8 +126,8 @@ def test_frontend_render_helpers():
     assert results["id_reserved_com1"] is False
     assert results["id_ok_console"] is True
     assert results["id_astral_33"] is True, "33 个增补平面字母（66 单元）按码点合法"
-    assert results["id_astral_60"] is True, "60×4=240 字节仍合法（服务端上限 240）"
-    assert results["id_astral_61"] is False, "61×4=244 字节超过服务端 240 字节上限"
+    assert results["id_astral_52"] is True, "52×4=208 字节仍合法（服务端上限 210）"
+    assert results["id_astral_53"] is False, "53×4=212 字节超过服务端 210 字节上限"
     assert results["id_astral_65"] is False, "65 个码点超过 64 上限"
     # 会话 ID 口径：设备名会话合法（仅用户 ID 拒绝），export 是保留路由
     assert results["session_device_name"] is True

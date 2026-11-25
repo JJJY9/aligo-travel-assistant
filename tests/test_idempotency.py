@@ -81,6 +81,27 @@ def test_key_binds_endpoint_and_message():
     print("✓ 幂等键绑定消息与端点")
 
 
+def test_discard_session_clears_all_forms():
+    """会话删除后清掉全部相关条目：含空 session_id 键（载荷带会话 id）。"""
+    cache = IdempotencyCache()
+    key_s1 = make_key("u1", "s1", "a")
+    key_empty = make_key("u1", "", "b")
+    key_s2 = make_key("u1", "s2", "c")
+    key_other_user = make_key("u2", "s1", "d")
+    cache.put(key_s1, {"session_id": "s1"})
+    cache.put(key_empty, {"session_id": "s1"})
+    cache.put(key_s2, {"session_id": "s2"})
+    cache.put(key_other_user, {"session_id": "s1"})
+    cache.discard_session("u1", "s1")
+    assert cache.get(key_s1) is None
+    assert cache.get(key_empty) is None, "空 session_id 键按载荷会话 id 清理"
+    assert cache.get(key_s2) == {"session_id": "s2"}
+    assert cache.get(key_other_user) == {"session_id": "s1"}
+    cache.discard_session("u1", "  ")
+    assert len(cache) == 2, "空白会话 id 不清任何条目"
+    print("✓ 幂等缓存按会话失效（含首条消息的空键）")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -96,4 +117,5 @@ if __name__ == "__main__":
     test_lru_eviction()
     test_key_normalization_and_clear()
     test_key_binds_endpoint_and_message()
+    test_discard_session_clears_all_forms()
     print("\n全部通过")

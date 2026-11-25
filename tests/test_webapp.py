@@ -1238,6 +1238,66 @@ def test_chat_idempotency_key_replays_without_rerun():
         _cleanup(user_id)
 
 
+def test_chat_idempotency_replay_blocked_after_session_delete():
+    """会话删除后同键重试不能回放已删除会话的答案。"""
+
+    class _CountingModel:
+        def __init__(self):
+            self.calls = 0
+            self._inner = _FakeModel()
+
+        async def __call__(self, messages, **kwargs):
+            self.calls += 1
+            return await self._inner(messages, **kwargs)
+
+    counting = _CountingModel()
+    client = TestClient(create_app(model=UsageTrackingModel(counting)))
+    user_id = _unique_user("web_test_idem_deleted")
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "session_id": "sess-replay-del",
+            "idempotency_key": "req-del-1",
+        }
+        first = client.post("/api/chat", json=payload)
+        assert first.status_code == 200, first.text
+        deleted = client.delete(
+            f"/api/sessions/sess-replay-del?user_id={user_id}"
+        )
+        assert deleted.status_code == 200, deleted.text
+
+        replay = client.post("/api/chat", json=payload)
+        assert replay.status_code == 404, replay.text
+        assert "已删除" in replay.text
+        assert replay.headers.get("x-idempotent-replay") is None
+
+        # 删除最后一轮后同键重发：缓存已清，必须真实执行而不是回放旧答案
+        payload2 = {
+            "message": "第二问",
+            "user_id": user_id,
+            "session_id": "sess-replay-turn",
+            "idempotency_key": "req-turn-1",
+        }
+        second = client.post("/api/chat", json=payload2)
+        assert second.status_code == 200, second.text
+        calls_after_second = counting.calls
+        last_turn = client.delete(
+            f"/api/sessions/sess-replay-turn/last-turn?user_id={user_id}"
+            "&expect=第二问"
+        )
+        assert last_turn.status_code == 200, last_turn.text
+        resent = client.post("/api/chat", json=payload2)
+        assert resent.status_code == 200, resent.text
+        assert resent.headers.get("x-idempotent-replay") is None, (
+            "删除最后一轮后同键重发不能回放已删除的答案"
+        )
+        assert counting.calls > calls_after_second
+        print("✓ 删除会话 / 最后一轮后幂等回放被拦截")
+    finally:
+        _cleanup(user_id)
+
+
 def test_chat_idempotency_key_binds_message_content():
     """同一幂等键换了消息不能被回放：新提问必须真实执行。"""
     class _CountingModel:

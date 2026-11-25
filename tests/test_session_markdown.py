@@ -460,6 +460,73 @@ def test_render_all_sessions_matches_with_precomputed_grouping():
 _DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
+def test_group_sessions_keeps_integer_zero_session():
+    """整数 0 是合法会话（列表 / 详情 / 单会话导出一致），合集导出不能丢。"""
+    messages = [
+        {"role": "user", "content": "零号会话", "session_id": 0, "timestamp": ""},
+        _msg("user", "普通会话", "s1", "2026-11-02T10:00:00"),
+        {"role": "user", "content": "无归属", "session_id": None, "timestamp": ""},
+        {"role": "user", "content": "空白会话", "session_id": "  ", "timestamp": ""},
+    ]
+    grouped = group_sessions(messages)
+    assert [session_id for session_id, _ in grouped] == ["s1", "0"], grouped
+    text, count = render_all_sessions_markdown("u1", messages)
+    assert count == 2, count
+    assert "零号会话" in text
+    print("✓ 整数 0 会话进入合集导出（None / 空白串仍跳过）")
+
+
+def _escape_reference(text):
+    """旧逐字符实现的参考版本（与 replace 链逐字节对拍）。"""
+    out = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char in "\\[]()`":
+            out.append("\\" + char)
+        elif char == "<":
+            out.append("&lt;")
+        elif char == ">":
+            out.append("&gt;")
+        elif char == "!" and index + 1 < len(text) and text[index + 1] == "[":
+            out.append("\\!")
+        else:
+            out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def test_escape_replace_chain_matches_charwise():
+    """转义改为 str.replace 链后与逐字符实现逐字节等价。"""
+    from utils.session_markdown import _escape_inline_markdown
+
+    samples = [
+        "",
+        "普通文本",
+        "![图](http://x)<script>alert(1)</script>",
+        "\\\\[a](b)`code`",
+        "!![x] <<>> ``",
+        "反引号 ` 结尾",
+        "![",
+        "!",
+        "[]()<>",
+    ]
+    for sample in samples:
+        assert _escape_inline_markdown(sample) == _escape_reference(sample)
+    print("✓ Markdown 行内转义 replace 链与逐字符实现一致")
+
+
+def test_title_scan_stops_at_40_chars_on_huge_message():
+    """标题派生只扫描标题前缀：超大消息不再 split 出百万级中间列表。"""
+    from utils.session_title import session_title_from_content
+
+    huge = ("ab " * 700_000) + "尾部"
+    expected = " ".join(huge.split())[:40]
+    assert session_title_from_content(huge) == expected
+    assert session_title_from_content(None) == ""
+    print("✓ 标题派生对超大消息只扫描前缀")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -490,4 +557,7 @@ if __name__ == "__main__":
     test_render_all_sessions_matches_with_precomputed_grouping()
     test_title_strips_terminal_controls()
     test_message_body_escaped_in_export()
+    test_group_sessions_keeps_integer_zero_session()
+    test_escape_replace_chain_matches_charwise()
+    test_title_scan_stops_at_40_chars_on_huge_message()
     print("\n全部通过")

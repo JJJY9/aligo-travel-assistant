@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Any
 
 from utils.console import strip_terminal_controls
+from utils.session_title import session_title_from_content
 from utils.stored_message import render_stored_message
 from utils.timestamps import chronological_key
 
@@ -53,25 +54,18 @@ def _escape_inline_markdown(text: str) -> str:
     标题行与引用块外的正文：链接 / 图片语法（`[x](url)`、`![x](url)`）与
     尖括号会让导出文件在允许 HTML 的预览器里变成可点击钓鱼链接、自动加载
     远程图片或执行原始标签；反斜杠转义在渲染后按原字面显示。
+
+    用 C 层 ``str.replace`` 链而不是逐字符 Python 循环：导出允许单条
+    50MB 级消息，逐字符追加列表会在「全部是可转义字符」的合法备份上
+    放大出数百 MB 内存与数十秒 CPU。替换顺序与逐字符语义逐字节等价。
     """
-    out = []
-    index = 0
-    while index < len(text):
-        char = text[index]
-        if char in "\\[]()`":
-            # 反引号同样转义：裸反引号在渲染器里可能与其它行 / 其它片段
-            # 组成行内代码段，让本该转义的内容被当作代码原样输出
-            out.append("\\" + char)
-        elif char == "<":
-            out.append("&lt;")
-        elif char == ">":
-            out.append("&gt;")
-        elif char == "!" and index + 1 < len(text) and text[index + 1] == "[":
-            out.append("\\!")
-        else:
-            out.append(char)
-        index += 1
-    return "".join(out)
+    # 反斜杠最先转义，后续插入的转义反斜杠不会被二次转义
+    text = text.replace("\\", "\\\\")
+    # 图片语法先于单独的 "[" 处理：两者都会再转义那个 "["
+    text = text.replace("![", "\\![")
+    for char in "[]()`":
+        text = text.replace(char, "\\" + char)
+    return text.replace("<", "&lt;").replace(">", "&gt;")
 
 
 def sanitize_title(title: str) -> str:
@@ -220,7 +214,7 @@ def _session_title(
         return sanitize_title(title)
     for message in messages:
         if message.get("role") == "user":
-            text = " ".join(str(message.get("content", "")).split())
+            text = session_title_from_content(message.get("content", ""))
             if text:
                 # 回退标题同样来自用户输入：与自定义标题一样清洗，
                 # 否则 <script> 之类会原样落进 `## ` 标题行
@@ -257,10 +251,15 @@ def group_sessions(
     """
     grouped: dict[str, list[dict[str, Any]]] = {}
     for message in messages:
-        session_id = str(message.get("session_id") or "")
-        if not session_id:
+        # 与 Web 列表 / CLI sessions 同口径：整数 0（以及 False）是合法
+        # 会话，只有 None 与纯空白串视为无归属——按 truthiness 归一会把
+        # 0 折成空串，合集导出（备份）静默丢掉整段会话
+        session_id = message.get("session_id")
+        if session_id is None or (
+            isinstance(session_id, str) and not session_id.strip()
+        ):
             continue
-        grouped.setdefault(session_id, []).append(message)
+        grouped.setdefault(str(session_id), []).append(message)
     ordered = sorted(
         grouped.items(),
         key=lambda item: chronological_key(_latest_timestamp(item[1])),

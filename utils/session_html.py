@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from utils.stored_message import render_stored_message
+from utils.session_title import session_title_from_content
 from utils.console import strip_terminal_controls
 
 _TEMPLATE = """<!doctype html>
@@ -111,7 +112,7 @@ def _bundle_title(
         return " ".join(title.split())
     for message in messages:
         if message.get("role") == "user":
-            text = " ".join(str(message.get("content", "")).split())
+            text = session_title_from_content(message.get("content", ""))
             if text:
                 return text[:40]
     return "Aligo 对话"

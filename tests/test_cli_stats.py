@@ -131,6 +131,21 @@ def test_stats_archived_counts_only_live_sessions(monkeypatch):
     print("✓ stats 归档只统计仍有消息的会话")
 
 
+def test_stats_archived_dedupes_equivalent_ids(monkeypatch):
+    """整数 42 与字符串 "42" 并存只计一次（与面板 archived_count 同口径）。"""
+    store = _FakeStore(
+        history=[_message("42")], archived=[42, "42"]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run("u-stats", as_json=True)
+    assert code == 0
+    data = json.loads(out)
+    assert data["sessions"]["archived"] == 1, data
+    print("✓ stats 归档按字符串去重计数")
+
+
 def test_stats_empty_and_failures(monkeypatch):
     store = _FakeStore()
     monkeypatch.setattr(
@@ -277,6 +292,11 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_stats_archived_counts_only_live_sessions(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_stats_archived_dedupes_equivalent_ids(_mp)
     finally:
         _mp.undo()
     _mp = pytest.MonkeyPatch()

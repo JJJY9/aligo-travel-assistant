@@ -3605,6 +3605,46 @@ def test_migrate_sanitizes_invalid_preferences():
     print("✓ 非法偏好记录在迁移时清洗并备份")
 
 
+def test_migrate_backup_truncated_is_rebuilt():
+    """半截 / 不可解析的迁移备份必须重建，不能「存在即跳过」。"""
+    from context.long_term_memory import LongTermMemory
+
+    storage_dir = tempfile.mkdtemp()
+    original = {"preferences": [{"type": ["bad"], "value": "x"}]}
+    db_path = Path(storage_dir) / "u-half.json"
+    db_path.write_text(json.dumps(original), encoding="utf-8")
+    backup = Path(storage_dir) / "u-half.json.migrate-backup"
+    backup.write_text('{"preferences": [{"type": ["bad"', encoding="utf-8")
+
+    memory = LongTermMemory("u-half", storage_dir)
+    memory.get_preference()  # 触发迁移 → 备份
+
+    rebuilt = json.loads(backup.read_text(encoding="utf-8"))
+    assert isinstance(rebuilt, dict), rebuilt
+    assert rebuilt == original, "备份必须是完整快照"
+    print("✓ 半截迁移备份被重建为完整快照")
+
+
+def test_migrate_backup_valid_is_not_overwritten():
+    """已有可解析备份仍保留首份（迁移备份不反复覆盖）。"""
+    from context.long_term_memory import LongTermMemory
+
+    storage_dir = tempfile.mkdtemp()
+    db_path = Path(storage_dir) / "u-keep.json"
+    db_path.write_text(
+        json.dumps({"preferences": [{"type": ["bad"], "value": "x"}]}),
+        encoding="utf-8",
+    )
+    backup = Path(storage_dir) / "u-keep.json.migrate-backup"
+    backup.write_text(json.dumps({"sentinel": True}), encoding="utf-8")
+
+    memory = LongTermMemory("u-keep", storage_dir)
+    memory.get_preference()
+
+    assert json.loads(backup.read_text(encoding="utf-8")) == {"sentinel": True}
+    print("✓ 有效迁移备份保留首份不被覆盖")
+
+
 def test_migrate_backup_file_is_owner_only():
     """迁移备份含完整用户数据：创建后必须收紧为 0600（不随 umask 共享）。"""
     import context.long_term_memory as ltm
@@ -4234,6 +4274,51 @@ def test_trip_save_matches_linebreak_variants():
     assert len(trips) == 1
     assert trips[0]["purpose"] == "会议", "未提供目的时保留原值"
     print("✓ 换行 / 未补零日期不同的同一趟行程命中存储去重")
+
+
+def test_delete_trips_verified_in_batch_rolls_back(monkeypatch):
+    """批内 delete_trips_verified 走 _persist：批失败后行程删除整体回滚。"""
+    import pytest
+
+    from context.long_term_memory import LongTermMemory
+
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-batch-trip", storage_dir)
+    memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+            "purpose": "出差",
+        }
+    )
+    saves: list[int] = []
+    real_save = LongTermMemory._save
+
+    def counting_save(self):
+        if self is memory:
+            saves.append(1)
+        return real_save(self)
+
+    monkeypatch.setattr(LongTermMemory, "_save", counting_save)
+    target = {
+        "trip_id": "trip_1",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-02",
+    }
+    with pytest.raises(RuntimeError):
+        with memory.write_batch():
+            memory.append_preference("hotel_brand", "汉庭")
+            memory.delete_trips_verified([target])
+            raise RuntimeError("boom")
+    assert saves == [], "批内不能直接落盘（否则回滚会固化半批快照）"
+    reloaded = LongTermMemory("u-batch-trip", storage_dir)
+    assert len(reloaded.get_trip_history(limit=None)) == 1, "行程删除必须回滚"
+    assert "hotel_brand" not in reloaded.get_preference()
+    print("✓ 批内 delete_trips_verified 随批整体回滚")
 
 
 def test_delete_trips_verified_batches_single_write():
@@ -6921,11 +7006,13 @@ def test_pg_delete_paths_lock_message_table_like_import():
 
 
 def test_pg_recent_reads_exclude_future_timestamps():
-    """最近 N 条与「最后一轮」查询排除未来时间戳（导入允许 ≤2100）。
+    """最近 N 条读取排除未来时间戳（导入允许 ≤2100）；最后一轮不排除。
 
     created_at 排序下 2030 行会永久占据 newest-N，把此后所有真实消息
-    挤出汇总窗口 / 短期回填，且 delete_last_turn 一直把 2030 当最后
-    一轮——JSON 后端随新消息追加自然恢复，PG 不会。
+    挤出汇总窗口 / 短期回填——读取侧必须过滤。但会话详情（无 limit）
+    会展示 2030 行并把它当最后一轮，delete_last_turn 若也排除，用户
+    「编辑 / 重新生成」会删到更早的真实轮次（expect 永远 mismatch），
+    因此删除侧与详情同口径、不再过滤。
     """
     from context.postgres_long_term_memory import PostgresLongTermMemory
 
@@ -6947,7 +7034,8 @@ def test_pg_recent_reads_exclude_future_timestamps():
     memory.get_chat_history(limit=5)
     assert "interval '1 hour'" in captured[-1], captured[-1]
     memory.delete_last_turn("s1")
-    assert "interval '1 hour'" in captured[-1], captured[-1]
+    assert "interval '1 hour'" not in captured[-1], captured[-1]
+    assert "ORDER BY created_at DESC, id DESC" in captured[-1], captured[-1]
 
 
 def test_pg_advisory_unlock_never_replays_after_reconnect():
