@@ -716,6 +716,126 @@ def test_health_check_redacts_api_key_in_error(monkeypatch):
 _DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
+def test_retry_respects_retry_after_header(monkeypatch):
+    """429/503 带 Retry-After：退避取指示值（秒数 / HTTP 日期），仍受上限约束。"""
+    import utils.llm_resilience as resilience_module
+
+    delays: list[float] = []
+
+    async def fake_sleep(sec):
+        delays.append(sec)
+
+    monkeypatch.setattr(resilience_module.asyncio, "sleep", fake_sleep)
+
+    class _Resp:
+        def __init__(self, headers):
+            self.headers = headers
+
+    class _RateLimited(Exception):
+        status_code = 429
+
+        def __init__(self, headers):
+            super().__init__("rate limited")
+            self.response = _Resp(headers)
+
+    attempts = {"n": 0}
+
+    def make_fail(headers):
+        async def fail_once():
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise _RateLimited(headers)
+            return "ok"
+
+        return fail_once
+
+    assert asyncio.run(
+        retry_with_backoff(
+            make_fail({"retry-after": "7"}),
+            max_retries=1,
+            base_delay_sec=1.0,
+            max_delay_sec=30.0,
+        )
+    ) == "ok"
+    assert delays == [7.0], delays
+
+    delays.clear()
+    attempts["n"] = 0
+    assert asyncio.run(
+        retry_with_backoff(
+            make_fail({"retry-after": "999"}),
+            max_retries=1,
+            base_delay_sec=1.0,
+            max_delay_sec=30.0,
+        )
+    ) == "ok"
+    assert delays == [30.0], delays
+
+    import datetime as _dt
+    from email.utils import format_datetime
+
+    delays.clear()
+    attempts["n"] = 0
+    when = _dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=5)
+    assert asyncio.run(
+        retry_with_backoff(
+            make_fail({"retry-after": format_datetime(when, usegmt=True)}),
+            max_retries=1,
+            base_delay_sec=1.0,
+            max_delay_sec=30.0,
+        )
+    ) == "ok"
+    assert 3.0 <= delays[0] <= 6.0, delays
+
+    # 非法值 / 无 headers：回退原指数退避，不抛新异常
+    delays.clear()
+    attempts["n"] = 0
+    assert asyncio.run(
+        retry_with_backoff(
+            make_fail({"retry-after": "abc"}),
+            max_retries=1,
+            base_delay_sec=1.0,
+            max_delay_sec=30.0,
+            jitter=False,
+        )
+    ) == "ok"
+    assert delays == [1.0], delays
+    print("✓ Retry-After 生效且受上限约束")
+
+
+def test_probe_hard_cap_reclaims_stuck_task(monkeypatch):
+    """归属任务永久挂起时，超过硬上限后回收半开试探名额。"""
+    times = {"now": 100.0}
+    monkeypatch.setattr(cb_module.time, "monotonic", lambda: times["now"])
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=10, half_open_successes=1
+    )
+    breaker.record_failure()
+    times["now"] = 111.0
+    hard_cap = breaker._probe_lease_sec + 10.0
+    breaker._probe_hard_cap_sec = hard_cap
+
+    async def scenario():
+        assert breaker.allow_call() is True  # 本任务持有试探
+        # 远超租约但未到硬上限：任务仍存活，任何请求都拒绝
+        times["now"] = 111.0 + breaker._probe_lease_sec + 1
+        assert breaker.denies_new_calls() is True
+        # 超过硬上限：视为主死，回收名额
+        times["now"] = 111.0 + hard_cap + 1
+        assert breaker.denies_new_calls() is False
+
+        async def other():
+            return breaker.allow_call()
+
+        assert await asyncio.create_task(other()) is True
+        # 旧 owner 迟到的成功因归属不匹配被忽略，不会凑够关闭计数
+        breaker.record_success()
+        assert breaker.state.value == "half_open"
+
+    asyncio.run(scenario())
+    print("✓ 半开试探硬上限回收卡死任务")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -840,6 +960,16 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_health_check_redacts_api_key_in_error(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_retry_respects_retry_after_header(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_probe_hard_cap_reclaims_stuck_task(_mp)
     finally:
         _mp.undo()
     test_json_formatter_includes_exc_info()

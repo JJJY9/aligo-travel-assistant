@@ -741,16 +741,69 @@ def test_close_swallows_backend_close_failure():
 
 
 def test_summary_failure_degrades_to_empty():
-    """历史总结失败时上下文仍可构建（只缺总结段）。"""
-    runtime, memory = _make_runtime()
+    """历史总结 / 近期摘要失败时上下文仍可构建，且失败要留下告警日志。"""
+    import logging as _logging
 
-    async def boom(max_messages=30):
-        raise RuntimeError("summary backend down")
+    records: list[_logging.LogRecord] = []
 
-    memory.get_long_term_summary_async = boom  # type: ignore[method-assign]
+    class _Capture(_logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture(level=_logging.WARNING)
+    logger = _logging.getLogger("agents.conversation")
+    logger.addHandler(handler)
+    try:
+        runtime, memory = _make_runtime()
+
+        async def boom(max_messages=30):
+            raise RuntimeError("summary backend down")
+
+        memory.get_long_term_summary_async = boom  # type: ignore[method-assign]
+        result = asyncio.run(runtime.ask("你好"))
+        assert result["reply"]
+
+        runtime2, memory2 = _make_runtime()
+
+        async def recent_boom(max_turns=10):
+            raise RuntimeError("recent summary down")
+
+        memory2.get_recent_summary_async = recent_boom  # type: ignore[method-assign]
+        result2 = asyncio.run(runtime2.ask("你好"))
+        assert result2["reply"]
+    finally:
+        logger.removeHandler(handler)
+    messages = [record.getMessage() for record in records]
+    assert any("长期会话总结" in text for text in messages), messages
+    assert any("最近对话摘要" in text for text in messages), messages
+    print("✓ 历史总结失败时降级为空并记录告警")
+
+
+def test_orchestration_results_object_yields_agents_list():
+    """编排结果 results 为对象（旧编排 / 补充导入）：agents 列表正常归一。"""
+    runtime, _ = _make_runtime()
+
+    class _ObjectOrchestrator:
+        async def reply(self, intention, on_event=None):
+            return _Response(
+                json.dumps(
+                    {
+                        "status": "completed",
+                        "results": {
+                            "agent_name": "GreetingAgent",
+                            "status": "success",
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    runtime.orchestrator = _ObjectOrchestrator()
     result = asyncio.run(runtime.ask("你好"))
-    assert result["reply"]
-    print("✓ 历史总结失败时降级为空")
+    assert result["agents"] == [
+        {"name": "GreetingAgent", "status": "success"}
+    ], result
+    print("✓ results 对象归一为 agents 列表")
 
 
 def test_rollback_failure_does_not_mask_original_error():
@@ -1906,6 +1959,7 @@ if __name__ == "__main__":
     test_progress_callback_failure_does_not_break_ask()
     test_close_swallows_backend_close_failure()
     test_summary_failure_degrades_to_empty()
+    test_orchestration_results_object_yields_agents_list()
     test_empty_short_term_backfills_current_session_history()
     test_non_empty_short_term_skips_long_term_backfill()
     test_rollback_failure_does_not_mask_original_error()

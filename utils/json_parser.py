@@ -241,22 +241,32 @@ _RESULT_KEY_RE = re.compile(r'"\s*[^"\\\n]{1,80}"\s*:')
 _RESULT_VALUE_RE = re.compile(
     r'"\s*:\s*(?:"|\d|\{|\[|true|false|null|-)'
 )
+# 平衡片段（完整 token 流）里的「结果键值对」证据：值必须是真正的结果
+# 值类型。裸数字 / 负号只对未配平（截断）片段有效——说明文字里的示例
+# （「注：若日期不同（例如 {"start_date": 2026-03-12}）」）常带裸值，
+# 不能据此认定正式结果被截断；真正损坏的结果几乎必含至少一个引号值。
+_RESULT_BALANCED_VALUE_RE = re.compile(
+    r'"\s*:\s*(?:"|\{|\[|true|false|null)'
+)
 
 
-def _looks_like_result_object(fragment: str) -> bool:
+def _looks_like_result_object(fragment: str, *, unclosed: bool = False) -> bool:
     """粗略判断无法解析的片段是否「像被破坏的结果对象」。
 
     仅用于「无法修复」的片段：含 NaN / Infinity（确定性非法）或至少一个
-    JSON 形态的值（引号字符串 / 数字 / 容器 / 字面量）时，视为正式结果
-    损坏或截断，拒绝让更早的示例对象顶替；说明文字里的 ``{"destination":
-    城市名}`` 这类平衡片段不满足条件，仍按普通说明忽略。
+    JSON 形态的值时，视为正式结果损坏或截断，拒绝让更早的示例对象顶替。
+    ``unclosed=True``（片段没有配平，即被截断）时裸数字 / 负号也算证据；
+    平衡片段只有在含引号字符串 / 容器 / 字面量这类真正的结果键值对时
+    才算损坏，说明文字里的 ``{"destination": 城市名}`` /
+    ``{"start_date": 2026-03-12}`` 这类片段仍按普通说明忽略。
     """
     window = fragment[:2000]
     if "NaN" in window or "Infinity" in window:
         return True
     if not _RESULT_KEY_RE.search(window):
         return False
-    return bool(_RESULT_VALUE_RE.search(window))
+    value_re = _RESULT_VALUE_RE if unclosed else _RESULT_BALANCED_VALUE_RE
+    return bool(value_re.search(window))
 
 
 def _iter_object_spans(text: str):
@@ -288,7 +298,9 @@ def _iter_object_spans(text: str):
             yield index, value, end, False
             index = end if end is not None else index + 1
             continue
-        yield index, None, end, _looks_like_result_object(fragment)
+        yield index, None, end, _looks_like_result_object(
+            fragment, unclosed=end is None
+        )
         index = end if end is not None else len(text)
 
 
@@ -317,6 +329,140 @@ def _iter_objects_with_repair(text: str):
 def has_unclosed_json_object(text: str) -> bool:
     """公共包装：文本中是否还有未闭合的 ``{``（字符串感知）。"""
     return _has_unclosed_object(text)
+
+
+def has_unclosed_json_array(text: str) -> bool:
+    """文本中是否还有未闭合的 ``[``（字符串感知，忽略转义）。
+
+    用于识别被 max_tokens 截断的顶层 JSON 数组：``has_unclosed_json_object``
+    只统计花括号，``[obj1, obj2`` 这类输入的元素对象全部配平、数组本身却
+    断了——只按对象扫描的技能会把其中一个元素当成完整结果。
+    """
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "[":
+            depth += 1
+        elif char == "]" and depth > 0:
+            depth -= 1
+    return depth > 0
+
+
+def _repair_array_fragment(fragment: str) -> str:
+    """按机械小瑕疵修复数组片段：尾逗号 / 单引号定界。
+
+    必需字符串感知：整体 ``replace("'", '"')`` 会把双引号字符串里的撇号
+    （``"McDonald's"``）也换成定界符，而 ``replace(",]", "]")`` 会把值里的
+    字面量 ``",]"`` 一起删掉——整组偏好被改写或直接解析失败。
+    """
+    out: list[str] = []
+    quote = ""  # 当前字符串定界符（" 或 '）；空串表示不在字符串内
+    escaped = False
+    index = 0
+    length = len(fragment)
+    while index < length:
+        char = fragment[index]
+        if quote:
+            if escaped:
+                # 单引号串里 JSON 不认识的 \' 转义：还原成撇号本身
+                if quote == "'" and char in ("'", '"'):
+                    out.append(char)
+                else:
+                    out.append("\\" + char)
+                escaped = False
+                index += 1
+                continue
+            if char == "\\":
+                out.append(char)
+                escaped = True
+                index += 1
+                continue
+            if char == quote:
+                out.append('"')
+                quote = ""
+                index += 1
+                continue
+            if char == '"':
+                # 单引号串里的裸双引号：转义后才能作为 JSON 字符串内容
+                out.append('\\"')
+                index += 1
+                continue
+            out.append(char)
+            index += 1
+            continue
+        if char in ('"', "'"):
+            quote = char
+            out.append('"')
+            index += 1
+            continue
+        if char == ",":
+            lookahead = index + 1
+            while lookahead < length and fragment[lookahead] in " \t\r\n":
+                lookahead += 1
+            if lookahead < length and fragment[lookahead] in "}]":
+                index += 1
+                continue
+        out.append(char)
+        index += 1
+    return "".join(out)
+
+
+def decode_json_array_at(text: str, index: int):
+    """从 ``index`` 起的 ``[`` 解析一个数组（严格失败时按小瑕疵修复再试）。
+
+    返回 ``(value, end)``；没有配平的 ``]`` 或无法修复时返回 ``(None, None)``。
+    技能脚本里的裸数组输出（尾逗号 / 单引号）共用这一实现，避免各写一份
+    「全局 replace」把字符串内容改掉。
+    """
+    decoder = json.JSONDecoder()
+    try:
+        value, end = decoder.raw_decode(text, index)
+        return value, end
+    except json.JSONDecodeError:
+        pass
+    depth = 0
+    quote = ""
+    escaped = False
+    end = -1
+    for pos in range(index, len(text)):
+        char = text[pos]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in ('"', "'"):
+            quote = char
+        elif char == "[":
+            depth += 1
+        elif char == "]":
+            depth -= 1
+            if depth == 0:
+                end = pos + 1
+                break
+    if end < 0:
+        return None, None
+    repaired = _repair_array_fragment(text[index:end])
+    try:
+        return json.loads(repaired), end
+    except json.JSONDecodeError:
+        return None, None
+
+
 def json_array_start(text: str) -> "int | None":
     """文本中第一个「能整体解析为合法顶层数组」的起始下标；没有返回 None。
 
@@ -604,17 +750,20 @@ def robust_json_parse(text: str, fallback=None) -> dict:
     # 尝试1: 直接解析
     try:
         return json.loads(json_str, parse_constant=reject_json_constant)
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, ValueError) as e:
+        # ValueError：NaN / Infinity 被 reject_json_constant 拒绝。不能逃出
+        # 函数——否则后面的修复策略与 fallback 全部不可达
         last_error = e
         logger.warning(f"Direct JSON parse failed: {e}")
-        # 输出出错位置附近的内容
-        error_pos = getattr(e, 'pos', 0)
-        start = max(0, error_pos - 50)
-        end = min(len(json_str), error_pos + 50)
-        logger.warning(
-            "Error context: ...%s...",
-            _safe_log_text(json_str[start:end])[:MAX_LOG_TEXT],
-        )
+        if isinstance(e, json.JSONDecodeError):
+            # 输出出错位置附近的内容（纯 ValueError 没有 pos，跳过上下文）
+            error_pos = getattr(e, 'pos', 0)
+            start = max(0, error_pos - 50)
+            end = min(len(json_str), error_pos + 50)
+            logger.warning(
+                "Error context: ...%s...",
+                _safe_log_text(json_str[start:end])[:MAX_LOG_TEXT],
+            )
 
     # 尝试2: 移除控制字符后解析
     try:
@@ -624,7 +773,7 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         )
         logger.info("JSON parsed successfully after removing control characters")
         return result
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, ValueError) as e:
         last_error = e
         logger.warning(f"JSON parse failed after cleaning: {e}")
 
@@ -639,7 +788,7 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         )
         logger.info("JSON parsed successfully after fixing quotes")
         return result
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, ValueError) as e:
         last_error = e
         logger.warning(f"JSON parse failed after fixing quotes: {e}")
 
@@ -652,7 +801,7 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         )
         logger.info("JSON parsed successfully after removing trailing commas")
         return result
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, ValueError) as e:
         last_error = e
         logger.warning(f"JSON parse failed after removing trailing commas: {e}")
 
@@ -700,14 +849,16 @@ def robust_json_parse(text: str, fallback=None) -> dict:
         )
         logger.info("JSON parsed successfully after smart escaping")
         return result
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, ValueError) as e:
         last_error = e
         logger.warning(f"JSON parse failed after smart escaping: {e}")
 
     # 尝试6: 使用 json5 或其他宽松解析器（如果可用）
     try:
         import json5
-        result = json5.loads(json_str)
+        # json5 默认把 NaN/Infinity 解析成 float('nan')/inf：与其它策略
+        # 同口径拒绝，避免非法数值流进持久化（标准 JSON 解析器会永久失败）
+        result = json5.loads(json_str, parse_constant=reject_json_constant)
         logger.info("JSON parsed successfully using json5")
         return result
     except ImportError as e:

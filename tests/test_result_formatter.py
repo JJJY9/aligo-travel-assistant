@@ -751,6 +751,28 @@ def test_itinerary_tolerant_shapes_extra():
     print("✓ 行程容错形状（非列表 / 字典 activities / 非字典环节）")
 
 
+def test_object_results_are_normalized():
+    """results 为对象 / 标量时按单条结果或无结果渲染，不迭代 dict 键。"""
+    from utils.result_formatter import normalize_results
+
+    item = {
+        "agent_name": "information_query",
+        "status": "success",
+        "data": {"answer": "北京明天晴"},
+    }
+    assert result_to_markdown(_wrap(item)) == result_to_markdown(_wrap([item]))
+    assert "北京明天晴" in result_to_markdown(_wrap(item))
+    empty = {"status": "no_agents", "results": {}}
+    assert result_to_markdown(empty) == result_to_markdown(
+        {"status": "no_agents", "results": []}
+    )
+    assert normalize_results({"results": item}) == [item]
+    assert normalize_results({"results": ["oops", 3, item]}) == [item]
+    assert normalize_results({"results": "oops"}) == []
+    assert normalize_results({"results": 5}) == []
+    print("✓ results 对象 / 标量归一")
+
+
 def test_event_collection_missing_non_list():
     """missing_info 非列表（数字）按空处理，其余字段照常渲染。"""
     md = result_to_markdown(
@@ -849,6 +871,7 @@ if __name__ == "__main__":
     test_preference_legacy_explanatory_keys_not_rendered()
     test_itinerary_tolerant_shapes_extra()
     test_event_collection_missing_non_list()
+    test_object_results_are_normalized()
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_render_agent_exception_falls_back(_mp)

@@ -1719,6 +1719,52 @@ def test_breaker_rechecked_when_idem_cache_misses_inside_lock(monkeypatch):
     print("✓ 锁内缓存 miss 时补熔断复核（503）")
 
 
+def test_breaker_rechecked_for_request_without_idem_key(monkeypatch):
+    """无幂等键的对话请求在锁内同样复核熔断：不能白扣额度、白建会话。"""
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_breaker_no_key")
+    calls = {"n": 0}
+
+    class _LateBreaker:
+        def denies_new_calls(self):
+            calls["n"] += 1
+            return calls["n"] > 1
+
+        def raise_if_open(self):
+            raise AssertionError("不应进入对话")
+
+    def _no_session(*args, **kwargs):
+        raise AssertionError("不应构造会话")
+
+    try:
+        monkeypatch.setattr(state, "breaker", _LateBreaker(), raising=False)
+        monkeypatch.setattr(state, "get_session", _no_session, raising=False)
+        response = client.post(
+            "/api/chat",
+            json={
+                "message": "你好",
+                "user_id": user_id,
+                "session_id": "s-nokey",
+            },
+        )
+        assert response.status_code == 503, response.text
+        calls["n"] = 0
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={
+                "message": "流式问题",
+                "user_id": user_id,
+                "session_id": "s-nokey",
+            },
+        ) as stream:
+            assert stream.status_code == 503
+    finally:
+        _cleanup(user_id)
+    print("✓ 无幂等键请求在锁内补熔断复核")
+
+
 def test_chat_lock_checks_disconnect_after_uncontended_acquire():
     """锁无竞争直接拿到时也要检查断连：不能为已断开的客户端构造会话。"""
     from webapp.server import _acquire_chat_lock

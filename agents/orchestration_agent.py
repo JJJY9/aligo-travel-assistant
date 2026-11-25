@@ -15,6 +15,7 @@
 """
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import re
@@ -43,6 +44,7 @@ from utils.preference_values import (
     has_preference_value,
     is_manageable_pref_type,
     merge_preference_value,
+    preference_value_problem,
 )
 
 logger = logging.getLogger(__name__)
@@ -147,6 +149,9 @@ _TRANSIENT_ERROR_MARKERS = (
     "连接",
     "限流",
     "暂时不可用",
+    # query-info 等技能把「200 空响应」折叠成错误文本返回：按瞬时故障
+    # 重试一次，与异常通道的空响应（ConnectionError）同口径
+    "空响应",
 )
 
 
@@ -475,7 +480,7 @@ class OrchestrationAgent(AgentBase):
         # 模型输出可能含孤立代理项（截断 emoji 的 \ud800）：意图数据会进入
         # 智能体 prompt、进度事件与 _update_memory 落库，先在入口统一转义，
         # 避免 UTF-8 编码失败让整轮在 LLM 调用后作废
-        intention_data = sanitize_json(intention_data)
+        intention_data = strip_nul(sanitize_json(intention_data))
         # 规范化调度计划：LLM 可能返回字符串项 / 单对象 / 非法 priority，
         # 直接 sorted 会抛 TypeError 让整轮对话 500
         raw_schedule = intention_data.get("agent_schedule", [])
@@ -986,11 +991,13 @@ class OrchestrationAgent(AgentBase):
         except Exception:  # noqa: BLE001 - 进度展示失败不应中断执行
             logger.debug("Progress callback failed", exc_info=True)
 
-    def _checkpoint_store_for_turn(self):
+    async def _checkpoint_store_for_turn(self):
         """本轮检查点存储（懒加载）；未提供键或初始化失败时返回 None。
 
         构造可能因磁盘 / 权限失败：必须按「检查点失败只记日志、不阻断
-        对话」的承诺吞掉，否则持久化执行反而让每一轮都 500。
+        对话」的承诺吞掉，否则持久化执行反而让每一轮都 500。构造会做
+        目录创建 / 过期清理 / 旧根扫描——放到线程池，避免每个新会话
+        首回合在事件循环上阻塞其它用户请求。
         """
         if not getattr(self, "_checkpoint_key", None):
             return None
@@ -1002,7 +1009,7 @@ class OrchestrationAgent(AgentBase):
                 # 不传显式 root：默认存储初始化时会清理旧 CWD / 包根目录
                 # 里已过 TTL 的检查点（显式 root 按测试 / 自定义部署语义
                 # 跳过清理，此前传默认路径让旧文件永远清不掉）
-                store = CheckpointStore()
+                store = await asyncio.to_thread(CheckpointStore)
             except Exception as exc:  # noqa: BLE001 - 检查点不可用不影响对话
                 logger.warning("初始化执行检查点失败，跳过持久化: %s", exc)
                 return None
@@ -1064,8 +1071,17 @@ class OrchestrationAgent(AgentBase):
             # 模型（一次 429/5xx 曾让同批已成功的智能体整体重发），也不再
             # 重发进度事件（首轮已经展示过）
             return retry_cache[cache_key]
-        checkpoint_store = self._checkpoint_store_for_turn()
+        checkpoint_store = await self._checkpoint_store_for_turn()
         checkpoint_key = getattr(self, "_checkpoint_key", None)
+        # 检查点复用必须绑定「本轮计划里的这份任务」：只按智能体名取回
+        # 成功步骤时，同 client_turn_id 的重试若意图计划已变（reason /
+        # expected_output / priority 不同），会把旧计划下的子结果拼进新
+        # 回复。摘要沿用 retry 缓存的同源键，计划措辞变化即不复用。
+        task_digest = (
+            hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
+            if cache_key
+            else ""
+        )
         if checkpoint_store is not None and checkpoint_key:
             try:
                 state = await asyncio.to_thread(checkpoint_store.load, checkpoint_key)
@@ -1073,9 +1089,20 @@ class OrchestrationAgent(AgentBase):
                 logger.warning("读取执行检查点失败: %s", exc)
                 state = None
             steps = state.get("steps") if isinstance(state, dict) else None
+            step_keys = (
+                state.get("step_keys") if isinstance(state, dict) else None
+            )
             cached = steps.get(canonical_name) if isinstance(steps, dict) else None
-            if isinstance(cached, dict) and cached.get("status") == "success":
-                # 持久化检查点里已成功：直接复用（重启 / 失败重试场景）
+            if (
+                isinstance(cached, dict)
+                and cached.get("status") == "success"
+                and task_digest
+                and isinstance(step_keys, dict)
+                and step_keys.get(canonical_name) == task_digest
+            ):
+                # 持久化检查点里同一任务的已成功结果：直接复用
+                # （重启 / 失败重试场景）；旧格式状态缺 step_keys 视为
+                # 未命中重跑（安全方向）
                 return cached
         self._emit(on_event, {"type": "agent_start", "agent_name": canonical_name})
         started = time.perf_counter()
@@ -1131,6 +1158,7 @@ class OrchestrationAgent(AgentBase):
                         canonical_name,
                         result,
                         scope=getattr(self, "_checkpoint_scope", None),
+                        task_digest=task_digest or None,
                     )
                 except Exception as exc:  # noqa: BLE001 - 检查点失败不阻断对话
                     logger.warning("保存执行检查点失败: %s", exc)
@@ -1462,6 +1490,12 @@ class OrchestrationAgent(AgentBase):
         self, pref_type: str, pref_value: Any, pref_action: str
     ) -> None:
         """写入一条偏好：append 优先走存储层的原子追加，否则覆盖保存。"""
+        problem = preference_value_problem(pref_value)
+        if problem:
+            # 超限值落库后该偏好在面板 / CLI 永远无法编辑：按条跳过并
+            # 记录类型（值可能是隐私内容，不写日志），其余偏好照常写入
+            logger.warning("跳过偏好（类型 %s）：%s", pref_type, problem)
+            return
         if pref_action in {"append", "add", "追加"}:
             append_pref = getattr(
                 self.memory_manager.long_term,
@@ -1679,6 +1713,10 @@ class OrchestrationAgent(AgentBase):
                                 continue
                             for source in sources:
                                 value = entities.get(source)
+                                if isinstance(value, str):
+                                    # NUL 在 PG 文本列确定性失败（行程静默
+                                    # 不落库）、在 JSON 后端存成不可编辑记录
+                                    value = strip_nul(value)
                                 if value not in (None, ""):
                                     event_data[target] = value
                                     break

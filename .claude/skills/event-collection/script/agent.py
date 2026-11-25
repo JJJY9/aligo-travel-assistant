@@ -22,9 +22,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
 from utils.user_query import extract_user_query
 from utils.json_parser import (
+    decode_json_array_at,
     extract_json_from_async_response,
     has_unclosed_json_object,
     iter_json_object_spans_with_repair,
+    json_array_start,
 )
 
 logger = logging.getLogger(__name__)
@@ -379,56 +381,41 @@ def _event_label_is_example(label: str) -> bool:
     return _is_example_phrase(_event_label_phrase(label))
 
 
+def _event_label_has_supplement_lead(label: str) -> bool:
+    """标签段最后一行是否以补充词开头（即使行内还有叙述文字）。
+
+    典型触发：「注：若日期不同（例如 {"start_date": "2026-03-12"}）请说明」
+    ——整行不是纯短语，``_event_label_phrase`` 返回 None，行内那个合法的
+    尾注片段会被当成最新结果顶掉前面的完整抽取。这里只识别「补充词开头」
+    的叙述式尾注；纯标签行由 ``_event_label_phrase`` 正常处理。
+    """
+    line = ""
+    for item in label.splitlines():
+        cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
+        if cleaned:
+            line = cleaned
+    if not line:
+        return False
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
+    head = re.split(r"[:：=]", decoration_free, maxsplit=1)[0]
+    changed = True
+    while changed:
+        changed = False
+        for lead in _LEAD_INS:
+            if head.startswith(lead) and len(head) > len(lead):
+                head = head[len(lead):]
+                changed = True
+                break
+    return head in _SUPPLEMENT_LABELS
+
+
 def _decoded_array_at(text: str, index: int):
     """严格解析失败时按「括号配平 + 修复尾逗号 / 单引号」再试一次。
 
-    返回 ``(value, end)``；无法修复时返回 ``(None, None)``。"""
-    decoder = json.JSONDecoder()
-    try:
-        return decoder.raw_decode(text, index)
-    except json.JSONDecodeError:
-        pass
-    depth = 0
-    in_str = False
-    quote = ""
-    end = -1
-    previous = ""
-    for pos in range(index, len(text)):
-        ch = text[pos]
-        if in_str:
-            if ch == quote and previous != "\\":
-                in_str = False
-        elif ch in ("'", '"'):
-            in_str = True
-            quote = ch
-        elif ch == "[":
-            depth += 1
-        elif ch == "]":
-            depth -= 1
-            if depth == 0:
-                end = pos + 1
-                break
-        previous = ch
-    if end < 0:
-        return None, None
-    fragment = text[index:end]
-    # 不用正则（跨层转义易碎）：循环删尾逗号、单引号统一换双引号
-    repaired = fragment
-    while True:
-        updated = (
-            repaired.replace(",]", "]")
-            .replace(",}", "}")
-            .replace(", ]", "]")
-            .replace(", }", "}")
-        )
-        if updated == repaired:
-            break
-        repaired = updated
-    repaired = repaired.replace("'", '"')
-    try:
-        return json.loads(repaired), end
-    except json.JSONDecodeError:
-        return None, None
+    返回 ``(value, end)``；无法修复时返回 ``(None, None)``。修复实现见
+    :func:`utils.json_parser.decode_json_array_at`（字符串感知，不会改写
+    值里的撇号 / ",]" 字面量）。"""
+    return decode_json_array_at(text, index)
 
 
 def _iter_array_spans(text: str):
@@ -595,6 +582,27 @@ def _unwrap_result(obj: object) -> dict | None:
     return None
 
 
+def _top_level_array_has_multiple_results(text: str) -> bool:
+    """顶层 JSON 数组里是否含多个实质事项对象。
+
+    模型偶尔把结果写成数组（``[{...}, {...}]``）：对象扫描会把每个元素
+    都当候选、按位置只保留最后一个，其余事项被静默丢弃，技能却仍报
+    success。单元素数组与 ``[结果, 尾注]`` 维持现有容错，不受影响。
+    """
+    start = json_array_start(text)
+    if start is None:
+        return False
+    value, _end = decode_json_array_at(text, start)
+    if not isinstance(value, list):
+        return False
+    substantive = 0
+    for item in value:
+        candidate = _unwrap_result(item)
+        if candidate is not None and _plan_score(candidate) > 0:
+            substantive += 1
+    return substantive > 1
+
+
 def _select_event_result(text: str) -> dict | None:
     """按位置选事项结果：最后一个实质结果（或显式缺省结果），尾注不顶替。
 
@@ -605,6 +613,12 @@ def _select_event_result(text: str) -> dict | None:
     真实提取写进 trip_history。这里只接受真正可用的结果候选；末尾出现
     「像结果但解析不了」的片段（截断）时抛错，不回退示例。
     """
+    if _top_level_array_has_multiple_results(text):
+        # 数组里的多个事项无法确定哪一个是本轮结果：宁可降级报错，也不能
+        # 只取最后一个元素、静默丢掉其余事项后当作完整提取
+        raise ValueError(
+            "事项收集结果包含多个事项对象（顶层 JSON 数组），无法确定单一提取"
+        )
     last_any: dict | None = None
     last_any_end = -1
     substantives: list[tuple[dict, int, bool]] = []
@@ -652,7 +666,10 @@ def _select_event_result(text: str) -> dict | None:
             # 的模板残留：按空结果处理并清洗字段
             candidate = _sanitize_empty(candidate)
         if _plan_score(candidate) > 0:
-            is_supplement = label_phrase in _SUPPLEMENT_LABELS
+            is_supplement = (
+                label_phrase in _SUPPLEMENT_LABELS
+                or _event_label_has_supplement_lead(label_segment)
+            )
             complete = _has_event_value(
                 candidate.get("destination")
             ) and _has_event_value(candidate.get("start_date"))

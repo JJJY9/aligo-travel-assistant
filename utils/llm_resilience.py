@@ -48,6 +48,51 @@ def _status_code(exc: BaseException) -> int | None:
     return None
 
 
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """读取上游 Retry-After（秒数或 HTTP 日期）；不可用时返回 None。
+
+    429/503 的限流窗口常是 30–60 秒，按默认指数退避（1s/2s/4s）会在
+    窗口内耗尽全部重试。解析必须全部容错：headers 不是映射、值非法、
+    负数、时区缺失都不能让重试循环抛新异常。
+    """
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    raw = None
+    try:
+        raw = headers.get("retry-after")
+    except Exception:  # noqa: BLE001 - 非映射 headers 按无头处理
+        raw = None
+    if raw is None:
+        try:
+            for key, value in headers.items():
+                if str(key).lower() == "retry-after":
+                    raw = value
+                    break
+        except Exception:  # noqa: BLE001
+            raw = None
+    if raw is None or not str(raw).strip():
+        return None
+    text = str(raw).strip()
+    try:
+        return max(0.0, float(text))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        import datetime as _dt
+
+        when = parsedate_to_datetime(text)
+        if when is None:
+            return None
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=_dt.timezone.utc)
+        return max(0.0, (when - _dt.datetime.now(_dt.timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def is_retriable_error(exc: BaseException) -> bool:
     """
     判断是否为可重试错误（网络/超时/限流/5xx）。
@@ -158,6 +203,11 @@ async def retry_with_backoff(
                 # max_delay_sec（此前截断后再乘最多到声明上限的 1.5 倍）
                 delay = delay * (0.5 + random.random())
             delay = min(delay, max_delay_sec)
+            # 上游明确指示等待时长时，取两者较大值（仍受 max_delay_sec
+            # 约束）：限流窗口内按默认退避耗尽重试毫无意义
+            retry_after = _retry_after_seconds(e)
+            if retry_after is not None:
+                delay = min(max(delay, retry_after), max_delay_sec)
             logger.warning(
                 "LLM call failed (attempt %d/%d), retry in %.1fs: %s",
                 attempt + 1,

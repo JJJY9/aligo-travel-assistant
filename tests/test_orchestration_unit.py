@@ -3597,6 +3597,131 @@ def test_previous_preferences_context_skips_explanatory_keys():
     assert context["user_preferences"] == {"hotel_brands": ["汉庭"]}
     print("✓ 说明性键不进入后续批次偏好上下文")
 
+def test_update_memory_strips_nul_from_key_entities():
+    """意图 key_entities 里的 NUL 不能写进行程（PG 静默失败 / JSON 不可编辑）。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    results = [
+        {
+            "agent_name": "event_collection",
+            "priority": 1,
+            "result": {
+                "status": "success",
+                "data": {
+                    "origin": None,
+                    "destination": None,
+                    "start_date": None,
+                    "end_date": None,
+                    "trip_purpose": None,
+                },
+            },
+        },
+        {
+            "agent_name": "itinerary_planning",
+            "priority": 2,
+            "result": {
+                "status": "success",
+                "data": {"itinerary": {"title": "trip"}},
+            },
+        },
+    ]
+    intention = {
+        "key_entities": {
+            "destination": "\u0000杭州",
+            "date": "2026-03-11",
+        }
+    }
+    orchestrator._update_memory(intention, results)
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 1, trips
+    assert trips[0]["destination"] == "杭州", trips
+    assert "\x00" not in json.dumps(trips, ensure_ascii=False), trips
+    print("✓ key_entities 的 NUL 被剔除")
+
+
+def test_oversized_preference_skipped_on_apply():
+    """LLM 写入超过 10000 字符的偏好按条跳过，其余偏好照常写入。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    orchestrator._apply_single_preference(
+        "hotel_brands", "x" * 10001, "replace"
+    )
+    assert "hotel_brands" not in memory.long_term.get_preference()
+    orchestrator._apply_single_preference("hotel_brands", "汉庭", "replace")
+    assert memory.long_term.get_preference().get("hotel_brands") == "汉庭"
+    # 存储层兜底：直接调用 save / append 同样拒绝越限值
+    with pytest.raises(ValueError):
+        memory.long_term.save_preference("airlines", "y" * 10001)
+    # 上限按 json.dumps 后的长度计（字符串多两个引号）
+    memory.long_term.save_preference("airlines", "y" * 9998)
+    with pytest.raises(ValueError):
+        memory.long_term.append_preference("airlines", "z")
+    print("✓ 超限偏好被跳过 / 拒绝")
+
+
+def test_checkpoint_reuse_requires_same_task_digest(tmp_path):
+    """同键重试的计划变化（reason 不同）不复用旧检查点步骤。"""
+    from utils.execution_checkpoint import CheckpointStore
+
+    def _run(store, key, schedule, agent):
+        orchestrator = OrchestrationAgent(agent_registry={"a": agent})
+        orchestrator._checkpoint_store = store
+        try:
+            asyncio.run(orchestrator.reply(_intent(schedule), checkpoint_key=key))
+        except Exception:  # noqa: BLE001 - 失败步骤本身不是本用例重点
+            pass
+
+    store = CheckpointStore(tmp_path, ttl_sec=3600)
+    schedule = [
+        {"agent_name": "a", "priority": 1, "reason": "r1"},
+        {"agent_name": "b", "priority": 1},
+    ]
+    first_a = _StubAgent("a", {"ok": True})
+    _run(store, "u:s:t9", schedule, first_a)
+    # 已写入步骤摘要
+    state = store.load("u:s:t9")
+    assert state and state.get("step_keys", {}).get("a"), state
+
+    # 计划变化：a 的 reason 不同 → 必须重新执行
+    changed = [
+        {"agent_name": "a", "priority": 1, "reason": "r2"},
+        {"agent_name": "b", "priority": 1, "raise_error": True},
+    ]
+
+    class _BoomAgent(_StubAgent):
+        async def reply(self, x):
+            self.calls += 1
+            raise RuntimeError("b boom")
+
+    orchestrator = OrchestrationAgent(
+        agent_registry={"a": _StubAgent("a", {"ok": True}), "b": _BoomAgent("b")}
+    )
+    orchestrator._checkpoint_store = store
+    try:
+        asyncio.run(orchestrator.reply(_intent(changed), checkpoint_key="u:s:t9"))
+    except Exception:  # noqa: BLE001
+        pass
+    assert orchestrator.agent_registry["a"].calls == 1, "计划变化后不能复用旧步骤"
+    # 相同计划：复用 a，不再执行
+    same = [
+        {"agent_name": "a", "priority": 1, "reason": "r2"},
+        {"agent_name": "b", "priority": 1, "raise_error": True},
+    ]
+    again_a = _StubAgent("a", {"ok": True})
+    orchestrator2 = OrchestrationAgent(
+        agent_registry={"a": again_a, "b": _BoomAgent("b")}
+    )
+    orchestrator2._checkpoint_store = store
+    try:
+        asyncio.run(
+            orchestrator2.reply(_intent(same), checkpoint_key="u:s:t9")
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    assert again_a.calls == 0, "任务摘要一致时应复用检查点步骤"
+    print("✓ 检查点复用绑定任务摘要")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理

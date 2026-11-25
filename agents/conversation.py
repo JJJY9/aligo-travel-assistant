@@ -38,7 +38,7 @@ from utils.json_safe import sanitize_json
 from utils.llm_resilience import retry_with_backoff
 from utils.paths import default_data_root
 from utils.preference_values import has_preference_value
-from utils.result_formatter import result_to_markdown
+from utils.result_formatter import normalize_results, result_to_markdown
 from utils.turn_meta import attach_turn_meta, build_turn_meta
 from utils.usage import add_usage
 
@@ -423,7 +423,7 @@ class ConversationRuntime:
 
             agents = [
                 {"name": item.get("agent_name", ""), "status": item.get("status", "unknown")}
-                for item in result_data.get("results", [])
+                for item in normalize_results(result_data)
             ]
             usage = self._drain_unsettled_usage(self._usage_delta(usage_before))
             usage_value = usage
@@ -1012,7 +1012,8 @@ class ConversationRuntime:
 
         try:
             summary = await self.memory.get_long_term_summary_async(max_messages=30)
-        except Exception:
+        except Exception:  # noqa: BLE001 - 摘要失败只降级本轮上下文
+            logger.warning("读取长期会话总结失败，本轮上下文降级", exc_info=True)
             summary = ""
         if summary:
             memory_parts.append(f"【历史会话总结】\n{summary}")
@@ -1025,7 +1026,10 @@ class ConversationRuntime:
         if callable(recent_summary_getter):
             try:
                 recent_summary = await recent_summary_getter(max_turns=10)
-            except Exception:
+            except Exception:  # noqa: BLE001 - 摘要失败只降级本轮上下文
+                logger.warning(
+                    "读取最近对话摘要失败，本轮上下文降级", exc_info=True
+                )
                 recent_summary = ""
             if recent_summary:
                 memory_parts.append(f"【最近对话摘要】\n{recent_summary}")

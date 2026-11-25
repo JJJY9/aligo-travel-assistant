@@ -94,6 +94,11 @@ class CircuitBreaker:
         # 真实成功 / 失败会因归属不匹配被丢弃。线程归属在租约到期后视为
         # 卡死回收（恢复期的 5 倍且不少于 300s）。
         self._probe_lease_sec = max(recovery_timeout_sec * 5.0, 300.0)
+        # 试探硬上限：仅作「归属 Task 卡死」兜底（不是常规租约）。一次
+        # 永久挂起的回合（存储线程被外部锁卡死且客户端不断连）会让唯一
+        # 试探名额永占，全站持续 503；超过硬上限按卡死回收，旧 owner 迟到
+        # 的成功 / 失败因归属不匹配本就会被忽略。
+        self._probe_hard_cap_sec = max(self._probe_lease_sec * 12.0, 3600.0)
         # 试探名额的持有线程：只有它能把结果计入半开 / 归还名额，
         # 熔断打开前放行的慢请求迟到返回时不能清掉别人的名额
         self._probe_owner: object | None = None
@@ -134,11 +139,12 @@ class CircuitBreaker:
                 return False
             if self._half_open_probe_at is None:
                 return False
+            elapsed = time.monotonic() - self._half_open_probe_at
+            if elapsed >= self._probe_hard_cap_sec:
+                # 归属 Task 卡死：不再阻止新请求（allow_call 会回收名额）
+                return False
             alive = _probe_owner_alive(self._probe_owner)
-            expired = (
-                time.monotonic() - self._half_open_probe_at
-                >= self._probe_lease_sec
-            )
+            expired = elapsed >= self._probe_lease_sec
             return alive is True or (alive is None and not expired)
 
     def allow_call(self) -> bool:
@@ -158,17 +164,24 @@ class CircuitBreaker:
             now = time.monotonic()
             if self._half_open_probe_at is not None:
                 alive = _probe_owner_alive(self._probe_owner)
-                expired = (
-                    now - self._half_open_probe_at >= self._probe_lease_sec
-                )
-                if alive is True:
+                elapsed = now - self._half_open_probe_at
+                expired = elapsed >= self._probe_lease_sec
+                hard_expired = elapsed >= self._probe_hard_cap_sec
+                if hard_expired:
+                    # 归属任务永久挂起：回收名额，否则全站持续 503
+                    logger.warning(
+                        "Circuit breaker: HALF_OPEN 试探超过硬上限 %.0fs，回收名额",
+                        self._probe_hard_cap_sec,
+                    )
+                elif alive is True:
                     # 归属任务仍在跑：任何情况下都不能覆盖（慢回合可能
                     # 远超租约，覆盖后它的真实结果会被 owner 检查丢弃）
                     return False
-                if alive is None and not expired:
+                elif alive is None and not expired:
                     # 线程归属无法判断活性：租约内不放行，过期才回收
                     return False
-                # 归属任务已结束（不可能再记录结果）或线程租约已过：回收
+                # 归属任务已结束（不可能再记录结果）、线程租约已过或
+                # 超过硬上限：回收
             self._half_open_probe_at = now
             self._probe_owner = _owner_identity()
             return True

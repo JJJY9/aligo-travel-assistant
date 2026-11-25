@@ -25,6 +25,7 @@ from utils.chat_import import filter_import_messages, prepare_import_messages
 from utils.errors import ImportVolumeError, MemoryPersistenceError
 from utils.identifiers import is_valid_web_session_id
 from utils.json_safe import MAX_JSON_DEPTH
+from utils.preference_values import PREFERENCE_VALUE_MAX_CHARS
 from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_export import normalized_uid_token
 from utils.trip_import import (
@@ -51,8 +52,8 @@ _MAX_KNOWLEDGE_PARTS = 100000
 MAX_BACKUP_BYTES = 50 * 1024 * 1024
 # 单个偏好值序列化后的字符上限：与 Web PUT /api/preferences 的
 # _PREFERENCE_VALUE_MAX_JSON、CLI 偏好编辑同一口径——恢复不能写进
-# 面板自身拒绝保存的超大值（之后编辑该偏好必然失败）
-PREFERENCE_VALUE_MAX_CHARS = 10000
+# 面板自身拒绝保存的超大值（之后编辑该偏好必然失败）。常量定义在
+# utils.preference_values（存储层同样用它兜底）。
 
 # 导出形状里的 user_id 占位：合法 user_id 最多 64 个字符，字符集允许
 # Unicode 字母（含 4 字节的扩展平面字符，最多 256 字节）。按 ASCII 或

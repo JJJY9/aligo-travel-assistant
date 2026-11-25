@@ -47,6 +47,25 @@ def preference_label(pref_type: str) -> str:
     return _PREF_NAMES.get(pref_type, pref_type)
 
 
+def normalize_results(result_data: Any) -> list[dict[str, Any]]:
+    """编排结果的 results 归一到 dict 条目列表。
+
+    Web / CLI 展示与历史消息渲染共用：旧版本编排、补充导入的备份或
+    手工修过的记忆文件可能把 results 写成单个对象或标量——直接迭代
+    dict 会得到键字符串、对标量调用 ``.get`` 会 AttributeError，整轮
+    回答丢失或退化成占位文案。单个非空对象按一条结果处理，其它非法
+    形状按无结果处理，列表里的非 dict 项跳过。
+    """
+    results = (
+        result_data.get("results") if isinstance(result_data, dict) else None
+    )
+    if isinstance(results, dict):
+        results = [results] if results else []
+    elif not isinstance(results, list):
+        results = []
+    return [item for item in results if isinstance(item, dict)]
+
+
 def _pref_value_text(value: Any) -> str:
     """偏好 / 事项字段的可读文本：列表逐项连接，不再输出 Python repr。"""
     if value is None:
@@ -67,7 +86,7 @@ def _pref_value_text(value: Any) -> str:
 
 def result_to_markdown(result_data: dict[str, Any]) -> str:
     """把编排结果转换为 Markdown 文本。"""
-    results = result_data.get("results") or []
+    results = normalize_results(result_data)
     if not results:
         if result_data.get("status") == "no_agents":
             return "已记录您的需求。可以继续补充出发地、目的地、时间等信息，我来帮您规划行程。"

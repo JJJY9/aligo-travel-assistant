@@ -312,6 +312,87 @@ def test_parse_failure_log_is_single_line_and_short(caplog):
     print("✓ 解析失败日志单行且截断")
 
 
+def test_unclosed_json_array_detection():
+    """未闭合数组判定：截断数组 / 字符串内方括号 / 对象内数组字段。"""
+    from utils.json_parser import has_unclosed_json_array
+
+    assert has_unclosed_json_array('[{"a": 1},') is True
+    assert has_unclosed_json_array('[{"a": 1}, {"b": 2}') is True
+    assert has_unclosed_json_array('[{"a": 1}]') is False
+    assert has_unclosed_json_array('{"a": [1, 2]}') is False
+    assert has_unclosed_json_array('{"s": "["}') is False
+    print("✓ 未闭合数组判定")
+
+
+def test_decode_json_array_at_preserves_string_contents():
+    """数组修复只改结构（尾逗号 / 单引号定界），不改写字符串内容。"""
+    from utils.json_parser import decode_json_array_at
+
+    text = (
+        '[{"type": "note", "value": "use [1,] here"},'
+        '{"type": "seat", "value": "window"},]'
+    )
+    value, end = decode_json_array_at(text, 0)
+    assert value == [
+        {"type": "note", "value": "use [1,] here"},
+        {"type": "seat", "value": "window"},
+    ], value
+    assert text[end - 1] == "]", text
+    # 双引号字符串里的撇号不是定界符
+    value, _ = decode_json_array_at('[{"value": "McDonald\'s"},]', 0)
+    assert value[0]["value"] == "McDonald's", value
+    # 单引号数组 + 尾逗号仍能修复
+    value, _ = decode_json_array_at(
+        "[{'type': 'airlines', 'value': '东航'},]", 0
+    )
+    assert value == [{"type": "airlines", "value": "东航"}], value
+    # 未配平的数组无法解析
+    assert decode_json_array_at('[{"a": 1}', 0) == (None, None)
+    print("✓ 数组修复保留字符串内容")
+
+
+def test_balanced_bare_value_explanation_is_not_truncation():
+    """平衡说明片段里的裸值示例（未加引号的日期 / 带单位金额）不判截断。"""
+    from utils.json_parser import last_json_object_with_keys_strict
+
+    full = (
+        '{"destination": "杭州", "start_date": "2026-03-10", '
+        '"extracted_count": 6}'
+    )
+    for tail in (
+        '\n注：若日期不同（例如 {"start_date": 2026-03-12}）请说明',
+        '\n备注：{"budget": 5000元}',
+    ):
+        result = last_json_object_with_keys_strict(
+            full + tail, ("destination",)
+        )
+        assert result["destination"] == "杭州", (tail, result)
+    # 真正的损坏结果（含引号值、未配平）仍拒绝回退到更早的示例
+    broken = (
+        '示例：{"destination": "杭州"}\n'
+        '正式：{"destination": "上海", "start_date": 2026-12-01'
+    )
+    with pytest.raises(ValueError):
+        last_json_object_with_keys_strict(broken, ("destination",))
+    print("✓ 平衡说明的裸值示例不误判截断")
+
+
+def test_robust_json_parse_nan_uses_fallback_and_recovers():
+    """NaN 只让当前策略失败：fallback 生效，后续合法对象仍能恢复。"""
+    assert robust_json_parse('{"a": 1, "b": NaN}', fallback={"fb": 1}) == {
+        "fb": 1
+    }
+    assert robust_json_parse('{"a": Infinity}', fallback={"fb": 1}) == {
+        "fb": 1
+    }
+    assert robust_json_parse('推理：{"score": NaN}\n最终：{"ok": 1}') == {
+        "ok": 1
+    }
+    with pytest.raises(ValueError):
+        robust_json_parse('{"a": 1, "b": NaN}')
+    print("✓ NaN 走 fallback 且可恢复后续对象")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
@@ -341,6 +422,10 @@ if __name__ == "__main__":
         test_truncation_detected_before_result_keys()
         test_balanced_explanation_after_result_is_not_truncation()
         test_prefer_strong_keys_helper()
+        test_unclosed_json_array_detection()
+        test_decode_json_array_at_preserves_string_contents()
+        test_balanced_bare_value_explanation_is_not_truncation()
+        test_robust_json_parse_nan_uses_fallback_and_recovers()
     finally:
         mp.undo()
     # json5 相关用例单独用各自的补丁实例：without_json5 会把

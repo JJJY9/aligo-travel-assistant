@@ -59,6 +59,33 @@ def test_redact_secret_masks_bare_api_keys():
     print("✓ redact_secret 遮蔽裸 API Key")
 
 
+def test_redact_secret_masks_auth_headers_and_colon_forms():
+    """Authorization 头、JSON / dict repr / YAML 冒号形态的凭据都要遮蔽。"""
+    header = redact_secret(
+        "401 Unauthorized: Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig"
+    )
+    assert "eyJhbGciOiJIUzI1NiJ9" not in header, header
+    assert "Authorization: Bearer ***" in header, header
+
+    basic = redact_secret("Proxy-Authorization: Basic dXNlcjpwYXNz")
+    assert "dXNlcjpwYXNz" not in basic, basic
+
+    for text, secret in (
+        ('{"api_key": "abcd1234efgh5678"}', "abcd1234efgh5678"),
+        ("'api_key': 'abcd1234efgh5678'", "abcd1234efgh5678"),
+        ("api-key: 0123456789abcdef", "0123456789abcdef"),
+        ("password: hunter2", "hunter2"),
+    ):
+        redacted = redact_secret(text)
+        assert secret not in redacted, (text, redacted)
+
+    # 无关字段与自然语言不被误伤
+    assert redact_secret("max_tokens: 100") == "max_tokens: 100"
+    assert redact_secret("risk-based approach: ok") == "risk-based approach: ok"
+    assert redact_secret("任务 sk-learn 流程") == "任务 sk-learn 流程"
+    print("✓ redact_secret 覆盖 Authorization 头与冒号形态凭据")
+
+
 def test_preference_and_title_values_not_logged(caplog):
     """偏好值 / 会话标题是用户隐私内容：不进 INFO 日志。"""
     memory = LongTermMemory("u-logredact", tempfile.mkdtemp())
@@ -158,6 +185,7 @@ if __name__ == "__main__":
     test_redact_secret_strips_userinfo_and_query()
     test_redact_secret_keeps_url_punctuation_passwords_out()
     test_redact_secret_masks_bare_api_keys()
+    test_redact_secret_masks_auth_headers_and_colon_forms()
     test_redact_paths_hides_internal_paths_and_urls()
     test_redact_local_paths_keeps_urls_intact()
     test_redact_local_paths_covers_paths_with_spaces()

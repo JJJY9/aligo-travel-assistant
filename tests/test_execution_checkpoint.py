@@ -5,6 +5,7 @@
 
 运行：python tests/test_execution_checkpoint.py
 """
+import asyncio
 import hashlib
 import os
 import shutil
@@ -233,7 +234,7 @@ def test_orchestration_checkpoint_store_cleans_legacy():
         agent = object.__new__(OrchestrationAgent)
         agent._checkpoint_key = "u:s:t:d"
         agent._checkpoint_store = None
-        store = agent._checkpoint_store_for_turn()
+        store = asyncio.run(agent._checkpoint_store_for_turn())
         assert store is not None
         assert store.root == Path(base) / "newdata" / "runtime" / "checkpoints", (
             store.root

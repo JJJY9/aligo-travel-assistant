@@ -5835,32 +5835,36 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=404, detail="会话已删除，请开始新对话"
                 )
-            if idem_key is not None:
-                cached = state.idempotency.get(idem_key)
-                if cached is None and state.breaker.denies_new_calls():
-                    # 入口预检到锁内之间缓存可能过期 / 被淘汰：熔断仍要拒绝，
-                    # 不能把打开期的请求放回限流 → 建会话 → ask 的重路径
+            cached = (
+                state.idempotency.get(idem_key)
+                if idem_key is not None
+                else None
+            )
+            if cached is None and state.breaker.denies_new_calls():
+                # 入口预检到锁内之间缓存可能过期 / 被淘汰，熔断也可能已
+                # 打开：无幂等键的请求同样要复核，不能把打开期的请求放回
+                # 限流 → 建会话 → ask 的重路径
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "服务暂时不可用，请稍后再试"
+                        f"（请求 ID：{_request_id(request)}）"
+                    ),
+                )
+            if cached is not None:
+                if cached.get("__incomplete__"):
+                    # 上一请求已落库但客户端断连没收到响应：不能重放
+                    # 空答案，也不能重新执行（会在历史里追加第二份问答）
                     raise HTTPException(
-                        status_code=503,
-                        detail=(
-                            "服务暂时不可用，请稍后再试"
-                            f"（请求 ID：{_request_id(request)}）"
+                        status_code=409,
+                        detail=str(
+                            cached.get("message")
+                            or "上一请求已处理但响应未送达，请刷新会话历史"
                         ),
                     )
-                if cached is not None:
-                    if cached.get("__incomplete__"):
-                        # 上一请求已落库但客户端断连没收到响应：不能重放
-                        # 空答案，也不能重新执行（会在历史里追加第二份问答）
-                        raise HTTPException(
-                            status_code=409,
-                            detail=str(
-                                cached.get("message")
-                                or "上一请求已处理但响应未送达，请刷新会话历史"
-                            ),
-                        )
-                    response.headers.update(rate_headers)
-                    response.headers["X-Idempotent-Replay"] = "1"
-                    return cached
+                response.headers.update(rate_headers)
+                response.headers["X-Idempotent-Replay"] = "1"
+                return cached
             # 构造会话会同步连接 Redis / PostgreSQL（最长数秒），放到线程池；
             # mark_in_use 阻止会话在 ask 期间被 LRU 淘汰 close；请求在等待
             # 期间被取消时，_get_session_marked 负责在构造完成后补 end_turn
@@ -6069,18 +6073,23 @@ def create_app(model: Any = None) -> FastAPI:
             # ——不依赖服务端新生成的会话 id（否则不带 session_id 的首条
             # 消息同键重试永远命不中）；回放不创建会话，会话事件回放首次
             # 执行的会话 id
+            cached = (
+                state.idempotency.get(idem_key)
+                if idem_key is not None
+                else None
+            )
+            if cached is None and state.breaker.denies_new_calls():
+                # 入口预检到锁内之间缓存可能过期 / 被淘汰、熔断也可能已
+                # 打开：无幂等键的请求同样复核，不让打开期的请求进入
+                # 限流后的重路径
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "服务暂时不可用，请稍后再试"
+                        f"（请求 ID：{_request_id(request)}）"
+                    ),
+                )
             if idem_key is not None:
-                cached = state.idempotency.get(idem_key)
-                if cached is None and state.breaker.denies_new_calls():
-                    # 入口预检到锁内之间缓存可能过期 / 被淘汰：补一次熔断
-                    # 复核，不让打开期的请求进入限流后的重路径
-                    raise HTTPException(
-                        status_code=503,
-                        detail=(
-                            "服务暂时不可用，请稍后再试"
-                            f"（请求 ID：{_request_id(request)}）"
-                        ),
-                    )
                 if cached is not None:
                     cached_session_id = str(
                         cached.get("session_id") or payload.session_id or ""

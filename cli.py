@@ -766,7 +766,11 @@ class AligoCLI:
 
     def _display_agents_called(self, result_data: dict):
         """显示调用的智能体列表"""
-        results = result_data.get("results", [])
+        from utils.result_formatter import normalize_results
+
+        # 与 _display_results 同一归一：对象 / 标量形状不能在这里先炸掉
+        # （异常发生在落库与用量结算之前，整轮已完成的编排会被丢弃）
+        results = normalize_results(result_data)
         if not results:
             return
 
@@ -797,15 +801,13 @@ class AligoCLI:
 
     def _display_results(self, result_data: dict):
         """显示执行结果 - 确保永远有回复"""
+        from utils.result_formatter import normalize_results
+
         self.console.print()
 
         # 获取结果列表（模型 / 旧编排可能把 results 返回成对象或标量：
         # 非列表时按无结果处理，不能让后续 result.get 在 REPL 里抛异常）
-        results = result_data.get("results", [])
-        if isinstance(results, dict):
-            results = [results] if results else []
-        elif not isinstance(results, list):
-            results = []
+        results = normalize_results(result_data)
 
         if not results:
             # 情况1: 没有任何智能体被调用

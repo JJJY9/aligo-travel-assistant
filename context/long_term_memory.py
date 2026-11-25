@@ -29,7 +29,7 @@ from utils.chat_import import (
 )
 from utils.errors import MemoryPersistenceError
 from utils.file_lock import file_lock
-from utils.preference_values import merge_preference_value
+from utils.preference_values import merge_preference_value, preference_value_problem
 from utils.timestamps import chronological_key
 
 logger = logging.getLogger(__name__)
@@ -1455,6 +1455,10 @@ class LongTermMemory:
                 break
         current = existing.get("value") if existing is not None else None
         merged = merge_preference_value(current, value)
+        # 必须校验合并后的值：多轮 append 累积同样能越过 10000 字符上限
+        problem = preference_value_problem(merged)
+        if problem:
+            raise ValueError(problem)
         if existing is not None:
             existing["value"] = merged
         else:
@@ -1484,6 +1488,9 @@ class LongTermMemory:
             value: 偏好值
         """
         _reject_reserved_preference_type(pref_type)
+        problem = preference_value_problem(value)
+        if problem:
+            raise ValueError(problem)
         # 查找是否已存在该类型的偏好
         preferences = self.data["preferences"]
         found = False
