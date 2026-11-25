@@ -228,10 +228,13 @@ class RateLimitConfig(TypedDict):
     window_sec: int
     # 进程内限流器每个桶的键表上限（满时对新 key fail-closed，Redis 后端不设上限）
     max_keys: int
-    # 是否信任反向代理写入的 X-Forwarded-For（默认关闭，避免客户端伪造 IP 绕过 IP 桶；采信末跳地址）
+    # 是否信任反向代理写入的 X-Forwarded-For（默认关闭，避免客户端伪造 IP 绕过 IP 桶）
     trust_proxy_headers: bool
     # TRUST_PROXY_HEADERS=1 时允许写入 XFF 的对端网段（逗号分隔 CIDR；默认只信回环）
     trusted_proxy_cidrs: str
+    # 可信代理层数：XFF 取倒数第 N 跳（默认 1；CDN→nginx→应用这类多层部署
+    # 设为实际代理层数，否则所有客户端共用 CDN 出口地址的限流桶）
+    trust_proxy_hops: int
     # IPv6 身份聚合前缀长度（默认 /64；按接入网络可收紧到 /56、/48）
     ipv6_prefix_len: int
 
@@ -349,9 +352,11 @@ RESILIENCE_CONFIG: ResilienceConfig = {
 #                        100..1000000）。表满时对新 key fail-closed，Retry-After
 #                        按最早到期键估算；小时 / 日窗口或单进程键基数可能超过
 #                        上限时应配置 REDIS_URL（Redis 后端不设键表上限）
-#   TRUST_PROXY_HEADERS  为 1 时按反向代理的 X-Forwarded-For 最后一个地址限流（默认关闭）
+#   TRUST_PROXY_HEADERS  为 1 时按反向代理的 X-Forwarded-For 地址限流（默认关闭）
 #   TRUSTED_PROXY_CIDRS  TRUST_PROXY_HEADERS=1 时允许写 XFF 的对端网段（默认只信
 #                        回环 127.0.0.1/32,::1/128；容器 / 跨主机代理必须显式配置）
+#   TRUST_PROXY_HOPS     XFF 取倒数第几跳（默认 1 = 直接对端代理追加的真实客户端；
+#                        CDN→nginx→应用这类多层部署设为实际代理层数）
 #   RATE_IPV6_PREFIX_LEN IPv6 客户端身份的聚合前缀（默认 64；按接入网络委派粒度
 #                        可改为 56 或 48，多实例部署必须同值）
 RATE_LIMIT_CONFIG: RateLimitConfig = {
@@ -368,6 +373,7 @@ RATE_LIMIT_CONFIG: RateLimitConfig = {
     "trusted_proxy_cidrs": _env_str(
         "TRUSTED_PROXY_CIDRS", "127.0.0.1/32,::1/128"
     ),
+    "trust_proxy_hops": _env_int("TRUST_PROXY_HOPS", 1),
     "ipv6_prefix_len": _env_int("RATE_IPV6_PREFIX_LEN", 64),
 }
 
@@ -451,3 +457,12 @@ if not 32 <= _prefix_value <= 64:
         _prefix_value,
     )
     RATE_LIMIT_CONFIG["ipv6_prefix_len"] = 64
+
+# 可信代理层数：1..8 之外没有实际语义（更深的链几乎必然是配置错误），
+# 按 1 处理（等价旧行为：只取 XFF 末跳）
+_hops_value = int(RATE_LIMIT_CONFIG["trust_proxy_hops"])
+if not 1 <= _hops_value <= 8:
+    logger.warning(
+        "TRUST_PROXY_HOPS=%s 非法（需 1..8），按 1 处理", _hops_value
+    )
+    RATE_LIMIT_CONFIG["trust_proxy_hops"] = 1
