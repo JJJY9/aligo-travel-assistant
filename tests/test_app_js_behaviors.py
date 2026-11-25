@@ -126,7 +126,13 @@ def test_frontend_render_helpers():
     assert results["id_reserved_com1"] is False
     assert results["id_ok_console"] is True
     assert results["id_astral_33"] is True, "33 个增补平面字母（66 单元）按码点合法"
+    assert results["id_astral_60"] is True, "60×4=240 字节仍合法（服务端上限 240）"
+    assert results["id_astral_61"] is False, "61×4=244 字节超过服务端 240 字节上限"
     assert results["id_astral_65"] is False, "65 个码点超过 64 上限"
+    # 会话 ID 口径：设备名会话合法（仅用户 ID 拒绝），export 是保留路由
+    assert results["session_device_name"] is True
+    assert results["session_export_reserved"] is False
+    assert results["session_bad_chars"] is False
     sentinel = results["sentinel_injection"]
     assert "" not in sentinel and "" not in sentinel, (
         "输入里的私用区占位符必须被剥离"
@@ -138,6 +144,12 @@ def test_frontend_render_helpers():
     table = results["table"]
     assert "<table>" in table and "<th>日期</th>" in table and "<td>小雨</td>" in table
     assert results["heading"] == "<h2>标题</h2>", "标题最小层级压到 h2"
+    # CRLF / CR 行尾必须先归一化：否则标题与代码围栏渲染成字面量
+    assert "<h2>标题</h2>" in results["crlf_heading"], results["crlf_heading"]
+    crlf_fence = results["crlf_fence"]
+    assert "<pre>" in crlf_fence and "<code" in crlf_fence, crlf_fence
+    assert "```" not in crlf_fence, crlf_fence
+    assert "<h2>标题</h2>" in results["cr_only"], results["cr_only"]
 
     assert results["slice_emoji"] == "😀😀…", "截断按码点，不能劈开代理对"
     assert results["pref_object"] == '{"a":1}', "对象偏好显示 JSON"
@@ -319,11 +331,64 @@ def test_editor_round2_preferences_and_guards():
     print("✓ 偏好编辑 / 保存守卫 / KB 重入确认 / 链接占位符")
 
 
+def test_frontend_detail_fixes():
+    """草稿合并 / 重命名待刷新 / 归档视图 / 行程重编辑与最新值。"""
+    data = _run_harness("frontendDetailFixes")
+    assert "你好" in data["merged"] and "草稿" in data["merged"], data
+    assert data["restored"] == "你好"
+    assert data["pending"]["pending"] is True and data["pending"]["loads"] == 0
+    assert data["refreshed"]["pending"] is False and data["refreshed"]["loads"] == 1
+    assert data["archived"]["show"] is False and data["archived"]["toggles"] == 1
+    assert data["tripReclick"]["calls"] == 1, data["tripReclick"]
+    assert data["tripReclick"]["destination"] == "用户改的目的地", (
+        "拒绝确认后草稿必须保留"
+    )
+    assert data["tripReclickClean"] == 0, "未改动的重复点击不应弹确认"
+    assert data["tripLatestView"] == "杭州", "刷新在途时回填最近一次保存值"
+    print("✓ 前端细节修复（草稿合并 / 待刷新 / 归档 / 行程重编辑）")
+
+
+def test_user_switch_trip_preference_drafts():
+    """切换用户前确认行程 / 偏好表单草稿。"""
+    data = _run_harness("userSwitchFormsDraft")
+    rejected = data["rejected"]
+    assert rejected["confirmCalls"] == 1, rejected
+    assert rejected["userId"] == "u1", rejected
+    assert rejected["destination"] == "杭州" and rejected["pref"] == "汉庭", rejected
+    accepted = data["accepted"]
+    assert accepted["userId"] == "u2", accepted
+    assert accepted["destination"] == "" and accepted["pref"] == "", accepted
+    print("✓ 切换用户确认行程 / 偏好草稿")
+
+
+def test_trip_dedupe_unknown_outcome_refreshes():
+    """行程去重删除超时 / 503：提示可能已删除、刷新并退出编辑。"""
+    data = _run_harness("tripDedupeUnknown")
+    for key in ("timeout", "partial503"):
+        case = data[key]
+        assert any("可能已删除部分行程" in toast for toast in case["toasts"]), case
+        assert case["refreshed"] >= 1, case
+        assert case["reset"] == 1, case
+        assert case["editing"] is None, case
+        assert case["button"] == "清理重复", case
+    print("✓ 行程去重结果未知时刷新并复位")
+
+
+def test_kb_pending_result_cleared_on_cancel():
+    """评测进行中被清理动作作废后取消：结果条不能永久停在「评测中」。"""
+    data = _run_harness("kbPendingCancel")
+    assert "检索评测中" in data["duringEval"], data
+    assert data["afterCancel"]["hidden"] is True, data
+    assert data["final"]["hidden"] is True, data
+    print("✓ 清理取消清掉被作废的评测进行中文案")
+
+
 def test_search_failure_restores_previous_query():
     """搜索失败回滚到「已渲染查询」；被取代的失败不滚到未渲染词。"""
     data = _run_harness("sessionSearchFailure")
     single = data["single"]
     assert single["searchQuery"] == "old", single
+    assert single["searchInput"] == "old", "搜索框可见词必须同步回滚"
     assert single["sessions"] == ["s-old"], single
     assert any("加载会话列表失败" in item for item in single["toasts"]), single
 
@@ -333,6 +398,10 @@ def test_search_failure_restores_previous_query():
     assert superseded["sessions"] == ["s-old"], superseded
 
     assert data["moreBlocked"] is True, "状态与已渲染快照不一致时不能发分页请求"
+    empty = data["emptyPage"]
+    assert empty["total"] == 0, empty
+    assert empty["count"] == 0, "服务端已无会话时陈旧行必须清掉"
+    assert empty["offset"] == 0, empty
     print("✓ 搜索失败恢复已渲染查询（列表与分页不混入新查询）")
 
 
@@ -939,10 +1008,16 @@ def test_user_backup_restore_reports_recovery_incomplete():
     partial = data["partial_toasts"]
     assert partial and partial[-1].startswith("恢复部分完成"), partial
     assert data["partial_refreshes"] >= 1, data
-    # 普通失败保持统一前缀
+    # 5xx / 连接中断：结果未知（可能已部分写入），提示并刷新
+    assert any("恢复结果未知" in toast for toast in data["failure_toasts"]), data
+    assert data["failure_refreshes"] >= 1, data
+    assert any("恢复结果未知" in toast for toast in data["network_toasts"]), data
+    assert data["network_refreshes"] >= 1, data
+    # 4xx 保持统一前缀且不刷新（服务端明确拒绝）
     assert any(
-        toast.startswith("恢复失败：") for toast in data["failure_toasts"]
+        toast.startswith("恢复失败：") for toast in data["failure_4xx_toasts"]
     ), data
+    assert data["failure_4xx_refreshes"] == 0, data
     # 成功后的刷新失败全部静默：恢复摘要不能被刷新错误覆盖
     silent = data["silent_refresh_toasts"]
     assert len(silent) == 1 and "已恢复" in silent[0], silent
@@ -1012,6 +1087,10 @@ if __name__ == "__main__":
     test_retired_thread_reset_on_open_session()
     test_knowledge_preview_locates_hits_in_original_text()
     test_frontend_render_helpers()
+    test_frontend_detail_fixes()
+    test_user_switch_trip_preference_drafts()
+    test_trip_dedupe_unknown_outcome_refreshes()
+    test_kb_pending_result_cleared_on_cancel()
     test_knowledge_duplicates_panel_states()
     test_knowledge_dedupe_panel_states()
     test_kb_panel_fixes()

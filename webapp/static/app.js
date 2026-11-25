@@ -80,6 +80,8 @@ const state = {
     safeStorageGet("local", "aligo.userId") ||
     "web_user",
   sessionId: safeStorageGet("session", "aligo.sessionId") || null,
+  // 深链接里的会话 ID 被拒绝：init 时统一提示（此处 els 尚未定义）
+  urlSessionRejected: false,
   // 初始化请求完成前不允许发送：此时页面还没展示已保存会话的历史，
   // 发送会把消息写进一个界面从未展示过的旧会话
   ready: false,
@@ -153,6 +155,11 @@ const state = {
   deletingSessions: new Set(),
   // 偏好编辑被取消时置位：刷新被有意跳过，面板关闭时补一次
   statusStale: false,
+  // 侧栏重命名输入框打断会话列表刷新时置位：重命名收尾时补一次刷新
+  historyRefreshPending: false,
+  // 行程最近一次保存的服务端值（同 preferenceLatest）：刷新在途 / 失败时
+  // 再点「编辑」必须回填最新值，否则第二次保存会把刚保存的字段写回旧值
+  tripLatest: new Map(),
 };
 
 // Windows 设备保留名（与服务端 is_valid_web_id 同口径）：ID 会拼成
@@ -174,7 +181,23 @@ function sanitizeStoredUserId() {
   safeStorageRemove("local", "aligo.userId");
 }
 
-function isValidId(value) {
+function utf8ByteLength(text) {
+  try {
+    if (typeof TextEncoder !== "undefined") {
+      return new TextEncoder().encode(text).length;
+    }
+  } catch {
+    /* 回退手工计算 */
+  }
+  let total = 0;
+  for (const char of Array.from(text)) {
+    const code = char.codePointAt(0);
+    total += code <= 0x7f ? 1 : code <= 0x7ff ? 2 : code <= 0xffff ? 3 : 4;
+  }
+  return total;
+}
+
+function hasValidIdShape(value) {
   // 与服务端 _ID_PATTERN（pydantic-core 的 Rust \w：Alphabetic + Mark +
   // Nd + Pc + Join_Control）同一集合：CLI / API 建出的含组合符 / 零宽
   // 连接符的 ID 在面板里也要能切换，上标数字这类 No 则两端都拒绝
@@ -182,7 +205,9 @@ function isValidId(value) {
   // 服务端按码点计数：增补平面字符在 JS 里占两个 UTF-16 单元，按
   // length 判断会把 33 个星形字母这类合法 ID 误拒
   if (!text || Array.from(text).length > 64) return false;
-  if (RESERVED_DEVICE_NAMES.has(text.toLowerCase())) return false;
+  // 与服务端 240 字节上限同口径（utils/identifiers.py）：61 个增补平面
+  // 字符 = 244 字节会被所有接口 422，而码点 / 字符集校验仍会放行
+  if (utf8ByteLength(text) > 240) return false;
   try {
     return /^[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\u200c\u200d-]+$/u.test(text);
   } catch {
@@ -190,8 +215,31 @@ function isValidId(value) {
   }
 }
 
+function isValidId(value) {
+  const text = String(value || "");
+  if (!hasValidIdShape(text)) return false;
+  return !RESERVED_DEVICE_NAMES.has(text.toLowerCase());
+}
+
+// 与服务端 RESERVED_SESSION_IDS 同口径（精确匹配）：export 会被静态导出
+// 路由截获；设备名会话（con 等）是合法的会话 ID，不能用用户 ID 规则拒绝
+const RESERVED_SESSION_IDS = new Set(["export"]);
+
+function isValidSessionId(value) {
+  const text = String(value || "");
+  return hasValidIdShape(text) && !RESERVED_SESSION_IDS.has(text);
+}
+
+function sanitizeStoredSessionId() {
+  if (state.sessionId === null) return;
+  if (isValidSessionId(state.sessionId)) return;
+  state.sessionId = null;
+  safeStorageRemove("session", "aligo.sessionId");
+}
+
 // state 在常量定义之前创建：存储里的非法 ID 在这里统一回退
 sanitizeStoredUserId();
+sanitizeStoredSessionId();
 
 /* 深链接：?user=...&session=... 可直接打开某个会话 */
 (function applyUrlState() {
@@ -204,9 +252,12 @@ sanitizeStoredUserId();
       safeStorageSet("session", "aligo.userId", urlUser);
     }
     const urlSession = params.get("session");
-    if (urlSession && isValidId(urlSession)) {
+    if (urlSession && isValidSessionId(urlSession)) {
       state.sessionId = urlSession;
       safeStorageSet("session", "aligo.sessionId", urlSession);
+    } else if (urlSession) {
+      // 等 init 里 els/toast 可用后再提示（此处 IIFE 早于 els 定义）
+      state.urlSessionRejected = true;
     }
   } catch {
     /* 忽略非法的 URL 参数 */
@@ -340,6 +391,9 @@ let searchTimer = null;
 // 知识库工具栏动作（评测 / 查重复 / 清理重复）共用同一结果条：序号仲裁，
 // 只有最新发起的动作可以写入结果，迟到的旧响应不能覆盖新结果
 let kbActionResultSeq = 0;
+// 共享结果条上的「进行中」文案归属：被清理等动作作废后，取消路径必须
+// 把它清掉，否则面板永久停在「检索评测中…」
+let kbResultPending = null;
 let memorySheetOpener = null;
 let shortcutOpener = null;
 
@@ -633,6 +687,9 @@ const MAX_MARKDOWN_CHARS = 200000;
 
 function renderMarkdown(text) {
   let source = String(text ?? "");
+  // 先归一化行尾：块级正则的 . / $ 不匹配 \r，CRLF 的标题与代码围栏
+  // 会渲染成字面量（模型答案与恢复的历史消息都可能带 CRLF）
+  source = source.replace(/\r\n?/g, "\n");
   let truncated = false;
   if (source.length > MAX_MARKDOWN_CHARS) {
     // 备份恢复允许单条消息接近 50MB：整段同步转义 + 正则扫描会在打开
@@ -1748,10 +1805,46 @@ function resetTripForm() {
   els.tripSubmit.textContent = "保存行程";
 }
 
+function tripFormDirty() {
+  // 行程表单有未保存草稿：编辑态或任一字段非空。切换用户会 resetTripForm
+  // 清空表单，与知识表单 / 聊天行内编辑同口径先确认。
+  if (!els.tripForm || els.tripForm.hidden) return false;
+  return Boolean(
+    state.tripEditingId !== null ||
+      els.tripOrigin.value.trim() ||
+      els.tripDestination.value.trim() ||
+      els.tripStart.value ||
+      els.tripEnd.value ||
+      els.tripPurpose.value.trim(),
+  );
+}
+
 function startEditTrip(trip) {
+  // 刷新在途 / 失败时列表里的 trip 可能落后于刚保存的值：优先用最近一次
+  // 服务端返回的行，避免第二次保存把已保存的字段写回旧值
+  trip = state.tripLatest.get(trip.trip_id) || trip;
+  // 历史数据可能有未补零 / 带时间的日期：<input type=date> 会静默清空非法值，
+  // 若原样写入，用户保存其它字段时返程日期会被悄悄删掉
+  const startDate = normalizeISODate(trip.start_date);
+  const endDate = normalizeISODate(trip.end_date);
   // 表单里已有未提交的新增 / 编辑草稿时先确认：直接覆盖会让用户以为
-  // 刚才填写的内容被保存了
-  if (state.tripEditingId !== trip.trip_id) {
+  // 刚才填写的内容被保存了。正在编辑同一行时按「表单 vs 将回填值」逐字段
+  // 比较：有改动才确认，未修改的重复点击保持静默
+  if (state.tripEditingId === trip.trip_id) {
+    const changed =
+      els.tripOrigin.value.trim() !== String(trip.origin || "").trim() ||
+      els.tripDestination.value.trim() !==
+        String(trip.destination || "").trim() ||
+      els.tripStart.value !== (startDate || "") ||
+      els.tripEnd.value !== (endDate || "") ||
+      els.tripPurpose.value.trim() !== String(trip.purpose || "").trim();
+    if (
+      changed &&
+      !window.confirm("表单里有未提交的内容，编辑将覆盖，继续？")
+    ) {
+      return;
+    }
+  } else {
     const draft =
       els.tripDestination.value.trim() ||
       els.tripOrigin.value.trim() ||
@@ -1763,10 +1856,6 @@ function startEditTrip(trip) {
     }
   }
   state.tripEditingId = trip.trip_id;
-  // 历史数据可能有未补零 / 带时间的日期：<input type=date> 会静默清空非法值，
-  // 若原样写入，用户保存其它字段时返程日期会被悄悄删掉
-  const startDate = normalizeISODate(trip.start_date);
-  const endDate = normalizeISODate(trip.end_date);
   els.tripOrigin.value = trip.origin || "";
   els.tripDestination.value = trip.destination || "";
   els.tripStart.value = startDate || "";
@@ -1835,6 +1924,10 @@ async function addTrip(event) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+      if (result && result.trip && result.trip.trip_id) {
+        // 服务端返回的保存后行程：刷新在途 / 失败时再次编辑也回填新值
+        state.tripLatest.set(result.trip.trip_id, result.trip);
+      }
       message += conflictNote(result.conflicts);
     } else {
       const result = await getJSON("/api/trips", {
@@ -1862,7 +1955,19 @@ async function addTrip(event) {
     }
     await refreshStatus();
   } catch (error) {
-    toast(error.message);
+    if (editingId && error.status === 404) {
+      // 编辑目标已被其它标签页 / CLI 删除：退出编辑态（保留当前字段作为
+      // 新增草稿），否则「保存修改」永远 404（与知识库保存 404 同口径）
+      toast(`${error.message}（该行程已被删除，已退出编辑，可重新添加）`);
+      if (state.tripEditingId === editingId) {
+        state.tripEditingId = null;
+        els.tripSubmit.textContent = "保存行程";
+        els.tripEnd.dataset.hadInvalid = "";
+      }
+      await refreshStatus({ silentFailure: true });
+    } else {
+      toast(error.message);
+    }
   } finally {
     els.tripSubmit.disabled = false;
     els.tripCancel.disabled = false;
@@ -2077,6 +2182,19 @@ async function _runUserBackupImport(file, targetUser) {
       if (state.userId === targetUser) {
         refreshStatus({ silentFailure: true });
         loadSessions(undefined, { silentFailure: true });
+      }
+    } else if (!status || status >= 500) {
+      // 服务端 5xx / 连接中断：写入可能已部分生效（通用 503 注明
+      // 「恢复可能部分成功」），按结果未知处理并尽力刷新当前视图
+      toast(
+        `恢复结果未知：${errorText}；服务端可能已部分写入，已刷新面板，可重试补齐剩余部分`,
+      );
+      if (state.userId === targetUser) {
+        await Promise.allSettled([
+          refreshStatus({ silentFailure: true }),
+          loadSessions(undefined, { silentFailure: true }),
+          refreshKnowledgeDocuments({ silentFailure: true }),
+        ]);
       }
     } else {
       toast(`恢复失败：${errorText}`);
@@ -2668,6 +2786,13 @@ function updateArchivedToggle(count) {
     : `已归档（${total}）`;
 }
 
+function leaveArchivedViewForNewConversation() {
+  // 新对话永远不在归档列表里：停留在归档视图会让新会话从侧栏消失
+  if (!state.showArchived) return;
+  state.showArchived = false;
+  updateArchivedToggle();
+}
+
 async function loadSessions(query = state.searchQuery, options = {}) {
   const previousQuery = state.searchQuery;
   state.searchQuery = String(query || "").trim();
@@ -2760,6 +2885,17 @@ async function loadSessions(query = state.searchQuery, options = {}) {
           : state.sessionsLoadedQuery;
       state.showArchived = Boolean(state.sessionsLoadedArchived);
       updateArchivedToggle();
+      // 搜索框里仍是这次失败的新词时同步回滚：否则可见查询与实际过滤
+      // （归档切换 / 加载更多 / 高亮）长期分叉，用户会把旧结果当成新词结果。
+      // 只在输入框仍等于本次请求词时改写，避免覆盖请求期间新输入的草稿。
+      if (
+        els.historySearch &&
+        els.historySearch.value.trim() === String(query || "").trim() &&
+        els.historySearch.value !== state.searchQuery
+      ) {
+        clearTimeout(searchTimer);
+        els.historySearch.value = state.searchQuery;
+      }
     }
     // 存储故障 / 网络抖动不能伪装成「没有历史」：保留已有列表并提示
     // （恢复备份后的批量刷新走静默：失败提示会覆盖恢复摘要）
@@ -2826,7 +2962,14 @@ async function loadMoreSessions() {
     // 游标按「取回的条数」前进：头部并发插入时本页可能与已显示内容重叠
     // （去重跳过），但窗口必须继续向前，否则「加载更多」永远停在原地
     state.sessionsOffset += (data.sessions || []).length;
-    state.sessionTotal = Number(data.total || state.sessionTotal);
+    // total=0 是合法值（其它标签页 / CLI 已删光）：真值判断会把它当缺失
+    const totalNum = Number(data.total);
+    if (Number.isFinite(totalNum)) state.sessionTotal = totalNum;
+    if (totalNum === 0 && !(data.sessions || []).length) {
+      // 服务端确认该查询下已无会话：陈旧行不能继续算「共 N 条」
+      state.sessions = [];
+      state.sessionsOffset = 0;
+    }
     renderHistory();
   } catch (error) {
     // 已作废的分页请求（新搜索 / 归档切换 / 新刷新）失败不能弹在当前视图上
@@ -3145,6 +3288,10 @@ function startRenameSession(item, session, initialValue) {
     if (input.isConnected) input.replaceWith(titleEl);
     // 取消移除了当前焦点输入框：把焦点还给会话条目，键盘用户不丢位置
     if (item.isConnected) item.focus();
+    if (state.historyRefreshPending) {
+      state.historyRefreshPending = false;
+      loadSessions();
+    }
   };
 
   const save = async () => {
@@ -3164,6 +3311,8 @@ function startRenameSession(item, session, initialValue) {
       // 先移除输入框再刷新：否则 renderHistory 会把「正在重命名」的
       // 快照恢复出来，已保存的输入框重新出现
       if (input.isConnected) input.remove();
+      // save 自己会刷新：清掉挂起的补刷新，避免重复请求
+      state.historyRefreshPending = false;
       await loadSessions();
       // 保存路径同样移除了焦点输入框：列表重建后把焦点还给该会话条目
       const refreshed = els.history.querySelector(
@@ -3236,6 +3385,9 @@ async function deleteSession(sessionId) {
       syncSessionControls();
       setConversationTitle("新对话");
       showWelcome();
+      // 删除归档会话后进入「新对话」状态：必须离开归档视图，
+      // 否则随后新建的会话不会出现在侧栏（与 newSession 同口径）
+      leaveArchivedViewForNewConversation();
     }
     // 先本地移除会话行：随后刷新若失败（旧数据保留策略），不能留下
     // 一条点击后切到「新对话」的幽灵会话
@@ -3265,6 +3417,16 @@ function setBusy(busy) {
   // 非流式阶段（删除并重发 / 会话加载）也会置 busy，但此时没有可中止的
   // 回合：显示「停止」只会让用户点到无反应的按钮
   els.stopBtn.hidden = !busy || !state.controller;
+}
+
+async function refreshSessionsAfterTurn() {
+  // 回复结束后刷新会话列表（新会话需出现在侧栏）。侧栏重命名输入框
+  // 打开时重建列表会打断输入：登记待刷新，由重命名收尾补一次
+  if (document.querySelector(".hi-input")) {
+    state.historyRefreshPending = true;
+    return;
+  }
+  await loadSessions();
 }
 
 async function sendMessage(text, options = {}) {
@@ -3302,6 +3464,9 @@ async function sendMessage(text, options = {}) {
 
   cancelPendingEdits();
   sessionLoadToken += 1;
+  // 欢迎页 / 删除后直接发送会新建未归档会话：离开归档视图，
+  // 否则回复后的列表刷新仍按 archived=1 过滤掉新会话
+  if (!state.sessionId) leaveArchivedViewForNewConversation();
   state.lastUserText = message;
   state.controller = new AbortController();
   setBusy(true);
@@ -3478,7 +3643,7 @@ async function sendMessage(text, options = {}) {
         active.tagName === "SELECT" ||
         active.isContentEditable);
     if (!isModalOpen() && !editing) els.input.focus();
-    if (!document.querySelector(".hi-input")) await loadSessions();
+    await refreshSessionsAfterTurn();
     // refreshStatus 内部会在偏好编辑框存在时跳过渲染（编辑结束后补刷新）
     refreshStatus();
   }
@@ -3489,6 +3654,20 @@ async function sendMessage(text, options = {}) {
    保证用户 + 助手成对出现，回合标识精确到本次提问）：已落库就按服务端
    状态重渲染；连续几次都没出现，说明提问没有保存，重渲染旧历史后把原文
    放回输入框，避免永久丢失。 */
+function restoreDraftText(text) {
+  // 未落库的提问放回输入框：已有草稿时合并而不是丢弃原文
+  const draftNow = els.input.value;
+  if (!String(text || "").trim()) return;
+  if (!draftNow.trim()) {
+    els.input.value = text;
+  } else if (!draftNow.includes(text)) {
+    els.input.value = `${text}
+
+${draftNow}`;
+  }
+  resizeInput();
+}
+
 async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = "已停止") {
   if (!message) return;
   // 本函数自己会调用 openSession（它自增 sessionLoadToken）：只认启动时
@@ -3601,11 +3780,10 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
           toast(`${reason}，暂未确认保存结果，请稍后刷新查看，避免重复发送`);
           return;
         }
-        if (!els.input.value.trim()) {
-          els.input.value = message;
-          resizeInput();
-        }
-        toast(`${reason}，暂未确认保存结果，请稍后刷新查看，避免重复发送`);
+        restoreDraftText(message);
+        toast(
+          `${reason}，暂未确认保存结果；提问未保存，已放回输入框（与草稿合并），请核对后重发`,
+        );
         return;
       }
     }
@@ -3619,11 +3797,10 @@ async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = 
     toast(`${reason}，暂未确认保存结果，请稍后刷新查看，避免重复发送`);
     return;
   }
-  if (!els.input.value.trim()) {
-    els.input.value = message;
-    resizeInput();
-  }
-  toast(`${reason}，暂未确认保存结果，请稍后刷新查看，避免重复发送`);
+  restoreDraftText(message);
+  toast(
+    `${reason}，暂未确认保存结果；提问未保存，已放回输入框（与草稿合并），请核对后重发`,
+  );
 }
 
 async function readEventStream(body, onEvent) {
@@ -3683,10 +3860,10 @@ function resetDeletedSessionState(restoreText) {
   // 会话被删除后必须清空消息区：否则旧对话继续显示，后续消息写进全新
   // 会话却追加在旧气泡下面，界面与真实历史前后不一致
   showWelcome();
-  if (restoreText && !els.input.value.trim()) {
-    // 未能写入服务端的提问放回输入框，用户可以直接重发到新会话
-    els.input.value = restoreText;
-    resizeInput();
+  if (restoreText) {
+    // 未能写入服务端的提问放回输入框（已有草稿时合并）：会话已被其它
+    // 窗口 / CLI 删除时这是原文唯一的留存处，不能因输入框非空就丢弃
+    restoreDraftText(restoreText);
   }
 }
 
@@ -4097,6 +4274,8 @@ function renderOverview() {
     // 展开列表已按 order=desc 取回最近若干条，直接使用
     const ordered = state.tripsExpanded ? [...trips] : [...trips].reverse();
     ordered.forEach((trip) => {
+      // 记录最近一次渲染的服务端值：刷新在途 / 失败时再点「编辑」用它回填
+      state.tripLatest.set(trip.trip_id, trip);
       const row = document.createElement("div");
       row.className = "trip";
       const route = document.createElement("div");
@@ -4566,6 +4745,11 @@ function resetPreferenceForm() {
   els.prefForm.hidden = true;
   els.prefForm.reset();
   els.prefType.value = "home_location";
+}
+
+function prefFormDirty() {
+  // 添加偏好表单有未保存输入（收起面板也不会清空输入）
+  return Boolean(els.prefValue && els.prefValue.value.trim());
 }
 
 async function addPreference(event) {
@@ -5327,16 +5511,31 @@ async function runSemanticSearch({ silent = false } = {}) {
   }
 }
 
+function setKbPendingResult(seq, text) {
+  kbResultPending = { seq, text };
+  if (els.kbEvalResult) {
+    els.kbEvalResult.hidden = false;
+    els.kbEvalResult.textContent = text;
+  }
+}
+
+function clearKbPendingResult(seq) {
+  if (!kbResultPending) return;
+  if (seq !== null && kbResultPending.seq !== seq) return;
+  if (els.kbEvalResult && els.kbEvalResult.textContent === kbResultPending.text) {
+    els.kbEvalResult.hidden = true;
+    els.kbEvalResult.classList.remove("warn");
+  }
+  kbResultPending = null;
+}
+
 async function runKbEval() {
   if (!els.kbEval) return;
   const seq = (kbActionResultSeq += 1);
   els.kbEval.disabled = true;
   els.kbEval.setAttribute("aria-busy", "true");
   els.kbEval.textContent = "评测中…";
-  if (els.kbEvalResult) {
-    els.kbEvalResult.hidden = false;
-    els.kbEvalResult.textContent = "检索评测中…（首次使用需加载向量模型）";
-  }
+  setKbPendingResult(seq, "检索评测中…（首次使用需加载向量模型）");
   try {
     const data = await getJSON("/api/knowledge/eval");
     const pct = (value) => `${Math.round(Number(value || 0) * 100)}%`;
@@ -5356,7 +5555,11 @@ async function runKbEval() {
         .join("、");
       missedText = ` · 未命中 ${missed.length} 个：${shown}${missed.length > 3 ? " 等" : ""}`;
     }
-    if (seq !== kbActionResultSeq) return;
+    if (seq !== kbActionResultSeq) {
+      clearKbPendingResult(seq);
+      return;
+    }
+    kbResultPending = null;
     if (els.kbEvalResult) {
       els.kbEvalResult.textContent =
         `检索评测：${data.total} 个问题 · hit@1 ${pct(data.hit1)}` +
@@ -5369,7 +5572,10 @@ async function runKbEval() {
     }
   } catch (error) {
     if (seq === kbActionResultSeq && els.kbEvalResult) {
+      kbResultPending = null;
       els.kbEvalResult.textContent = `评测失败：${error.message}`;
+    } else {
+      clearKbPendingResult(seq);
     }
   } finally {
     els.kbEval.disabled = false;
@@ -5384,14 +5590,15 @@ async function runKbDuplicates() {
   els.kbDuplicates.disabled = true;
   els.kbDuplicates.setAttribute("aria-busy", "true");
   els.kbDuplicates.textContent = "检查中…";
-  if (els.kbEvalResult) {
-    els.kbEvalResult.hidden = false;
-    els.kbEvalResult.classList.remove("warn");
-    els.kbEvalResult.textContent = "正在检查重复知识片段…";
-  }
+  setKbPendingResult(seq, "正在检查重复知识片段…");
+  if (els.kbEvalResult) els.kbEvalResult.classList.remove("warn");
   try {
     const data = await getJSON("/api/knowledge/duplicates?limit=20");
-    if (seq !== kbActionResultSeq) return;
+    if (seq !== kbActionResultSeq) {
+      clearKbPendingResult(seq);
+      return;
+    }
+    kbResultPending = null;
     const groups = Array.isArray(data.groups) ? data.groups : [];
     const totalGroups = Number(data.total_groups || 0);
     if (els.kbEvalResult) {
@@ -5419,7 +5626,10 @@ async function runKbDuplicates() {
     }
   } catch (error) {
     if (seq === kbActionResultSeq && els.kbEvalResult) {
+      kbResultPending = null;
       els.kbEvalResult.textContent = `重复检查失败：${error.message}`;
+    } else {
+      clearKbPendingResult(seq);
     }
   } finally {
     els.kbDuplicates.disabled = false;
@@ -5450,6 +5660,7 @@ async function runKbDedupe() {
     if (seq !== kbActionResultSeq) return;
     const planned = Number(preview.planned || 0);
     if (!planned) {
+      kbResultPending = null;
       if (els.kbEvalResult) {
         els.kbEvalResult.hidden = false;
         els.kbEvalResult.classList.remove("warn");
@@ -5460,11 +5671,19 @@ async function runKbDedupe() {
     // 面板在扫描期间被关闭：不再弹确认，更不能在看不见的界面里执行删除
     // 只看记忆面板本身：快捷键浮层打开时 isModalOpen() 也为真，
     // 面板已关仍会弹确认并在看不见的界面里写库
-    if (els.memorySheet.hidden) return;
+    if (els.memorySheet.hidden) {
+      // 面板已关：被本次动作作废的评测 / 查重复不再有收尾方，清掉进行中文案
+      clearKbPendingResult(null);
+      return;
+    }
     const ok = window.confirm(
       `将删除 ${planned} 条重复片段（${Number(preview.groups || 0)} 组，每组保留最早一条）。继续？`,
     );
-    if (!ok) return; // 取消不覆盖之前的结果（用户可能正在看重复列表）
+    if (!ok) {
+      // 取消不覆盖之前的结果，但被本次动作作废的「进行中」文案必须清掉
+      clearKbPendingResult(null);
+      return;
+    }
     els.kbDedupe.textContent = "清理中…";
     deleteSent = true;
     const result = await getJSON("/api/knowledge/duplicates/cleanup", {
@@ -6341,7 +6560,12 @@ async function saveUser() {
     return;
   }
   if (value !== state.userId) {
-    if (document.querySelector(".user-edit-input") || kbFormDirty()) {
+    if (
+      document.querySelector(".user-edit-input") ||
+      kbFormDirty() ||
+      tripFormDirty() ||
+      prefFormDirty()
+    ) {
       if (!window.confirm("正在编辑的修改尚未保存，切换用户将丢弃修改。继续？")) {
         return;
       }
@@ -6375,6 +6599,7 @@ async function saveUser() {
     updateArchivedToggle(0);
     // 清掉上一个用户遗留的行程 / 知识编辑状态，避免提交到新用户
     resetTripForm();
+    state.tripLatest.clear();
     els.tripForm.hidden = true;
     resetKnowledgeForm();
     resetPreferenceForm();
@@ -6639,6 +6864,10 @@ function bindEvents() {
 
   els.copyLink.addEventListener("click", () => {
     if (!state.sessionId) return;
+    if (!isValidSessionId(state.sessionId)) {
+      toast("该会话不支持分享链接");
+      return;
+    }
     copyText(shareUrl(), "链接已复制");
   });
 
@@ -6679,6 +6908,8 @@ function bindEvents() {
       const button = els.tripsDedupe;
       // 固定发起时的用户：清理期间切换用户不能把去重打到另一个账号
       const userId = state.userId;
+      // 清理请求是否已发出：超时 / 断连 / 503 时服务端可能已部分删除
+      let applySent = false;
       button.disabled = true;
       button.textContent = "检查中…";
       try {
@@ -6714,6 +6945,7 @@ function bindEvents() {
           toast("已取消清理重复行程");
           return;
         }
+        applySent = true;
         const result = await getJSON("/api/trips/dedupe", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -6725,7 +6957,18 @@ function bindEvents() {
         if (removedCount > 0 && state.tripEditingId) resetTripForm();
         await refreshStatus({ silentFailure: true });
       } catch (error) {
-        toast(`清理重复行程失败：${error.message || error}`);
+        if (applySent) {
+          // 服务端 apply_trip_dedupe 中途失败会返回 503「已删除 N 条」，
+          // 客户端超时 / 断连时也可能已部分删除：刷新并退出编辑态，
+          // 避免用户对已删除行反复「保存修改」得到 404
+          toast(
+            `清理重复行程失败：${error.message || error}（服务端可能已删除部分行程，已刷新）`,
+          );
+          if (state.tripEditingId) resetTripForm();
+          await refreshStatus({ silentFailure: true });
+        } else {
+          toast(`清理重复行程失败：${error.message || error}`);
+        }
       } finally {
         button.disabled = false;
         button.textContent = "清理重复";
@@ -6874,6 +7117,11 @@ async function init() {
   welcomeTemplate = els.messages.querySelector("[data-welcome]").cloneNode(true);
   els.userIdInput.value = state.userId;
   bindEvents();
+  if (state.urlSessionRejected) {
+    // 深链接里的会话 ID 非法（设备名会话可用；export 等保留字拒绝）
+    state.urlSessionRejected = false;
+    toast("链接中的会话 ID 无效，已忽略");
+  }
   updateThemeButton();
   restoreSidebar();
   updateUserCard();
