@@ -10,6 +10,7 @@ import os
 import re
 import signal
 import sys
+import unicodedata
 from typing import Any
 
 # 添加项目根目录到路径
@@ -35,9 +36,16 @@ from utils.identifiers import is_valid_web_id, is_valid_web_session_id
 from utils.paths import default_data_root
 from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
-from utils.preference_values import has_preference_value, is_manageable_pref_type
+from utils.preference_values import (
+    has_preference_value,
+    is_manageable_pref_type,
+    preference_value_problem,
+)
 from utils.progress import format_progress_event
-from utils.session_title import session_title_from_content
+from utils.session_title import (
+    normalized_preview_from_content,
+    session_title_from_content,
+)
 from utils.timestamps import chronological_key
 from utils.turn_meta import attach_turn_meta, build_turn_meta
 from utils.usage import add_usage
@@ -108,6 +116,43 @@ def _single_line_safe(value: object) -> str:
     列表行、标题回显与偏好值必须单行，否则存储内容可以用换行伪造列表行。
     """
     return " ".join(strip_terminal_controls(str(value)).split())
+
+
+def _display_width(value: object) -> int:
+    """终端显示宽度：东亚宽字符/全角（W/F）按 2 列，组合符/零宽格式符按 0 列。
+
+    Python 的 ``str.ljust`` / 格式宽度按码点补齐，中文与 emoji 在等宽终端
+    占 2 列，直接用 ``{:<32}`` 会让消息数、时间列随标题语种漂移。
+    """
+    width = 0
+    for char in str(value):
+        width += _char_display_width(char)
+    return width
+
+
+def _char_display_width(char: str) -> int:
+    """单个字符的显示宽度（组合符 / 零宽格式符为 0，宽字符为 2，其余 1）。"""
+    if unicodedata.combining(char) or unicodedata.category(char) in ("Mn", "Me", "Cf"):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+
+
+def _truncate_display(value: str, limit: int) -> str:
+    """按显示宽度截断，不劈开宽字符（纯 ASCII 时与 ``[:limit]`` 等价）。"""
+    width = 0
+    out: list[str] = []
+    for char in value:
+        char_width = _char_display_width(char)
+        if width + char_width > limit:
+            break
+        out.append(char)
+        width += char_width
+    return "".join(out)
+
+
+def _pad_display(value: str, width: int) -> str:
+    """按显示宽度右补空格（纯 ASCII 时与 ``{:<width}`` 等价）。"""
+    return value + " " * max(0, width - _display_width(value))
 
 
 def _valid_web_id(value: object) -> bool:
@@ -185,14 +230,27 @@ else:
 def _console_kwargs() -> dict:
     """Rich Console 的宽度守卫：无效 COLUMNS（0 / 1 / 非数字）会让 Rich 把
     max_width 缓存成 0/-1，横幅 / 帮助 / 表格全部静默消失。此时显式回退 80；
-    正整数交给 Rich 自适应。"""
+    COLUMNS 未设置时交给 Rich 按真实终端宽度自适应（cmd/PowerShell 默认不导出
+    COLUMNS，固定 80 会在窄终端折行、宽终端只用一半）。"""
+    raw = os.environ.get("COLUMNS")
+    if raw is None:
+        return {}
     try:
-        columns = int(os.environ.get("COLUMNS", "0") or "0")
+        columns = int(raw or "0")
     except ValueError:
         columns = 0
     if columns >= 20:
         return {}
     return {"width": 80}
+
+
+def _stream_isatty(stream: object) -> bool:
+    """安全判断流是否为终端（抽象流 / 已关闭流按非终端处理）。"""
+    try:
+        isatty = getattr(stream, "isatty", None)
+        return bool(isatty()) if callable(isatty) else False
+    except Exception:  # noqa: BLE001 - 判断失败按非终端处理
+        return False
 
 
 class AligoCLI:
@@ -259,6 +317,23 @@ class AligoCLI:
 
         self.console.print(table)
 
+    def _prompt_console(self):
+        """提示符输出流：键盘与屏幕都是终端时写 stdout（交互外观不变）；
+        stdin 是管道或 stdout 被重定向时改走 stderr——否则提示符会粘在命令
+        输出的首行前（``用户ID: ✓ …``、``>: 表格``），``> session.log`` 时
+        提示又完全不可见。"""
+        if _stream_isatty(getattr(sys, "stdin", None)) and _stream_isatty(
+            getattr(sys, "stdout", None)
+        ):
+            return self.console
+        console = getattr(self, "_prompt_stderr_console", None)
+        if console is None:
+            console = _SanitizedConsole(
+                file=PipeSafeTextIO(sys.stderr), **_console_kwargs()
+            )
+            self._prompt_stderr_console = console
+        return console
+
     def _prompt_user_id(self) -> str:
         """交互式询问用户 ID，并按与 Web 相同的规则校验。"""
 
@@ -273,7 +348,7 @@ class AligoCLI:
                     raw_value = Prompt.ask(
                         "用户ID",
                         default="default_user" if is_tty else None,
-                        console=self.console,
+                        console=self._prompt_console(),
                     )
                     value = (raw_value or "").strip()
                 finally:
@@ -359,10 +434,25 @@ class AligoCLI:
             return True
         self.memory_manager.reload_long_term()
         quarantined = _manager_quarantine_marker(self.memory_manager)
-        if not quarantined:
-            return True
-        self._print_quarantine_notice(quarantined)
-        return False
+        if quarantined:
+            self._print_quarantine_notice(quarantined)
+            self._command_failed = True
+            return False
+        from config import STORAGE_CONFIG
+        from context.long_term_memory import LongTermMemory
+
+        if STORAGE_CONFIG.get("postgres_dsn") and isinstance(
+            getattr(self.memory_manager, "long_term", None), LongTermMemory
+        ):
+            # 与 user-export / CLI 子命令 / Web 读接口同口径：PostgreSQL
+            # 故障期的回退 JSON 可能为空或过期，不能当账号现状展示
+            self._command_failed = True
+            self.console.print(
+                "[red]PostgreSQL 不可用：长期记忆当前为本地 JSON 回退库"
+                "（可能为空或过期），不展示为账号现状；请恢复数据库后重试[/red]"
+            )
+            return False
+        return True
 
     async def initialize_system(self):
         """初始化系统 - 使用懒加载优化启动速度"""
@@ -733,14 +823,45 @@ class AligoCLI:
                         if callable(discard):
                             discard()
                     else:
+                        failures: list[str] = []
                         try:
                             await commit_deferred()
                         except asyncio.CancelledError:
                             pending_cancel = True
                         except Exception:  # noqa: BLE001 - 逐条写入已吞异常，这里兜底
+                            failures = ["偏好 / 行程"]
+                        else:
+                            # 编排层对逐条失败只记录不抛异常（超限 / 上限 /
+                            # 单条写入失败），提交成功不代表偏好 / 行程真的
+                            # 落库——与 Web 端 #957 同口径在回复后提示
+                            failures = [
+                                str(item).strip()
+                                for item in (
+                                    getattr(
+                                        self.orchestrator,
+                                        "_last_memory_write_failures",
+                                        None,
+                                    )
+                                    or []
+                                )
+                                if str(item).strip()
+                            ]
+                        if failures:
+                            from utils.result_formatter import preference_label
+
+                            labels: list[str] = []
+                            for item in failures:
+                                label = (
+                                    "行程"
+                                    if item == "行程"
+                                    else preference_label(item)
+                                )
+                                if label not in labels:
+                                    labels.append(label)
                             self.console.print(
-                                "[dim yellow]偏好 / 行程写入记忆失败，"
-                                "可在面板重试[/dim yellow]"
+                                "[dim yellow]偏好 / 行程写入记忆失败（"
+                                + _markup_safe("、".join(labels))
+                                + "），可在面板核对或重试[/dim yellow]"
                             )
                     if pending_cancel:
                         raise asyncio.CancelledError()
@@ -1147,6 +1268,9 @@ class AligoCLI:
                     for item in prefs_list
                     if isinstance(item, dict)
                     and is_manageable_pref_type(item.get("type"))
+                    # 与落库路径 / Web 渲染器同口径：超限 / 畸形的值不会
+                    # 真正写入，不能先回显「已更新」
+                    and preference_value_problem(item.get("value")) is None
                 ]
 
                 if prefs_items:
@@ -1559,6 +1683,7 @@ class AligoCLI:
                 self.user_id, str(default_data_root() / "memory"), strict=True
             )
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
+            self._command_failed = True
             self.console.print(
                 f"[red]导出中止：{_markup_safe(exc)}[/red]"
             )
@@ -1568,6 +1693,7 @@ class AligoCLI:
             # 当作成功备份写出
             quarantined = _recovered_corrupt_backup(store)
             if quarantined:
+                self._command_failed = True
                 self.console.print(
                     "[red]导出中止：记忆文件损坏，已隔离备份到 "
                     f"{_markup_safe(quarantined)}（当前会导出空快照）[/red]"
@@ -1587,6 +1713,7 @@ class AligoCLI:
                     "statistics": store.get_statistics(),
                 }
         except Exception as exc:  # noqa: BLE001 - 读取失败直接展示原因
+            self._command_failed = True
             self.console.print(
                 f"[red]导出中止：{_markup_safe(exc)}[/red]"
             )
@@ -1612,6 +1739,7 @@ class AligoCLI:
         prepared: dict[str, Any] = {}
         problem = export_backup_limit_problem(data, prepared_out=prepared)
         if problem:
+            self._command_failed = True
             self.console.print(
                 f"[red]导出中止：{problem}（该文件将无法再导入恢复，"
                 "请先清理部分旧会话 / 行程后重试）[/red]"
@@ -1751,13 +1879,27 @@ class AligoCLI:
             # 主循环
             while True:
                 try:
+                    if interrupt["count"]:
+                        # 上一条同步命令执行期间按下的 Ctrl-C 只能排队（同步
+                        # 代码不让出事件循环，取消送不达）：必须在进入提示符
+                        # 前就地消化，否则残留计数会让提示符处的一次 Ctrl-C
+                        # 被当成「连按两次」直接强制退出（130）
+                        interrupt["count"] = 0
+                        interrupt["user"] = False
+                        # uncancel 清不掉已排队的取消：在检查点交付并吞掉，
+                        # 否则下一条命令（或 exit / EOF 的收尾）会收到它
+                        await _drain_pending_cancel()
+                        self.console.print("已取消上一步操作", style="dim")
                     # 获取用户输入。stdin 不可用只可能发生在 Prompt.ask 本身：
                     # 收窄在这里捕获；放到整个循环体会误伤 MemoryPersistenceError
                     # （RuntimeError 子类），一次记忆写盘失败就被当成 stdin 故障退出
                     try:
                         interrupt["at_prompt"] = True
                         try:
-                            user_input = Prompt.ask("\n[cyan]>[/cyan]", console=self.console)
+                            user_input = Prompt.ask(
+                                "\n[cyan]>[/cyan]",
+                                console=self._prompt_console(),
+                            )
                         finally:
                             interrupt["at_prompt"] = False
                     except (RuntimeError, ValueError, OSError) as exc:
@@ -1768,17 +1910,6 @@ class AligoCLI:
                             style="dim",
                         )
                         break
-
-                    if interrupt["count"]:
-                        # 提示符下按过 Ctrl-C：取消还挂在任务上，会在本命令
-                        # 的第一个 await 处才送达——先清掉，让输入的命令正常
-                        # 执行（回到提示符，而不是取消下一条命令）
-                        interrupt["count"] = 0
-                        interrupt["user"] = False
-                        # uncancel 清不掉已排队的取消：在检查点交付并吞掉，
-                        # 否则下一条命令（或 exit / EOF 的收尾）会收到它
-                        await _drain_pending_cancel()
-                        self.console.print("已取消上一步操作", style="dim")
 
                     if not user_input.strip():
                         continue
@@ -2035,8 +2166,13 @@ def _valid_user_id(value: str) -> bool:
 
 
 def _args_have_json(args: list[str]) -> bool:
-    """参数列表中是否出现 --json（大小写不敏感）。"""
-    return any(item.lower() == "--json" for item in args)
+    """参数列表中是否出现 --json（大小写不敏感；``--`` 之后按位置参数处理）。"""
+    for item in args:
+        if item == "--":
+            return False
+        if item.lower() == "--json":
+            return True
+    return False
 
 
 def _parse_user_and_json_args(args: list[str]) -> tuple[str, bool] | None:
@@ -2392,7 +2528,7 @@ def _parse_eval_cases_args(
             if not re.fullmatch(r"[0-9]{1,4}", value):
                 return None
             count = int(value)
-            if count > 5000:
+            if count < 1 or count > 5000:
                 return None
         elif lowered == "--seed" or lowered.startswith("--seed="):
             if lowered == "--seed":
@@ -3061,9 +3197,13 @@ def run_knowledge_search_standalone(
         return _fail(f"检索失败：{exc}")
 
     if as_json:
+        from utils.json_safe import sanitize_json
+
         print(
             json.dumps(
-                {"query": query, "top_k": top_k, "results": results},
+                sanitize_json(
+                    {"query": query, "top_k": top_k, "results": results}
+                ),
                 ensure_ascii=False,
                 indent=2,
             )
@@ -3139,7 +3279,9 @@ def run_knowledge_show_standalone(doc_id: int, as_json: bool = False) -> int:
     if document is None:
         return _fail(f"知识点 #{doc_id} 不存在")
     if as_json:
-        print(json.dumps(document, ensure_ascii=False, indent=2))
+        from utils.json_safe import sanitize_json
+
+        print(json.dumps(sanitize_json(document), ensure_ascii=False, indent=2))
         return 0
     parts = int(document.get("parts") or 1)
     group = str(document.get("group") or "")
@@ -4832,9 +4974,13 @@ def run_sessions_list_standalone(
         updated = _local_timestamp_text(item["updated_at"]) or "—"
         # 标题 / 命中片段来自 Web 或 LLM 写入的内容：ESC / OSC 序列不能
         # 直达终端（OSC 8 伪造链接、OSC 52 覆盖剪贴板）
-        title = _single_line_safe(item["title"])[:30]
+        title = _truncate_display(_single_line_safe(item["title"]), 30)
+        session_cell = _single_line_safe(item["session_id"])
+        # 中文 / emoji 每个占 2 列：按码点补空格会让消息数、时间列随
+        # 标题语种漂移（默认中文提问派生的标题即触发）
         print(
-            f"  [{status}] {item['session_id']:<16} {title:<32}"
+            f"  [{status}] {_pad_display(session_cell, 16)}"
+            f" {_pad_display(title, 32)}"
             f" {item['messages']:>3} 条  {updated}"
         )
         if item.get("_snippet"):
@@ -5311,8 +5457,11 @@ def run_session_show_standalone(
     for message in messages:
         role = str(message.get("role") or "assistant")
         time_text = _local_timestamp_text(str(message.get("timestamp") or ""))
-        content = " ".join(render_stored_message(message).split())
-        preview = content[:80] + ("…" if len(content) > 80 else "")
+        # 预览只需前 80 字：对整条（最高 50MB）消息做 split 会生成
+        # 数千万项中间列表，内存按消息词元数放大
+        preview = normalized_preview_from_content(
+            render_stored_message(message), 80
+        )
         # 助手消息来自 LLM / 第三方内容：预览同样剥终端控制序列
         print(f"  [{time_text}] {role}: {_single_line_safe(preview)}")
     return 0
@@ -5368,6 +5517,35 @@ def _parse_archive_flags(args: list[str]) -> tuple[bool, bool] | None:
         else:
             return None
     return restore, as_json
+
+
+def _split_positionals(
+    args: list[str], value_options: frozenset[str] = frozenset()
+) -> tuple[list[str], list[str]]:
+    """把参数拆成 (位置参数, 选项参数)，选项可出现在位置参数之前或之后。
+
+    ``value_options`` 里的带值选项连同其后一个 token 归入选项参数
+    （兼容 ``--opt=值`` 写法），其余以 ``-`` 开头的 token 原样转交各命令
+    现有的选项解析函数。此前 sessions / session-archive / *-export 等
+    命令先按固定 argv 槽判用法，``sessions --json alice`` 这类与
+    stats / trips 一致的前置选项写法会被误判成缺参数。
+    """
+    positionals: list[str] = []
+    rest: list[str] = []
+    index = 0
+    while index < len(args):
+        item = args[index]
+        if item.lower() in value_options:
+            rest.append(item)
+            index += 1
+            if index < len(args):
+                rest.append(args[index])
+        elif item.startswith("-"):
+            rest.append(item)
+        else:
+            positionals.append(item)
+        index += 1
+    return positionals, rest
 
 
 def run_session_export_standalone(
@@ -5427,7 +5605,7 @@ def run_session_export_standalone(
     if not title:
         for message in messages:
             if message.get("role") == "user":
-                title = " ".join(str(message.get("content", "")).split())[:40]
+                title = session_title_from_content(message.get("content", ""))
                 break
     # 换行会伪造导出结构：先折叠空白；尖括号的转义按出口区分——HTML 导出
     # 由 render_session_html 统一 _escape（预转义会双重转义成 &amp;lt;），
@@ -7048,6 +7226,11 @@ def run_preference_set_standalone(
 
     if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
+    # 与 Web PUT 同口径：先 strip 再校验。精确键消费方读不到「 hotel_brands 」
+    # 这类首尾带空格的影子键，而列表回显会折叠空白、看不出问题。
+    pref_type = pref_type.strip()
+    if not pref_type:
+        return _fail("偏好类型不能为空白")
     if not _valid_pref_type(pref_type) or pref_type.startswith("-"):
         return _fail("偏好类型不能包含控制字符或斜杠（最多 64 字符）")
     if pref_type == "preferences":
@@ -7605,13 +7788,14 @@ def _main_impl():
             if (
                 doc_id is None
                 or len(args) > 2
-                or any(extra != "--group" for extra in args[1:])
+                or any(extra.lower() != "--group" for extra in args[1:])
             ):
                 print("用法：python cli.py kb-delete <id> [--group]")
                 sys.exit(2)
             sys.exit(
                 run_knowledge_delete_standalone(
-                    doc_id, whole_group="--group" in args[1:]
+                    doc_id,
+                    whole_group="--group" in [extra.lower() for extra in args[1:]],
                 )
             )
         if arg == "kb-duplicates":
@@ -7846,16 +8030,15 @@ def _main_impl():
                 )
             )
         if arg == "trips-dedupe":
-            if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
-                _cli_fail(
-                    "用法：python cli.py trips-dedupe <user_id> [--dry-run] [--json]",
-                    _args_have_json(sys.argv[2:]),
-                )
+            usage = "用法：python cli.py trips-dedupe <user_id> [--dry-run] [--json]"
+            dedupe_positional, dedupe_flags = _split_positionals(sys.argv[2:])
+            if len(dedupe_positional) != 1:
+                _cli_fail(usage, _args_have_json(sys.argv[2:]))
                 sys.exit(2)
             dry_run = False
             as_json = False
             valid = True
-            for item in sys.argv[3:]:
+            for item in dedupe_flags:
                 lowered = item.lower()
                 if lowered == "--dry-run":
                     dry_run = True
@@ -7865,14 +8048,11 @@ def _main_impl():
                     valid = False
                     break
             if not valid:
-                _cli_fail(
-                    "用法：python cli.py trips-dedupe <user_id> [--dry-run] [--json]",
-                    _args_have_json(sys.argv[2:]),
-                )
+                _cli_fail(usage, _args_have_json(sys.argv[2:]))
                 sys.exit(2)
             sys.exit(
                 run_trips_dedupe_standalone(
-                    sys.argv[2], dry_run=dry_run, as_json=as_json
+                    dedupe_positional[0], dry_run=dry_run, as_json=as_json
                 )
             )
         if arg == "sessions":
@@ -7880,13 +8060,16 @@ def _main_impl():
                 "用法：python cli.py sessions <user_id> "
                 "[--archived|--all] [--query 关键词] [--json]"
             )
-            if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
+            sessions_positional, sessions_flags = _split_positionals(
+                sys.argv[2:], frozenset({"--query"})
+            )
+            if len(sessions_positional) != 1:
                 _cli_fail(
                     usage,
                     _args_have_json(sys.argv[2:]),
                 )
                 sys.exit(2)
-            parsed = _parse_sessions_flags(sys.argv[3:])
+            parsed = _parse_sessions_flags(sessions_flags)
             if parsed is None:
                 _cli_fail(
                     usage,
@@ -7896,7 +8079,7 @@ def _main_impl():
             archived_only, include_all, query, sessions_json = parsed
             sys.exit(
                 run_sessions_list_standalone(
-                    sys.argv[2],
+                    sessions_positional[0],
                     archived_only=archived_only,
                     include_all=include_all,
                     query=query,
@@ -7904,28 +8087,23 @@ def _main_impl():
                 )
             )
         if arg == "session-archive":
-            if (
-                len(sys.argv) < 4
-                or sys.argv[2].startswith("-")
-                or sys.argv[3].startswith("-")
-            ):
-                _cli_fail(
-                    "用法：python cli.py session-archive <user_id> <session_id> [--restore] [--json]",
-                    _args_have_json(sys.argv[2:]),
-                )
+            usage = (
+                "用法：python cli.py session-archive <user_id> <session_id> "
+                "[--restore] [--json]"
+            )
+            archive_positional, archive_flags = _split_positionals(sys.argv[2:])
+            if len(archive_positional) != 2:
+                _cli_fail(usage, _args_have_json(sys.argv[2:]))
                 sys.exit(2)
-            parsed_archive = _parse_archive_flags(sys.argv[4:])
+            parsed_archive = _parse_archive_flags(archive_flags)
             if parsed_archive is None:
-                _cli_fail(
-                    "用法：python cli.py session-archive <user_id> <session_id> [--restore] [--json]",
-                    _args_have_json(sys.argv[2:]),
-                )
+                _cli_fail(usage, _args_have_json(sys.argv[2:]))
                 sys.exit(2)
             restore, as_json = parsed_archive
             sys.exit(
                 run_session_archive_standalone(
-                    sys.argv[2],
-                    sys.argv[3],
+                    archive_positional[0],
+                    archive_positional[1],
                     archived=not restore,
                     as_json=as_json,
                 )
@@ -8054,22 +8232,23 @@ def _main_impl():
                 "用法：python cli.py trip-calendar <user_id> <trip_id> "
                 "[path] [--stdout] [--force]"
             )
-            if (
-                len(sys.argv) < 4
-                or sys.argv[2].startswith("-")
-                or sys.argv[3].startswith("-")
-            ):
+            calendar_positional, calendar_flags = _split_positionals(
+                sys.argv[2:]
+            )
+            if not 2 <= len(calendar_positional) <= 3:
                 print(usage)
                 sys.exit(2)
-            parsed_calendar = _parse_session_export_args(sys.argv[4:])
+            parsed_calendar = _parse_session_export_args(
+                calendar_positional[2:] + calendar_flags
+            )
             if parsed_calendar is None or parsed_calendar[3]:
                 print(usage)
                 sys.exit(2)
             target, to_stdout, force, _html = parsed_calendar
             sys.exit(
                 run_trip_calendar_standalone(
-                    sys.argv[2],
-                    sys.argv[3],
+                    calendar_positional[0],
+                    calendar_positional[1],
                     target=target,
                     to_stdout=to_stdout,
                     force=force,
@@ -8080,22 +8259,21 @@ def _main_impl():
                 "用法：python cli.py session-export <user_id> <session_id> "
                 "[path] [--stdout] [--force] [--html]"
             )
-            if (
-                len(sys.argv) < 4
-                or sys.argv[2].startswith("-")
-                or sys.argv[3].startswith("-")
-            ):
+            export_positional, export_flags = _split_positionals(sys.argv[2:])
+            if not 2 <= len(export_positional) <= 3:
                 print(usage)
                 sys.exit(2)
-            parsed_export = _parse_session_export_args(sys.argv[4:])
+            parsed_export = _parse_session_export_args(
+                export_positional[2:] + export_flags
+            )
             if parsed_export is None:
                 print(usage)
                 sys.exit(2)
             target, to_stdout, force, html = parsed_export
             sys.exit(
                 run_session_export_standalone(
-                    sys.argv[2],
-                    sys.argv[3],
+                    export_positional[0],
+                    export_positional[1],
                     target=target,
                     to_stdout=to_stdout,
                     force=force,
@@ -8107,10 +8285,11 @@ def _main_impl():
                 "用法：python cli.py sessions-export <user_id> [path] "
                 "[--stdout] [--force] [--html]"
             )
-            if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
+            batch_positional, batch_flags = _split_positionals(sys.argv[2:])
+            if not 1 <= len(batch_positional) <= 2:
                 print(usage)
                 sys.exit(2)
-            raw_export_args = sys.argv[3:]
+            raw_export_args = batch_positional[1:] + batch_flags
             export_args = [
                 item for item in raw_export_args if item.lower() != "--html"
             ]
@@ -8121,7 +8300,7 @@ def _main_impl():
             target, to_stdout, force, _, _, _ = parsed_export
             sys.exit(
                 run_sessions_export_standalone(
-                    sys.argv[2],
+                    batch_positional[0],
                     target=target,
                     to_stdout=to_stdout,
                     force=force,
@@ -8129,11 +8308,14 @@ def _main_impl():
                 )
             )
         if arg == "user-export":
-            with_knowledge = "--with-knowledge" in sys.argv[2:]
+            # 与其它选项同一口径（_parse_json_flag 等均大小写不敏感）
+            with_knowledge = any(
+                item.lower() == "--with-knowledge" for item in sys.argv[2:]
+            )
             export_args = [
                 item
                 for item in sys.argv[2:]
-                if item != "--with-knowledge"
+                if item.lower() != "--with-knowledge"
             ]
             if (
                 not 1 <= len(export_args) <= 2
@@ -8194,10 +8376,13 @@ def _main_impl():
                 "[--stdout] [--force] [--ics|--html] [--query 关键词] "
                 "[--status active|upcoming|past]"
             )
-            if len(sys.argv) < 3 or sys.argv[2].startswith("-"):
+            trips_positional, trips_flags = _split_positionals(
+                sys.argv[2:], frozenset({"--query", "--status"})
+            )
+            if not 1 <= len(trips_positional) <= 2:
                 print(trips_usage)
                 sys.exit(2)
-            raw_export_args = sys.argv[3:]
+            raw_export_args = trips_positional[1:] + trips_flags
             export_args = [
                 item for item in raw_export_args if item.lower() != "--html"
             ]
@@ -8213,7 +8398,7 @@ def _main_impl():
                 sys.exit(2)
             sys.exit(
                 run_trips_export_standalone(
-                    sys.argv[2],
+                    trips_positional[0],
                     target=target,
                     to_stdout=to_stdout,
                     force=force,
@@ -8257,7 +8442,7 @@ def _main_impl():
             print(_COMMANDS_HINT)
             print("不带参数进入交互模式；--version 查看版本")
             sys.exit(0)
-        print(f"未知命令：{sys.argv[1]}")
+        print(f"未知命令：{_single_line_safe(sys.argv[1])}")
         print(_COMMANDS_HINT)
         print("不带参数进入交互模式；--version 查看版本")
         sys.exit(2)

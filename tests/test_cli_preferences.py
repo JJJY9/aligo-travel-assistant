@@ -753,6 +753,28 @@ def test_pref_type_allows_web_charset(monkeypatch):
     assert code == 1 and "偏好类型" in out.getvalue()
     print("✓ 偏好类型字符集与 Web 对齐（空格 / 点号可用，斜杠拒绝）")
 
+def test_pref_set_strips_type_and_rejects_blank(monkeypatch):
+    """与 Web PUT 同口径：首尾空白 strip 后落库，纯空白类型拒绝。"""
+    store = _WriteStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", " home_location ", "上海")
+    assert code == 0
+    assert store.saved == [("home_location", "上海")], (
+        "带空格的类型会落成精确键消费方读不到的影子偏好"
+    )
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", "   ", "x")
+    assert code == 1 and "偏好类型" in out.getvalue()
+    assert store.saved == [("home_location", "上海")]
+    print("✓ pref-set 类型 strip 后落库，纯空白拒绝")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -792,6 +814,7 @@ if __name__ == "__main__":
         test_pref_set_rejects_new_type_over_limit,
         test_pref_values_strip_controls_and_collapse_newlines,
         test_pref_type_allows_web_charset,
+        test_pref_set_strips_type_and_rejects_blank,
         test_preferences_list_json,
         test_preferences_dispatch_json_and_bad_args,
         test_preferences_hides_blank_and_null_items,

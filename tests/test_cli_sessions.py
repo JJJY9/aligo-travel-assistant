@@ -1742,6 +1742,71 @@ def test_session_delete_cleans_metadata_only_ghost(monkeypatch):
     print("✓ CLI 清理仅剩元数据的幽灵会话")
 
 
+def test_list_columns_aligned_for_cjk_titles(monkeypatch):
+    """中文 / emoji 标题按显示宽度补位：消息数 / 时间列不随语种漂移。"""
+    fake = _FakeStore(
+        [
+            _message("user", "Book a hotel near the airport", "s-ascii"),
+            _message("user", "帮我规划一下下周去北京出差的完整行程安排", "s-cjk"),
+        ]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: fake
+    )
+    code, out = _run_list("u1")
+    assert code == 0
+    widths = {
+        cli._display_width(line.split(" 条  ")[0])
+        for line in out.splitlines()
+        if " 条  " in line
+    }
+    assert len(widths) == 1, f"列宽漂移：{widths}"
+    print("✓ sessions 列表按显示宽度对齐（中文 / emoji 标题）")
+
+
+def test_option_before_positional_dispatch(monkeypatch):
+    """与 stats / trips 一致：选项可出现在位置参数之前。"""
+    calls = []
+
+    monkeypatch.setattr(
+        cli,
+        "run_sessions_list_standalone",
+        lambda user_id, **kwargs: (
+            calls.append(("sessions", user_id, kwargs)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "run_session_archive_standalone",
+        lambda user_id, session_id, **kwargs: (
+            calls.append(("archive", user_id, session_id, kwargs)) or 0
+        ),
+    )
+    for argv, expected in (
+        (
+            ["cli.py", "sessions", "--json", "u1"],
+            ("sessions", "u1", {"as_json": True}),
+        ),
+        (
+            ["cli.py", "session-archive", "--restore", "u1", "s1"],
+            ("archive", "u1", "s1", {"archived": False}),
+        ),
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        with pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 0, argv
+        got = calls[-1]
+        if expected[0] == "sessions":
+            assert got[0] == "sessions" and got[1] == "u1"
+            assert got[2]["as_json"] is True
+            assert got[2]["archived_only"] is False
+        else:
+            assert got[:3] == ("archive", "u1", "s1")
+            assert got[3]["archived"] is False
+    print("✓ sessions / session-archive 支持选项在位置参数之前")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理

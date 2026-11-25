@@ -527,6 +527,28 @@ def test_title_scan_stops_at_40_chars_on_huge_message():
     print("✓ 标题派生对超大消息只扫描前缀")
 
 
+def test_preview_scan_matches_join_and_stops_on_huge_message():
+    """会话预览只扫描前 80 字，输出与整句 join 后截断逐字节一致。"""
+    from utils.session_title import normalized_preview_from_content
+
+    samples = [
+        "",
+        "   ",
+        "abc",
+        "ab " * 40,
+        "x" * 80,
+        "x" * 81,
+        "a\tb\nc",
+        ("ab " * 700_000) + "尾部",
+    ]
+    for sample in samples:
+        content = " ".join(sample.split())
+        expected = content[:80] + ("…" if len(content) > 80 else "")
+        assert normalized_preview_from_content(sample, 80) == expected
+    assert normalized_preview_from_content(None, 80) == ""
+    print("✓ 会话预览对超大消息只扫描前缀")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -560,4 +582,5 @@ if __name__ == "__main__":
     test_group_sessions_keeps_integer_zero_session()
     test_escape_replace_chain_matches_charwise()
     test_title_scan_stops_at_40_chars_on_huge_message()
+    test_preview_scan_matches_join_and_stops_on_huge_message()
     print("\n全部通过")
