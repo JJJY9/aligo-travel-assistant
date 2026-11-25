@@ -1220,6 +1220,69 @@ def test_pipeline_exit_code_reflects_command_failure():
     print("✓ 管道失败的退出码")
 
 
+def test_pipeline_exit_code_reflects_all_failed_agents():
+    """所有被调度的智能体都失败：管道模式退出码 1（部分成功不受影响）。"""
+    agent, _ = _make_cli_stub()
+
+    class _AllFailedOrchestrator:
+        async def reply(self, intention, on_event=None):
+            return _TextMessage(
+                json.dumps(
+                    {
+                        "status": "partial_failure",
+                        "results": [
+                            {
+                                "agent_name": "information_query",
+                                "status": "error",
+                                "data": {"error": "搜索服务不可用"},
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    agent.orchestrator = _AllFailedOrchestrator()
+    agent._user_id_from_stdin = True
+    agent._command_failed = False
+    asyncio.run(agent.process_query("明天杭州天气"))
+    assert agent._command_failed is True
+    assert agent._pipeline_exit_code() == 1
+
+    partial, _ = _make_cli_stub()
+
+    class _PartialOrchestrator:
+        async def reply(self, intention, on_event=None):
+            return _TextMessage(
+                json.dumps(
+                    {
+                        "status": "partial_failure",
+                        "results": [
+                            {
+                                "agent_name": "information_query",
+                                "status": "success",
+                                "data": {"answer": "晴"},
+                            },
+                            {
+                                "agent_name": "rag_knowledge",
+                                "status": "error",
+                                "data": {"error": "知识库不可用"},
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+    partial.orchestrator = _PartialOrchestrator()
+    partial._user_id_from_stdin = True
+    partial._command_failed = False
+    asyncio.run(partial.process_query("明天杭州天气"))
+    assert partial._command_failed is False, "部分成功不应标记命令失败"
+    assert partial._pipeline_exit_code() == 0
+    print("✓ 全部智能体失败时管道退出码为 1")
+
+
 def test_summary_prefers_recent_trips():
     """长期记忆摘要注入最近的行程（与 Web 摘要窗口同口径）。"""
 
@@ -1401,6 +1464,7 @@ if __name__ == "__main__":
     test_nontty_single_line_query_is_not_swallowed()
     test_nontty_blank_first_line_is_rejected()
     test_pipeline_exit_code_reflects_command_failure()
+    test_pipeline_exit_code_reflects_all_failed_agents()
     test_summary_prefers_recent_trips()
     test_read_commands_stop_on_quarantine()
     _mp = pytest.MonkeyPatch()

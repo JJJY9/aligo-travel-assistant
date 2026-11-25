@@ -17,6 +17,7 @@ import json
 import logging
 import re
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 from agentscope.agent import AgentBase
@@ -222,18 +223,45 @@ class IntentionAgent(AgentBase):
         # 可调度的智能体名（目录名 / 标准名 / frontmatter 名，大小写不敏感）：
         # 模型回显 prompt 模板时条目名是占位说明，不能被当成真实决策
         skill_names = list(self.skill_loader.load_skills())
+        # 真实存在 script/agent.py 的技能目录（与 LazyAgentRegistry 同一来源）：
+        # 自定义技能目录 / wheel 缺技能时，过滤与静态优先级块都不能宣传注册表
+        # 加载不到的名字，否则模型按宣传调度必然落到「智能体未注册」
+        from utils.skill_paths import skill_scripts
+
+        self._available_skill_dirs = {
+            str(skill_dir).strip()
+            for skill_dir in skill_scripts(Path(self.skill_loader.skills_dir))
+            if str(skill_dir).strip()
+        }
+        valid_names: list[str] = []
+        for skill_dir, standard_name in (
+            *self._skill_mapping.items(),
+            *SKILL_AGENT_NAMES.items(),
+            ("preference", "preference"),
+        ):
+            if skill_dir in self._available_skill_dirs:
+                valid_names.extend((skill_dir, standard_name))
+        valid_names.extend(str(name) for name in skill_names)
         self._valid_agent_names = {
             str(skill_name).strip().casefold()
-            for skill_name in (
-                *self._skill_mapping,
-                *self._skill_mapping.values(),
-                *SKILL_AGENT_NAMES,
-                *SKILL_AGENT_NAMES.values(),
-                *skill_names,
-                "preference",
-            )
+            for skill_name in valid_names
             if str(skill_name).strip()
         }
+        # 连字符 ↔ 下划线变体也归一（模型按 JSON snake_case 习惯输出
+        # trip_budget / plan_trip / packing_list 时不能被当成未知智能体名，
+        # 否则单项计划整轮降级、多项计划静默丢条）；值优先取先登记的
+        # 技能目录名，编排层的去重与依赖排序才能按目录名口径继续工作
+        self._agent_name_lookup: dict[str, str] = {}
+        for valid_name in valid_names:
+            text = str(valid_name).strip()
+            if not text:
+                continue
+            self._agent_name_lookup.setdefault(text.casefold(), text)
+            swapped = (
+                text.replace("-", "_") if "-" in text else text.replace("_", "-")
+            )
+            if swapped != text:
+                self._agent_name_lookup.setdefault(swapped.casefold(), text)
 
     def _valid_schedule(self, schedule: list) -> list[dict]:
         """过滤占位 / 未知智能体名的调度条目（大小写与旧名变体均接受）。"""
@@ -244,8 +272,10 @@ class IntentionAgent(AgentBase):
             agent_name = str(entry.get("agent_name") or "").strip()
             if not agent_name:
                 continue
+            canonical = self._agent_name_lookup.get(agent_name.casefold())
             if (
-                agent_name.casefold() not in self._valid_agent_names
+                canonical is None
+                and agent_name.casefold() not in self._valid_agent_names
                 and canonical_agent_name(agent_name).casefold()
                 not in self._valid_agent_names
             ):
@@ -253,8 +283,117 @@ class IntentionAgent(AgentBase):
                     "忽略未知智能体名的调度条目：%r", agent_name[:40]
                 )
                 continue
+            if (
+                canonical is not None
+                and canonical != agent_name
+                and agent_name.casefold() not in self._valid_agent_names
+            ):
+                # 互换变体（trip_budget / plan_trip）重写为真实技能名：
+                # 后续去重 / 依赖排序 / 注册表查找都按既有路径工作。
+                # 大小写变体本身已合法（下游 canonical 归一口径不变），
+                # 不在这里改写，保持历史输出形状
+                entry = {**entry, "agent_name": canonical}
             valid.append(entry)
         return valid
+
+    def _priority_groups_prompt(self) -> str:
+        """按实际可调度技能生成优先级分组说明（默认安装下与旧文案逐字一致）。"""
+        available = self._available_skill_dirs
+
+        def render_group(title: str, lines: list[str]) -> list[str]:
+            rendered = [line for line in lines if line]
+            if not rendered:
+                return []
+            return [title, *rendered]
+
+        group1 = render_group(
+            "**Priority 1（并行执行）- 信息收集类：**",
+            [
+                (
+                    "- memory_query: 记忆查询智能体"
+                    if "memory-query" in available
+                    else ""
+                ),
+                (
+                    "- event_collection: 事项收集智能体"
+                    if "event-collection" in available
+                    else ""
+                ),
+                "- preference: 偏好管理智能体" if "preference" in available else "",
+                (
+                    "- information_query: 信息查询智能体（联网搜索）"
+                    if "query-info" in available
+                    else ""
+                ),
+                (
+                    "- rag_knowledge: RAG知识库智能体（查询企业知识库）"
+                    if "ask-question" in available
+                    else ""
+                ),
+            ],
+        )
+        simple_dirs = [
+            name
+            for name in (
+                "packing-list",
+                "travel-checklist",
+                "safety-tips",
+                "trip-notes",
+            )
+            if name in available
+        ]
+        group2 = render_group(
+            "**Priority 2（依赖 Priority 1）- 行程规划与行前信息类：**",
+            [
+                (
+                    "- itinerary_planning: 行程规划智能体（需要事项收集的结果）"
+                    if "plan-trip" in available
+                    else ""
+                ),
+                (
+                    "- "
+                    + " / ".join(simple_dirs)
+                    + ": 行李 / 行前 / 安全 / 贴士（需要目的地、日期等事项信息）"
+                    if simple_dirs
+                    else ""
+                ),
+            ],
+        )
+        group3 = render_group(
+            "**Priority 3（依赖行程规划）：**",
+            [
+                (
+                    "- trip-budget: 预算建议（需要行程规划结果）"
+                    if "trip-budget" in available
+                    else ""
+                ),
+                (
+                    "- local-transport: 市内交通（需要行程规划结果）"
+                    if "local-transport" in available
+                    else ""
+                ),
+            ],
+        )
+        known_dirs = set(self._skill_mapping) | set(SKILL_AGENT_NAMES) | {
+            "preference",
+            *simple_dirs,
+            "trip-budget",
+            "local-transport",
+        }
+        others = sorted(available - known_dirs)
+        other_lines = (
+            ["- 其他技能（Priority 1）：" + ", ".join(others)] if others else []
+        )
+        blocks = [
+            block
+            for block in (group1, group2, group3, other_lines)
+            if block
+        ]
+        if not blocks:
+            return ""
+        return "\n\n".join(
+            ["**所有智能体优先级分组：**", *("\n".join(block) for block in blocks)]
+        )
 
     def _schedule_has_known_agent(self, result: dict) -> bool:
         schedule = result.get("agent_schedule")
@@ -328,6 +467,9 @@ class IntentionAgent(AgentBase):
         skill_mapping = self._skill_mapping
 
         dynamic_skills_prompt = self.skill_loader.get_skill_prompt(skill_mapping)
+        # 优先级分组只宣传真实可调度的技能：与动态清单同一口径，避免模型
+        # 按静态块调度到注册表加载不到的技能（custom 目录 / wheel 缺技能）
+        priority_groups_prompt = self._priority_groups_prompt()
         
         # 构建意图识别Prompt
         prompt = f"""你是一个高级意图识别专家（IntentionRecognitionAgent）。请分析用户查询，识别意图并输出结构化的决策。
@@ -417,26 +559,12 @@ class IntentionAgent(AgentBase):
 【字段要求】
 - key_entities 中没有的字段必须填 null（不要填「出发地（如果有）」之类的说明文字）；date 必须是 YYYY-MM-DD 格式（根据当前时间把「明天」等相对时间换算成完整日期）。
 - agent_schedule 的 agent_name 必须是上方「可调度的子智能体」列表中的名称（或其后括号外的标准名）；不要原样输出模板占位值，否则该条目会被丢弃。
+- agent_schedule 仅当用户是纯问候、闲聊或致谢时可以为空；凡涉及出行规划、信息查询、偏好或记忆的请求必须至少调度一个智能体，无法判断时调度 information_query。
 
 【重要提示 - 优先级设置规则】
 优先级数字相同的智能体会**并行执行**，不同优先级按顺序批次执行。
 
-**所有智能体优先级分组：**
-
-**Priority 1（并行执行）- 信息收集类：**
-- memory_query: 记忆查询智能体
-- event_collection: 事项收集智能体
-- preference: 偏好管理智能体
-- information_query: 信息查询智能体（联网搜索）
-- rag_knowledge: RAG知识库智能体（查询企业知识库）
-
-**Priority 2（依赖 Priority 1）- 行程规划与行前信息类：**
-- itinerary_planning: 行程规划智能体（需要事项收集的结果）
-- packing-list / travel-checklist / safety-tips / trip-notes: 行李 / 行前 / 安全 / 贴士（需要目的地、日期等事项信息）
-
-**Priority 3（依赖行程规划）：**
-- trip-budget: 预算建议（需要行程规划结果）
-- local-transport: 市内交通（需要行程规划结果）
+{priority_groups_prompt}
 
 **说明：**
 - Priority 1 的智能体都是信息获取，互不依赖，可并行执行提升速度

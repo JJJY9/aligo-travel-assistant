@@ -17,7 +17,7 @@
 - **混合检索**：向量 + BM25（中文按字符二元组，无需分词器）双路召回，RRF 融合；可选 `RAG_RERANK_MODEL` 做 cross-encoder 精排（默认关闭）。BM25 按 IDF 加权覆盖度 × 绝对证据量归一（覆盖全部查询词才接近满分；只命中一部分查询词、或重复单个查询词都不会满分绕过 `min_score`；未在库的查询词按 df=0 计入分母；单字中文查询无法组成二元组，关键词路退化为纯向量），索引进程内缓存、写入 / 删除即时失效，构建 / 重排失败自动回退纯向量；首轮结果全部低于阈值时用去掉疑问词 / 标点的简化查询重检索一次，仍无命中才拒答；精排只对通过 `min_score` 的候选排序（证据门槛先于精排 / 截断，不会把有证据的片段挤出 top-K）；管理 / 评测接口保持纯向量口径。
 - **行程约束求解与校验**：需求提取（预算 / 必去项 / 天数）→ 必去项按天分配（OR-Tools CP-SAT 可选，未安装时确定性贪心）→ 五项校验（天数、时间冲突、预算、必去项、费用复核）；未通过时带原因重生成一次，仍失败保留原行程并返回 `validation`。
 - **固定 DAG 调度**：行程规划依赖事项收集 / 偏好抽取；`trip-budget` / `local-transport` 依赖行程规划，`packing-list` / `travel-checklist` / `safety-tips` / `trip-notes` 依赖事项收集，优先级只上调不下调（迭代处理传递依赖）；事项缺失信息随结果返回 `missing_info` / `clarification`，不阻断规划。
-- **持久化执行与防重**：`/api/chat` / `/api/chat/stream` 支持 `idempotency_key`（重复提交直接回放成功响应）；编排按 `user:session:turn_id` 落执行检查点到 `data/runtime/checkpoints`，失败重试 / 重启复用已成功的子智能体结果，只重跑失败者；键绑定本轮提问内容，成功落库后清理，删除会话时按 `user:session` 作用域清理（落盘只存哈希，不等 TTL）。
+- **持久化执行与防重**：`/api/chat` / `/api/chat/stream` 支持 `idempotency_key`（重复提交直接回放成功响应）；编排按 `user:session:turn_id` 落执行检查点到 `data/runtime/checkpoints`，失败重试 / 重启复用已成功的子智能体结果、只重跑失败者（复用要求两轮执行的计划字段——`agent_name` / `priority` / `reason` / `expected_output`——逐字段一致；意图重新生成后措辞变化会让对应步骤按未命中重跑，日志会记录「摘要不匹配」）；键绑定本轮提问内容，成功落库后清理，删除会话时按 `user:session` 作用域清理（落盘只存哈希，不等 TTL）。
 - **记忆一致性**：最近 10 轮对话生成 ≤200 字滚动摘要（窗口指纹缓存、失败冷却）；PostgreSQL 后端偏好快照 5 秒缓存，写入后立即失效（配置 Redis 时按共享版本键跨进程即时失效）。
 - **12 个技能**：原 6 个技能 + `trip-budget` / `packing-list` / `travel-checklist` / `local-transport` / `safety-tips` / `trip-notes`，统一 `SKILL.md` + 懒加载，意图阶段只暴露元数据。
 - **评测骨架**：`utils/eval_harness.py`（规则验收 + 可选 LLM-as-Judge ≥0.6、Pass@1 / 分类准确率 / 失败原因）与 `utils/eval_cases.py`（12 类场景确定性生成 500 条分层用例，JSONL 导出）。

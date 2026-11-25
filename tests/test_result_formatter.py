@@ -901,9 +901,51 @@ def test_extra_skills_have_chinese_display_names():
         "trip-notes",
     ):
         assert display_name(skill) != skill, skill
+        # 历史 _meta 可能保存模型输出的混合大小写变体：显示名查找不敏感
+        assert display_name(skill.title().replace("-", " ").replace(" ", "-")) != skill
+        assert display_name(skill.upper()) != skill
     # 未知名称保持原样
     assert display_name("unknown_agent") == "unknown_agent"
-    print("✓ 扩展技能具备中文显示名")
+    print("✓ 扩展技能具备中文显示名（大小写变体同样命中）")
+
+
+def test_preference_over_limit_value_not_rendered():
+    """序列化超限的偏好值不会落库：回显不能宣称「已更新」。"""
+    from utils.result_formatter import result_to_markdown
+
+    huge = "x" * 12000
+    data = {
+        "results": [
+            {
+                "agent_name": "preference",
+                "status": "success",
+                "data": {
+                    "preferences": [
+                        {"type": "hotel_brands", "value": huge, "action": "replace"}
+                    ]
+                },
+            }
+        ]
+    }
+    rendered = result_to_markdown(data)
+    assert "已更新偏好" not in rendered, rendered[:200]
+    assert huge[:50] not in rendered
+
+    ok = {
+        "results": [
+            {
+                "agent_name": "preference",
+                "status": "success",
+                "data": {
+                    "preferences": [
+                        {"type": "hotel_brands", "value": "汉庭", "action": "replace"}
+                    ]
+                },
+            }
+        ]
+    }
+    assert "已更新偏好" in result_to_markdown(ok)
+    print("✓ 超限偏好值不渲染「已更新」")
 
 
 if __name__ == "__main__":
@@ -940,6 +982,7 @@ if __name__ == "__main__":
     test_object_results_are_normalized()
     test_itinerary_validation_warning_rendered()
     test_extra_skills_have_chinese_display_names()
+    test_preference_over_limit_value_not_rendered()
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_render_agent_exception_falls_back(_mp)

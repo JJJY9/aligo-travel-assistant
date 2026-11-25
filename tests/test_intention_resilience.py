@@ -634,6 +634,64 @@ def test_trailing_template_example_does_not_override_real_result():
     print("✓ 尾随模板示例不覆盖真实决策")
 
 
+class _UnderscoreSingleModel:
+    async def __call__(self, messages):
+        return json.dumps(
+            {
+                "reasoning": "x",
+                "intents": [],
+                "key_entities": {},
+                "rewritten_query": "算一下去杭州三天预算",
+                "agent_schedule": [{"agent_name": "trip_budget", "priority": 1}],
+            },
+            ensure_ascii=False,
+        )
+
+
+class _UnderscoreMultiModel:
+    async def __call__(self, messages):
+        return json.dumps(
+            {
+                "reasoning": "x",
+                "intents": [],
+                "key_entities": {},
+                "rewritten_query": "打包行李并规划行程",
+                "agent_schedule": [
+                    {"agent_name": "packing_list", "priority": 1},
+                    {"agent_name": "itinerary_planning", "priority": 2},
+                ],
+            },
+            ensure_ascii=False,
+        )
+
+
+def test_underscore_skill_variants_are_accepted():
+    """模型按 snake_case 习惯输出 trip_budget / packing_list：不能当未知智能体。"""
+    single = IntentionAgent(name="IntentionAgent", model=_UnderscoreSingleModel())
+    data = json.loads(asyncio.run(single.reply([_user_msg()])).content)
+    names = [task["agent_name"] for task in data["agent_schedule"]]
+    assert names == ["trip-budget"], names
+    multi = IntentionAgent(name="IntentionAgent", model=_UnderscoreMultiModel())
+    data = json.loads(asyncio.run(multi.reply([_user_msg()])).content)
+    names = [task["agent_name"] for task in data["agent_schedule"]]
+    assert names == ["packing-list", "itinerary_planning"], names
+    print("✓ 下划线形式的技能名被接受并归一为目录名")
+
+
+def test_priority_prompt_only_lists_dispatchable_skills():
+    """静态优先级块只宣传真实可调度的技能（custom 目录 / wheel 缺技能）。"""
+    agent = IntentionAgent.__new__(IntentionAgent)
+    agent._available_skill_dirs = {"query-info", "custom-skill"}
+    agent._skill_mapping = {}
+    prompt = agent._priority_groups_prompt()
+    assert "information_query" in prompt
+    assert "custom-skill" in prompt and "其他技能" in prompt
+    assert "trip-budget" not in prompt
+    assert "rag_knowledge" not in prompt
+    assert "packing-list" not in prompt
+    print("✓ 优先级块只列出可调度技能")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -666,4 +724,6 @@ if __name__ == "__main__":
     test_string_schedule_entries_degrade_to_default_query()
     test_placeholder_entries_dropped_and_date_normalized()
     test_trailing_template_example_does_not_override_real_result()
+    test_underscore_skill_variants_are_accepted()
+    test_priority_prompt_only_lists_dispatchable_skills()
     print("\n全部通过")

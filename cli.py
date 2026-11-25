@@ -636,6 +636,26 @@ class AligoCLI:
             # 同上：先转义孤立代理项，再做显示与落库
             result_data = sanitize_json(result_data)
 
+            # 管道模式（脚本 / CI）的退出码：所有被调度的智能体都失败时
+            # 没有任何有效回答，不能与成功回合同样以 0 结束。部分成功
+            # （任一 success / no_knowledge）不受影响
+            results_list = (
+                result_data.get("results")
+                if isinstance(result_data, dict)
+                else None
+            )
+            if (
+                isinstance(result_data, dict)
+                and result_data.get("status") == "partial_failure"
+                and isinstance(results_list, list)
+                and results_list
+                and all(
+                    isinstance(entry, dict) and entry.get("status") == "error"
+                    for entry in results_list
+                )
+            ):
+                self._command_failed = True
+
             # 7. 显示调用的智能体与最终结果（原逻辑不变）
             self._display_agents_called(result_data)
             self.console.print()
@@ -935,6 +955,23 @@ class AligoCLI:
             return _json.dumps(value, ensure_ascii=False)
         return str(value)
 
+    def _print_plan_validation_warning(self, data: dict) -> None:
+        """行程校验未通过时当场提示（与 Web 实时回复 / 历史渲染同一渲染器）：
+        只在重看历史时才出现警告会让用户按不合约束的行程执行。"""
+        from utils.result_formatter import _render_plan_validation_warning
+
+        nested = data.get("data")
+        validation = data.get("validation") or (
+            nested.get("validation") if isinstance(nested, dict) else None
+        )
+        warning = _render_plan_validation_warning(validation)
+        if not warning.strip():
+            return
+        self.console.print()
+        for line in warning.strip().splitlines():
+            text = line[4:] if line.startswith("### ") else line
+            self.console.print(_markup_safe(text), style="yellow")
+
     def _generate_human_response(self, results: list) -> bool:
         """
         根据结果生成人性化的回复
@@ -987,11 +1024,13 @@ class AligoCLI:
                     self.console.print()
                     self.console.print("✈️  [bold cyan]行程规划[/bold cyan]")
                     self.console.print(_markup_safe(itinerary))
+                    self._print_plan_validation_warning(data)
                     current_agent_shown = True
                 elif itinerary and not isinstance(itinerary, dict):
                     self.console.print()
                     self.console.print("✈️  [bold cyan]行程规划[/bold cyan]")
                     self.console.print(_markup_safe(str(itinerary)))
+                    self._print_plan_validation_warning(data)
                     current_agent_shown = True
                 elif itinerary:
                     title = _markup_safe(str(itinerary.get("title", "行程规划")))
@@ -1070,6 +1109,7 @@ class AligoCLI:
                         self.console.print("[bold]📌 注意事项[/bold]")
                         for note in notes:
                             self.console.print(f"  • {_markup_safe(str(note))}")
+                    self._print_plan_validation_warning(data)
                     current_agent_shown = True
 
             # 偏好管理

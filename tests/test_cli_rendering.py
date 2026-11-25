@@ -366,6 +366,48 @@ def test_repl_input_unavailable_exits(monkeypatch):
     print("✓ stdin 不可用时干净退出（不刷屏）")
 
 
+def test_cli_realtime_renders_itinerary_validation_warning():
+    """CLI 实时回复与 Web / 历史同口径：行程校验失败必须当场提示。"""
+    instance = _new_cli()
+    results = [
+        {
+            "agent_name": "itinerary_planning",
+            "status": "success",
+            "data": {
+                "itinerary": {
+                    "title": "杭州三日",
+                    "duration": "3天",
+                    "daily_plans": [],
+                    "notes": [],
+                },
+                "validation": {
+                    "passed": False,
+                    "issues": [{"message": "必去项未覆盖：西湖"}],
+                },
+            },
+        }
+    ]
+    assert instance._generate_human_response(results) is True
+    output = instance._buffer.getvalue()
+    assert "未通过行程校验" in output, output
+    assert "必去项未覆盖：西湖" in output
+
+    passed = _new_cli()
+    passed_results = [
+        {
+            "agent_name": "itinerary_planning",
+            "status": "success",
+            "data": {
+                "itinerary": {"title": "杭州三日", "daily_plans": []},
+                "validation": {"passed": True, "issues": []},
+            },
+        }
+    ]
+    assert passed._generate_human_response(passed_results) is True
+    assert "未通过行程校验" not in passed._buffer.getvalue()
+    print("✓ CLI 实时回复渲染行程校验警告")
+
+
 def test_result_formatter_generic_output_field():
     from utils.result_formatter import result_to_markdown
 
@@ -467,6 +509,7 @@ if __name__ == "__main__":
     test_status_renders_assistant_plaintext()
     test_preferences_table_keeps_zero_and_lists()
     test_result_formatter_generic_output_field()
+    test_cli_realtime_renders_itinerary_validation_warning()
     print("全部通过（capsys 相关用例请用 pytest 运行）")
     test_agent_error_uses_aggregated_message()
     if _DIRECT_RUN_SKIP:

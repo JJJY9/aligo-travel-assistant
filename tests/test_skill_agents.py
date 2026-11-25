@@ -1202,6 +1202,42 @@ def test_plan_trip_null_rewritten_query_falls_back():
     print("✓ 行程规划回退用户原话")
 
 
+def test_plan_trip_prompt_bounds_user_preferences():
+    """全量偏好无预算可达 2MB：数据块内副本按共享预算裁剪，规划不再超上下文。"""
+    module = _load_skill_module("plan-trip")
+
+    class _Model:
+        def __init__(self):
+            self.prompts = []
+
+        async def __call__(self, messages, **kwargs):
+            self.prompts.append(messages)
+            return '{"itinerary": {"title": "x", "daily_plans": [{"day": 1}]}}'
+
+    model = _Model()
+    agent = module.ItineraryPlanningAgent(
+        name="ItineraryPlanningAgent", model=model
+    )
+    agent.skill_loader = _PlanTripLoader()
+    preferences = {
+        f"custom_type_{index}": "y" * 9990 for index in range(200)
+    }
+    payload = json.dumps(
+        {
+            "context": {
+                "rewritten_query": "去杭州三天",
+                "user_preferences": preferences,
+            }
+        },
+        ensure_ascii=False,
+    )
+    asyncio.run(agent.reply(Msg(name="x", content=payload, role="user")))
+    prompt = model.prompts[0][-1]["content"]
+    assert len(prompt) < 20000, len(prompt)
+    assert "y" * 1000 not in prompt, "超长偏好值必须被预算截断"
+    print("✓ 行程规划 prompt 对全量偏好做预算裁剪")
+
+
 def test_plan_trip_rejects_non_object_result():
     """数组输出不能当成功行程返回（robust_json_parse 会把它截成第一个元素）。"""
     module = _load_skill_module("plan-trip")

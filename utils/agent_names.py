@@ -20,6 +20,20 @@ _STANDARD_AGENT_NAMES = {
     value.casefold(): value
     for value in (*SKILL_AGENT_NAMES.values(), "preference")
 }
+# v2 扩展技能（simple 技能）目录名同样是精确小写键：模型写成
+# "Trip-Budget" / "Packing-List" 时意图过滤按 casefold 接受、执行也正常，
+# 但结果名保留原大小写会让中文显示名映射失效、用量统计拆成两个桶
+_EXTRA_SKILL_NAMES = {
+    name.casefold(): name
+    for name in (
+        "trip-budget",
+        "packing-list",
+        "travel-checklist",
+        "local-transport",
+        "safety-tips",
+        "trip-notes",
+    )
+}
 
 
 def canonical_agent_name(agent_name: str) -> str:
@@ -35,4 +49,6 @@ def canonical_agent_name(agent_name: str) -> str:
     mapped = SKILL_AGENT_NAMES.get(key)
     if mapped is not None:
         return mapped
-    return _STANDARD_AGENT_NAMES.get(key, name)
+    if key in _STANDARD_AGENT_NAMES:
+        return _STANDARD_AGENT_NAMES[key]
+    return _EXTRA_SKILL_NAMES.get(key, name)

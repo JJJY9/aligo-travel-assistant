@@ -3992,6 +3992,32 @@ def test_summary_not_starved_by_long_current_session():
     print("✓ 长当前会话不会饿死跨会话总结（提示词含其它会话）")
 
 
+def test_long_term_summary_output_is_capped():
+    """总结模型不守「200 字」时输出在写缓存前截断，不逐轮稀释意图 prompt。"""
+    import asyncio
+
+    from context.memory_manager import (
+        _LONG_TERM_SUMMARY_MAX_CHARS,
+        MemoryManager,
+    )
+
+    class _VerboseModel:
+        async def __call__(self, messages, **kwargs):
+            return {
+                "content": [{"type": "text", "text": "很长的总结" * 500}],
+                "usage": {"input_tokens": 8, "output_tokens": 4, "time": 0.05},
+            }
+
+    manager = MemoryManager(
+        "u-cap", "s-cap", storage_path=tempfile.mkdtemp(), llm_model=_VerboseModel()
+    )
+    manager.long_term.add_chat_message("user", "北京出差记录", "s-old")
+    summary = asyncio.run(manager.get_long_term_summary_async(max_messages=10))
+    assert summary, "总结不应为空"
+    assert len(summary) <= _LONG_TERM_SUMMARY_MAX_CHARS, len(summary)
+    print("✓ 跨会话总结输出有长度上限")
+
+
 def test_append_preference_merges_atomically():
     """append_preference 在锁内重新加载后合并，避免覆盖并发写入。"""
     storage_dir = tempfile.mkdtemp()

@@ -197,6 +197,93 @@ def test_checkpoint_scope_hash_recorded_for_session_cleanup(tmp_path):
     print("✓ 检查点作用域哈希与会话清理")
 
 
+def test_checkpoint_store_init_is_single_flight(monkeypatch):
+    """首个回合并行批次：并发初始化必须收敛到同一实例（否则 update_step 丢写）。"""
+    import utils.execution_checkpoint as checkpoint_module
+
+    created: list[object] = []
+
+    class _Store:
+        def __init__(self, *args, **kwargs):
+            created.append(self)
+
+    monkeypatch.setattr(checkpoint_module, "CheckpointStore", _Store)
+
+    async def scenario():
+        agent = OrchestrationAgent(agent_registry={})
+        agent._checkpoint_key = "u:s:t"
+        return await asyncio.gather(
+            agent._checkpoint_store_for_turn(),
+            agent._checkpoint_store_for_turn(),
+        )
+
+    stores = asyncio.run(scenario())
+    assert stores[0] is not None
+    assert stores[0] is stores[1], "并发初始化必须共享同一 CheckpointStore"
+    assert len(created) == 1
+    print("✓ 检查点存储单飞构造（并发共享同一实例）")
+
+
+def test_checkpoint_reuse_emits_progress_events(tmp_path):
+    """复用的已完成步骤也要补发 start/done，新流执行路线不能一直 pending。"""
+    import hashlib
+
+    from utils.execution_checkpoint import CheckpointStore
+
+    store = CheckpointStore(tmp_path, ttl_sec=3600)
+    schedule = [
+        {
+            "agent_name": "a",
+            "priority": 1,
+            "reason": "r",
+            "expected_output": "e",
+        }
+    ]
+    digest = hashlib.sha256(b"a|1|r|e").hexdigest()
+    store.update_step(
+        "u:s:reuse",
+        "a",
+        {"status": "success", "data": {"ok": True}, "duration": 0.2},
+        task_digest=digest,
+    )
+    stub = _StubAgent("a", {"ok": True})
+    orch = OrchestrationAgent(agent_registry={"a": stub})
+    orch._checkpoint_store = store
+    events: list[dict] = []
+    asyncio.run(
+        orch.reply(_intent(schedule), on_event=events.append, checkpoint_key="u:s:reuse")
+    )
+    assert stub.calls == 0, "同计划的已成功步骤应复用而不是重新执行"
+    pairs = {(event.get("type"), event.get("agent_name")) for event in events}
+    assert ("agent_start", "a") in pairs, events
+    assert ("agent_done", "a") in pairs, events
+    print("✓ 检查点复用的步骤补发进度事件")
+
+
+def test_memory_write_failures_are_tracked():
+    """超限偏好被跳过时登记类型，供调用方在回复中提示写入失败。"""
+    memory = _StubMemory()
+    orch = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    results = [
+        {
+            "agent_name": "preference",
+            "priority": 1,
+            "result": {
+                "status": "success",
+                "data": {
+                    "preferences": [
+                        {"type": "hotel_brands", "value": "x" * 12000, "action": "replace"}
+                    ]
+                },
+            },
+        }
+    ]
+    orch._update_memory({"key_entities": {}}, results)
+    assert "hotel_brands" in orch._last_memory_write_failures
+    assert "hotel_brands" not in memory.long_term.get_preference()
+    print("✓ 偏好写入失败按类型登记")
+
+
 def test_checkpoint_tombstone_probe_only_for_successful_results(tmp_path):
     """墓碑复查只服务检查点写入：失败结果不做无用的 Redis 查询。"""
     from utils.execution_checkpoint import CheckpointStore
@@ -227,8 +314,25 @@ def test_checkpoint_tombstone_probe_only_for_successful_results(tmp_path):
     ok._checkpoint_store = store
     ok._session_deleted_now = make_probe("success")  # type: ignore[method-assign]
     asyncio.run(ok.reply(_intent(schedule), checkpoint_key="u:s:ok"))
-    assert probes["success"] == 1, "成功结果写入检查点前必须复查墓碑"
+    # 写入前复查一次 + 落盘后再复查一次（防跨实例删除落在两步之间）
+    assert probes["success"] == 2, "成功结果写入前与落盘后都必须复查墓碑"
     print("✓ 墓碑复查只在该轮写入检查点（成功）时执行")
+
+
+def test_checkpoint_cleared_when_session_deleted_between_probe_and_write(tmp_path):
+    """墓碑复查与 update_step 之间的跨实例删除：落盘后补删，不留到 TTL。"""
+    from utils.execution_checkpoint import CheckpointStore
+
+    store = CheckpointStore(tmp_path, ttl_sec=3600)
+    schedule = [{"agent_name": "a", "priority": 1}]
+    answers = iter([False, True])
+
+    probe = OrchestrationAgent(agent_registry={"a": _StubAgent("a", {"ok": True})})
+    probe._checkpoint_store = store
+    probe._session_deleted_now = lambda: next(answers, True)  # type: ignore[method-assign]
+    asyncio.run(probe.reply(_intent(schedule), checkpoint_key="u:s:gone"))
+    assert store.load("u:s:gone") is None, "落盘后复查到删除必须补删检查点"
+    print("✓ 跨实例删除落在复查与落盘之间时检查点被补删")
 
 
 def test_checkpoint_store_failure_does_not_block_turn(monkeypatch):

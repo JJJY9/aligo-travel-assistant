@@ -68,6 +68,7 @@ from utils.access_log import (
     access_log_format,
     format_access_log,
 )
+from utils.agent_names import canonical_agent_name
 from utils.errors import (
     ImportVolumeError,
     MemoryPersistenceError,
@@ -3866,7 +3867,11 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(agents, list):
             for agent in agents:
                 if isinstance(agent, dict) and agent.get("name"):
-                    agent_counts[str(agent["name"])] += 1
+                    # 同一技能的大小写 / 目录名变体合并为一个桶（历史 _meta
+                    # 可能保存 Trip-Budget 等混合大小写），未知名称原样
+                    agent_counts[
+                        canonical_agent_name(str(agent["name"]).strip())
+                    ] += 1
 
     today = datetime.now().date()
     recent_days = []

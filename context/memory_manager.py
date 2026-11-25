@@ -49,6 +49,10 @@ _SUMMARY_TRIP_WINDOW = 20
 # 当前会话最近对话的滚动摘要（v2.0）：200 字以内，按窗口内容指纹缓存，
 # 窗口不变时不重复调用 LLM（与跨会话长期总结互补）
 _RECENT_SUMMARY_MAX_CHARS = 200
+# 跨会话长期总结的输出上限：prompt 已要求「不超过200字」，但模型不遵守 /
+# 上游 max_tokens 被放大时会原样进入每轮意图 system 消息（该 role 不截断），
+# 持续稀释系统指令并挤占上下文；与最近摘要同一口径在写缓存前截断
+_LONG_TERM_SUMMARY_MAX_CHARS = 200
 _RECENT_SUMMARY_MIN_MESSAGES = 4
 _RECENT_SUMMARY_WINDOW_TURNS = 10
 _RECENT_SUMMARY_FAILURE_COOLDOWN_SEC = 30.0
@@ -877,6 +881,10 @@ class MemoryManager:
             # 孤立代理项（截断的 emoji）会让请求体 UTF-8 编码在后续每一轮
             # 抛 UnicodeEncodeError，且指纹不变使被污染的缓存一直命中
             summary = sanitize_json(summary.strip())
+            if len(summary) > _LONG_TERM_SUMMARY_MAX_CHARS:
+                # 截断发生在写缓存之前：缓存值与对话 / CLI / 记忆查询
+                # 三处消费者同时受约束，且不会每轮重复截断
+                summary = summary[:_LONG_TERM_SUMMARY_MAX_CHARS]
             if summary:
                 self._summary_cache = (fingerprint, summary)
                 self._summary_failure_until = 0.0
