@@ -46,7 +46,9 @@ function makeNode() {
     insertBefore(child) {
       return child;
     },
-    remove() {},
+    remove() {
+      this.removed = true;
+    },
     removeChild() {},
     replaceChildren() {},
     setAttribute() {},
@@ -3040,6 +3042,82 @@ async function scenarioEditorsRound2(source) {
   results.prefCancelAfter = run(`({
     cancelDisabled: els.prefCancel.disabled,
     submitDisabled: els.prefSubmit.disabled,
+  })`);
+
+  // 数值 / 布尔列表行内编辑保留元素类型（不能静默变成字符串）
+  results.typedLists = run(`({
+    numbers: preferenceOutputValue([1, 2, 3], "1、2、4"),
+    numbersInvalid: preferenceOutputValue([1, 2, 3], "1、x"),
+    booleans: preferenceOutputValue([true, false], "true、false"),
+    booleansInvalid: preferenceOutputValue([true, false], "true、也许"),
+  })`);
+
+  // 偏好编辑框上限与服务端 10000 字符口径一致
+  results.prefMaxChars = run("PREFERENCE_VALUE_MAX_CHARS");
+
+  // 列表型偏好「添加」是追加语义：与现有值合并去重后再 PUT；标量仍覆盖
+  run(`
+    __toasts = [];
+    globalThis.__putBodies = [];
+    preferenceLatest.clear();
+    preferenceLatest.set("hotel_brands", ["汉庭", "如家"]);
+    state.status = { preferences: { hotel_brands: ["汉庭", "如家"] } };
+    getJSON = async (url, options) => {
+      __putBodies.push(JSON.parse(options.body).value);
+      return {};
+    };
+    refreshStatus = async () => {};
+    els.prefValue.value = "锦江、汉庭";
+    els.prefType.value = "hotel_brands";
+  `);
+  await run("addPreference({ preventDefault() {} })");
+  results.addMerges = run("__putBodies[0]");
+  run(`
+    __putBodies = [];
+    els.prefValue.value = "上海";
+    els.prefType.value = "home_location";
+  `);
+  await run("addPreference({ preventDefault() {} })");
+  results.addScalar = run("__putBodies[0]");
+
+  // 行内编辑失焦：草稿已修改才需要确认（与 save() 同口径，换行剥离）
+  results.blurPrompt = run(`({
+    changed: preferenceBlurNeedsConfirm(["汉庭"], "如家"),
+    unchanged: preferenceBlurNeedsConfirm(["汉庭"], "汉庭"),
+    newline: preferenceBlurNeedsConfirm("a\\r\\nb", "ab"),
+  })`);
+
+  // 删除结果未知（超时 / 断连 / 5xx）：对账刷新并提示，不当作确定失败
+  run(`
+    __toasts = [];
+    globalThis.__refreshes = [];
+    window.confirm = () => true;
+    getJSON = async () => { throw new Error("网络中断"); };
+    refreshStatus = async (options) => { __refreshes.push(options || {}); };
+  `);
+  await run('deletePreference("hotel_brands", "酒店偏好", null)');
+  results.deleteUnknown = run(`({
+    toasts: __toasts.slice(),
+    refreshes: __refreshes.slice(),
+  })`);
+
+  // 删除成功：本地移除行 + 静默刷新（刷新失败不能留下已删除的行）
+  run(`
+    __toasts = [];
+    __refreshes = [];
+    getJSON = async () => ({});
+    const row = document.createElement("div");
+    row.className = "pref-row";
+    els.overview.appendChild(row);
+    preferenceLatest.set("home_location", "上海");
+    globalThis.__row = row;
+  `);
+  await run('deletePreference("home_location", "常住地", __row)');
+  results.deleteSuccess = run(`({
+    rowRemoved: __row.removed === true,
+    latestHas: preferenceLatest.has("home_location"),
+    refreshes: __refreshes.slice(),
+    toasts: __toasts.slice(),
   })`);
 
   // 知识库同一行再次点编辑：草稿已修改时必须确认，拒绝后草稿保留

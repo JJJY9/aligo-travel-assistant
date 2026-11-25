@@ -4227,6 +4227,75 @@ def test_preference_type_with_space_is_editable():
         _cleanup(user_id)
 
 
+def test_preference_put_strips_type_and_rejects_blank():
+    """PUT 规范化类型：首尾空格写入规范键，纯空白 422。
+
+    此前 ` home_location` / `home_location ` 会落库成与规范键并存的影子
+    偏好（精确键查找读不到，却计入类型上限）。
+    """
+    client = _client()
+    user_id = _unique_user("web_test_pref_strip")
+    try:
+        padded = client.put(
+            "/api/preferences/%20home_location",
+            json={"user_id": user_id, "value": "上海"},
+        )
+        assert padded.status_code == 200, padded.text
+        assert padded.json()["type"] == "home_location", padded.json()
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["preferences"] == {"home_location": "上海"}, status["preferences"]
+        blank = client.put(
+            "/api/preferences/%20%20",
+            json={"user_id": user_id, "value": "x"},
+        )
+        assert blank.status_code == 422, blank.text
+        trail = client.put(
+            "/api/preferences/home_location%20",
+            json={"user_id": user_id, "value": "北京"},
+        )
+        assert trail.status_code == 200, trail.text
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["preferences"] == {"home_location": "北京"}, status["preferences"]
+        print("✓ PUT 规范化偏好类型并拒绝纯空白")
+    finally:
+        _cleanup(user_id)
+
+
+def test_preference_put_cleans_hidden_blank_entries():
+    """写入偏好时顺带清理面板不可见的空值条目（释放类型上限名额）。"""
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user_id = _unique_user("web_test_pref_heal")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_preference("ghost_type", None)
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        response = client.put(
+            "/api/preferences/home_location",
+            json={"user_id": user_id, "value": "上海"},
+        )
+        assert response.status_code == 200, response.text
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert "ghost_type" not in status["preferences"]
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            assert "ghost_type" not in store.get_preference(), (
+                "空值偏好应被清理而不是仅隐藏"
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        print("✓ 写入偏好时清理空值条目")
+    finally:
+        _cleanup(user_id)
+
+
 def test_session_search_snippet_strips_markdown():
     """搜索预览应剥离标题 / 列表 / 表格 / 引用等 Markdown 记号。"""
     from context.storage import create_long_term_memory

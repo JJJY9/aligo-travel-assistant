@@ -37,7 +37,7 @@ from utils.errors import MemoryPersistenceError, UserFacingError
 from utils.json_safe import sanitize_json
 from utils.llm_resilience import retry_with_backoff
 from utils.paths import default_data_root
-from utils.preference_values import has_preference_value
+from utils.preference_values import has_preference_value, preference_prompt_lines
 from utils.result_formatter import normalize_results, result_to_markdown
 from utils.turn_meta import attach_turn_meta, build_turn_meta
 from utils.usage import add_usage
@@ -1003,11 +1003,10 @@ class ConversationRuntime:
             if has_preference_value(value)
         }
         if preferences:
+            # 单值 / 总量预算：200 类型 × 10000 字符的合法偏好全量拼进
+            # 系统消息会让每轮意图识别都超上下文（见 preference_prompt_lines）
             pref_lines = ["【用户背景信息】（来自长期记忆，可用于推断缺失信息）"]
-            for key, value in preferences.items():
-                if isinstance(value, list):
-                    value = ", ".join(str(item) for item in value)
-                pref_lines.append(f"• {key}: {value}")
+            pref_lines.extend(preference_prompt_lines(preferences))
             memory_parts.append("\n".join(pref_lines))
 
         try:

@@ -312,6 +312,26 @@ def test_parse_export_rejects_invalid():
     print("✓ 非 JSON / 非对象 / 空备份报错")
 
 
+def test_parse_export_skips_blank_preference_values():
+    """空值偏好（null / 空白串 / 全空列表）= 未设置：导入拒绝并计入 errors。
+
+    空值偏好在面板 / 状态接口不可见，却会占用类型上限名额（面板无行可删）。
+    """
+    payload = {
+        "preferences": {
+            "home_location": None,
+            "meal_preference": "   ",
+            "hotel_brands": [None, "  "],
+            "ok": "北京",
+            "flag": False,  # 0 / False 是合法偏好
+        }
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert sections["preferences"] == {"ok": "北京", "flag": False}, sections
+    assert any("值为空" in item for item in errors), errors
+    print("✓ 导入跳过空值偏好")
+
+
 def test_parse_export_skips_invalid_rows():
     payload = {
         "preferences": {"": "x", "home_location": "北京"},

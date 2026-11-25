@@ -29,7 +29,11 @@ from utils.chat_import import (
 )
 from utils.errors import MemoryPersistenceError
 from utils.file_lock import file_lock
-from utils.preference_values import merge_preference_value, preference_value_problem
+from utils.preference_values import (
+    merge_preference_value,
+    preference_value_problem,
+    has_preference_value,
+)
 from utils.timestamps import chronological_key
 
 logger = logging.getLogger(__name__)
@@ -1249,6 +1253,15 @@ class LongTermMemory:
                     logger.warning("丢弃缺少 value 的偏好记录：%s", pref.get("type"))
                     destructive = True
                     continue
+                if not has_preference_value(pref.get("value")):
+                    # 空值 = 未设置：面板 / 导出口径都不可见，却会占用类型
+                    # 上限名额（面板无行可删）。与 Web PUT / CLI 拒绝空值
+                    # 同口径，读入时即丢弃（写入路径下次落盘生效）
+                    logger.warning(
+                        "丢弃空值的偏好记录（空值=未设置）：%s", pref.get("type")
+                    )
+                    destructive = True
+                    continue
                 # 错误的嵌套：{"type": "preferences", "value": [...]}
                 if pref.get("type") == "preferences" and isinstance(pref.get("value"), list):
                     for nested_pref in pref["value"]:
@@ -1565,12 +1578,19 @@ class LongTermMemory:
         for pref in preferences:
             if pref.get("type") == "hotel_brands":
                 # 确保 value 是列表
-                if not isinstance(pref["value"], list):
-                    pref["value"] = [pref["value"]] if pref["value"] else []
-
-                # 追加品牌
-                if brand not in pref["value"]:
-                    pref["value"].append(brand)
+                current = pref["value"]
+                merged = list(current) if isinstance(current, list) else (
+                    [current] if current else []
+                )
+                # 追加品牌；合并后同样受单值上限约束——PG 后端经
+                # save_preference 会拒绝超限值，JSON 落库会让该偏好在
+                # 面板 / CLI 永远无法编辑（两后端口径必须一致）
+                if brand not in merged:
+                    merged.append(brand)
+                    problem = preference_value_problem(merged)
+                    if problem:
+                        raise ValueError(problem)
+                pref["value"] = merged
                 found = True
                 break
 
@@ -1585,6 +1605,9 @@ class LongTermMemory:
                 raise ValueError(
                     f"偏好条目已达上限（{cap}），请先删除不用的偏好"
                 )
+            problem = preference_value_problem([brand])
+            if problem:
+                raise ValueError(problem)
             preferences.append({"type": "hotel_brands", "value": [brand]})
 
         self._persist()
@@ -1600,12 +1623,18 @@ class LongTermMemory:
         for pref in preferences:
             if pref.get("type") == "airlines":
                 # 确保 value 是列表
-                if not isinstance(pref["value"], list):
-                    pref["value"] = [pref["value"]] if pref["value"] else []
-
-                # 追加航空公司
-                if airline not in pref["value"]:
-                    pref["value"].append(airline)
+                current = pref["value"]
+                merged = list(current) if isinstance(current, list) else (
+                    [current] if current else []
+                )
+                # 追加航空公司；合并后同样受单值上限约束（与
+                # add_hotel_brand / save_preference / PG 后端同口径）
+                if airline not in merged:
+                    merged.append(airline)
+                    problem = preference_value_problem(merged)
+                    if problem:
+                        raise ValueError(problem)
+                pref["value"] = merged
                 found = True
                 break
 
@@ -1620,6 +1649,9 @@ class LongTermMemory:
                 raise ValueError(
                     f"偏好条目已达上限（{cap}），请先删除不用的偏好"
                 )
+            problem = preference_value_problem([airline])
+            if problem:
+                raise ValueError(problem)
             preferences.append({"type": "airlines", "value": [airline]})
 
         self._persist()

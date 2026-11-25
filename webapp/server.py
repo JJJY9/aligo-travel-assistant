@@ -5141,6 +5141,12 @@ def create_app(model: Any = None) -> FastAPI:
     ) -> dict[str, Any]:
         """新增或覆盖一条用户偏好（记忆面板的手动维护入口）。"""
         _enforce_write_rate_limit(state, request)
+        # 规范化类型：` home_location` / `home_location ` 会落库成与规范键
+        # 并存的「影子偏好」——精确键查找（如推断出发地）读不到它，面板却
+        # 单独成行并占用类型上限。与对话侧 strip 后落库的口径一致
+        pref_type = pref_type.strip()
+        if not pref_type:
+            raise HTTPException(status_code=422, detail="偏好类型不能为空白")
         if pref_type == "preferences":
             # 存储层把该类型视为旧版嵌套偏好容器并在下次加载时展开 / 丢弃：
             # 写入会「保存成功」后立即消失，删除恒为 false
@@ -5159,6 +5165,20 @@ def create_app(model: Any = None) -> FastAPI:
         store = _open_long_term(payload.user_id, strict=True)
         try:
             existing = store.get_preference()
+            # 面板永远看不到的空值条目（旧备份导入 / 旧版本写入）不渲染、
+            # 也无法从面板删除，却占用类型上限名额：写入偏好时顺带释放，
+            # 409 只在真实可见条目达到上限时出现
+            for hidden in [
+                key
+                for key, value in existing.items()
+                if not has_preference_value(value)
+            ]:
+                try:
+                    if store.delete_preference(hidden):
+                        existing.pop(hidden, None)
+                        logger.info("清理空值偏好条目: %s", hidden)
+                except Exception:  # noqa: BLE001 - 清理失败不阻断本次写入
+                    logger.warning("清理空值偏好失败: %s", hidden)
             # 只拦「恰好在上限、本次新增类型」：已越限的历史账号（上限
             # 上线前的存量）继续可用，与存储写层 / 导入基线豁免同口径
             if pref_type not in existing and len(existing) == MAX_PREFERENCE_ENTRIES:

@@ -1,11 +1,11 @@
 ---
 name: preference
-description: Use this skill when the user states or updates their preferences, e.g. hotel brands, airlines, home location, seat preference. Triggers when user says "我喜欢住汉庭", "我还喜欢如家", "我搬家到上海了", "我常坐东航". This skill uses PreferenceAgent and requires a MemoryManager to persist preferences; when used standalone, apply returned preferences via memory_manager.long_term.save_preference.
+description: Use this skill when the user states or updates their preferences, e.g. hotel brands, airlines, home location, seat preference. Triggers when user says "我喜欢住汉庭", "我还喜欢如家", "我搬家到上海了", "我常坐东航". This skill uses PreferenceAgent and requires a MemoryManager to persist preferences; when used standalone, apply returned preferences via memory_manager.long_term.append_preference (append) or memory_manager.long_term.save_preference (replace).
 ---
 
 # Preference (偏好管理)
 
-识别用户偏好并支持**追加**（还、也）与**覆盖**（搬家到、改成）。使用 **PreferenceAgent**。持久化由 **MemoryManager** 完成：在协调器流程中由协调器写回；单独调用时需根据返回的 `preferences` 列表自行调用 `memory_manager.long_term.save_preference()`。
+识别用户偏好并支持**追加**（还、也）与**覆盖**（搬家到、改成）。使用 **PreferenceAgent**。持久化由 **MemoryManager** 完成：在协调器流程中由协调器写回；单独调用时需根据返回的 `preferences` 列表自行写回——append 用 `memory_manager.long_term.append_preference()`（存储层在写锁内重新读取并合并），replace 用 `memory_manager.long_term.save_preference()`。不要用 `get_preference()` + `save_preference()` 手写追加：并发追加会互相覆盖，列表值还会拼成嵌套列表。
 
 ## When to Use
 
@@ -50,13 +50,34 @@ async def save_preference(user_query: str, user_id: str = "default_user", sessio
     result = await agent.reply(user_msg)
     data = json.loads(result.content) if isinstance(result.content, str) else result.content
     if data.get("has_preferences") and data.get("preferences"):
+        from utils.preference_values import (
+            has_preference_value,
+            is_manageable_pref_type,
+            merge_preference_value,
+        )
+
         for item in data["preferences"]:
             pref_type = item.get("type")
             value = item.get("value")
-            action = item.get("action", "replace")
-            current = memory_manager.long_term.get_preference().get(pref_type)
-            if action == "append" and isinstance(current, list):
-                memory_manager.long_term.save_preference(pref_type, current + [value])
+            action = str(item.get("action") or "replace").strip().lower()
+            if not is_manageable_pref_type(pref_type):
+                continue
+            pref_type = pref_type.strip()
+            if not has_preference_value(value):
+                continue
+            if action in {"append", "add", "追加"}:
+                # 追加必须走存储层的原子方法：写锁内重新读取并逐项合并
+                # （列表值不会变成嵌套列表），并发追加不会互相覆盖
+                long_term = memory_manager.long_term
+                append = getattr(long_term, "append_preference", None)
+                if callable(append):
+                    append(pref_type, value)
+                else:
+                    # 自定义后端没有 append_preference：共享合并逻辑兜底
+                    current = long_term.get_preference(pref_type)
+                    long_term.save_preference(
+                        pref_type, merge_preference_value(current, value)
+                    )
             else:
                 memory_manager.long_term.save_preference(pref_type, value)
     return data

@@ -945,6 +945,59 @@ def test_json_preference_cap_covers_append_and_helpers(monkeypatch):
     print("✓ JSON 偏好上限覆盖 append / 酒店品牌 / 航司的新建分支")
 
 
+def test_json_add_brand_rejects_oversized_merge():
+    """add_hotel_brand / add_airline 合并后同样受单值上限约束（与
+    save_preference / PG 后端同口径）：超限抛 ValueError 且不落盘。"""
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+
+    store = LongTermMemory(f"json-pref-size-{uuid.uuid4().hex[:8]}", tempfile.mkdtemp())
+    chunk = "品" * 400
+    for index in range(24):
+        store.add_hotel_brand(f"{chunk}{index:04d}")
+    brands = store.get_preference("hotel_brands")
+    assert len(brands) == 24, brands
+    with pytest.raises(ValueError, match="偏好值过大"):
+        store.add_hotel_brand(f"{chunk}9999")
+    reloaded = store.get_preference("hotel_brands")
+    assert len(reloaded) == 24 and all(
+        not str(item).endswith("9999") for item in reloaded
+    ), "超限追加必须整次拒绝，不能留下半写入的列表"
+    print("✓ add_hotel_brand 合并后校验单值上限")
+
+
+def test_json_migration_drops_blank_preference_values():
+    """历史文件里的空值偏好（null / 空白串）在加载时丢弃。
+
+    空值 = 未设置：面板 / 状态接口不可见却占用类型上限名额，面板无行可删。
+    """
+    import json
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+
+    directory = tempfile.mkdtemp()
+    user_id = f"json-pref-blank-{uuid.uuid4().hex[:8]}"
+    with open(
+        os.path.join(directory, f"{user_id}.json"), "w", encoding="utf-8"
+    ) as handle:
+        json.dump(
+            {
+                "preferences": [
+                    {"type": "home_location", "value": None},
+                    {"type": "meal_preference", "value": "   "},
+                    {"type": "ok", "value": "北京"},
+                ]
+            },
+            handle,
+            ensure_ascii=False,
+        )
+    store = LongTermMemory(user_id, directory)
+    assert store.get_preference() == {"ok": "北京"}
+    print("✓ 加载时丢弃空值偏好条目")
+
+
 def test_pg_preference_cap_serializes_across_types(monkeypatch):
     """用户级写锁：A 持锁复核上限期间，另一个实例的新类型写入必须等待，
     不能读到「上限减一」后各自插入。"""

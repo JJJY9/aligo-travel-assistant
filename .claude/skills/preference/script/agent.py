@@ -22,6 +22,7 @@ from utils.preference_values import (
     has_preference_value,
     is_manageable_pref_type,
     merge_preference_value,
+    preference_prompt_lines,
 )
 from utils.user_query import extract_user_query
 from utils.json_parser import (
@@ -36,6 +37,21 @@ logger = logging.getLogger(__name__)
 # 结果包装键与说明键：旧格式字典扫描必须跳过（{"data": {...}} 的 data
 # 不是偏好类型，否则会落库一条 type="data" 的垃圾偏好）
 _PREF_NON_TYPE_KEYS = frozenset(EXPLANATORY_PREF_KEYS | {"data", "result", "output", "preferences"})
+
+
+def _neutralize_prompt_data(value: object) -> str:
+    """中和偏好文本里的数据块分隔符与全角方括号。
+
+    偏好值可经备份导入写入外部内容，原样拼进 prompt 能伪造「【任务说明】」
+    等结构。与 memory-query / plan-trip 对同类内容的处理一致。
+    """
+    return (
+        str(value or "")
+        .replace("<<<", "＜＜＜")
+        .replace(">>>", "＞＞＞")
+        .replace("【", "［")
+        .replace("】", "］")
+    )
 
 
 
@@ -204,7 +220,10 @@ def _result_from_preferences(
     if isinstance(preferences, list):
         preferences = _expand_legacy_array_items(preferences)
     elif isinstance(preferences, dict):
-        preferences = [preferences]
+        # 旧格式 {类型: 值} 字典（可含多个可管理键）：按数组元素同一口径
+        # 展开每个可管理键。此前整个字典当作单条目，多键时在归一环节被
+        # 静默丢弃（返回「成功但无偏好」），单键却能用——兼容分支缺环
+        preferences = _expand_legacy_array_items([preferences])
     elif isinstance(preferences, str):
         # 模型可能把数组序列化成字符串：能解析就恢复，否则按无结果处理
         try:
@@ -782,6 +801,7 @@ class PreferenceAgent(AgentBase):
         else:
             content = x.content
 
+        context: dict = {}
         # 如果content是JSON字符串，解析它
         if isinstance(content, str):
             try:
@@ -791,9 +811,9 @@ class PreferenceAgent(AgentBase):
             # 顶层 / context 可能不是对象（数组 / 数字 / null）：直接 .get 会
             # AttributeError 绕过上面的兜底，按纯文本输入处理
             if isinstance(data, dict):
-                context = data.get("context")
-                if not isinstance(context, dict):
-                    context = {}
+                raw_context = data.get("context")
+                if isinstance(raw_context, dict):
+                    context = raw_context
                 # 优先使用用户本轮原话：只从用户自己的表述中抽取偏好，
                 # 避免把上下文或助手建议（如行程里提到的舱位）误记为用户偏好
                 user_query = (
@@ -806,21 +826,39 @@ class PreferenceAgent(AgentBase):
         else:
             user_query = extract_user_query(content)
 
-        # 获取当前已保存的偏好
-        current_preferences = {}
+        # 获取当前已保存的偏好。读取失败不能静默当成「没有偏好」：抽取
+        # 规则会把空基线下「我喜欢住如家」判成首次设置（replace），随后
+        # 整值覆盖已有列表偏好——先退到编排层随输入下发的
+        # context.user_preferences（可能来自更新几秒内的快照缓存），仍
+        # 不可用则把本轮非 append 结果降级为 append（见下方
+        # baseline_unavailable 分支），保证旧值不被覆盖
+        baseline: object = None
         if self.memory_manager:
             # 偏好查询是阻塞 IO（JSON 文件 / PostgreSQL 网络往返）：
             # 放到线程池执行，留在事件循环线程会冻结同进程所有 SSE 流
             try:
-                current_preferences = await asyncio.to_thread(
+                baseline = await asyncio.to_thread(
                     self.memory_manager.long_term.get_preference
                 )
-            except Exception as e:  # noqa: BLE001 - 存储抖动按空偏好继续抽取
+            except Exception as e:  # noqa: BLE001 - 存储抖动走降级
                 logger.warning(f"Failed to load current preferences: {e}")
-                current_preferences = {}
+                baseline = None
+        if not isinstance(baseline, dict):
+            fallback = context.get("user_preferences")
+            if isinstance(fallback, dict):
+                baseline = fallback
+        baseline_unavailable = not isinstance(baseline, dict)
+        current_preferences = baseline if isinstance(baseline, dict) else {}
 
-        # 格式化当前偏好，便于展示
-        current_prefs_str = json.dumps(current_preferences, ensure_ascii=False, indent=2)
+        # 预算化 + 分隔符中和：偏好单值上限 10000 字符、类型上限 200，
+        # 全量原样拼接最多约 2MB，任何模型上下文都会超限（该账号的偏好
+        # 抽取永久失败）；值里伪造的「【任务说明】」也不能当成 prompt 结构
+        pref_lines = preference_prompt_lines(current_preferences)
+        current_prefs_str = (
+            _neutralize_prompt_data("\n".join(pref_lines))
+            if pref_lines
+            else "（暂无已保存偏好）"
+        )
 
         # 动态读取 Prompt 指令 (Progressive Disclosure)
         skill_instruction = self.skill_loader.get_skill_content("preference")
@@ -830,6 +868,7 @@ class PreferenceAgent(AgentBase):
         prompt = f"""你是用户偏好分析专家，负责提取用户的长期偏好信息。
 
 【当前已保存的用户偏好】
+（值过长时已截断；被截断的值仅用于判断该字段已存在，不要原样回填到输出）
 {current_prefs_str}
 
 【新的用户输入】
@@ -869,6 +908,21 @@ class PreferenceAgent(AgentBase):
             result = _select_preference_result(text)
             if result is None:
                 raise ValueError("模型输出中没有可解析的偏好结果对象")
+            if baseline_unavailable and isinstance(result.get("preferences"), list):
+                # 当前偏好读取失败（直读与 context.user_preferences 都不可用）：
+                # 本轮非 append 的条目降级为 append——存储层会在锁内重新读取
+                # 并合并，空基线下的 replace 不会整值覆盖已有列表偏好
+                for item in result["preferences"]:
+                    if not isinstance(item, dict):
+                        continue
+                    action = str(item.get("action") or "").strip().lower()
+                    if action not in {"append", "add", "追加"}:
+                        item["action"] = "append"
+                if result["preferences"]:
+                    result["baseline_unavailable"] = True
+                    logger.warning(
+                        "偏好基线不可用，本轮非 append 结果已降级为 append"
+                    )
         except Exception as e:
             if is_retriable_error(e) or is_permanent_llm_error(e):
                 # 瞬时错误交给编排层重试；401/402/403/404 等永久错误
