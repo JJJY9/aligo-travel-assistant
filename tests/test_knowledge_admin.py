@@ -3669,6 +3669,211 @@ _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_hermetic_knowledge_db_path_is_missing": "需要 hermetic_kb_path 夹具（conftest 注入）",
 }
 
+def test_update_document_rejects_stale_expect_metadata(monkeypatch):
+    """另一会话只改分类：元数据快照不匹配必须 409，而不是静默改回。"""
+    from pathlib import Path
+
+    rows = [
+        {
+            "id": 7,
+            "content": "住宿标准正文",
+            "metadata": json.dumps({"category": "B_当前"}),
+        }
+    ]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def update_document(self, *args, **kwargs):
+            raise AssertionError("元数据冲突时不应进入写入")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    with pytest.raises(knowledge_admin.DocumentConflictError, match="元数据"):
+        knowledge_admin.update_document(
+            7,
+            "住宿标准正文（改）",
+            {"category": "A_旧快照"},
+            expect_content="住宿标准正文",
+            expect_parts=1,
+            expect_group="",
+            expect_metadata={"category": "A_旧快照"},
+        )
+    assert json.loads(rows[0]["metadata"])["category"] == "B_当前"
+    print("✓ 元数据轴的乐观并发（陈旧快照 409）")
+
+
+def test_update_document_preserves_per_part_metadata(monkeypatch):
+    """整份编辑保留逐片 title，只把真正改动的字段应用到全组。"""
+    from pathlib import Path
+
+    def _meta(part):
+        return json.dumps(
+            {
+                "part": str(part),
+                "parts": "2",
+                "group": "g-old",
+                "title": f"城市交通 (Part {part})",
+                "category": "交通",
+            }
+        )
+
+    rows = [
+        {"id": 1, "content": "甲" * 400, "metadata": _meta(1)},
+        {"id": 2, "content": "乙" * 100, "metadata": _meta(2)},
+    ]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def __init__(self):
+            self.updated = None
+            self.added = []
+
+        def update_document(self, doc_id, content, metadata):
+            self.updated = (doc_id, content, metadata)
+            return {"status": "success", "id": doc_id}
+
+        def add_documents(self, documents):
+            self.added = documents
+            return {
+                "status": "success",
+                "ids": list(range(100, 100 + len(documents))),
+                "total_count": len(documents),
+            }
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    # 从 part 2 进入编辑、只改分类：提交的 title 是 part 2 的旧标题
+    result = knowledge_admin.update_document(
+        2,
+        "甲" * 400 + "乙" * 100,
+        {"title": "城市交通 (Part 2)", "category": "住宿"},
+        expect_parts=2,
+        expect_group="g-old",
+    )
+    assert result["parts"] >= 2
+    metas = [agent.updated[2]] + [item["metadata"] for item in agent.added]
+    assert [m["title"] for m in metas] == [
+        f"城市交通 (Part {index + 1})" for index in range(len(metas))
+    ], metas
+    assert all(m["category"] == "住宿" for m in metas), "真正改动的字段应用到全组"
+    print("✓ 整份编辑保留逐片元数据（Part 后缀重编号）")
+
+
+def test_import_group_existing_as_ungrouped_pieces_is_duplicate(monkeypatch):
+    """备份组内容已以无 group 独立片段存在：按已存在计，不报布局冲突。"""
+    from pathlib import Path
+
+    rows = [
+        {"id": 1, "content": "甲段内容", "metadata": "{}"},
+        {"id": 2, "content": "乙段内容", "metadata": "{}"},
+    ]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    documents = [
+        {
+            "content": "甲段内容",
+            "metadata": {"group": "g1", "part": "1", "parts": "2"},
+        },
+        {
+            "content": "乙段内容",
+            "metadata": {"group": "g1", "part": "2", "parts": "2"},
+        },
+    ]
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    assert result["skipped_invalid"] == 0, result
+    assert result["skipped_duplicate"] == 2, result
+    assert result["skipped_conflict"] == 0, result
+    assert result.get("needs_model") is False, result
+    print("✓ 组内容以独立片段存在时按已存在（不误报冲突）")
+
+
+def test_restore_pieces_keep_per_piece_metadata_by_source():
+    """旧分片被重切 / 合并后仍按来源下标对齐逐片元数据。"""
+    parts = ["甲" * 500, "乙" * 100, "丙" * 100]
+    pieces = knowledge_admin._restore_pieces_with_sources(parts, "")
+    sources = [source for _, source in pieces]
+    assert sources == [0, 0, 1, 2], sources
+    # 600 个极短分片合并后，每个输出分片仍映射到区间首片
+    tiny = ["文" * 29 for _ in range(600)]
+    merged = knowledge_admin._restore_pieces_with_sources(tiny, "")
+    assert len(merged) < 600
+    merged_sources = [source for _, source in merged]
+    assert all(
+        source is not None and 0 <= source < 600 for source in merged_sources
+    )
+    assert merged_sources == sorted(merged_sources)
+    print("✓ 还原分片保留来源下标（逐片元数据可对齐）")
+
+
+def test_import_rejects_nul_content_and_metadata(monkeypatch):
+    """导入 / CLI 与面板同口径拒绝 NUL：否则片段永远无法在面板保存。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    result = knowledge_admin.import_documents(
+        [
+            {"content": "正常内容", "metadata": {}},
+            {"content": "前" + chr(0) + "后", "metadata": {}},
+            {"content": "正常", "metadata": {"title": "含" + chr(0) + "NUL"}},
+        ],
+        dry_run=True,
+        ignore_existing=True,
+    )
+    assert result["skipped_invalid"] == 2, result
+    with pytest.raises(ValueError, match="NUL"):
+        knowledge_admin._chunk_documents("内容" + chr(0), {})
+    print("✓ 导入 / 写入拒绝 NUL（与面板同口径）")
+
+
+def test_update_document_crlf_saved_from_panel_is_unchanged(monkeypatch):
+    """库内 CRLF + 面板 LF 基线：原样保存命中 unchanged，不误报 409。"""
+    from pathlib import Path
+
+    crlf = "导入第一行" + chr(13) + chr(10) + "导入第二行"
+    rows = [{"id": 7, "content": crlf, "metadata": "{}"}]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def __init__(self):
+            self.updated = None
+
+        def update_document(self, doc_id, content, metadata):
+            self.updated = (doc_id, content, metadata)
+            return {"status": "success", "id": doc_id}
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    lf = "导入第一行" + chr(10) + "导入第二行"
+    result = knowledge_admin.update_document(
+        7,
+        lf,
+        {},
+        expect_content=lf,
+        expect_parts=1,
+        expect_group="",
+    )
+    assert result.get("unchanged") is True, result
+    assert agent.updated is None, "原样保存不应重切 / 重嵌入"
+    # 只改分类：以 LF 重新入库（新内容不再含 CR）
+    result2 = knowledge_admin.update_document(
+        7,
+        lf,
+        {"category": "新分类"},
+        expect_content=lf,
+        expect_parts=1,
+        expect_group="",
+    )
+    assert result2.get("status") == "success"
+    assert chr(13) not in agent.updated[1]
+    print("✓ CRLF 片段经面板保存不再误报冲突")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -3682,6 +3887,7 @@ if __name__ == "__main__":
     test_load_collection_failure_is_non_fatal()
     test_iter_all_rows_closes_iterator_even_on_error()
     test_restore_pieces_fallbacks()
+    test_restore_pieces_keep_per_piece_metadata_by_source()
     test_regroup_keeps_non_dict_items()
     test_meta_int_handles_non_finite_metadata()
     test_regroup_tolerates_non_finite_part_metadata()
@@ -3703,6 +3909,11 @@ if __name__ == "__main__":
         test_chunk_documents_overrides_stale_part_metadata,
         test_update_document_rejects_multipart_edit,
         test_update_document_replaces_grouped_multipart,
+        test_update_document_rejects_stale_expect_metadata,
+        test_update_document_preserves_per_part_metadata,
+        test_import_group_existing_as_ungrouped_pieces_is_duplicate,
+        test_import_rejects_nul_content_and_metadata,
+        test_update_document_crlf_saved_from_panel_is_unchanged,
         test_update_grouped_add_failure_keeps_old_content,
         test_update_grouped_update_failure_rolls_back_extras,
         test_chunk_documents_marks_even_with_full_metadata,

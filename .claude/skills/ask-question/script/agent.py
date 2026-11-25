@@ -74,6 +74,7 @@ from utils.hybrid_retrieval import (
     bm25_cache_epoch,
     invalidate_bm25_cache,
     rrf_fuse,
+    tokenize,
 )
 from utils.log_redact import redact_paths
 from utils.user_query import extract_user_query
@@ -512,6 +513,48 @@ class RAGKnowledgeAgent(AgentBase):
         """
         return next_entity_id(self.milvus_client, self.collection_name)
 
+    _QUERY_SENTENCE_RE = re.compile("[。！？!?" + chr(10) + chr(13) + "]+")
+
+    _QUERY_QUESTION_RE = re.compile(r"[？?吗呢多少如何怎么是什么]")
+
+    def _bounded_retrieval_query(self, query: str) -> str:
+        """超长查询按末句（优先含疑问标记）截断后再检索。
+
+        嵌入模型（BGE-small）max_seq_length=512，超长部分被 encode 静默
+        截断；BM25 路的覆盖度分母也随查询长度膨胀。把问题写在一长段
+        闲聊末尾时，向量与关键词两路都检索不到真正的问题。这里用模型
+        自己的 tokenizer 判断是否超窗，超窗时取末句（问题通常在结尾），
+        LLM prompt 仍使用原话。
+        """
+        text = str(query or "").strip()
+        tokenizer = getattr(self.embedding_model, "tokenizer", None)
+        if not text or tokenizer is None:
+            return text
+        try:
+            max_len = int(getattr(self.embedding_model, "max_seq_length", 512) or 512)
+            tokens = tokenizer.tokenize(text)
+        except Exception:  # noqa: BLE001 - 无法判定时保持原查询
+            return text
+        if len(tokens) <= max_len - 2:
+            return text
+        parts = [
+            part.strip()
+            for part in self._QUERY_SENTENCE_RE.split(text)
+            if part.strip()
+        ]
+        if not parts:
+            return text
+        question_parts = [p for p in parts if self._QUERY_QUESTION_RE.search(p)]
+        chosen = question_parts[-1] if question_parts else parts[-1]
+        if len(chosen) > 200:
+            chosen = chosen[-200:]
+        logger.warning(
+            "查询超过嵌入模型上下文（%d tokens），改用末句检索: %s",
+            len(tokens),
+            chosen[:50],
+        )
+        return chosen
+
     def search_knowledge(
         self,
         query: str,
@@ -551,6 +594,10 @@ class RAGKnowledgeAgent(AgentBase):
                 raise ValueError("查询内容为空")
             return []
         query = str(query)
+        # 超长查询取末句（替身 / 旧实例没有该 helper 时保持原查询）
+        _bounded = getattr(self, "_bounded_retrieval_query", None)
+        if callable(_bounded):
+            query = _bounded(query)
 
         load_error: Exception | None = None
         try:
@@ -909,6 +956,8 @@ class RAGKnowledgeAgent(AgentBase):
             "missing_parts",
             "retrieved_parts",
             "parts_abnormal",
+            # 检索侧生成的「命中片段」快照：同名的用户元数据不能冒充
+            "snippet",
         }
         grouped: dict[str, list[tuple[int, dict]]] = {}
         assembled: list[dict] = []
@@ -953,6 +1002,8 @@ class RAGKnowledgeAgent(AgentBase):
             best_score = 0.0
             best_rerank: float | None = None
             base_meta: dict = {}
+            best_doc: dict | None = None
+            best_doc_rank = float("-inf")
             declared = 0
             for part, doc in parts:
                 if part in seen_parts:
@@ -960,14 +1011,26 @@ class RAGKnowledgeAgent(AgentBase):
                 seen_parts.add(part)
                 metadata = doc.get("metadata")
                 metadata = metadata if isinstance(metadata, dict) else {}
+                # 组内「最佳分片」：有精排分看精排，否则看向量相似度；
+                # 拼装正文仍按 part 升序，但参考来源（标题 / 命中片段）
+                # 必须来自证据所在的分片，否则会引用到无关章节
+                doc_rank = float(doc.get("distance") or 0.0)
+                rerank_value = doc.get("rerank_score")
+                if rerank_value is not None:
+                    try:
+                        doc_rank = float(rerank_value) + 2.0
+                    except (TypeError, ValueError):
+                        pass
+                if best_doc is None or doc_rank > best_doc_rank:
+                    best_doc = doc
+                    best_doc_rank = doc_rank
                 try:
                     declared = max(declared, int(metadata.get("parts") or 0))
                 except (TypeError, ValueError, OverflowError):
                     pass
                 if not base_meta:
-                    # 保留首片的业务元数据（title/category/parent_doc…）：
-                    # 只留 group/parts 会让回答的「参考来源」消失或指错文档；
-                    # 检索侧内部键（含 missing_parts）一律不保留
+                    # 兜底：首个带业务元数据的分片（title/category/
+                    # parent_doc…）——最佳分片缺这些键时使用
                     base_meta = {
                         key: value
                         for key, value in metadata.items()
@@ -1001,7 +1064,21 @@ class RAGKnowledgeAgent(AgentBase):
                 # 直接打爆内存——按实际取回片数收尾，缺片信息放弃
                 # （检索上下文不承担修复职责）
                 total_parts = len(seen_parts)
-            assembled_meta = dict(base_meta)
+            # 参考来源优先取「证据所在分片」（best_doc）的业务元数据，
+            # 缺失的键用首个带元数据分片补齐：此前固定取 part 最小的
+            # 分片，命中 Part 5 的答案会标注成 Part 1 的标题
+            best_meta: dict = {}
+            snippet = ""
+            if best_doc is not None:
+                best_metadata = best_doc.get("metadata")
+                if isinstance(best_metadata, dict):
+                    best_meta = {
+                        key: value
+                        for key, value in best_metadata.items()
+                        if key not in internal_keys
+                    }
+                snippet = str(best_doc.get("content") or "").strip()
+            assembled_meta = {**base_meta, **best_meta}
             assembled_meta.update(
                 {
                     "group": group_id,
@@ -1029,6 +1106,9 @@ class RAGKnowledgeAgent(AgentBase):
                 "content": "\n".join(texts),
                 "metadata": assembled_meta,
                 "distance": best_score,
+                # 命中分片的原文快照：参考片段展示用（content 是整篇拼接，
+                # 其前缀通常是 part 1，不是证据所在段落）
+                "snippet": snippet,
             }
             if best_rerank is not None:
                 assembled_doc["rerank_score"] = best_rerank
@@ -1157,27 +1237,62 @@ class RAGKnowledgeAgent(AgentBase):
             ]
 
         retrieved_docs = _above_threshold(retrieved_docs)
-        if not retrieved_docs:
-            # 无命中重检索（v2.0）：疑问 / 客套词会稀释向量相似度；去掉
-            # 后再检一次，仍无命中才按「没有相关信息」拒答。二次检索失败
-            # 不升级成错误——首轮已经成功，只是没有可用片段
-            simplified = _simplify_retrieval_query(user_query)
-            if simplified and simplified != str(user_query).strip():
-                try:
-                    retried = await asyncio.to_thread(
-                        self.search_knowledge,
-                        simplified,
-                        None,
-                        True,
-                        hybrid=True,
-                        min_distance=min_score,
+
+        def _covers_query(docs: list[dict], query: str) -> bool:
+            """首轮命中是否覆盖简化查询的内容词。
+
+            0.5–0.7 的擦边片段可能完全不相关（分数重叠），它们非空会
+            阻断「疑问词稀释查询」的救援重检；命中内容与简化查询词零
+            交集时按未命中处理。
+            """
+            terms = set(tokenize(_simplify_retrieval_query(query)))
+            if not terms:
+                return bool(docs)
+            return any(
+                terms & set(tokenize(doc.get("content") or "")) for doc in docs
+            )
+
+        simplified = _simplify_retrieval_query(user_query)
+        needs_retry = not retrieved_docs or not _covers_query(
+            retrieved_docs, user_query
+        )
+        if (
+            simplified
+            and simplified != str(user_query).strip()
+            and needs_retry
+        ):
+            # 重检索（v2.0）：疑问 / 客套词会稀释向量相似度；去掉后再检
+            # 一次，仍无命中才按「没有相关信息」拒答。二次检索失败不升级
+            # 成错误——首轮已经成功，只是没有可用片段
+            try:
+                retried = await asyncio.to_thread(
+                    self.search_knowledge,
+                    simplified,
+                    None,
+                    True,
+                    hybrid=True,
+                    min_distance=min_score,
+                )
+            except Exception as exc:  # noqa: BLE001 - 重检索失败按无结果
+                logger.warning("简化查询重检索失败: %s", exc)
+            else:
+                retried = _above_threshold(retried)
+                if retried:
+                    merged = {
+                        str(doc.get("id")): doc for doc in retrieved_docs
+                    }
+                    for doc in retried:
+                        key = str(doc.get("id"))
+                        current = merged.get(key)
+                        if current is None or float(
+                            doc.get("distance") or 0.0
+                        ) > float(current.get("distance") or 0.0):
+                            merged[key] = doc
+                    retrieved_docs = list(merged.values())
+                    logger.info(
+                        "首轮命中未覆盖查询内容词，简化查询重检索补充 %d 条",
+                        len(retried),
                     )
-                except Exception as exc:  # noqa: BLE001 - 重检索失败按无结果
-                    logger.warning("简化查询重检索失败: %s", exc)
-                else:
-                    retrieved_docs = _above_threshold(retried)
-                    if retrieved_docs:
-                        logger.info("首次检索无命中，简化查询重检索成功")
         # 多分片文档按 group/part 拼回整篇：相似度排序会把整篇拆散、
         # 低分分片被阈值过滤后还会缺片，直接逐条注入可能重复或乱序
         retrieved_docs = self._assemble_grouped_documents(retrieved_docs)
@@ -1293,11 +1408,18 @@ class RAGKnowledgeAgent(AgentBase):
             "answer": answer,
             "retrieved_documents": [
                 {
-                    "content": doc['content'][:200] + "..." if len(doc['content']) > 200 else doc['content'],
-                    "metadata": doc['metadata']
+                    # 参考片段取「命中分片」的原文：多分片文档的 content
+                    # 是整篇拼接，其前缀通常是 part 1 而不是证据段
+                    "content": (
+                        str(doc.get("snippet") or doc.get("content") or "")[:200]
+                        + "..."
+                        if len(str(doc.get("snippet") or doc.get("content") or "")) > 200
+                        else str(doc.get("snippet") or doc.get("content") or "")
+                    ),
+                    "metadata": doc["metadata"],
                 }
                 for doc in retrieved_docs
-            ]
+            ],
         }
         if answer_error:
             result["error"] = f"生成答案失败：{answer_error}"

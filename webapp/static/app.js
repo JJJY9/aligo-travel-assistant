@@ -5435,6 +5435,9 @@ function failedIdsText(failed) {
 async function runKbDedupe() {
   if (!els.kbDedupe) return;
   const seq = (kbActionResultSeq += 1);
+  // 删除请求是否已发出：超时 / 断连时服务端可能已部分或全部删除，
+  // 必须区分「未执行」与「结果未知」（与导入路径同口径）
+  let deleteSent = false;
   els.kbDedupe.disabled = true;
   els.kbDedupe.setAttribute("aria-busy", "true");
   els.kbDedupe.textContent = "检查中…";
@@ -5463,6 +5466,7 @@ async function runKbDedupe() {
     );
     if (!ok) return; // 取消不覆盖之前的结果（用户可能正在看重复列表）
     els.kbDedupe.textContent = "清理中…";
+    deleteSent = true;
     const result = await getJSON("/api/knowledge/duplicates/cleanup", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -5512,9 +5516,30 @@ async function runKbDedupe() {
     ]);
     if (stale) toast(summary);
   } catch (error) {
+    // 删除已发出但没有明确响应（超时 / 断连 / 代理 5xx 无 JSON）：
+    // cleanup_duplicate_contents 在写锁内不可取消，可能已部分或全部删除。
+    // 429 / 503 只会在删除开始前返回（限流 / 写锁忙 / 库缺失），
+    // 按普通失败处理；预览（dry_run）阶段的失败不涉及删除。
+    const status = Number((error && error.status) || 0);
+    const unknownOutcome =
+      deleteSent && (!status || (status >= 500 && status !== 503));
+    const suffix = unknownOutcome
+      ? "（服务端可能已部分或全部删除，已刷新）"
+      : "";
     if (seq === kbActionResultSeq && els.kbEvalResult) {
       els.kbEvalResult.hidden = false;
-      els.kbEvalResult.textContent = `清理重复失败：${error.message}`;
+      els.kbEvalResult.textContent = `清理重复失败：${error.message}${suffix}`;
+    } else if (unknownOutcome) {
+      toast(`${error.message}${suffix}`);
+    }
+    if (unknownOutcome) {
+      await Promise.all([
+        refreshKnowledge(),
+        refreshKnowledgeDocuments({
+          refreshCategories: true,
+          silentFailure: true,
+        }),
+      ]);
     }
   } finally {
     els.kbDedupe.disabled = false;
@@ -5736,6 +5761,9 @@ async function startEditKnowledge(doc) {
   // 乐观并发快照：保存时随 PUT 提交，服务端写锁内比对（并发编辑 409）
   state.kbEditExpectParts = groupParts > 1 ? Number(groupParts) : 1;
   state.kbEditExpectGroup = groupParts > 1 ? String(group || "") : "";
+  // 元数据快照：另一会话只改分类 / 标题时保存也要 409，而不是把对方
+  // 的修改用旧快照静默改回
+  state.kbEditExpectMetadata = { ...(doc.metadata || {}) };
   // 保留完整 metadata：PUT 会整体覆盖，只回填分类会丢掉 title / source 等字段
   state.kbEditingMetadata = { ...(doc.metadata || {}) };
   // 与后端 JOINED_MAX_CHARS（文档 20000 字 + 分片分隔符余量 100）对齐，
@@ -5767,6 +5795,7 @@ function resetKnowledgeForm({ clear = true } = {}) {
   state.kbEditingGroupParts = 0;
   state.kbEditExpectParts = null;
   state.kbEditExpectGroup = null;
+  state.kbEditExpectMetadata = null;
   els.kbContent.maxLength = 2000;
   els.kbContent.placeholder = "新增知识片段，例如：一线城市住宿标准为每晚 600 元";
   els.kbSubmit.textContent = "添加片段";
@@ -5775,6 +5804,21 @@ function resetKnowledgeForm({ clear = true } = {}) {
     els.kbContent.value = "";
     els.kbCategory.value = "";
   }
+}
+
+function kbFormDirty() {
+  // 知识表单是否有未保存草稿（新增：有内容即草稿；编辑：正文偏离基线
+  // 或分类与载入时不同）。切换用户会 resetKnowledgeForm 清空表单，
+  // 与聊天行内编辑同口径先确认，避免静默丢数据。
+  const contentValue = els.kbContent.value;
+  const contentDirty =
+    contentValue.trim() &&
+    (state.kbEditingId === null || contentValue !== state.kbEditBaseline);
+  const categoryDirty =
+    state.kbEditingId !== null &&
+    els.kbCategory.value.trim() !==
+      String((state.kbEditingMetadata && state.kbEditingMetadata.category) || "");
+  return Boolean(contentDirty || categoryDirty);
 }
 
 async function addKnowledgeDocument(event) {
@@ -5818,6 +5862,7 @@ async function addKnowledgeDocument(event) {
                 expect: state.kbEditBaseline,
                 expect_parts: state.kbEditExpectParts,
                 expect_group: state.kbEditExpectGroup,
+                expect_metadata: state.kbEditExpectMetadata,
               }
             : {}),
         }),
@@ -6296,7 +6341,7 @@ async function saveUser() {
     return;
   }
   if (value !== state.userId) {
-    if (document.querySelector(".user-edit-input")) {
+    if (document.querySelector(".user-edit-input") || kbFormDirty()) {
       if (!window.confirm("正在编辑的修改尚未保存，切换用户将丢弃修改。继续？")) {
         return;
       }
