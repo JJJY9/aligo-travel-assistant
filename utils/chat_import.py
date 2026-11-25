@@ -71,7 +71,6 @@ def prepare_import_messages(
         session_key = session_dedupe_key(message.get("session_id"))
         if keys[index]:
             timestamp = message.get("timestamp")
-            previous[session_key] = keys[index]
         else:
             previous_key = previous.get(session_key, "")
             next_key = next_keys[index]
@@ -82,6 +81,14 @@ def prepare_import_messages(
                 timestamp = next_key if role == "user" else previous_key
             else:
                 timestamp = previous_key or next_key or fallback
+        # 用「生效锚点」推进 previous：无时间戳的回答要继承其提问借到的
+        # 同一侧锚点，否则同一轮会被拆到 previous/next 两侧，回答排到
+        # 提问之前（违背本模块的提问在前保证）。自带时间戳与借用邻居时
+        # 锚点保持 UTC 键口径（宽度预检依赖）；两侧都无锚点时存 fallback
+        # 原串，连续消息保持同一文本，落库形状体积与旧口径一致
+        anchor = keys[index] or str(timestamp or "")
+        if anchor:
+            previous[session_key] = anchor
         prepared.append({**message, "timestamp": timestamp})
     return prepared
 

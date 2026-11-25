@@ -1282,10 +1282,10 @@ class PostgresLongTermMemory:
         rows = self._fetchall(
             "SELECT id, role, content, created_at FROM aligo_chat_messages "
             "WHERE user_id = %s AND session_id = %s "
-            # 与 get_chat_history(limit) 同口径排除未来时间戳：否则导入的
-            # 2030 行会一直被当作「最后一轮」，用户真实最新一轮无法编辑 /
-            # 重新生成（expect 也对不上）
-            "AND created_at <= now() + interval '1 hour' "
+            # 不再排除未来时间戳：界面（get_chat_history 无 limit）会展示
+            # 导入的 2030 行并把它当最后一轮，这里排除会让「编辑 / 重新
+            # 生成」删到更早的真实轮次（expect 永远 mismatch）。只保留
+            # 读取侧（limit）的未来过滤，供会话总结 / 短期回填窗口使用
             "ORDER BY created_at DESC, id DESC LIMIT 2",
             (self.user_id, session_id),
         )

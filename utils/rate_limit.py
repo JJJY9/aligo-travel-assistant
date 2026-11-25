@@ -81,6 +81,12 @@ redis.call('PEXPIRE', key, math.ceil(window * 1000) + 1000)
 return '-1'
 """
 
+_REFUND_SCRIPT = """
+local key = KEYS[1]
+redis.call('ZREMRANGEBYRANK', key, -1, -1)
+return 1
+"""
+
 _STATUS_SCRIPT = """
 local key = KEYS[1]
 local window = tonumber(ARGV[1])
@@ -210,6 +216,21 @@ class RateLimiter:
 
             events.append(now)
             return None
+
+    def refund(self, key: str) -> None:
+        """归还最近一次 :meth:`check` 记录的额度（罕见竞态分支专用）。
+
+        用于「已记账、但随后零 LLM 开销地拒绝」的路径（如锁内二次熔断
+        复核），避免重试者在服务恢复后仍被 429 锁在滑动窗口里。并发下
+        弹出的是该桶最近一个事件，语义为「归还一单位额度」。
+        """
+        with self._lock:
+            events = self._events.get(key)
+            if not events:
+                return
+            events.pop()
+            if not events:
+                self._events.pop(key, None)
 
     def peek(self, key: str) -> float | None:
         """不记录请求，返回现在发起请求会被限流的 Retry-After（否则 None）。
@@ -399,6 +420,16 @@ class RedisRateLimiter:
         if result is None:
             return self._fallback.peek(key)
         return self._retry_after(result)
+
+    def refund(self, key: str) -> None:
+        """归还最近一次 :meth:`check` 记录的额度（罕见竞态分支专用）。
+
+        Redis 后端删除该键分数最高（最新）的成员；同窗口内其它请求的
+        事件按「归还一单位额度」近似处理。Redis 不可用时退还进程内桶。
+        """
+        result = self._eval(_REFUND_SCRIPT, key)
+        if result is None:
+            self._fallback.refund(key)
 
     def probe(self) -> bool:
         """主动探测 Redis 限流是否已恢复；未降级时直接返回 True。

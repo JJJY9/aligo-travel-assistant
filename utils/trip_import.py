@@ -881,3 +881,41 @@ def trip_export_roundtrip_problems(
         _, errors = parse_trips_csv(text, max_rows=None)
     total = int(getattr(errors, "total", len(errors)))
     return total, list(errors[:3])
+
+
+# 面板导入阈值（与 webapp/server.py 的 TripImportPayload / app.js 一致）：
+# 导出端按合法数据渲染、不做导入上限预检，超过阈值时导出仍成功，但同一
+# 面板或 CLI 回导会被整份拒绝——必须提前告知，不能把「导出成功」当成
+# 「备份可用」。
+WEB_IMPORT_MAX_CHARS = 500_000
+WEB_IMPORT_MAX_BYTES = 2 * 1024 * 1024
+
+
+def trip_export_import_limit(text: str) -> str:
+    """导出文本超过哪一级导入上限：``"cli"`` / ``"panel"`` / ``""``。
+
+    只读判断，不改变导出字节，也不抛异常（超限导出仍必须成功）。
+    行数上限（5000）由导入解析器在回导时检查；这里按字符与字节的最严
+    门槛提示，避免为提示再解析一遍超大文件。
+    """
+    chars = len(text)
+    if chars > _MAX_IMPORT_CHARS:
+        return "cli"
+    if chars > WEB_IMPORT_MAX_CHARS or len(
+        text.encode("utf-8")
+    ) > WEB_IMPORT_MAX_BYTES:
+        return "panel"
+    return ""
+
+
+def trip_export_import_limit_note(level: str) -> str:
+    """把 :func:`trip_export_import_limit` 的级别转成 CLI / 面板提示文案。"""
+    if level == "cli":
+        return (
+            f"导出文件超过 CLI 单次导入上限（{_MAX_IMPORT_CHARS} 字符），"
+            "回导会被整份拒绝，请拆分后用 CLI 导入，或用 JSON 备份恢复"
+        )
+    return (
+        f"导出文件超过面板导入上限（{WEB_IMPORT_MAX_CHARS} 字符 / 2MB），"
+        "面板回导会被拒收，请用 CLI 导入或 JSON 备份恢复"
+    )

@@ -29,12 +29,26 @@ class _FakeRedis:
         self.values: dict[str, str] = {}
 
     def eval(self, script, numkeys, *keys_and_args):
-        """模拟纪元脚本（INCR + EXPIRE 原子完成，无 incr/expire 两条命令）。"""
+        """按脚本内容模拟：纪元 INCR+EXPIRE / 墓碑 compare-and-delete。"""
         if self.fail:
             raise ConnectionError("redis down")
         args = list(keys_and_args)
         self.eval_calls.append((script, args))
         key = args[0]
+        if "ZREMRANGEBYRANK" in script:
+            return 1
+        if "redis.call('DEL'" in script:
+            expected = args[1]
+            current = self.values.get(key)
+            text = (
+                current.decode()
+                if isinstance(current, bytes)
+                else current
+            )
+            if text == expected:
+                self.values.pop(key, None)
+                return 1
+            return 0
         value = int(self.values.get(key, "0")) + 1
         self.values[key] = str(value)
         self.ttls[key] = int(args[1])
@@ -323,6 +337,23 @@ def test_epoch_bump_is_atomic_script(monkeypatch):
     print("✓ 会话纪元原子推进（单脚本 INCR + EXPIRE）")
 
 
+def test_reassert_overwrites_shared_tombstone(monkeypatch):
+    """成功删除方重写墓碑：先到者按旧 token 回滚不再删掉删除保护。"""
+    client = _FakeRedis()
+    _use_client(monkeypatch, client)
+    client.values["aligo:deleted:u1:s1"] = "first"
+    assert (
+        tombstones.reassert_session_deleted("u1", "s1", "second") is True
+    )
+    assert client.values["aligo:deleted:u1:s1"] == "second"
+    assert (
+        tombstones.unmark_session_deleted("u1", "s1", source="first") is False
+    )
+    assert client.values["aligo:deleted:u1:s1"] == "second"
+    assert tombstones.unmark_session_deleted("u1", "s1", source="second") is True
+    print("✓ 重写墓碑后旧 token 的回滚不再命中")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -346,6 +377,7 @@ if __name__ == "__main__":
         test_unmark_failure_paths,
         test_unmark_accepts_bytes_value,
         test_epoch_bump_is_atomic_script,
+        test_reassert_overwrites_shared_tombstone,
     ):
         mp = pytest.MonkeyPatch()
         try:

@@ -105,6 +105,7 @@ from utils.paths import default_data_root
 from utils.preference_values import has_preference_value
 from utils.rate_limit import CapacityRetry, create_rate_limiter
 from utils.session_ids import RESERVED_SESSION_IDS
+from utils.session_title import session_title_from_content
 from utils.redis_lock import DistributedLock
 from utils.stored_message import render_stored_message
 from utils.session_html import render_all_sessions_html, render_session_html
@@ -132,6 +133,7 @@ from utils.trip_export import (
 from utils.trip_import import (
     import_trips_from_text,
     normalize_identity_date,
+    trip_export_import_limit,
     trip_export_roundtrip_problems,
     trip_skip_label,
 )
@@ -2648,6 +2650,23 @@ def _enforce_rate_limit(
     }
 
 
+def _refund_rate_limit(
+    state: AligoWebApp, user_id: str, request: Request
+) -> None:
+    """归还一次对话限流额度（锁内二次熔断拒绝时使用）。
+
+    ``_enforce_rate_limit`` 在两个桶里各记录一次；熔断在入口预检之后、
+    锁内复核之前打开时，本请求没有发生任何 LLM 调用，额度不能留在滑动
+    窗口里——否则连续重试会耗尽默认额度，服务恢复后仍被 429。
+    """
+    client = _rate_identity(_client_host(request))
+    try:
+        state.rate_limiter.refund(f"{client}:{user_id}")
+        state.ip_limiter.refund(client)
+    except Exception:  # noqa: BLE001 - 归还是尽力而为
+        logger.warning("归还对话限流额度失败", exc_info=True)
+
+
 def _rate_limited_exception(
     request: Request,
     message: str,
@@ -3569,20 +3588,12 @@ def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
 
 
 def _session_title_from_content(content: object) -> str:
-    """会话标题：折叠空白后取前 40 字符，只扫描到足够长度即停止。
+    """会话标题：折叠空白后取前 40 字符（实现见 utils/session_title）。
 
-    导入允许 50MB 级消息；对整条大消息做 ``split()`` 会生成数千万项
-    中间列表（数百 MB~GB 内存、秒级 CPU）。标题只需要前 40 个归一化
-    字符，按 ``\\S+`` 惰性扫描到够长即停止，内存与耗时只和标题前缀有关；
-    输出与 ``" ".join(str(content).split())[:40]`` 完全一致。
+    保留本模块别名：既有测试与内部调用按 ``server._session_title_from_content``
+    访问；实现下沉到 utils 供 CLI / 会话导出共用同一惰性扫描。
     """
-    result = ""
-    for match in re.finditer(r"\S+", str(content or "")):
-        piece = (" " if result else "") + match.group(0)
-        if len(result) + len(piece) >= 40:
-            return (result + piece)[:40]
-        result += piece
-    return result[:40]
+    return session_title_from_content(content)
 
 
 def _id_set(values: list[str] | None) -> set[str]:
@@ -3640,6 +3651,10 @@ def _group_sessions(
     # 仅标题命中的会话也拿不到 snippet / match_index
     raw_query = query.strip()
     tz_epoch = _tz_epoch()
+    # 归档集合提前到消息循环前：搜索时「当前视图下必被过滤」的会话不必
+    # 渲染助手消息（_message_search_text 要做 json.loads + Markdown 渲染，
+    # 大账号 / archived=1 子请求会因此把全部非归档消息各渲染一遍）
+    archived_ids = _id_set(archived)
     grouped: dict[str, dict[str, Any]] = {}
     # 每条消息的行内时间戳只解析一次：/api/sessions 每次请求都重新聚合全量
     # 历史，原实现对同一个最新时间戳反复 fromisoformat，几十万条消息时 CPU
@@ -3674,11 +3689,16 @@ def _group_sessions(
             if title:
                 entry["title"] = title
         if raw_query and "snippet" not in entry:
-            snippet = _match_snippet(_message_search_text(message), raw_query)
-            if snippet:
-                entry["snippet"] = snippet
-                # 会话内消息序号（0 起），供前端打开会话时定位到命中消息
-                entry["match_index"] = entry["message_count"] - 1
+            # 与输出阶段的 archived 过滤同口径：当前视图下必被过滤掉的
+            # 会话不参与搜索渲染，响应逐字段不变
+            if (str(session_id) in archived_ids) == (archived_mode == "only"):
+                snippet = _match_snippet(
+                    _message_search_text(message), raw_query
+                )
+                if snippet:
+                    entry["snippet"] = snippet
+                    # 会话内消息序号（0 起），供前端打开会话时定位到命中消息
+                    entry["match_index"] = entry["message_count"] - 1
 
     if live_session_ids is not None:
         # 聚合后的会话集合即列表可见集合（已按 None / 空白串 / 保留字过滤），
@@ -3704,7 +3724,6 @@ def _group_sessions(
             entry["title"] = custom
 
     pinned_ids = _id_set(pinned)
-    archived_ids = _id_set(archived)
     for entry in sessions:
         entry["pinned"] = entry["session_id"] in pinned_ids
         entry["archived"] = entry["session_id"] in archived_ids
@@ -5679,6 +5698,11 @@ def create_app(model: Any = None) -> FastAPI:
                     state.unmark_deleted, user_id, session_id, token
                 )
             await asyncio.to_thread(state.drop_session, user_id, session_id)
+            # 幂等缓存里的成功响应也属于该会话：不清理的话，删除后用同键
+            # 重试会回放已删除会话的答案（客户端以为仍可继续使用）
+            await asyncio.to_thread(
+                state.idempotency.discard_session, user_id, session_id
+            )
             await asyncio.to_thread(clear_short_term_session, session_id, user_id)
             # 检查点里是子智能体结果（含用户数据）：会话删除后不等 TTL
             await asyncio.to_thread(
@@ -5759,6 +5783,12 @@ def create_app(model: Any = None) -> FastAPI:
                 return {"session_id": session_id, "removed": 0, "mismatch": True}
 
             if removed > 0:
+                # 删除最后一轮不落会话墓碑：只有清掉幂等缓存才能阻止旧答案
+                # 在「编辑后重发」时被同键回放
+                await asyncio.to_thread(
+                    state.idempotency.discard_session, user_id, session_id
+                )
+
                 def _truncate_short_term() -> None:
                     # 短期记忆只是上下文缓存：清理失败不影响已完成的长期记忆删除。
                     # Redis 键按 user_id + session_id 隔离，未缓存的会话也可安全清理。
@@ -5880,6 +5910,9 @@ def create_app(model: Any = None) -> FastAPI:
                 # 入口预检到锁内之间缓存可能过期 / 被淘汰，熔断也可能已
                 # 打开：无幂等键的请求同样要复核，不能把打开期的请求放回
                 # 限流 → 建会话 → ask 的重路径
+                await asyncio.to_thread(
+                    _refund_rate_limit, state, payload.user_id, request
+                )
                 raise HTTPException(
                     status_code=503,
                     detail=(
@@ -5897,6 +5930,20 @@ def create_app(model: Any = None) -> FastAPI:
                             cached.get("message")
                             or "上一请求已处理但响应未送达，请刷新会话历史"
                         ),
+                    )
+                cached_session_id = str(
+                    cached.get("session_id") or payload.session_id or ""
+                )
+                cached_deleted: bool = await asyncio.to_thread(
+                    state.is_recently_deleted,
+                    payload.user_id,
+                    cached_session_id,
+                )
+                if cached_session_id and cached_deleted:
+                    # 跨实例：本进程缓存未必被删除方清理，回放前按共享墓碑
+                    # 复核缓存响应所属会话
+                    raise HTTPException(
+                        status_code=404, detail="会话已删除，请开始新对话"
                     )
                 response.headers.update(rate_headers)
                 response.headers["X-Idempotent-Replay"] = "1"
@@ -6118,6 +6165,9 @@ def create_app(model: Any = None) -> FastAPI:
                 # 入口预检到锁内之间缓存可能过期 / 被淘汰、熔断也可能已
                 # 打开：无幂等键的请求同样复核，不让打开期的请求进入
                 # 限流后的重路径
+                await asyncio.to_thread(
+                    _refund_rate_limit, state, payload.user_id, request
+                )
                 raise HTTPException(
                     status_code=503,
                     detail=(
@@ -6130,6 +6180,16 @@ def create_app(model: Any = None) -> FastAPI:
                     cached_session_id = str(
                         cached.get("session_id") or payload.session_id or ""
                     )
+                    cached_deleted: bool = await asyncio.to_thread(
+                        state.is_recently_deleted,
+                        payload.user_id,
+                        cached_session_id,
+                    )
+                    if cached_session_id and cached_deleted:
+                        raise HTTPException(
+                            status_code=404,
+                            detail="会话已删除，请开始新对话",
+                        )
 
                     replay_state = {"terminal_delivered": False}
 
@@ -6788,6 +6848,9 @@ def create_app(model: Any = None) -> FastAPI:
         # 回导自检：用真实导入解析器复核渲染结果（字段超长等会被导入端
         # 拒绝），与 CLI trips-export 的告警同源
         unimportable, _ = trip_export_roundtrip_problems(content, is_ics=True)
+        # 导出按合法数据渲染、不受导入上限约束：超过时导出仍成功，但回导
+        # 会被整份拒绝——响应头告知面板（"" 时省略）
+        export_limit = trip_export_import_limit(content)
         safe_user = _safe_filename(user_id, "user")
         return Response(
             content=content,
@@ -6799,6 +6862,11 @@ def create_app(model: Any = None) -> FastAPI:
                 "X-Aligo-Export-Skipped": str(skipped),
                 "X-Aligo-Export-Truncated-End": str(truncated_end),
                 "X-Aligo-Export-Unimportable": str(unimportable),
+                **(
+                    {"X-Aligo-Export-Over-Limit": export_limit}
+                    if export_limit
+                    else {}
+                ),
                 **rate_headers,
             },
         )
@@ -6851,6 +6919,7 @@ def create_app(model: Any = None) -> FastAPI:
             unimportable, _ = trip_export_roundtrip_problems(
                 content, is_ics=True
             )
+            export_limit = trip_export_import_limit(content)
             return Response(
                 content=content,
                 media_type="text/calendar; charset=utf-8",
@@ -6861,6 +6930,11 @@ def create_app(model: Any = None) -> FastAPI:
                     "X-Aligo-Export-Skipped": str(skipped),
                     "X-Aligo-Export-Truncated-End": str(truncated_end),
                     "X-Aligo-Export-Unimportable": str(unimportable),
+                    **(
+                        {"X-Aligo-Export-Over-Limit": export_limit}
+                        if export_limit
+                        else {}
+                    ),
                     **rate_headers,
                 },
             )
@@ -6879,6 +6953,7 @@ def create_app(model: Any = None) -> FastAPI:
         # 与 CLI trips-export 同一回导自检：日期非法 / 倒置、字段超长的行
         # 导入时会被整行拒绝，导出侧必须提前暴露（只读解析，不改导出字节）
         unimportable, _ = trip_export_roundtrip_problems(content, is_ics=False)
+        export_limit = trip_export_import_limit(content)
         return Response(
             content=content,
             media_type="text/csv; charset=utf-8",
@@ -6887,6 +6962,11 @@ def create_app(model: Any = None) -> FastAPI:
                     f'attachment; filename="aligo_{safe_user}_trips.csv"'
                 ),
                 "X-Aligo-Export-Unimportable": str(unimportable),
+                **(
+                    {"X-Aligo-Export-Over-Limit": export_limit}
+                    if export_limit
+                    else {}
+                ),
                 **rate_headers,
             },
         )

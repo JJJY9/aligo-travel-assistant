@@ -663,3 +663,26 @@ def test_idempotent_import_without_reorder_does_not_rewrite(monkeypatch):
         print("✓ 无变化的幂等恢复不重写文件")
     finally:
         store._close() if hasattr(store, "_close") else None
+
+
+def test_prepare_import_keeps_untimestamped_round_together():
+    """整轮都缺时间戳时，回答继承提问借到的同一锚点，不再倒挂。"""
+    rows = [
+        {"role": "user", "content": "P1", "session_id": "s1",
+         "timestamp": "2026-01-01T10:00:00"},
+        {"role": "assistant", "content": "A1", "session_id": "s1",
+         "timestamp": "2026-01-01T10:01:00"},
+        {"role": "user", "content": "P2", "session_id": "s1",
+         "timestamp": ""},
+        {"role": "assistant", "content": "A2", "session_id": "s1",
+         "timestamp": ""},
+        {"role": "user", "content": "P3", "session_id": "s1",
+         "timestamp": "2026-01-01T12:00:00"},
+    ]
+    prepared = prepare_import_messages(rows)
+    keys = [chronological_key(item["timestamp"]) for item in prepared]
+    assert keys == sorted(keys), keys
+    p2_key = keys[2]
+    a2_key = keys[3]
+    assert a2_key == p2_key, (p2_key, a2_key)
+    print("✓ 整轮缺时间戳时问答同锚点、顺序不倒挂")

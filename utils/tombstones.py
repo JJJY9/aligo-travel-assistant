@@ -40,6 +40,17 @@ def reset_failure_cache() -> None:
     _failure_until = 0.0
 
 
+# GET 与 DEL 必须原子：先读后删的两步之间，并发的成功删除方可能已用
+# ``reassert_session_deleted`` 把墓碑覆盖为自己的 token，回滚方再按旧
+# token 删除就会抹掉对方唯一的删除保护
+_UNMARK_TOMBSTONE_LUA = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
 def _shared_client(force: bool = False) -> "Any | None":
     """取共享 Redis 客户端；冷却期内或获取失败返回 None。
 
@@ -213,6 +224,37 @@ def is_session_deleted(
         return False
 
 
+def reassert_session_deleted(
+    user_id: str,
+    session_id: str,
+    source: str,
+    ttl_sec: float = DEFAULT_TOMBSTONE_TTL_SEC,
+    force: bool = False,
+) -> bool:
+    """删除已成功执行：用本请求的值覆盖共享墓碑（与 Web 端 reassert 同义）。
+
+    CLI 并发删除同一会话时，后到者的 ``SET NX`` 落败；先到者若因「会话
+    已不存在」回滚，会删掉唯一的共享墓碑。成功删除方在删除后覆盖为自己
+    的值，先到者的回滚因值不匹配不再命中，已删除会话保留删除保护。
+    覆盖只发生在删除成功之后，不会抢占真正需要回滚的墓碑。
+    """
+    global _failure_until
+    client = _shared_client(force=force)
+    if client is None:
+        return False
+    try:
+        client.set(
+            deleted_key(user_id, session_id),
+            source,
+            ex=max(int(ttl_sec), 1),
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 - 墓碑失败不影响删除本身
+        _failure_until = time.monotonic() + _FAILURE_COOLDOWN_SEC
+        logger.warning("重写共享删除墓碑失败：%s", exc)
+        return False
+
+
 def unmark_session_deleted(
     user_id: str, session_id: str, source: str = "", force: bool = False
 ) -> bool:
@@ -220,7 +262,8 @@ def unmark_session_deleted(
 
     与 :func:`mark_session_deleted` 的 SET NX 配对：删除失败（会话仍存在）
     时恢复可写，但不撤销其它实例先写的墓碑（它们代表先发生的删除；Web 端
-    的墓碑值是请求 token，CLI 是 "cli"，互不误删）。
+    的墓碑值是请求 token，CLI 是 "cli"，互不误删）。带 ``source`` 的
+    比对 + 删除在单个 Lua 脚本里原子完成。
     """
     global _failure_until
     client = _shared_client(force=force)
@@ -232,9 +275,7 @@ def unmark_session_deleted(
         if current is None:
             return False
         if source:
-            value = current.decode() if isinstance(current, bytes) else str(current)
-            if value != source:
-                return False
+            return bool(client.eval(_UNMARK_TOMBSTONE_LUA, 1, key, source))
         client.delete(key)
         return True
     except Exception as exc:  # noqa: BLE001 - 撤销失败只影响可写性一会儿

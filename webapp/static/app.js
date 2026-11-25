@@ -211,9 +211,11 @@ function hasValidIdShape(value) {
   // 服务端按码点计数：增补平面字符在 JS 里占两个 UTF-16 单元，按
   // length 判断会把 33 个星形字母这类合法 ID 误拒
   if (!text || Array.from(text).length > 64) return false;
-  // 与服务端 240 字节上限同口径（utils/identifiers.py）：61 个增补平面
-  // 字符 = 244 字节会被所有接口 422，而码点 / 字符集校验仍会放行
-  if (utf8ByteLength(text) > 240) return false;
+  // 与服务端 210 字节上限同口径（utils/identifiers.py）：ID 会拼成
+  // .json.lock / .corrupt-* / .migrate-backup / .import.lock 等派生文件名，
+  // 按最长的损坏备份名（id + 42 字节）给 NAME_MAX=255 留余量；
+  // 53 个增补平面字符 = 212 字节会被所有接口 422
+  if (utf8ByteLength(text) > 210) return false;
   try {
     return /^[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\u200c\u200d-]+$/u.test(text);
   } catch {
@@ -1514,6 +1516,19 @@ async function downloadFromApi(url, fallbackName) {
     if (unimportable > 0) {
       toast(
         `导出文件有 ${unimportable} 项在重新导入时会被跳过（日期非法 / 倒置、字段超长等），请先修正后再迁移`,
+      );
+    }
+    // 导出文件整体超过导入上限：回导会整份被拒（不是部分跳过），
+    // 必须和「回导会被跳过」分开告知
+    const overImportLimit =
+      response.headers.get("x-aligo-export-over-limit") || "";
+    if (overImportLimit === "cli") {
+      toast(
+        "导出文件超过 CLI 单次导入上限（500 万字符），回导会被整份拒绝，请拆分或用 JSON 备份恢复",
+      );
+    } else if (overImportLimit) {
+      toast(
+        "导出文件超过面板导入上限（50 万字符 / 2MB），面板回导会被拒收，请用 CLI 导入或 JSON 备份恢复",
       );
     }
     // 含知识库的备份在恢复时可能跳过无法恢复的旧版 / 残缺片段：
@@ -2853,11 +2868,14 @@ async function loadSessions(query = state.searchQuery, options = {}) {
     // 本请求会早退——快照必须已经与 state.sessions / offset 对齐
     state.sessionsLoadedQuery = state.searchQuery;
     state.sessionsLoadedArchived = state.showArchived;
+    const archivedCount = Number(data.archived_count || 0);
     if (data.archived_count !== undefined) {
-      updateArchivedToggle(Number(data.archived_count));
+      updateArchivedToggle(archivedCount);
     }
-    // 普通视图搜索时提示归档会话中的匹配数量（不把归档内容混进主列表）
-    if (state.searchQuery && !state.showArchived) {
+    // 普通视图搜索时提示归档会话中的匹配数量（不把归档内容混进主列表）。
+    // 没有归档会话时该子请求的 total 必为 0（归档列表是 archived∩live
+    // 的子集），白跑一次全量搜索没有意义
+    if (state.searchQuery && !state.showArchived && archivedCount > 0) {
       const archivedParams = new URLSearchParams({
         user_id: state.userId,
         limit: "1",
@@ -2946,6 +2964,7 @@ async function loadMoreSessions() {
   }
   const viewQuery = state.searchQuery;
   const viewArchived = state.showArchived;
+  const totalBefore = state.sessionTotal;
   const requestId = (sessionsRequestId += 1);
   const params = new URLSearchParams({
     user_id: state.userId,
@@ -2958,6 +2977,14 @@ async function loadMoreSessions() {
     const data = await getJSON(`/api/sessions?${params}`, undefined, 30000);
     if (requestId !== sessionsRequestId) return;
     if (viewQuery !== state.searchQuery || viewArchived !== state.showArchived) return;
+    const totalNum = Number(data.total);
+    if (Number.isFinite(totalNum) && totalNum !== totalBefore) {
+      // 分页期间列表被其它标签页 / CLI 增删：offset 游标已失真（删除靠前
+      // 会话会让「加载更多」永久跳过中间条目），按当前已加载数量从 0
+      // 重取整窗；本页不再并入、也不按取回条数前进
+      await loadSessions(state.searchQuery, { silentFailure: true });
+      return;
+    }
     const seen = new Set(state.sessions.map((session) => session.session_id));
     for (const session of data.sessions || []) {
       if (!seen.has(session.session_id)) {
@@ -2969,7 +2996,6 @@ async function loadMoreSessions() {
     // （去重跳过），但窗口必须继续向前，否则「加载更多」永远停在原地
     state.sessionsOffset += (data.sessions || []).length;
     // total=0 是合法值（其它标签页 / CLI 已删光）：真值判断会把它当缺失
-    const totalNum = Number(data.total);
     if (Number.isFinite(totalNum)) state.sessionTotal = totalNum;
     if (totalNum === 0 && !(data.sessions || []).length) {
       // 服务端确认该查询下已无会话：陈旧行不能继续算「共 N 条」

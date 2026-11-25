@@ -1058,17 +1058,41 @@ class LongTermMemory:
 
         这些修正是破坏性的（非对象消息被丢弃、非数字计数器归零），直接把
         清理后的快照写回磁盘会让原始内容不可恢复；保留原始副本便于排查。
-        备份含完整用户数据：copyfile 按 umask 新建文件，POSIX 上收紧到
-        0600，避免与协作目录共享时被同组 / 其他用户读取。
+        备份含完整用户数据：文件按同目录 mkstemp + fsync + os.replace
+        原子落盘（最终路径收紧到 0600，避免与协作目录共享时被同组 / 其他
+        用户读取）。已有备份若不可解析（崩溃 / 磁盘满留下的半截文件），
+        重建而不是「存在即跳过」，否则破坏性迁移会永久失去可用快照；
+        原子替换也避免两个进程同时首次加载时交错出混合内容的备份。
         """
         backup = f"{self.db_path}.migrate-backup"
         if os.path.exists(backup):
-            return
+            try:
+                with open(backup, encoding="utf-8") as existing:
+                    if isinstance(json.load(existing), dict):
+                        return
+            except (OSError, ValueError):
+                pass
+            logger.warning("迁移备份不完整，重新生成：%s", backup)
+        tmp_path: str | None = None
         try:
-            shutil.copyfile(self.db_path, backup)
+            fd, tmp_path = tempfile.mkstemp(
+                prefix=f".{self.user_id}.migrate-backup.",
+                suffix=".tmp",
+                dir=os.path.dirname(backup) or ".",
+            )
+            with os.fdopen(fd, "wb") as out, open(self.db_path, "rb") as src:
+                shutil.copyfileobj(src, out)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp_path, backup)
+            tmp_path = None
         except OSError:
             logger.warning("无法备份迁移前的记忆文件：%s", self.db_path)
             return
+        finally:
+            if tmp_path is not None:
+                with contextlib.suppress(OSError):
+                    os.remove(tmp_path)
         try:
             os.chmod(backup, 0o600)
         except OSError:  # Windows 只映射只读位；权限本就不按 POSIX 位控制
@@ -2605,8 +2629,10 @@ class LongTermMemory:
                 continue
             self._remove_trip_row(trips, matches[-1] if prefer_last else matches[0])
             removed += 1
-        if removed and not self._save():
-            raise MemoryPersistenceError("写入长期记忆失败")
+        if removed:
+            # 必须走 _persist：write_batch 内直接 _save 会把批内其它未提交
+            # 修改一并写盘，批失败后的回滚重载反而固化「半批」快照
+            self._persist()
         if skipped:
             logger.warning(
                 "去重跳过 %d 条：计划生成后行程已变更或保留项已删除", skipped

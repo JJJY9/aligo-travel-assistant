@@ -132,14 +132,42 @@ def test_unassigned_codepoints_never_accepted():
 
 
 def test_oversized_filename_ids_rejected():
-    """64 个 4 字节字符会拼出 261 字节文件名（POSIX NAME_MAX=255）。"""
+    """按最长派生名（损坏隔离备份 = id + 41 字节）给 NAME_MAX=255 留余量。"""
     deseret = chr(0x10400)
-    assert is_valid_web_id(deseret * 60) is True  # 240 字节
-    assert is_valid_web_id(deseret * 61) is False  # 244 字节
+    assert is_valid_web_id(deseret * 52) is True  # 208 字节
+    assert is_valid_web_id(deseret * 53) is False  # 212 字节
+    assert is_valid_web_id(deseret * 60) is False  # 240 字节（旧上限）
     assert is_valid_web_id(deseret * 64) is False
     # 会话 ID 不拼记忆库文件名，不受字节上限约束
     assert is_valid_web_session_id(deseret * 64) is True
     print("✓ 超长文件名的用户 ID 被拒绝（会话 ID 不受影响）")
+
+
+def test_derived_filenames_fit_name_max():
+    """最大合法 ID 的全部派生文件名（含崩溃/隔离/迁移/导入锁）≤ NAME_MAX。"""
+    from utils.identifiers import _MAX_ID_UTF8_BYTES
+
+    # 用真实上限构造最长的合法 ID（4 字节字符数向下取整）
+    unit = "𝔸"  # U+1D538，4 字节
+    count = _MAX_ID_UTF8_BYTES // len(unit.encode("utf-8"))
+    user_id = unit * count
+    assert is_valid_web_id(user_id) is True
+    suffixes = (
+        ".json",
+        ".json.lock",
+        f".{user_id}.{ 'x' * 8 }.tmp",  # _save 的 mkstemp 名
+        ".json.quarantine",
+        f".{user_id}.{ 'x' * 8 }.quarantine.tmp",
+        ".json.corrupt-20261125191225123456-1234567",
+        ".json.migrate-backup",
+        ".json.import.lock",
+        ".json.deleted",
+    )
+    for suffix in suffixes:
+        name = f"{user_id}{suffix}" if not suffix.startswith(f".{user_id}") else suffix
+        size = len(name.encode("utf-8"))
+        assert size <= 255, f"派生文件名 {size} 字节超过 NAME_MAX：{name!r}"
+    print("✓ 最大合法 ID 的全部派生文件名均在 NAME_MAX 内")
 
 
 if __name__ == "__main__":
@@ -154,4 +182,5 @@ if __name__ == "__main__":
     test_session_ids_allow_windows_device_names()
     test_unassigned_codepoints_never_accepted()
     test_oversized_filename_ids_rejected()
+    test_derived_filenames_fit_name_max()
     print("\n全部通过")

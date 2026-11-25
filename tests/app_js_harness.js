@@ -408,8 +408,8 @@ function scenarioRender(source) {
     id_reserved_com1: invoke("isValidId", "com1"),
     id_ok_console: invoke("isValidId", "console"),
     id_astral_33: invoke("isValidId", "𝐀".repeat(33)),
-    id_astral_60: invoke("isValidId", "𝐀".repeat(60)),
-    id_astral_61: invoke("isValidId", "𝐀".repeat(61)),
+    id_astral_52: invoke("isValidId", "𝐀".repeat(52)),
+    id_astral_53: invoke("isValidId", "𝐀".repeat(53)),
     id_astral_65: invoke("isValidId", "𝐀".repeat(65)),
     session_device_name: invoke("isValidSessionId", "con"),
     session_export_reserved: invoke("isValidSessionId", "export"),
@@ -2022,6 +2022,13 @@ async function scenarioSessionSearchFailure(source) {
   const morePromise = run("loadMoreSessions()");
   const moreRequest = await waitRequest(env);
   moreRequest.resolve({ sessions: [], total: 0 });
+  // total 从 300 变为 0：分页游标失真，loadMoreSessions 会按已加载数量
+  // 从 0 重取整窗（重置后的第一页为空，loadSessions 会再补一页以凑够
+  // 目标数量），两个请求都由本场景给出空响应
+  const reloadRequest = await waitRequest(env);
+  reloadRequest.resolve({ sessions: [], total: 0 });
+  const refillRequest = await waitRequest(env);
+  refillRequest.resolve({ sessions: [], total: 0 });
   await morePromise;
   const emptyPage = {
     total: run("state.sessionTotal"),

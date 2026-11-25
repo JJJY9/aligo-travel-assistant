@@ -1650,6 +1650,24 @@ def test_parse_csv_row_limit_can_be_disabled_for_export_roundtrip():
     assert len(rows) == 5001 and errors == []
     print("✓ 导出的超限 CSV 可关闭行数上限回读")
 
+def test_trip_export_import_limit_levels():
+    """导出超过导入上限时给出「回导会被拒」级别（导出本身仍成功）。"""
+    from utils.trip_import import (
+        WEB_IMPORT_MAX_CHARS,
+        trip_export_import_limit,
+        trip_export_import_limit_note,
+    )
+
+    assert trip_export_import_limit("a" * 1000) == ""
+    assert trip_export_import_limit("a" * (WEB_IMPORT_MAX_CHARS + 1)) == "panel"
+    assert trip_export_import_limit("a" * 5_000_001) == "cli"
+    # 字节超 2MB 但字符数未超面板上限（多字节字符）也按面板级提示
+    assert trip_export_import_limit("汉" * 600_000) == "panel"
+    assert "CLI" in trip_export_import_limit_note("cli")
+    assert "面板" in trip_export_import_limit_note("panel")
+    print("✓ 行程导出导入上限级别判定")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -1726,4 +1744,5 @@ if __name__ == "__main__":
     test_ics_roundtrip_linebreak_identity_closed()
     test_ics_extreme_year_datetime_skipped()
     test_parse_csv_row_limit_can_be_disabled_for_export_roundtrip()
+    test_trip_export_import_limit_levels()
     print("\n全部通过")

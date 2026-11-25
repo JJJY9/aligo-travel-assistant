@@ -37,6 +37,7 @@ from utils.llm_resilience import retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
 from utils.preference_values import has_preference_value, is_manageable_pref_type
 from utils.progress import format_progress_event
+from utils.session_title import session_title_from_content
 from utils.timestamps import chronological_key
 from utils.turn_meta import attach_turn_meta, build_turn_meta
 from utils.usage import add_usage
@@ -3240,8 +3241,9 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
             close()
 
     # 与面板 archived_count 同口径：只统计仍有消息的归档会话，幽灵归档
-    # （会话已删 / 从未落库）不计入，否则统计永久偏大且 CLI 无法清理
-    archived_alive = [sid for sid in archived if str(sid) in session_ids]
+    # （会话已删 / 从未落库）不计入，否则统计永久偏大且 CLI 无法清理；
+    # 重复条目（整数 42 与字符串 "42" 并存）按字符串去重只计一次
+    archived_alive = {str(sid) for sid in archived if str(sid) in session_ids}
     travel = summarize_travel(trips)
     # 与面板 / 状态接口同口径：null / 空白 / 全空列表不计入偏好条数
     visible_preferences = {
@@ -4632,9 +4634,9 @@ def _session_summaries(store, *, needle: str = "") -> list[dict]:
                 # 追加，旧消息排在末尾时最近更新会被错误回拨
                 entry["updated_at"] = timestamp
         if not entry["title"] and message.get("role") == "user":
-            title = " ".join(str(message.get("content", "")).split())
-            if title:
-                entry["title"] = title[:40]
+            entry["title"] = session_title_from_content(
+                message.get("content", "")
+            )
         if needle and not entry.get("_query_hit"):
             # 助手消息存的是编排 JSON：用渲染后的正文做关键词匹配（与 Web
             # 面板同口径），直接匹配原始 JSON 会把「回答里有没有某个词」判错
@@ -4945,7 +4947,11 @@ def run_session_delete_standalone(
         # SET NX 落败的一方不能把成功删除方的墓碑当成自己的回滚掉
         import uuid
 
-        from utils.tombstones import mark_session_deleted, unmark_session_deleted
+        from utils.tombstones import (
+            mark_session_deleted,
+            reassert_session_deleted,
+            unmark_session_deleted,
+        )
 
         tombstone_token = f"cli-{uuid.uuid4().hex}"
         shared_tombstone = mark_session_deleted(
@@ -4961,6 +4967,14 @@ def run_session_delete_standalone(
                     user_id, session_id, source=tombstone_token, force=True
                 )
             return _fail(f"删除会话失败：{exc}")
+        if not metadata_only and not shared_tombstone:
+            # 并发 CLI 删除时 SET NX 落败、但本进程也删成功了：以本请求
+            # token 覆盖共享墓碑（与 Web DELETE 同一语义）。先到者若因
+            # 「会话已不存在」回滚，按旧 token 不匹配，不会删掉唯一的
+            # 删除保护
+            shared_tombstone = reassert_session_deleted(
+                user_id, session_id, tombstone_token, force=True
+            )
         if metadata_only and shared_tombstone:
             # 仅元数据命中的「删除」没有会话可保护：撤销本进程刚写的墓碑，
             # 允许同一 session_id 立即复用（与 Web DELETE 对「从未存在 /
@@ -5597,6 +5611,7 @@ def run_trips_export_standalone(
     roundtrip_errors: list[tuple[int, str]] = []
     roundtrip_total = 0
     roundtrip_unit = "行"
+    export_limit_level = ""
     safe_user = _safe_export_user(user_id)
     if ics:
         text = render_trips_ics(trips, user_id)
@@ -5608,11 +5623,15 @@ def run_trips_export_standalone(
         truncated_end = sum(1 for trip in trips if trip_ics_end_unparsable(trip))
         # 与 CSV 对称的回导自检：超长字段等会被导入端拒绝的事件同样要提前
         # 告警（ICS 的跳过单位是事件，不是物理行）
-        from utils.trip_import import trip_export_roundtrip_problems
+        from utils.trip_import import (
+            trip_export_import_limit,
+            trip_export_roundtrip_problems,
+        )
 
         roundtrip_total, roundtrip_errors = trip_export_roundtrip_problems(
             text, is_ics=True
         )
+        export_limit_level = trip_export_import_limit(text)
         roundtrip_unit = "个事件"
     elif html:
         text = render_trips_html(trips, user_id)
@@ -5626,11 +5645,15 @@ def run_trips_export_standalone(
         # 超长字段的行导入时会被整行跳过，导出侧必须提前告警，否则迁移 /
         # 换机恢复时静默丢行程。只读导出不受导入侧行数上限约束：超过
         # 5000 条也必须能导出（导入时再按文件拆分）
-        from utils.trip_import import trip_export_roundtrip_problems
+        from utils.trip_import import (
+            trip_export_import_limit,
+            trip_export_roundtrip_problems,
+        )
 
         roundtrip_total, roundtrip_errors = trip_export_roundtrip_problems(
             text, is_ics=False
         )
+        export_limit_level = trip_export_import_limit(text)
     if to_stdout:
         if ics:
             # ICS 行尾已是 \r\n：文本模式在 Windows 会再次翻译；优先写字节
@@ -5658,7 +5681,12 @@ def run_trips_export_standalone(
         # --stdout 下 stdout 只能有导出内容：跳过 / 回导告警走 stderr，
         # 否则空日历 + 退出码 0 会被脚本当成导出成功
         for note in _trip_export_notes(
-            skipped, truncated_end, roundtrip_errors, roundtrip_total, roundtrip_unit
+            skipped,
+            truncated_end,
+            roundtrip_errors,
+            roundtrip_total,
+            roundtrip_unit,
+            limit_level=export_limit_level,
         ):
             print(f"注意：{note}", file=sys.stderr)
         return 0
@@ -5682,7 +5710,12 @@ def run_trips_export_standalone(
         filter_note += f"，状态「{status_label}」"
     print(f"已导出 {exported} 条行程到 {path}{suffix}{filter_note}")
     for note in _trip_export_notes(
-        skipped, truncated_end, roundtrip_errors, roundtrip_total, roundtrip_unit
+        skipped,
+        truncated_end,
+        roundtrip_errors,
+        roundtrip_total,
+        roundtrip_unit,
+        limit_level=export_limit_level,
     ):
         print(f"注意：{note}")
     return 0
@@ -5694,9 +5727,14 @@ def _trip_export_notes(
     roundtrip_errors: list[tuple[int, str]],
     roundtrip_total: int,
     roundtrip_unit: str = "行",
+    limit_level: str = "",
 ) -> list[str]:
     """导出后的数据质量提示（跳过 / 截断 / 回导会被拒绝的条目）。"""
     notes: list[str] = []
+    if limit_level:
+        from utils.trip_import import trip_export_import_limit_note
+
+        notes.append(trip_export_import_limit_note(limit_level))
     if skipped:
         notes.append(f"跳过 {skipped} 条缺少出发日期（日历中不会出现）")
     if truncated_end:
