@@ -309,6 +309,230 @@ def test_text_duration_skips_ordinals_and_ranges():
     print("✓ 序数 / 日期区间不算行程天数")
 
 
+def test_negation_lookalikes_are_positive():
+    """「特别 / 分别 / 别人 / 迫不及待」里的别 / 不是否定词。"""
+    assert extract_requirements("特别想去西湖")["must_see"] == ["西湖"]
+    assert extract_requirements("分别想去西湖和故宫")["must_see"] == ["西湖", "故宫"]
+    assert extract_requirements("别人都想去西湖")["must_see"] == ["西湖"]
+    assert extract_requirements("我迫不及待想去西湖")["must_see"] == ["西湖"]
+    assert extract_requirements("特别别错过西湖")["must_see"] == ["西湖"]
+    # 否定契约不能被放宽
+    assert "must_see" not in extract_requirements("不想去西湖")
+    assert "must_see" not in extract_requirements("不太想去西湖")
+    assert "must_see" not in extract_requirements("不一定要去西湖")
+    assert extract_requirements("不想去西湖，特别想去故宫")["must_see"] == ["故宫"]
+    print("✓ 否定词近似词不再误杀必去项")
+
+
+def test_budget_prefers_total_and_handles_units():
+    """显式预算优先于分项费用；小数 / 千 / k / 中文数字 / 区间按上限。"""
+    assert extract_requirements("去杭州玩2天，酒店费用800，预算3000")["budget"] == 3000
+    assert (
+        extract_requirements("去杭州玩2天，路上花费2小时，预算3000")["budget"]
+        == 3000
+    )
+    assert extract_requirements("预算1.5万元")["budget"] == 15000
+    assert extract_requirements("预算0.8万")["budget"] == 8000
+    assert extract_requirements("预算3千")["budget"] == 3000
+    assert extract_requirements("预算5k")["budget"] == 5000
+    assert extract_requirements("预算一万")["budget"] == 10000
+    assert extract_requirements("预算三千元")["budget"] == 3000
+    assert extract_requirements("预算5000-8000元")["budget"] == 8000
+    assert extract_requirements("预算3人分摊5000元")["budget"] == 5000
+    assert "budget" not in extract_requirements("花费2小时")
+    assert "budget" not in extract_requirements("费用：交通500，住宿600")
+    print("✓ 预算：总量优先、单位 / 小数 / 区间")
+
+
+def test_must_see_suffix_triggers_and_connectors():
+    """后置触发词（都要去 / 必须去）与「或」连接词都能提取。"""
+    assert extract_requirements("想去西湖或者故宫")["must_see"] == ["西湖", "故宫"]
+    assert extract_requirements("去杭州玩3天，西湖、灵隐寺都要去")[
+        "must_see"
+    ] == ["西湖", "灵隐寺"]
+    assert extract_requirements("西湖和灵隐寺一定要去")["must_see"] == [
+        "西湖",
+        "灵隐寺",
+    ]
+    assert extract_requirements("故宫必须去")["must_see"] == ["故宫"]
+    assert extract_requirements("去杭州玩3天，必去外滩不能错过")[
+        "must_see"
+    ] == ["外滩"]
+    # 后置触发词只在地名与句读之间成立
+    assert "must_see" not in extract_requirements("周末都要去爬山")
+    assert "must_see" not in extract_requirements("西湖、灵隐寺不一定要去")
+    assert "must_see" not in extract_requirements("北京必去景点有哪些")
+    print("✓ 后置触发词 /「或」连接词提取")
+
+
+def test_must_see_cleans_fillers_and_action_suffixes():
+    """「顺便去 / 再去 / 也不」与「看夜景」等动作不进入必去项。"""
+    assert extract_requirements(
+        "我想去北京出差，顺便去故宫", {"destination": "北京"}
+    )["must_see"] == ["故宫"]
+    assert extract_requirements("想去西湖，再去故宫")["must_see"] == ["西湖", "故宫"]
+    assert extract_requirements("必去外滩看夜景")["must_see"] == ["外滩"]
+    assert extract_requirements("我想去西湖也不想去灵隐寺")["must_see"] == ["西湖"]
+    assert extract_requirements("必须去故宫，别的随意")["must_see"] == ["故宫"]
+    print("✓ 必去项清洗分句连接词与动作后缀")
+
+
+def test_must_see_long_enumeration_not_truncated():
+    """超过 24 字的枚举不能截断成半个地名。"""
+    requirements = extract_requirements(
+        "去杭州玩3天，必去西湖、灵隐寺、雷峰塔、千岛湖、宋城、西溪湿地、河坊街",
+        {"destination": "杭州"},
+    )
+    assert requirements["must_see"] == [
+        "西湖",
+        "灵隐寺",
+        "雷峰塔",
+        "千岛湖",
+        "宋城",
+        "西溪湿地",
+        "河坊街",
+    ], requirements
+    print("✓ 长枚举的必去项完整保留")
+
+
+def test_duration_fraction_week_and_play_prefix():
+    """小数天数向上取整；周单位换算；优先「玩 N 天」。"""
+    assert extract_requirements("去杭州出差1.5天")["duration_days"] == 2
+    assert extract_requirements("玩一周")["duration_days"] == 7
+    assert extract_requirements("玩两周")["duration_days"] == 14
+    assert extract_requirements("往返路上2天，在杭州玩3天")["duration_days"] == 3
+    assert extract_requirements("", {"duration_days": "7"})["duration_days"] == 7
+    assert extract_requirements("", {"duration_days": "7天"})["duration_days"] == 7
+    assert "duration_days" not in extract_requirements("", {"duration_days": True})
+    assert "duration_days" not in extract_requirements("周末")
+    print("✓ 小数 / 周 / 字符串天数")
+
+
+def test_must_see_checks_activity_identity_only():
+    """主题 / 备注 / 描述里提到的地名不算「已安排」。"""
+    plan = {
+        "daily_plans": [
+            {
+                "day": 1,
+                "theme": "西湖一日游",
+                "notes": "因闭馆未去灵隐寺",
+                "activities": [],
+            }
+        ]
+    }
+    codes = {
+        issue["code"]
+        for issue in validate_itinerary(plan, {"must_see": ["西湖", "灵隐寺"]})
+    }
+    assert codes == {"must_see_missing"}, codes
+    plan_ok = {
+        "daily_plans": [
+            {
+                "day": 1,
+                "activities": [
+                    {"time": "09:00-11:00", "location": "西湖", "description": "游览"}
+                ],
+            }
+        ]
+    }
+    assert validate_itinerary(plan_ok, {"must_see": ["西湖"]}) == []
+    plan_desc = {
+        "daily_plans": [
+            {
+                "day": 1,
+                "activities": [
+                    {
+                        "time": "09:00-11:00",
+                        "location": "某公园",
+                        "description": "如时间充裕可去雷峰塔",
+                    }
+                ],
+            }
+        ]
+    }
+    assert any(
+        issue["code"] == "must_see_missing"
+        for issue in validate_itinerary(plan_desc, {"must_see": ["雷峰塔"]})
+    )
+    print("✓ 必去项只核对活动身份字段")
+
+
+def test_time_range_cross_midnight_and_dashes():
+    """跨午夜时间合法；次日 / 24:00 / 全角连接符可解析。"""
+    from utils.itinerary_validation import _parse_time_range
+
+    assert _parse_time_range("22:00-02:00") == (1320, 120)
+    assert _parse_time_range("14:00-次日02:00") == (840, 1560)
+    assert _parse_time_range("22:00-24:00") == (1320, 1440)
+    assert _parse_time_range("09:00–12:00") == (540, 720)
+    assert _parse_time_range("09:00～12:00") == (540, 720)
+    plan = {
+        "daily_plans": [
+            {
+                "day": 1,
+                "activities": [
+                    {"time": "22:00-02:00", "title": "夜班火车"},
+                    {"time": "09:00-10:00", "title": "早餐"},
+                ],
+            }
+        ]
+    }
+    assert validate_itinerary(plan, {}) == []
+    bad = {
+        "daily_plans": [
+            {
+                "day": 1,
+                "activities": [{"time": "15:00-09:00", "title": "夜游"}],
+            }
+        ]
+    }
+    assert any(
+        issue["code"] == "invalid_time_range"
+        for issue in validate_itinerary(bad, {})
+    )
+    overlap = {
+        "daily_plans": [
+            {
+                "day": 1,
+                "activities": [
+                    {"time": "20:00-次日01:00", "title": "甲"},
+                    {"time": "23:00-次日00:30", "title": "乙"},
+                ],
+            }
+        ]
+    }
+    assert any(
+        issue["code"] == "time_conflict"
+        for issue in validate_itinerary(overlap, {})
+    )
+    print("✓ 跨午夜时间区间与连接符")
+
+
+def test_number_prefers_amount_over_quantity():
+    """「2人共500元」取金额而非人数；区间取上限。"""
+    from utils.itinerary_validation import _number
+
+    assert _number("2人共500元") == 500
+    assert _number("门票2张共120元") == 120
+    assert _number("人均300元共900元") == 900
+    assert _number("约3000-5000元") == 5000
+    assert _number("约1.5万元") == 15000
+    assert _number("-5") == -5
+    plan = {
+        "estimated_budget": 500,
+        "daily_plans": [
+            {
+                "day": 1,
+                "activities": [
+                    {"time": "09:00-10:00", "title": "A", "cost": "2人共500元"}
+                ],
+            }
+        ],
+    }
+    assert validate_itinerary(plan, {}) == []
+    print("✓ 费用数字优先取带单位的金额")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -332,4 +556,13 @@ if __name__ == "__main__":
     test_activities_accepts_mapping_and_schedule_key()
     test_must_see_strips_admin_suffix_and_leading_particles()
     test_text_duration_skips_ordinals_and_ranges()
+    test_negation_lookalikes_are_positive()
+    test_budget_prefers_total_and_handles_units()
+    test_must_see_suffix_triggers_and_connectors()
+    test_must_see_cleans_fillers_and_action_suffixes()
+    test_must_see_long_enumeration_not_truncated()
+    test_duration_fraction_week_and_play_prefix()
+    test_must_see_checks_activity_identity_only()
+    test_time_range_cross_midnight_and_dashes()
+    test_number_prefers_amount_over_quantity()
     print("\n全部通过")

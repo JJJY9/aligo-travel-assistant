@@ -130,7 +130,9 @@ def schedule_must_see(
     "unscheduled": [...], "solver": "cp-sat"|"greedy"}``。
     """
     names = [str(name).strip() for name in must_see if str(name).strip()]
-    days = max(0, int(days))
+    # 事件抽取给出的天数可能异常大：上限 366 天，避免为每天建列表 / CP-SAT
+    # 变量导致内存与耗时失控
+    days = max(0, min(366, int(days)))
     day_start = max(0, min(24 * 60, int(day_start)))
     day_end = max(day_start, min(24 * 60, int(day_end)))
     visit_min = max(1, int(visit_min))

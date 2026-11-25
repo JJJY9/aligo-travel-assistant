@@ -98,6 +98,14 @@ def test_tight_window_counts_travel_only_between_items():
     print("✓ 紧凑窗口按项间通勤计算容量")
 
 
+def test_days_upper_bound_clamped():
+    """异常大的天数被钳到 366，避免为每天建列表 / CP-SAT 变量。"""
+    schedule = schedule_must_see(["西湖"], days=100000)
+    assert len(schedule["days"]) == 366, len(schedule["days"])
+    assert [item["name"] for item in schedule["days"][0]["items"]] == ["西湖"]
+    print("✓ 天数上限钳制")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -108,4 +116,5 @@ if __name__ == "__main__":
     test_zero_days()
     test_render_schedule_text()
     test_tight_window_counts_travel_only_between_items()
+    test_days_upper_bound_clamped()
     print("\n全部通过")
