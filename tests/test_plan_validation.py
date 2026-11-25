@@ -320,6 +320,141 @@ def test_plan_prompt_neutralizes_user_query_and_preferences():
     print("✓ 行程 prompt 中和用户需求与偏好")
 
 
+def test_repair_retries_use_latest_version():
+    """多次重试应基于最近一次修复版与它的问题，而不是重复第一版提示。"""
+    import config
+
+    module = _load_plan_module()
+
+    def _activity(title, cost):
+        return {"time": "09:00-12:00", "title": title, "cost": cost}
+
+    first = json.loads(_plan([{"day": 1, "activities": [_activity("西湖", 400)]}], 400))
+    first["itinerary"]["title"] = "第一版"
+    second = json.loads(
+        _plan(
+            [
+                {"day": 1, "activities": [_activity("西湖", 400)]},
+                {"day": 2, "activities": [_activity("西湖", 400)]},
+            ],
+            800,
+        )
+    )
+    second["itinerary"]["title"] = "第二版"
+    final = json.loads(
+        _plan(
+            [
+                {"day": 1, "activities": [_activity("西湖", 400)]},
+                {"day": 2, "activities": [_activity("灵隐寺", 400)]},
+            ],
+            800,
+        )
+    )
+    final["itinerary"]["title"] = "第三版"
+    model = _ScriptedModel(
+        [
+            json.dumps(first, ensure_ascii=False),
+            json.dumps(second, ensure_ascii=False),
+            json.dumps(final, ensure_ascii=False),
+        ]
+    )
+    agent = module.ItineraryPlanningAgent(
+        name="ItineraryPlanningAgent", model=model
+    )
+    previous = dict(config.PLAN_CONFIG)
+    config.PLAN_CONFIG["repair_enabled"] = True
+    config.PLAN_CONFIG["max_repair_attempts"] = 2
+    try:
+        out = asyncio.run(
+            agent.reply(
+                Msg(
+                    name="orchestrator",
+                    content=_payload("去杭州玩2天，预算1000元，一定要去灵隐寺"),
+                    role="user",
+                )
+            )
+        )
+    finally:
+        config.PLAN_CONFIG.clear()
+        config.PLAN_CONFIG.update(previous)
+    result = json.loads(out.content)
+    assert len(model.prompts) == 3, model.prompts
+    assert "第一版" in model.prompts[1]
+    assert "第二版" in model.prompts[2], "第二次修复应携带最近一次修复版"
+    assert model.prompts[1] != model.prompts[2]
+    assert result["itinerary"]["title"] == "第三版"
+    assert result["validation"]["passed"] is True
+    print("✓ 多次修复基于最近版本收敛")
+
+
+def test_repair_prompt_keeps_valid_json_for_long_plan():
+    """长行程的「上一版」必须结构感知裁剪，不能截成半截 JSON。"""
+    module = _load_plan_module()
+    days = [
+        {
+            "day": index,
+            "activities": [
+                {
+                    "time": "09:00-11:00",
+                    "title": f"景点{index}",
+                    "description": "很长的描述" * 60,
+                }
+            ],
+        }
+        for index in range(1, 41)
+    ]
+    previous = {"itinerary": {"title": "北京四十日游", "daily_plans": days}}
+    model = _ScriptedModel(["{}"])
+    agent = module.ItineraryPlanningAgent(
+        name="ItineraryPlanningAgent", model=model
+    )
+    asyncio.run(
+        agent._repair_plan(
+            "BASE", [{"code": "x", "message": "问题"}], previous
+        )
+    )
+    prompt = model.prompts[0]
+    block = prompt.split("<<<", 1)[1].split(">>>", 1)[0].strip()
+    parsed = json.loads(block)  # 必须是合法 JSON（旧实现会在这里失败）
+    assert parsed["itinerary"]["title"] == "北京四十日游"
+    assert parsed.get("_truncated"), parsed
+    assert len(parsed["itinerary"]["daily_plans"]) < 40
+    print("✓ 修复提示对长行程保持合法 JSON 并标注省略")
+
+
+def test_unscheduled_schedule_does_not_demand_full_coverage():
+    """求解器判定排不下时，提示词不能再要求「必须覆盖全部必去项」。"""
+    module = _load_plan_module()
+    plan = _plan(
+        [
+            {
+                "day": 1,
+                "activities": [
+                    {"time": "09:00-12:00", "title": "故宫", "cost": 100}
+                ],
+            }
+        ],
+        estimated_budget=100,
+    )
+    model = _ScriptedModel([plan])
+    agent = module.ItineraryPlanningAgent(
+        name="ItineraryPlanningAgent", model=model
+    )
+    asyncio.run(
+        agent.reply(
+            Msg(
+                name="orchestrator",
+                content=_payload("去北京玩1天，必去故宫、天安门、颐和园、圆明园"),
+                role="user",
+            )
+        )
+    )
+    prompt = model.prompts[0]
+    assert "无法安排" in prompt
+    assert "必须覆盖全部必去项" not in prompt
+    print("✓ 未安排项不再与「必须覆盖」矛盾")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -331,4 +466,7 @@ if __name__ == "__main__":
     test_repair_prompt_neutralizes_issue_messages()
     test_plan_constraints_use_original_user_query()
     test_plan_prompt_neutralizes_user_query_and_preferences()
+    test_repair_retries_use_latest_version()
+    test_repair_prompt_keeps_valid_json_for_long_plan()
+    test_unscheduled_schedule_does_not_demand_full_coverage()
     print("\n全部通过")

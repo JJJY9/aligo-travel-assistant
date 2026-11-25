@@ -202,11 +202,36 @@ def _render_itinerary(itinerary: Any) -> str:
     return "\n".join(lines)
 
 
+def _render_plan_validation_warning(validation: object) -> str:
+    """行程未通过五项校验时给用户的可见提示（实时回复 / CLI / 历史同一路径）。"""
+    if not isinstance(validation, dict) or validation.get("passed") is not False:
+        return ""
+    lines = ["", "### ⚠️ 未通过行程校验"]
+    issues = validation.get("issues")
+    if isinstance(issues, list):
+        for issue in issues[:8]:
+            if isinstance(issue, dict):
+                message = str(issue.get("message") or issue.get("code") or "").strip()
+            else:
+                message = str(issue).strip()
+            if message:
+                lines.append(f"- {message}")
+    if len(lines) == 2:
+        lines.append("- 行程未满足用户约束，请核对后再出行。")
+    return "\n".join(lines)
+
+
 def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
     if agent_name == "itinerary_planning":
-        itinerary = data.get("itinerary") or (data.get("data") or {}).get("itinerary")
+        nested_payload = data.get("data")
+        plan_nested = nested_payload if isinstance(nested_payload, dict) else {}
+        itinerary = data.get("itinerary") or plan_nested.get("itinerary")
         if itinerary:
-            return _render_itinerary(itinerary)
+            # validation 可能挂在顶层或 data.data 里（与 itinerary 同一口径）
+            validation = data.get("validation") or plan_nested.get("validation")
+            return _render_itinerary(itinerary) + _render_plan_validation_warning(
+                validation
+            )
         if data.get("error"):
             return f"> ⚠️ 行程规划：{data['error']}"
         return ""

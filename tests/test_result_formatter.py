@@ -840,6 +840,54 @@ def test_preference_legacy_explanatory_keys_not_rendered():
     assert "message **设置为**" not in md, md
     print("✓ 旧格式说明性键不回显为偏好")
 
+def test_itinerary_validation_warning_rendered():
+    """validation.passed=false 时用户能看到未通过原因（实时 / CLI / 历史同一路径）。"""
+    data = _wrap([
+        {
+            "agent_name": "itinerary_planning",
+            "priority": 2,
+            "status": "success",
+            "data": {
+                "itinerary": {
+                    "title": "杭州二日",
+                    "duration": "2天",
+                    "daily_plans": [
+                        {
+                            "day": 1,
+                            "activities": [
+                                {"time": "09:00-11:00", "location": "西湖"}
+                            ],
+                        }
+                    ],
+                },
+                "validation": {
+                    "passed": False,
+                    "issues": [
+                        {"code": "budget_exceeded", "message": "预计费用 2000 元超出预算 1000 元"}
+                    ],
+                },
+            },
+        }
+    ])
+    text = result_to_markdown(data)
+    assert "未通过行程校验" in text
+    assert "超出预算" in text
+    # 通过时不出现警告
+    passed = _wrap([
+        {
+            "agent_name": "itinerary_planning",
+            "priority": 2,
+            "status": "success",
+            "data": {
+                "itinerary": {"title": "杭州一日", "daily_plans": []},
+                "validation": {"passed": True, "issues": []},
+            },
+        }
+    ])
+    assert "未通过行程校验" not in result_to_markdown(passed)
+    print("✓ 行程校验未通过时渲染警告")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -872,6 +920,7 @@ if __name__ == "__main__":
     test_itinerary_tolerant_shapes_extra()
     test_event_collection_missing_non_list()
     test_object_results_are_normalized()
+    test_itinerary_validation_warning_rendered()
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_render_agent_exception_falls_back(_mp)

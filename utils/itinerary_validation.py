@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import json
 import math
 import re
 from datetime import date as _date
@@ -18,45 +17,82 @@ from typing import Any, Iterable
 
 from utils.entity_normalize import normalize_event_data
 
+_MUST_SEE_TRIGGERS = (
+    "必去|一定要去|必须去|想去|打卡|别错过|不能错过|非去不可"
+)
 _BUDGET_RE = re.compile(
-    r"(?:预算|总预算|花费|费用)"
+    r"(?P<kind>预算|总预算|花费|费用)"
     # 冒号后必须紧跟金额（「费用：交通500」是分项不是总预算）；
-    # 无冒号时允许「预算大约是」等短填充，但不能跨越顿号 / 逗号 / 句号
-    r"(?:[：:]\s*|[^\d。！？；;，,、：:\n]{0,8})"
-    # 千分位组（10,000 / 1，500 / 10 000）整体匹配：只认「逗号后恰好三位」，
-    # 避免把「预算5000，3000」这类并列数字连成一个巨款
-    r"(\d{1,3}(?:[,， ]\d{3})+|\d+)(?:\.\d+)?\s*(万元|万|元|块)?"
+    # 无冒号时允许「预算大约是」等短填充，但不能跨越顿号 / 逗号 / 句号；
+    # 「预算3人分摊5000元」里的数量词是填充，不是总预算
+    r"(?:[：:]\s*"
+    r"|\d+\s*(?:人|位)(?:共|均|分摊|平摊|左右)?[^\d。！？；;，,、：:\n]{0,4}"
+    r"|[^\d。！？；;，,、：:\n]{0,8}?)"
+    # 金额支持千分位与小数、中文数字（一万 / 三千 / 五千元）
+    r"(?P<amount>\d{1,3}(?:[,， ]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|[一二两三四五六七八九十百千]+)"
+    r"\s*(?P<unit>万元|万|千元|千|[kK](?![A-Za-z])|[wW](?![A-Za-z])|元|块)?"
+    # 区间「5000-8000 元」按上限理解（用户可接受到更高一档）
+    r"(?:\s*[-~—–至到]\s*"
+    r"(?P<amount2>\d{1,3}(?:[,， ]\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|[一二两三四五六七八九十百千]+)"
+    r"\s*(?P<unit2>万元|万|千元|千|元|块)?"
+    r")?"
+    # 「花费2小时」「预算3天」不是金额
+    r"(?!\s*(?:个?(?:半)?(?:小时|钟头)|分钟|天|日|周|月))"
 )
 _MUST_SEE_RE = re.compile(
-    r"(?:必去|一定要去|必须去|想去|打卡|别错过)[：:\s]*"
+    r"(?:" + _MUST_SEE_TRIGGERS + r")[：:\s]*"
     # 捕获串允许顿号 / 逗号分隔符（交给 _split_must_see 拆分），但惰性
     # 截到下一个触发词 / 句末为止——不能让一个触发词的捕获吞掉下一句
-    # 触发词（否则否定语境会连带把后面的正常必去项一起丢掉）。没有边界
-    # 的超长列表退回 24 字贪心截断，避免吞掉整段叙述
+    # 触发词（否则否定语境会连带把后面的正常必去项一起丢掉）。分句连接
+    # 词（也不 / 还 / 再…）也作为边界，避免把「西湖也不」这类残句带进
+    # 必去项。没有边界的长列表退回分隔符截断，绝不保存半个名字
     r"("
-    r"[一-鿿A-Za-z0-9·、，,；;/ ]{2,24}?"
-    r"(?=(?:必去|一定要去|必须去|想去|打卡|别错过)|[。！？；;\n]|$)"
+    r"[一-鿿A-Za-z0-9·、，,；;/ ]{2,200}?"
+    r"(?=(?:也不|也都|还|也|就|再|顺便|然后|接着)?"
+    r"(?:" + _MUST_SEE_TRIGGERS + r")|[。！？；;\n]|$)"
     r"|"
-    r"[一-鿿A-Za-z0-9·、，,；;/ ]{2,24}"
+    r"[一-鿿A-Za-z0-9·、，,；;/ ]{2,24}(?=[、，,；;/ ]|$)"
     r")"
 )
+# 后置触发词：「西湖、灵隐寺都要去 / 故宫必须去 / 外滩不能错过」
+_MUST_SEE_SUFFIX_RE = re.compile(
+    r"(?:^|[。！？；;\n，,])\s*([一-鿿A-Za-z0-9·、；;/ ]{2,48}?)"
+    r"\s*(?:必须都要去|都必须去|必须去|都要去|都得去|都去|一定要去|不能错过|非去不可)"
+    r"(?=[。！？；;\n，,]|$)"
+)
 # 否定语境（不想去 / 不太想去 / 不一定要去 / 不必去 / 无需去）：触发词
-# 前 6 个字里出现否定词、且否定词与触发词之间最多隔 2 个字时不算必去项
-_MUST_SEE_NEGATION_RE = re.compile(r"(?:不|别|无需|不用|不要)[^，。！？；\n]{0,2}$")
-# 费用字段的数值：千分位组（逗号后恰好三位）整体匹配，支持万单位
+# 前 6 个字里出现否定词、且否定词与触发词之间最多隔 2 个字时不算必去项。
+# 「别」须是独立否定词（特别 / 分别 / 别人 / 个别 / 级别 / 告别 不是），
+# 「不」前面是「迫 / 得」时是肯定（迫不及待 / 不得不）
+_MUST_SEE_NEGATION_RE = re.compile(
+    r"(?:(?<![迫得])不|无需|无须|不用|不要|不必|未必"
+    r"|(?<![特分个告级类性别派区识])别(?!人|的|处))"
+    r"[^，。！？；\n]{0,2}$"
+)
+# 费用字段的数值：千分位组（逗号后恰好三位）整体匹配，支持万 / 千单位
 _NUMBER_RE = re.compile(
-    r"(-?(?:\d{1,3}(?:[,， ]\d{3})+|\d+)(?:\.\d+)?)\s*(万元|万|元|块)?"
+    r"((?<![\d.])-?(?:\d{1,3}(?:[,， ]\d{3})+|\d+)(?:\.\d+)?)"
+    r"\s*(万元|万|千元|千|[kK](?![A-Za-z])|元|块)?"
 )
 # 城市名的行政后缀：目的地「杭州市」与必去项「杭州市西湖」按「杭州」比较
 _ADMIN_SUFFIXES = ("特别行政区", "自治区", "自治州", "地区", "市", "省", "区", "县")
 # 「3月4日」里的「4日」是日期不是行程天数：匹配后再看数字前是否紧邻「月」
-_DURATION_RE = re.compile(r"(\d+|[一二两三四五六七八九十]+)\s*(?:天|日)")
+# 小数天数（1.5 天）整体捕获，不能只取小数点后的尾数
+_DURATION_RE = re.compile(
+    r"(?<![\d.])(\d+(?:\.\d+)?|[一二两三四五六七八九十]+)\s*(?:天|日)"
+)
+# 「一周 / 两周 / 3 个星期」：周单位换算成 7 天
+_WEEK_DURATION_RE = re.compile(
+    r"(?<![\d.])(\d+(?:\.\d+)?|[一二两三四五六七八九十]+)\s*(?:周|个?星期|个?礼拜)"
+)
 # 必去项里混入的天数 / 预算片段：截断后再清洗动词后缀
-_MUST_SEE_DURATION_RE = re.compile(r"[0-9一二两三四五六七八九十]+\s*[天日].*$")
+_MUST_SEE_DURATION_RE = re.compile(
+    r"(?:\d+(?:\.\d+)?|[0-9一二两三四五六七八九十]+)\s*[天日].*$"
+)
 _MUST_SEE_BUDGET_RE = re.compile(r"(?:预算|花费|费用|人均|总价|左右|以内).*$")
-# 「和 / 与 / 及」既可能是并列连接词，也可能是地名的一部分（颐和园、
+# 「和 / 与 / 及 / 或」既可能是并列连接词，也可能是地名的一部分（颐和园、
 # 和平饭店）：只在两侧都像完整名称时才拆
-_MUST_SEE_CONNECTOR_RE = re.compile(r"[和与及]")
+_MUST_SEE_CONNECTOR_RE = re.compile(r"(?:或者|或|和|与|及)")
 _MUST_SEE_GENERIC = frozenset(
     {
         "景点",
@@ -70,13 +106,42 @@ _MUST_SEE_GENERIC = frozenset(
         "旅游",
         "旅行",
         "好玩",
+        # 后置触发词的捕获段常见主语 / 时间词，不是地名
+        "我们",
+        "你们",
+        "他们",
+        "她们",
+        "大家",
+        "咱们",
+        "自己",
+        "这次",
+        "下次",
+        "到时候",
+        "今天",
+        "明天",
+        "后天",
+        "周末",
+        "假期",
+        # 「必须去故宫，别的随意」：收尾短语不是地名
+        "随意",
+        "都行",
+        "都可以",
+        "也行",
+        "就好",
+        "即可",
+        "就行",
+        "别的",
+        "其他",
+        "其它",
     }
 )
 _TIME_RANGE_RE = re.compile(
-    r"(\d{1,2})\s*[:：]\s*(\d{2})\s*(?:-|~|—|至|到)\s*"
-    r"(\d{1,2})\s*[:：]\s*(\d{2})"
+    # 连接符兼容半角 / 全角 / en dash；end 前可带「次日 / 翌日」跨午夜标记
+    r"(\d{1,2})\s*[:：]\s*(\d{2})\s*(?:-|–|~|～|—|－|至|到)\s*"
+    r"(?:(次日|翌日|第二天)\s*)?(\d{1,2})\s*[:：]\s*(\d{2})"
 )
 _CN_DIGITS = {
+    "零": 0,
     "一": 1,
     "二": 2,
     "两": 2,
@@ -91,23 +156,26 @@ _CN_DIGITS = {
 
 
 def _cn_number(value: str) -> int | None:
+    """中文数字转整数（十 / 百 / 千 组合；「一百零五」「三千」均可）。"""
     text = str(value or "").strip()
     if not text:
         return None
     if text.isdigit():
         return int(text)
-    if text[0] == "十":
-        number = 10
-        if len(text) > 1 and text[1] in _CN_DIGITS:
-            number += _CN_DIGITS[text[1]]
-        return number
-    if text[0] in _CN_DIGITS:
-        number = _CN_DIGITS[text[0]]
-        if len(text) > 1 and text[1] == "十":
-            number = number * 10 + (
-                _CN_DIGITS.get(text[2], 0) if len(text) > 2 else 0
-            )
-        return number
+    for unit_char, factor in (("千", 1000), ("百", 100), ("十", 10)):
+        index = text.find(unit_char)
+        if index < 0:
+            continue
+        head = text[:index]
+        head_number = _cn_number(head) if head else 1
+        rest = text[index + 1 :]
+        rest_number = _cn_number(rest) if rest else 0
+        if head_number is None or rest_number is None:
+            return None
+        return head_number * factor + rest_number
+    digits = [_CN_DIGITS.get(char) for char in text]
+    if all(number is not None for number in digits):
+        return int("".join(str(number) for number in digits))
     return None
 
 
@@ -197,6 +265,29 @@ def _clean_must_see(value: str) -> list[str]:
         "的",
         "了",
         "一下",
+        # 「西湖也不想去灵隐寺」的残句 / 「别的随意」的收尾
+        "也不",
+        "也都",
+        "也",
+        "随意",
+        "都行",
+        "都可以",
+        "也行",
+        "就好",
+        "即可",
+        "就行",
+        # 「必去外滩看夜景」：动作不是地名的一部分
+        "看夜景",
+        "看升旗",
+        "看日出",
+        "看日落",
+        "看表演",
+        "看演出",
+        "看灯光秀",
+        "看展览",
+        "吃火锅",
+        "吃小吃",
+        "吃美食",
     )
     names: list[str] = []
     for part in parts:
@@ -204,6 +295,16 @@ def _clean_must_see(value: str) -> list[str]:
         # 触发词后面的前置助词 / 疑问词不是地名的一部分（「西湖的哪些景点」）
         name = re.sub(
             r"^(?:的|了|哪些|什么|哪个|哪儿|哪里|地点|地方|景点|还有|大概|大约)+",
+            "",
+            name,
+        ).strip()
+        # 分句连接词 / 副词起头（「顺便去故宫」「再去灵隐寺」「别的随意」）；
+        # 单剥「还 / 再 / 也 / 就」会破坏「还剑湖」这类真实地名，必须带动作词
+        name = re.sub(
+            r"^(?:(?:顺便|然后|接着|之后|另外|并且|还有)+(?:想|要|去|到|来|逛|看|玩|参观|游览|打卡)?"
+            r"|(?:再|也|就|还)+(?:想|要|去|到|来|逛|看|玩|参观|游览|打卡)+"
+            r"|(?:必去|一定要去|必须去|想去|打卡|别错过|不能错过|非去不可)+"
+            r"|(?:别的|其它的|其他|剩下的)(?:地方|景点|行程|安排)?)",
             "",
             name,
         ).strip()
@@ -247,12 +348,26 @@ def _date_range_days(requirements: dict[str, Any]) -> int | None:
     return days if 0 < days <= 366 else None
 
 
+def _duration_number(raw: str) -> int | None:
+    """天数数值：小数天数向上取整（1.5 天跨两个日历日）。"""
+    text = str(raw or "").strip()
+    if "." in text:
+        try:
+            return math.ceil(float(text))
+        except ValueError:
+            return None
+    return _cn_number(text)
+
+
 def _text_duration(text: str) -> int | None:
-    """「N 天 / 日」天数；跳过「3月4日」「第一天」「5日到7日」这类日期。
+    """「N 天 / 日」「N 周」天数；跳过「3月4日」「第一天」「5日到7日」。
 
     序数（第 N 天）与日期区间（N 日到 M 日）不是行程总天数：把「第一天」
-    读成 1 天会让天数校验把正确行程判失败。
+    读成 1 天会让天数校验把正确行程判失败。优先「玩 / 待 / 住 / 停留」
+    后面的天数：「往返路上 2 天，在杭州玩 3 天」取 3。
     """
+    preferred: int | None = None
+    fallback: int | None = None
     for match in _DURATION_RE.finditer(text):
         prefix = text[: match.start()].rstrip()
         if prefix.endswith(("月", "第", "到", "至", "~", "—", "-")):
@@ -260,10 +375,53 @@ def _text_duration(text: str) -> int | None:
         suffix = text[match.end() :].lstrip()
         if suffix[:1] in ("到", "至", "~", "—", "-"):
             continue
-        number = _cn_number(match.group(1))
-        if number and 0 < number <= 365:
-            return number
+        number = _duration_number(match.group(1))
+        if not number or not 0 < number <= 365:
+            continue
+        if prefix.endswith(("玩", "待", "住", "停留", "游玩", "旅游", "行程")):
+            preferred = number
+            break
+        if fallback is None:
+            fallback = number
+    if preferred is not None:
+        return preferred
+    if fallback is not None:
+        return fallback
+    for match in _WEEK_DURATION_RE.finditer(text):
+        prefix = text[: match.start()].rstrip()
+        if prefix.endswith(("第", "到", "至", "~", "—", "-")):
+            continue
+        suffix = text[match.end() :].lstrip()
+        # 「三周年」是年份不是行程长度
+        if suffix[:1] in ("到", "至", "~", "—", "-", "年"):
+            continue
+        number = _duration_number(match.group(1))
+        if number and 0 < number * 7 <= 365:
+            return number * 7
     return None
+
+
+def _budget_amount(raw: object, unit: object) -> float | None:
+    """预算金额归一：千分位 / 小数 / 中文数字，万、千、k、w 单位换算。"""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text[0].isdigit():
+        try:
+            amount = float(re.sub(r"[,，\s]", "", text))
+        except ValueError:
+            return None
+    else:
+        number = _cn_number(text)
+        if number is None:
+            return None
+        amount = float(number)
+    unit_text = str(unit or "")
+    if unit_text in ("万元", "万", "w", "W"):
+        amount *= 10000
+    elif unit_text in ("千元", "千", "k", "K"):
+        amount *= 1000
+    return amount if math.isfinite(amount) else None
 
 
 def extract_requirements(
@@ -273,7 +431,18 @@ def extract_requirements(
     requirements: dict[str, Any] = {}
     event = normalize_event_data(event_data)
     duration = event.get("duration_days")
-    if isinstance(duration, (int, float)) and int(duration) > 0:
+    if isinstance(duration, str):
+        # 模型 / 备份里的字符串天数（"7" / "7天"）此前被静默丢弃
+        stripped = duration.strip()
+        if re.fullmatch(r"\d{1,3}", stripped):
+            duration = int(stripped)
+        else:
+            duration = _text_duration(stripped)
+    if (
+        isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and 0 < int(duration) <= 366
+    ):
         requirements["duration_days"] = int(duration)
     for key in ("start_date", "end_date"):
         value = event.get(key)
@@ -287,16 +456,29 @@ def extract_requirements(
         requirements["duration_days"] = date_days
 
     text = str(user_query or "")
-    budget_match = _BUDGET_RE.search(text)
+    # 「酒店费用800，预算3000」：显式的 预算 / 总预算 优先；没有时再退化
+    # 到第一个 费用 / 花费 候选（时间 / 数量数字已由正则排除）
+    budget_match = None
+    fallback_match = None
+    for candidate in _BUDGET_RE.finditer(text):
+        if candidate.group("kind") in ("预算", "总预算"):
+            budget_match = candidate
+            break
+        if fallback_match is None:
+            fallback_match = candidate
+    budget_match = budget_match or fallback_match
     if budget_match:
-        raw_amount = re.sub(r"[,，\s]", "", budget_match.group(1))
-        try:
-            amount = float(raw_amount)
-        except ValueError:
-            amount = 0.0
-        if budget_match.group(2) in ("万元", "万"):
-            amount *= 10000
-        if math.isfinite(amount) and amount > 0:
+        amounts = [
+            _budget_amount(budget_match.group("amount"), budget_match.group("unit"))
+        ]
+        if budget_match.group("amount2"):
+            amounts.append(
+                _budget_amount(
+                    budget_match.group("amount2"), budget_match.group("unit2")
+                )
+            )
+        amount = max((value for value in amounts if value is not None), default=None)
+        if amount is not None and amount > 0:
             requirements["budget"] = amount
 
     must_see: list[str] = []
@@ -306,6 +488,15 @@ def extract_requirements(
         if _MUST_SEE_NEGATION_RE.search(negated):
             continue
         for name in _clean_must_see(match.group(1)):
+            if name not in must_see:
+                must_see.append(name)
+    # 后置触发词：「西湖、灵隐寺都要去 / 故宫必须去」；「不一定要去」里
+    # 触发词前紧邻「不」时是否定，不能算必去项
+    for match in _MUST_SEE_SUFFIX_RE.finditer(text):
+        raw = match.group(1).rstrip()
+        if re.search(r"[不别没未]$", raw):
+            continue
+        for name in _clean_must_see(raw):
             if name not in must_see:
                 must_see.append(name)
     destination = str(event.get("destination") or "").strip()
@@ -390,10 +581,19 @@ def _parse_time_range(value: object) -> tuple[int, int] | None:
     match = _TIME_RANGE_RE.search(str(value or ""))
     if not match:
         return None
-    hour, minute, end_hour, end_minute = (int(part) for part in match.groups())
-    if hour > 23 or end_hour > 23 or minute > 59 or end_minute > 59:
+    hour, minute, next_day, end_hour, end_minute = match.groups()
+    hour, minute = int(hour), int(minute)
+    end_hour, end_minute = int(end_hour), int(end_minute)
+    if hour > 23 or minute > 59 or end_minute > 59:
         return None
-    return hour * 60 + minute, end_hour * 60 + end_minute
+    # 「22:00-24:00」：24:00 是当天结束的合法写法
+    if end_hour > 24 or (end_hour == 24 and end_minute != 0):
+        return None
+    start = hour * 60 + minute
+    end = end_hour * 60 + end_minute
+    if next_day:
+        end += 1440
+    return start, end
 
 
 def _number(value: object) -> float | None:
@@ -402,11 +602,24 @@ def _number(value: object) -> float | None:
     if isinstance(value, (int, float)):
         number = float(value)
     elif isinstance(value, str):
-        # 费用字段可能是「约1.5万元」「10,000元」：支持千分位与万单位，
-        # 否则「1.5万」会被读成 1.5、「10,000」只读到 10
-        match = _NUMBER_RE.search(value)
-        if not match:
+        # 费用字段可能是「约1.5万元」「10,000元」「2人共500元」：支持
+        # 千分位与万 / 千单位；数量词（2 人 / 2 张）不是金额，优先取
+        # 「共 / 合计 / 总价」修饰或带货币单位的数
+        matches = list(_NUMBER_RE.finditer(value))
+        if not matches:
             return None
+        chosen = None
+        total_hit = None
+        for match in matches:
+            if match.group(2) not in ("元", "块", "万元", "万", "千元", "千"):
+                continue
+            prefix = value[max(0, match.start() - 4) : match.start()]
+            if re.search(r"(?:共|合计|总计|共计|总价)", prefix):
+                total_hit = match
+                break
+            if chosen is None:
+                chosen = match
+        match = total_hit or chosen or matches[-1]
         raw = re.sub(r"[,，\s]", "", match.group(1))
         try:
             number = float(raw)
@@ -414,6 +627,8 @@ def _number(value: object) -> float | None:
             return None
         if match.group(2) in ("万元", "万"):
             number *= 10000
+        elif match.group(2) in ("千元", "千"):
+            number *= 1000
     else:
         return None
     return number if math.isfinite(number) else None
@@ -486,13 +701,19 @@ def validate_itinerary(
                 or activity.get("time")
             )
             if end <= start:
-                issues.append(
-                    {
-                        "code": "invalid_time_range",
-                        "message": f"第 {day_index} 天「{label}」的结束时间不晚于开始时间",
-                    }
-                )
-                continue
+                # 跨午夜（22:00-02:00 / 20:00-次日01:00）是合法安排；
+                # 零长度或超过 12 小时的反向区间（15:00-09:00）仍是非法时间
+                if end == start or end + 1440 - start > 12 * 60:
+                    issues.append(
+                        {
+                            "code": "invalid_time_range",
+                            "message": (
+                                f"第 {day_index} 天「{label}」的结束时间不晚于开始时间"
+                            ),
+                        }
+                    )
+                    continue
+                end += 1440
             intervals.append((start, end, label))
         intervals.sort(key=lambda item: (item[0], item[1]))
         for previous, current in zip(intervals, intervals[1:]):
@@ -554,11 +775,28 @@ def validate_itinerary(
                 }
             )
 
-    # 5) 必去项：只核对每日安排。整份 JSON 会把备注 / 用户原话里提到的
-    # 地名也算作「已安排」，行程实际没去也判通过
+    # 5) 必去项：只核对每日活动的名称 / 地点等身份字段。整份 JSON 会把
+    # 备注、当天主题、交通说明里顺带提到的地名也算作「已安排」，行程
+    # 实际没去也判通过
     must_see = requirements.get("must_see")
     if isinstance(must_see, list):
-        text = json.dumps(plans, ensure_ascii=False).casefold()
+        parts: list[str] = []
+        for plan in plans:
+            for activity in _activities(plan):
+                for key in (
+                    "title",
+                    "name",
+                    "activity",
+                    "location",
+                    "place",
+                    "景点",
+                    "名称",
+                    "目的地",
+                ):
+                    value = activity.get(key)
+                    if isinstance(value, str) and value.strip():
+                        parts.append(value)
+        text = "\n".join(parts).casefold()
         for name in must_see:
             if str(name).casefold() not in text:
                 issues.append(
