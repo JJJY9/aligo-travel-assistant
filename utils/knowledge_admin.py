@@ -165,7 +165,10 @@ class KnowledgeBusyError(RuntimeError):
 def _read_lock(timeout: float = _READ_LOCK_TIMEOUT_SEC):
     """只读路径的有界共享锁：拿不到立即失败，由调用方快速返回「正在写入」。"""
     if not _WRITE_LOCK.acquire_read(timeout):
-        raise KnowledgeBusyError("知识库正在写入（导入进行中），请稍后重试")
+        raise KnowledgeBusyError(
+            "知识库正在写入（导入 / 编辑 / 删除 / 导出等操作进行中），"
+            "读取请稍后重试"
+        )
     try:
         yield
     finally:
@@ -176,7 +179,10 @@ def _read_lock(timeout: float = _READ_LOCK_TIMEOUT_SEC):
 def _write_lock(timeout: float = _WRITE_LOCK_TIMEOUT_SEC):
     """写路径的有界独占锁：长导入进行中时快速失败，不占住线程池排队。"""
     if not _WRITE_LOCK.acquire_write(timeout):
-        raise KnowledgeBusyError("知识库正在写入（导入进行中），请稍后重试")
+        raise KnowledgeBusyError(
+            "知识库正在写入（导入 / 编辑 / 删除 / 导出等操作进行中），"
+            "请稍后重试"
+        )
     try:
         yield
     finally:
@@ -552,7 +558,15 @@ def _chunk_documents(
         ]
     )
     if not chunks:
-        chunks = [text.strip()]
+        # split_text 会过滤不含字母数字的分片：纯破折号 / emoji / 标点的
+        # 长文本会整体落到这里。不能整篇当一个分片（嵌入只编码前 512
+        # token，尾部永久检索不到），按上限硬切成多片维持 ≤400 字契约
+        stripped = text.strip()
+        chunks = [
+            stripped[index : index + _MAX_CONTENT_CHARS]
+            for index in range(0, len(stripped), _MAX_CONTENT_CHARS)
+            if stripped[index : index + _MAX_CONTENT_CHARS].strip()
+        ] or [stripped]
     # 分片标记是派生字段：调用方回传的旧 part/parts/group 必须丢弃，
     # 否则编辑后会沿用旧编号 / 旧组。派生标记是内部记账字段，不受用户
     # 元数据 10 键上限约束（该上限只约束输入 / 导入），否则用户元数据
@@ -1049,6 +1063,10 @@ def update_document(
             _removed_extra, failed_compensation = _delete_ids(
                 extra_ids, "更新失败后补偿删除分片"
             )
+            # 补偿删除不 bump 缓存版本：失败窗口内按当前版本构建的 BM25
+            # 索引会收录这些从未保存成功的分片，必须在抛出前再失效一次
+            # （TTL 只兜底其它进程）
+            _invalidate_hybrid_cache()
             if failed_compensation:
                 raise RuntimeError(
                     "更新失败且补偿删除未完成，残留分片 "

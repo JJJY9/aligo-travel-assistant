@@ -88,7 +88,7 @@ _COLLECTION_INIT_LOCK = threading.Lock()
 # 版本号：技能脚本可能以不同模块名被加载多次，各副本缓存互不可见，
 # 写入方 bump utils 里的进程级版本号即可让所有副本一起过期。
 _BM25_CACHE: dict[tuple[str, str], tuple[float, BM25Index, int]] = {}
-_BM25_FAILED_AT: dict[tuple[str, str], float] = {}
+_BM25_FAILED_AT: dict[tuple[str, str], tuple[float, int]] = {}
 _BM25_CACHE_LOCK = threading.Lock()
 _BM25_KEY_LOCKS: dict[tuple[str, str], threading.Lock] = {}
 
@@ -752,14 +752,32 @@ class RAGKnowledgeAgent(AgentBase):
                 return cached[1]
             if failed and failed[1] == epoch and (now - failed[0]) <= ttl:
                 return None
+            # 全量扫描必须与整组替换 / 导入的写锁互斥：query_iterator 没有
+            # 快照隔离，多步写入窗口内会同时读到同组的新旧两版分片。锁只
+            # 包扫描，建索引 / 融合 / 精排仍在锁外；拿不到读锁按「本次不
+            # 重建」退回纯向量，且不写失败退避（写结束即可重试）。
+            busy_types: tuple[type[BaseException], ...] = ()
             try:
-                rows = self._fetch_all_documents(max_docs)
+                from utils.knowledge_admin import KnowledgeBusyError, _read_lock
+
+                scan_lock = _read_lock()
+                busy_types = (KnowledgeBusyError,)
+            except Exception:  # noqa: BLE001 - 维护模块不可用时保持原行为
+                scan_lock = contextlib.nullcontext()
+            try:
+                with scan_lock:
+                    # 锁内重取版本号：持读锁期间写者无法变更，据此缓存安全
+                    epoch = bm25_cache_epoch()
+                    rows = self._fetch_all_documents(max_docs)
+                index = BM25Index(rows)
             except Exception as exc:  # noqa: BLE001 - 混合检索是增强项
+                if busy_types and isinstance(exc, busy_types):
+                    logger.info("知识库正在写入，本次混合检索退回纯向量")
+                    return None
                 logger.warning("BM25 索引构建失败，检索退回纯向量: %s", exc)
                 with _BM25_CACHE_LOCK:
                     _BM25_FAILED_AT[key] = (now, epoch)
                 return None
-            index = BM25Index(rows)
             # 扫描期间若发生知识写入 / 删除（版本号已变），这份快照可能
             # 读到整组替换的中间态：只服务本次请求，不能写入缓存覆盖新
             # 数据（下一次请求会按新版本重建）
@@ -838,56 +856,68 @@ class RAGKnowledgeAgent(AgentBase):
         index = self._get_bm25_index()
         if index is None or not len(index):
             return _vector_fallback()
-        bm25_hits = index.search(query, candidates)
-        if not bm25_hits:
-            return _vector_fallback()
-        bm25_docs = [{**doc, "bm25_score": score} for doc, score in bm25_hits]
         try:
-            from config import RAG_CONFIG
-
-            rrf_k = int(RAG_CONFIG.get("rrf_k", 60) or 60)
-        except Exception:  # noqa: BLE001 - 配置异常按默认值
-            rrf_k = 60
-        fused = rrf_fuse([vector_docs, bm25_docs], k=max(1, rrf_k))
-        vector_scores = {
-            str(doc.get("id") or ""): float(doc.get("distance") or 0.0)
-            for doc in vector_docs
-        }
-        bm25_scores = {
-            str(doc.get("id") or ""): float(doc.get("bm25_score") or 0.0)
-            for doc in bm25_docs
-        }
-        fused = annotate_hybrid_scores(
-            fused,
-            vector_scores,
-            bm25_scores,
-            # 按每篇文档自身长度归一（覆盖度 × TF 饱和、长度中性）：平均
-            # 长度基准会把覆盖全部关键词的长片段压到阈值以下（评分倒挂），
-            # 也会让只命中个别常见词的短片段过线
-            bm25_normalized={
-                str(doc.get("id") or ""): index.normalized_score(
-                    query, doc.get("content")
-                )
-                for doc in fused
-                if str(doc.get("id") or "") in bm25_scores
-            },
-        )
-        if min_distance is not None:
-            # 证据门槛先于精排 / 截断：精排分与 distance 不在同一量纲，
-            # 先按精排截断会把通过阈值的片段挤出 top-K，有证据也拒答。
-            # 精排只负责给已过门槛的候选排序
-            fused = [
-                doc
-                for doc in fused
-                if float(doc.get("distance") or 0.0) >= min_distance
+            bm25_hits = index.search(query, candidates)
+            if not bm25_hits:
+                return _vector_fallback()
+            bm25_docs = [
+                {**doc, "bm25_score": score} for doc, score in bm25_hits
             ]
-        fused = self._rerank_documents(query, fused)
-        return fused[:top_k]
+            try:
+                from config import RAG_CONFIG
+
+                rrf_k = int(RAG_CONFIG.get("rrf_k", 60) or 60)
+            except Exception:  # noqa: BLE001 - 配置异常按默认值
+                rrf_k = 60
+            fused = rrf_fuse([vector_docs, bm25_docs], k=max(1, rrf_k))
+            vector_scores = {
+                str(doc.get("id") or ""): float(doc.get("distance") or 0.0)
+                for doc in vector_docs
+            }
+            bm25_scores = {
+                str(doc.get("id") or ""): float(doc.get("bm25_score") or 0.0)
+                for doc in bm25_docs
+            }
+            fused = annotate_hybrid_scores(
+                fused,
+                vector_scores,
+                bm25_scores,
+                # 按每篇文档自身长度归一（覆盖度 × TF 饱和、长度中性）：平均
+                # 长度基准会把覆盖全部关键词的长片段压到阈值以下（评分倒挂），
+                # 也会让只命中个别常见词的短片段过线
+                bm25_normalized={
+                    str(doc.get("id") or ""): index.normalized_score(
+                        query, doc.get("content")
+                    )
+                    for doc in fused
+                    if str(doc.get("id") or "") in bm25_scores
+                },
+            )
+            if min_distance is not None:
+                # 证据门槛先于精排 / 截断：精排分与 distance 不在同一量纲，
+                # 先按精排截断会把通过阈值的片段挤出 top-K，有证据也拒答。
+                # 精排只负责给已过门槛的候选排序
+                fused = [
+                    doc
+                    for doc in fused
+                    if float(doc.get("distance") or 0.0) >= min_distance
+                ]
+            fused = self._rerank_documents(query, fused)
+            return fused[:top_k]
+        except Exception as exc:  # noqa: BLE001 - 融合失败按纯向量回退
+            # 文档承诺「任何一步失败都退回向量结果」：索引查询 / RRF /
+            # 归一化 / 精排的异常不能冒到 strict 检索变成「知识库不可用」
+            logger.warning("混合检索融合失败，退回纯向量: %s", exc)
+            return _vector_fallback()
 
     def _rerank_documents(
         self, query: str, documents: list[dict]
     ) -> list[dict]:
         """可选 cross-encoder 精排；模型未配置 / 加载失败时保持 RRF 顺序。"""
+        if not documents:
+            # 候选被 min_distance 全部过滤时仍会走到这里：空输入不能触发
+            # 重排模型加载 / 下载（首次可达 ~1GB），直接返回空列表
+            return documents
         try:
             from config import RAG_CONFIG
 

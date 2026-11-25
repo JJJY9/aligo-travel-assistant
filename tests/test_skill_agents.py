@@ -2437,6 +2437,99 @@ def test_bm25_index_built_during_write_is_not_cached(monkeypatch):
     print("✓ BM25 构建期间写入不缓存旧快照")
 
 
+def test_bm25_index_build_skips_during_write(monkeypatch):
+    """写锁持有期间不扫描构建 BM25，退回纯向量且不写 TTL 退避。"""
+    from utils import knowledge_admin
+
+    module = _load_skill_module("ask-question")
+    agent = object.__new__(module.RAGKnowledgeAgent)
+    agent.knowledge_base_path = "/tmp/kb-busy"
+    agent.collection_name = "kb-busy-test"
+
+    def _never_scan(limit):
+        raise AssertionError("写锁期间不得全库扫描")
+
+    agent._fetch_all_documents = _never_scan
+    module._BM25_CACHE.clear()
+    module._BM25_FAILED_AT.clear()
+    key = (agent.knowledge_base_path, agent.collection_name)
+    assert knowledge_admin._WRITE_LOCK.acquire_write(timeout=1)
+    try:
+        assert agent._get_bm25_index() is None
+    finally:
+        knowledge_admin._WRITE_LOCK.release_write()
+    assert key not in module._BM25_FAILED_AT, "写忙不应触发 60s 退避"
+    print("✓ 写锁期间跳过 BM25 构建且不写退避")
+
+
+def test_bm25_index_construction_failure_falls_back(monkeypatch):
+    """索引构造（非扫描）抛错同样退回纯向量并记录短时退避。"""
+    module = _load_skill_module("ask-question")
+    agent = object.__new__(module.RAGKnowledgeAgent)
+    agent.knowledge_base_path = "/tmp/kb-build-fail"
+    agent.collection_name = "kb-build-fail-test"
+    agent._fetch_all_documents = lambda limit: [
+        {"id": 1, "content": "住宿标准", "metadata": {}}
+    ]
+
+    class _BoomIndex:
+        def __init__(self, rows):
+            raise MemoryError("index too large")
+
+    monkeypatch.setattr(module, "BM25Index", _BoomIndex)
+    module._BM25_CACHE.clear()
+    module._BM25_FAILED_AT.clear()
+    assert agent._get_bm25_index() is None
+    key = (agent.knowledge_base_path, agent.collection_name)
+    assert key in module._BM25_FAILED_AT, "构造失败应写入退避标记"
+    assert agent._get_bm25_index() is None
+    print("✓ BM25 构造失败退回纯向量并退避")
+
+
+def test_hybrid_search_fusion_failure_falls_back_to_vector():
+    """索引查询 / 融合异常不冒到 strict 检索，按纯向量回退（含门槛过滤）。"""
+    module = _load_skill_module("ask-question")
+    agent = object.__new__(module.RAGKnowledgeAgent)
+
+    class _BrokenIndex:
+        def __len__(self):
+            return 1
+
+        def search(self, query, top_k):
+            raise RuntimeError("index broken")
+
+    agent._hybrid_settings = lambda: (True, 20)
+    agent._get_bm25_index = lambda: _BrokenIndex()
+    docs = [
+        {"id": 1, "content": "住宿标准", "distance": 0.8},
+        {"id": 2, "content": "无关内容", "distance": 0.2},
+    ]
+    result = agent._hybrid_search("住宿标准", [dict(doc) for doc in docs], 5, 0.5)
+    assert [doc["id"] for doc in result] == [1], result
+    print("✓ 融合异常退回纯向量")
+
+
+def test_rerank_skips_model_when_candidates_empty(monkeypatch):
+    """候选被阈值全部过滤时不能为空列表加载 / 下载重排模型。"""
+    import utils.reranker_model as reranker_model
+    from config import RAG_CONFIG
+
+    module = _load_skill_module("ask-question")
+    agent = object.__new__(module.RAGKnowledgeAgent)
+    agent._reranker = None
+    agent._reranker_failed = False
+    calls: list[str] = []
+    monkeypatch.setattr(
+        reranker_model,
+        "get_shared_cross_encoder",
+        lambda name: calls.append(name),
+    )
+    monkeypatch.setitem(RAG_CONFIG, "rerank_model", "fake-reranker")
+    assert agent._rerank_documents("住宿标准", []) == []
+    assert calls == [], "空候选不得触发模型加载"
+    print("✓ 空候选不加载重排模型")
+
+
 def test_fetch_all_documents_parses_metadata_json(monkeypatch):
     """BM25 索引行里的 metadata 字符串要解析成 dict，分组才能生效。"""
     module = _load_skill_module("ask-question")

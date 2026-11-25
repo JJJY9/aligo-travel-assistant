@@ -6467,6 +6467,40 @@ def test_knowledge_update_error_mappings(monkeypatch):
     print("✓ PUT 知识片段 400 / 503 映射")
 
 
+def test_knowledge_update_without_metadata_sets_expect_baseline(monkeypatch):
+    """PUT 省略 metadata 时以读到的快照作为并发基线，防止旧值覆盖并发修改。"""
+    from webapp import server as server_module
+
+    client = _client()
+    monkeypatch.setattr(
+        server_module,
+        "get_document",
+        lambda doc_id: {
+            "id": doc_id,
+            "content": "旧内容",
+            "metadata": {"category": "交通", "title": "市内交通"},
+        },
+    )
+    captured = {}
+
+    def fake_update(doc_id, content, metadata=None, **kwargs):
+        captured["metadata"] = metadata
+        captured["expect_metadata"] = kwargs.get("expect_metadata")
+        return {"id": doc_id}
+
+    monkeypatch.setattr(server_module, "update_document", fake_update)
+    response = client.put(
+        "/api/knowledge/documents/1", json={"content": "新内容"}
+    )
+    assert response.status_code == 200
+    assert captured["metadata"] == {"category": "交通", "title": "市内交通"}
+    assert captured["expect_metadata"] == {
+        "category": "交通",
+        "title": "市内交通",
+    }
+    print("✓ 省略 metadata 的 PUT 带上并发基线")
+
+
 def test_static_assets_no_cache_header():
     """/static/ 响应必须带 Cache-Control: no-cache（发版后不能吃到旧脚本）。"""
     response = _client().get("/static/app.js")
@@ -12885,6 +12919,28 @@ def test_knowledge_eval_api(monkeypatch):
     state.kb_limiter = RateLimiter(limit=3, window_sec=60)
     degraded = client.get("/api/knowledge/eval")
     assert degraded.status_code == 200 and "warning" in degraded.json()
+
+    # 零命中诊断与共享锁告警必须同时保留（此前后写者覆盖先写者）
+    def zero_hit_evaluate(*args, **kwargs):
+        return {
+            "total": 1,
+            "hit1": 0.0,
+            "hit3": 0.0,
+            "hit5": 0.0,
+            "mrr": 0.0,
+            "rows": [],
+            "warning": "没有命中任何评测题：请先确认知识库已初始化且片段数量正常",
+        }
+
+    monkeypatch.setattr("utils.rag_eval.evaluate_retrieval", zero_hit_evaluate)
+    state.kb_limiter = RateLimiter(limit=3, window_sec=60)
+    merged = client.get("/api/knowledge/eval")
+    assert merged.status_code == 200
+    merged_warning = merged.json().get("warning", "")
+    assert "没有命中任何评测题" in merged_warning
+    assert "共享锁不可用" in merged_warning
+    # 恢复命中结果的假实现，后续「未配置 Redis 不应误报」用例仍按原口径
+    monkeypatch.setattr("utils.rag_eval.evaluate_retrieval", fake_evaluate)
 
     # 未配置 Redis 时进程内锁是正常模式，不应误报
     monkeypatch.setitem(server_module.STORAGE_CONFIG, "redis_url", "")

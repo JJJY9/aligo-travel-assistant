@@ -3237,7 +3237,11 @@ def _knowledge_unavailable(action: str, exc: Exception) -> HTTPException:
         )
     # 可操作的临时状态：导入占用写锁 / 嵌入模型正在加载，给与
     # /api/knowledge、doctor 一致的提示与 Retry-After，而不是通用 503
-    if "导入进行中" in lowered or "正在加载（首次使用需加载嵌入模型）" in lowered:
+    if (
+        "导入进行中" in lowered
+        or "正在写入" in lowered
+        or "正在加载（首次使用需加载嵌入模型）" in lowered
+    ):
         return HTTPException(
             status_code=503,
             detail=redact_paths(str(exc)) or "知识库正在忙，请稍后再试",
@@ -4773,8 +4777,14 @@ def create_app(model: Any = None) -> FastAPI:
                         lock_lost,
                         lock_degraded,
                     )
-                    result["warning"] = (
-                        "评测期间共享锁不可用（可能存在并发评测），结果仅供参考"
+                    prev_warning = str(result.get("warning") or "").strip()
+                    result["warning"] = "；".join(
+                        part
+                        for part in (
+                            prev_warning,
+                            "评测期间共享锁不可用（可能存在并发评测），结果仅供参考",
+                        )
+                        if part
                     )
                 return result
             except Exception as exc:  # noqa: BLE001 - 检索失败统一提示
@@ -4906,6 +4916,7 @@ def create_app(model: Any = None) -> FastAPI:
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             metadata = payload.metadata
+            expect_metadata = payload.expect_metadata
             if metadata is None:
                 # 请求省略 metadata：沿用库中现有元数据（与 CLI kb-update
                 # 一致），否则只改正文就会把 category / title / source
@@ -4914,6 +4925,10 @@ def create_app(model: Any = None) -> FastAPI:
                 if existing is None:
                     raise LookupError("知识片段不存在")
                 metadata = dict(existing.get("metadata") or {})
+                if expect_metadata is None:
+                    # 「沿用现有元数据」依据的是写锁外的旧快照：并发会话
+                    # 改过元数据时应返回 409，而不是把旧值静默写回
+                    expect_metadata = dict(metadata)
             return update_document(
                 doc_id,
                 payload.content,
@@ -4921,7 +4936,7 @@ def create_app(model: Any = None) -> FastAPI:
                 expect_content=payload.expect,
                 expect_parts=payload.expect_parts,
                 expect_group=payload.expect_group,
-                expect_metadata=payload.expect_metadata,
+                expect_metadata=expect_metadata,
             )
         except DocumentConflictError as exc:
             # 并发修改冲突可刷新后重试：不能混进 400 的「内容不合法」口径

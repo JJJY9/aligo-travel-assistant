@@ -1043,9 +1043,13 @@ def test_update_grouped_update_failure_rolls_back_extras(monkeypatch):
             return {"status": "error", "message": "upsert failed"}
 
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    from utils.hybrid_retrieval import bm25_cache_epoch
+
+    epoch_before = bm25_cache_epoch()
     with pytest.raises(RuntimeError, match="upsert failed"):
         knowledge_admin.update_document(7, "长" * 1000, {"category": "测试"})
     assert fake_client.deleted == [8, 9], "应补偿删除本次插入的分片"
+    assert bm25_cache_epoch() != epoch_before, "补偿删除后必须失效 BM25 缓存"
     print("✓ 覆盖目标失败时补偿删除新分片")
 
 
@@ -1076,6 +1080,19 @@ def test_chunk_documents_marks_even_with_full_metadata(monkeypatch):
         assert item["metadata"]["parts"] == str(len(agent.documents))
         assert item["metadata"]["group"]
     print("✓ 元数据较多时分片标记仍然写入")
+
+
+def test_chunk_documents_hard_cuts_non_alnum_text(monkeypatch):
+    """全非字母数字长文本按上限硬切，而不是整篇存成一个分片。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    documents = knowledge_admin._chunk_documents("—" * 1000, {})
+    assert len(documents) == 3, documents
+    assert all(len(doc["content"]) <= 400 for doc in documents)
+    assert all(doc["metadata"].get("group") for doc in documents)
+    assert [doc["metadata"].get("part") for doc in documents] == ["1", "2", "3"]
+    print("✓ 全非字母数字文本硬切为多片")
 
 
 def test_existing_contents_scans_all_rows(monkeypatch):
@@ -3917,6 +3934,7 @@ if __name__ == "__main__":
         test_update_grouped_add_failure_keeps_old_content,
         test_update_grouped_update_failure_rolls_back_extras,
         test_chunk_documents_marks_even_with_full_metadata,
+        test_chunk_documents_hard_cuts_non_alnum_text,
         test_import_regroups_exported_chunks,
         test_import_skips_group_with_non_finite_part_metadata,
         test_find_duplicate_contents_ignores_grouped_fragments,
