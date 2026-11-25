@@ -534,6 +534,39 @@ def test_export_stdout_strips_terminal_controls(monkeypatch):
     print("✓ trips-export --stdout 剥离控制序列")
 
 
+def test_dispatch_option_before_positional(monkeypatch):
+    """--stdout / --query / --status 可出现在 user_id 之前。"""
+    calls = []
+
+    def fake(user, **kwargs):
+        calls.append((user, kwargs))
+        return 0
+
+    monkeypatch.setattr(cli, "run_trips_export_standalone", fake)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "cli.py",
+            "trips-export",
+            "--query",
+            "北京",
+            "--status",
+            "past",
+            "--stdout",
+            "u1",
+        ],
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    user, kwargs = calls[-1]
+    assert user == "u1"
+    assert kwargs["to_stdout"] is True
+    assert kwargs["query"] == "北京" and kwargs["status"] == "past"
+    print("✓ trips-export 选项可在位置参数之前（含带值选项）")
+
+
 def test_export_status_arg_parsing():
     """--status 只对 trips-export 生效，非法状态按用法错误拒绝。"""
     assert cli._parse_export_args(["--status", "past"], allow_ics=True) == (
@@ -605,6 +638,7 @@ if __name__ == "__main__":
         test_main_dispatch_status,
         test_export_html,
         test_main_dispatch_html_and_conflict,
+        test_dispatch_option_before_positional,
         test_export_status_filter,
         test_export_csv_warns_about_unimportable_rows,
         test_export_ics_stdout_reports_skipped,

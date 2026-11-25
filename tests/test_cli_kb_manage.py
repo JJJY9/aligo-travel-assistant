@@ -1126,6 +1126,65 @@ def test_kb_show_json_missing_document(monkeypatch):
     assert code == 1 and payload["ok"] is False and "不存在" in payload["error"]
     print("✓ kb-show --json 缺失片段输出 JSON 错误")
 
+def test_search_and_show_json_sanitize_non_finite(monkeypatch):
+    """脏元数据（inf / nan）经 kb-search / kb-show --json 输出仍是合法 JSON。"""
+
+    def reject(value):
+        raise ValueError(f"非有限常量：{value}")
+
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "search_documents",
+        lambda q, top_k=5: [
+            {
+                "id": 1,
+                "content": "x",
+                "metadata": {"score": float("inf")},
+                "distance": float("nan"),
+            }
+        ],
+    )
+    code, out = _capture(cli.run_knowledge_search_standalone, "住宿", as_json=True)
+    assert code == 0
+    data = json.loads(out, parse_constant=reject)
+    assert data["results"][0]["metadata"]["score"] is None
+    assert data["results"][0]["distance"] is None
+
+    monkeypatch.setattr(
+        knowledge_admin,
+        "get_document_group",
+        lambda doc_id: {
+            "id": doc_id,
+            "content": "x",
+            "metadata": {"score": float("inf")},
+        },
+    )
+    code, out = _capture(cli.run_knowledge_show_standalone, 1, as_json=True)
+    assert code == 0
+    data = json.loads(out, parse_constant=reject)
+    assert data["metadata"]["score"] is None
+    print("✓ kb-search / kb-show --json 清洗非有限数")
+
+
+def test_kb_delete_group_flag_case_insensitive(monkeypatch):
+    """--GROUP 与其它选项一致：大小写不敏感。"""
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_knowledge_delete_standalone",
+        lambda doc_id, whole_group=False: (
+            calls.append((doc_id, whole_group)) or 0
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["cli.py", "kb-delete", "5", "--GROUP"])
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == (5, True)
+    print("✓ kb-delete --GROUP 大小写不敏感")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -1177,6 +1236,8 @@ if __name__ == "__main__":
         test_update_missing_or_unreadable_document,
         test_kb_add_gbk_file_friendly_error,
         test_kb_show_json_missing_document,
+        test_search_and_show_json_sanitize_non_finite,
+        test_kb_delete_group_flag_case_insensitive,
     ):
         mp = pytest.MonkeyPatch()
         try:

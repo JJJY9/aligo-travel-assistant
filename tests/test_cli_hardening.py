@@ -53,6 +53,17 @@ def test_unknown_command_exits_2(monkeypatch):
     print("✓ 未知命令 → 退出码 2")
 
 
+def test_unknown_command_strips_terminal_controls(monkeypatch):
+    """未知命令回显 argv[1] 时剥掉 ESC / OSC 序列（不能只做分派用的 lower）。"""
+    code, output = _main_exit(
+        monkeypatch, ["cli.py", "\x1b]52;c;Zm9v\x07伪造"]
+    )
+    assert code == 2
+    assert "未知命令" in output
+    assert "\x1b" not in output and "\x07" not in output
+    print("✓ 未知命令回显剥离终端控制序列")
+
+
 def test_help_exits_0(monkeypatch):
     code, output = _main_exit(monkeypatch, ["cli.py", "--help"])
     assert code == 0
@@ -193,6 +204,7 @@ if __name__ == "__main__":
     _tmp_registry.install()
     for case in (
         test_unknown_command_exits_2,
+        test_unknown_command_strips_terminal_controls,
         test_commands_hint_matches_dispatch,
         test_help_exits_0,
         test_kb_delete_rejects_extra_flags,

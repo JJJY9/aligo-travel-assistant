@@ -31,6 +31,9 @@ def test_parse_eval_cases_args():
     ) == (500, 7, "cases.jsonl", False, True)
     assert cli._parse_eval_cases_args(["--count", "abc"]) is None
     assert cli._parse_eval_cases_args(["--count", "5001"]) is None
+    # 0 条用例会产出空数据集却报成功（同族 eval-agent 的合法域是 1..5000）
+    assert cli._parse_eval_cases_args(["--count", "0"]) is None
+    assert cli._parse_eval_cases_args(["--count=0000"]) is None
     assert cli._parse_eval_cases_args(["--seed", "-1"]) is None
     assert cli._parse_eval_cases_args(["--out"]) is None
     assert cli._parse_eval_cases_args(["--unknown"]) is None

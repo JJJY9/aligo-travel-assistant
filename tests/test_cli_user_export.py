@@ -351,6 +351,26 @@ def test_user_export_with_knowledge_dispatch(monkeypatch):
     assert calls[-1] == ("u1", None, True)
     print("✓ user-export dispatch --with-knowledge")
 
+def test_user_export_with_knowledge_case_insensitive(monkeypatch):
+    """--with-knowledge 与其它选项一致：大小写不敏感。"""
+    calls = []
+    monkeypatch.setattr(
+        cli,
+        "run_user_export_standalone",
+        lambda user_id, target_dir=None, with_knowledge=False: (
+            calls.append((user_id, target_dir, with_knowledge)) or 0
+        ),
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "user-export", "u1", "--WITH-KNOWLEDGE"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", None, True)
+    print("✓ user-export --WITH-KNOWLEDGE 大小写不敏感")
+
+
 def test_user_export_refuses_when_memory_file_quarantined(monkeypatch):
     """损坏记忆文件被隔离后不能把空快照当成成功备份导出。"""
     import tempfile
@@ -527,6 +547,11 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_user_export_write_failure_reports(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_user_export_with_knowledge_case_insensitive(mp)
     finally:
         mp.undo()
     mp = pytest.MonkeyPatch()

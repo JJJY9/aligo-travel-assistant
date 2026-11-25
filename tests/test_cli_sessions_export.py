@@ -181,6 +181,25 @@ def test_export_rejects_bad_user_id(monkeypatch):
     print("✓ sessions-export 非法用户 ID")
 
 
+def test_dispatch_option_before_positional(monkeypatch):
+    """--stdout 可出现在 user_id 之前（与 stats / trips 同一口径）。"""
+    calls = []
+
+    def fake(user, target=None, to_stdout=False, force=False, html=False):
+        calls.append((user, target, to_stdout, force, html))
+        return 0
+
+    monkeypatch.setattr(cli, "run_sessions_export_standalone", fake)
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "sessions-export", "--stdout", "u1"]
+    )
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 0
+    assert calls[-1] == ("u1", None, True, False, False)
+    print("✓ sessions-export 选项可在位置参数之前")
+
+
 def test_dispatch_strict(monkeypatch):
     calls = []
 
@@ -238,6 +257,7 @@ if __name__ == "__main__":
         test_export_failures,
         test_export_rejects_bad_user_id,
         test_dispatch_strict,
+        test_dispatch_option_before_positional,
         test_export_write_failure_reports,
     ):
         mp = pytest.MonkeyPatch()

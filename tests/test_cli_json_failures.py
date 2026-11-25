@@ -350,6 +350,24 @@ def test_open_cli_store_forwards_allow_quarantined(monkeypatch):
     print("✓ CLI 存储打开按入口转发 allow_quarantined")
 
 
+def test_double_dash_json_is_positional(monkeypatch):
+    """``--`` 之后的 --json 是位置参数，不能翻转用法错误的输出格式。"""
+    assert cli._args_have_json(["--json", "--"]) is True
+    assert cli._args_have_json(["u", "t", "--", "--json"]) is False
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["cli.py", "pref-set", "u", "t", "--", "--json", "x"],
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+    text = out.getvalue().lstrip()
+    assert text.startswith("用法"), f"应输出纯文本用法，实际：{text[:80]}"
+    print("✓ -- 之后的 --json 不再翻转错误格式")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理

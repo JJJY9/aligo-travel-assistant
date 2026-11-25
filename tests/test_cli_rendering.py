@@ -134,6 +134,26 @@ def test_preference_rendering_skips_unmanageable_types():
     print("✓ 偏好回显过滤含 / 与超长 type")
 
 
+def test_preference_rendering_skips_oversized_value():
+    """超限偏好值不会落库：回显不能先宣称「已更新」。"""
+    instance = _new_cli()
+    instance._generate_human_response(
+        [
+            {
+                "agent_name": "preference",
+                "status": "success",
+                "data": {
+                    "preferences": [
+                        {"type": "home_location", "value": "x" * 10001},
+                    ]
+                },
+            }
+        ]
+    )
+    assert "已更新" not in instance._buffer.getvalue()
+    print("✓ 偏好回显过滤超限的值")
+
+
 def test_preference_legacy_dict_and_nested_shapes():
     instance = _new_cli()
     results = [
@@ -503,6 +523,7 @@ if __name__ == "__main__":
         mp.undo()
     test_preference_rendering_robust_and_consistent()
     test_preference_rendering_skips_unmanageable_types()
+    test_preference_rendering_skips_oversized_value()
     test_preference_legacy_dict_and_nested_shapes()
     test_local_timestamp_text_tolerates_extreme_years()
     test_agent_error_message_fallback()

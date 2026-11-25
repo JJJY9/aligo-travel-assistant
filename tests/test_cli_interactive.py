@@ -1359,6 +1359,130 @@ def test_read_commands_stop_on_quarantine():
     print("✓ 隔离状态下读命令提示并中止")
 
 
+def test_console_adaptive_when_columns_unset(monkeypatch):
+    """COLUMNS 未设置时交给 Rich 按真实终端宽度自适应；显式无效值仍回退 80。"""
+    monkeypatch.delenv("COLUMNS", raising=False)
+    assert cli._console_kwargs() == {}
+    for value in ("0", "1", "abc", ""):
+        monkeypatch.setenv("COLUMNS", value)
+        assert cli._console_kwargs() == {"width": 80}, value
+    monkeypatch.setenv("COLUMNS", "120")
+    assert cli._console_kwargs() == {}
+    print("✓ COLUMNS 未设置时自适应终端宽度")
+
+
+def test_prompt_ctrl_c_after_sync_command_does_not_force_exit(monkeypatch):
+    """同步命令期间的 Ctrl-C 不能在提示符处被算成「连按两次」强制退出。"""
+    import signal as signal_module
+    import types
+
+    agent = cli.AligoCLI()
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=100)
+
+    async def fake_init():
+        agent.user_id = "u1"
+        agent.memory_manager = types.SimpleNamespace(end_session=lambda: None)
+
+    def fake_history():
+        # 同步命令不让出事件循环：取消只挂在主任务上
+        signal_module.raise_signal(signal_module.SIGINT)
+
+    answers = iter(["history", "PROMPT_CTRL_C", "exit"])
+
+    def fake_ask(*args, **kwargs):
+        value = next(answers)
+        if value == "PROMPT_CTRL_C":
+            # 提示符处按一次 Ctrl-C：意图只是清空输入
+            signal_module.raise_signal(signal_module.SIGINT)
+        return value
+
+    monkeypatch.setattr(agent, "initialize_system", fake_init)
+    monkeypatch.setattr(agent, "print_banner", lambda: None)
+    monkeypatch.setattr(agent, "show_history", fake_history)
+    monkeypatch.setattr(cli.Prompt, "ask", staticmethod(fake_ask))
+    asyncio.run(agent.run())
+    text = buffer.getvalue()
+    assert "再见" in text, "提示符处的一次 Ctrl-C 不能把会话强制退出（130）"
+    assert "已取消上一步操作" in text
+    print("✓ 同步命令期间的 Ctrl-C 不跨命令累加成强制退出")
+
+
+def test_prompt_console_routes_to_stderr_when_captured(monkeypatch):
+    """stdout 被重定向 / stdin 是管道时，提示符走 stderr 而不是污染 stdout。"""
+    import types
+
+    agent = object.__new__(cli.AligoCLI)
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=100)
+
+    stale = io.StringIO()
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO("x\n"))
+    monkeypatch.setattr(sys, "stdout", stale)
+    monkeypatch.setattr(sys, "stderr", err)
+    agent._prompt_console().print("提示")
+    assert "提示" in err.getvalue()
+    assert "提示" not in buffer.getvalue()
+    assert "提示" not in stale.getvalue()
+
+    tty = types.SimpleNamespace(isatty=lambda: True)
+    monkeypatch.setattr(sys, "stdin", tty)
+    monkeypatch.setattr(cli, "_stream_isatty", lambda stream: True)
+    agent._prompt_console().print("交互")
+    assert "交互" in buffer.getvalue(), "双终端时提示符仍在原 console（外观不变）"
+    print("✓ 提示符在管道 / 重定向时走 stderr")
+
+
+def test_read_commands_refuse_pg_fallback(monkeypatch):
+    """PostgreSQL 故障回退的 JSON 不能当账号现状展示（与导出 / Web 同口径）。"""
+    import types
+
+    from config import STORAGE_CONFIG
+    from context import long_term_memory as ltm
+
+    class DummyLongTermMemory:
+        pass
+
+    monkeypatch.setattr(ltm, "LongTermMemory", DummyLongTermMemory)
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "postgresql://u:p@h/db")
+
+    agent = object.__new__(cli.AligoCLI)
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=200)
+    agent.memory_manager = types.SimpleNamespace(
+        reload_long_term=lambda: None, long_term=DummyLongTermMemory()
+    )
+    agent._command_failed = False
+    assert agent._reload_long_term_checked() is False
+    assert agent._command_failed is True
+    assert "PostgreSQL" in buffer.getvalue()
+    print("✓ REPL 读命令拒绝展示 PG 回退 JSON")
+
+
+def test_pipeline_marks_export_failure(monkeypatch):
+    """管道模式下导出中止必须以非零退出（脚本不能把没产出备份当成功）。"""
+    from context import storage
+
+    agent = object.__new__(cli.AligoCLI)
+    buffer = io.StringIO()
+    agent.console = Console(file=buffer, force_terminal=False, width=200)
+    agent.user_id = "u1"
+    agent.memory_manager = None
+    agent._command_failed = False
+    agent._user_id_from_stdin = True
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("PostgreSQL 已配置但连接失败（已回退本地 JSON）")
+
+    monkeypatch.setattr(storage, "create_long_term_memory", boom)
+    agent.export_memory()
+    assert "导出中止" in buffer.getvalue()
+    assert agent._command_failed is True
+    assert agent._pipeline_exit_code() == 1
+    print("✓ 交互 export 中止计入管道退出码")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -1487,6 +1611,18 @@ if __name__ == "__main__":
     finally:
         _mp.undo()
     test_sanitized_console_strips_controls_from_print()
+    for _case in (
+        test_console_adaptive_when_columns_unset,
+        test_prompt_ctrl_c_after_sync_command_does_not_force_exit,
+        test_prompt_console_routes_to_stderr_when_captured,
+        test_read_commands_refuse_pg_fallback,
+        test_pipeline_marks_export_failure,
+    ):
+        _mp = pytest.MonkeyPatch()
+        try:
+            _case(_mp)
+        finally:
+            _mp.undo()
     if _DIRECT_RUN_SKIP:
         print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
     print("\n全部通过")
