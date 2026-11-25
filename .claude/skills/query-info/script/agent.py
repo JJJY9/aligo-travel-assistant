@@ -20,7 +20,10 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
+from utils.access_log import _safe_log_text
 from utils.json_parser import extract_json_from_async_response
+from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
+from utils.log_redact import redact_paths
 from utils.user_query import extract_user_query
 
 logger = logging.getLogger(__name__)
@@ -80,6 +83,29 @@ _QUERY_PREFIX_PATTERN = re.compile(
 )
 # 路线连接词：裸「飞」不能命中「飞机」里的飞（「北京坐飞机去纽约」）
 _ROUTE_SPLIT_PATTERN = re.compile(r"去|到|飞往|飞(?!机)")
+# 天气词：意图判断与城市提取共用一份口径（「多少度 / 有雨吗」等口语问法
+# 与「天气 / 温度」等价，否则会被当成普通搜索去翻第三方网页）
+_WEATHER_WORDS = (
+    "天气", "气温", "温度", "下雨", "降雨", "有雨", "下雪", "降雪",
+    "预报", "湿度", "多少度", "几度", "热不热", "冷不冷",
+)
+# 商品 / 设备类问句里出现「湿度 / 温度」不是查天气
+_WEATHER_EXCLUDE_WORDS = ("湿度计", "湿度传感器", "加湿器", "除湿机")
+_WEATHER_EN_PATTERN = re.compile(
+    r"weather|forecast|temperature|humidity", re.IGNORECASE
+)
+
+
+def _is_weather_text(query: str) -> bool:
+    """问句是否在问天气（供意图判断与城市提取的分句筛选共用）。"""
+    q = (query or "").strip()
+    if not q:
+        return False
+    if any(word in q for word in _WEATHER_EXCLUDE_WORDS):
+        return False
+    return _WEATHER_EN_PATTERN.search(q) is not None or any(
+        word in q for word in _WEATHER_WORDS
+    )
 
 
 def _is_suspicious_url(url: str) -> bool:
@@ -174,7 +200,10 @@ class InformationQueryAgent(AgentBase):
             try:
                 result = await self._weather_query(user_query)
             except Exception as e:
-                logger.warning(f"Weather query failed, fallback to web search: {e}")
+                logger.warning(
+                    "Weather query failed, fallback to web search: %s",
+                    _safe_log_text(redact_paths(e)),
+                )
                 result = None
             if result is not None and result.get("query_success"):
                 return Msg(name=self.name, content=json.dumps(result, ensure_ascii=False), role="assistant")
@@ -186,11 +215,17 @@ class InformationQueryAgent(AgentBase):
             try:
                 result = await self._web_search(user_query)
             except Exception as e:
-                logger.error(f"Query failed: {e}")
+                # 摘要模型的 5xx / 超时 / 401 与搜索服务无关：穿透给编排层
+                # 退避重试与熔断记账，不能折叠成字符串错误
+                if is_retriable_error(e) or is_permanent_llm_error(e):
+                    raise
+                logger.error(
+                    "Query failed: %s", _safe_log_text(redact_paths(e))
+                )
                 result = {
                     "query_type": "网络搜索",
                     "query_success": False,
-                    "results": {"error": str(e)},
+                    "results": {"error": redact_paths(e)},
                 }
             if (
                 weather_failure is not None
@@ -204,19 +239,7 @@ class InformationQueryAgent(AgentBase):
 
     def _is_weather_query(self, query: str) -> bool:
         """简单判断是否为天气类问题。"""
-        q = (query or "").strip()
-        if not q:
-            return False
-        lowered = q.lower()
-        if "weather" in lowered or "forecast" in lowered:
-            return True
-        return (
-            "天气" in q
-            or "气温" in q
-            or "温度" in q
-            or "下雨" in q
-            or "预报" in q
-        )
+        return _is_weather_text(query)
 
     async def _weather_query(self, query: str) -> dict[str, Any]:
         """查询天气：从问题里提取城市，复用 utils.weather.fetch_weather。
@@ -311,6 +334,7 @@ class InformationQueryAgent(AgentBase):
             "后天", "昨天", "周末", "这周", "下周", "什么", "怎么", "哪里",
             "这边", "那边", "这里", "那里", "附近", "情况", "天气", "气温",
             "预报", "活动", "安排", "计划", "准备", "一下", "请问", "帮我",
+            "出发", "出发地", "目的地",
         })
 
         def _clean_city_head(text: str) -> str:
@@ -335,16 +359,39 @@ class InformationQueryAgent(AgentBase):
             )
             return value.strip(_CITY_PUNCT)
 
+        # 问句词按「完整词」拦截，不能按单字：「多」「什」是合法城市名用字
+        # （多伦多 / 多哈 / 什邡 / 喀什），单字规则会把真实目的地整条丢弃
+        _IMPLAUSIBLE_CHARS = ("哪",)
+        _IMPLAUSIBLE_WORDS = (
+            "什么", "怎么", "怎样", "多少", "多久", "多远", "多长",
+            "几点", "几号", "几月", "几天", "哪些", "哪天", "哪里", "哪儿",
+        )
+        # 时间短语不是城市：「出发当天」这类跟进语送去地理编码必然 404
+        _TIME_PHRASE_TOKENS = (
+            "当天", "当日", "出发日", "出行日", "返程日", "抵达日",
+        )
+
         def _implausible_city(value: str) -> bool:
-            """兜底片段不是城市：问句词 / 动作词拼进去的残片一律拒绝。"""
+            """兜底片段不是城市：问句词 / 时间短语拼进去的残片一律拒绝。"""
             if not value or value in _CITY_STOPWORDS:
                 return True
-            return any(ch in value for ch in "哪什么怎多少几")
+            if any(token in value for token in _TIME_PHRASE_TOKENS):
+                return True
+            return any(ch in value for ch in _IMPLAUSIBLE_CHARS) or any(
+                word in value for word in _IMPLAUSIBLE_WORDS
+            )
 
         _ENGLISH_STOPWORDS = frozenset({
-            "weather", "forecast", "temperature", "tomorrow", "today",
-            "tonight", "week", "weekend", "the", "and", "what", "how",
-            "next",
+            "weather", "forecast", "temperature", "humidity", "rain", "snow",
+            "tomorrow", "today", "tonight", "week", "weekend", "the", "and",
+            "what", "what's", "whats", "how", "how's", "hows", "next",
+            "hi", "hello", "hey", "please", "tell", "is", "are", "was",
+            "will", "would", "can", "could", "should", "do", "does",
+            "going", "go", "like", "in", "on", "at", "for", "of", "from",
+            "to", "me", "i", "it", "there", "this", "that", "my",
+            "monday", "tuesday", "wednesday", "thursday", "friday",
+            "saturday", "sunday", "mon", "tue", "wed", "thu", "fri",
+            "sat", "sun",
         })
 
         def _english_city(text: str) -> str:
@@ -375,7 +422,8 @@ class InformationQueryAgent(AgentBase):
             # 非内置常见城市（如「纽约」）：截到 的 / 天气 / 气温 之前的
             # 2~6 个连续中文字，并去掉方向动词、助词与出行目的后缀
             head = re.split(
-                r"(?:的|天气|气温|温度|怎么样|如何|weather|forecast)",
+                r"(?:的|天气|气温|温度|湿度|下雨|降雨|有雨|下雪|降雪|预报|"
+                r"多少度|几度|热不热|冷不冷|怎么样|如何|weather|forecast)",
                 dest_text,
                 maxsplit=1,
                 flags=re.IGNORECASE,
@@ -386,6 +434,23 @@ class InformationQueryAgent(AgentBase):
                     return ""
                 return head
             return _english_city(head)
+
+        # 「从上海出发去北京，杭州天气怎么样」：天气分句自带城市且分句里
+        # 没有行程连接词时，用户显式问的就是该城市——必须在行程目的地
+        # 分支之前返回，否则会答成行程目的地（北京）的天气
+        for clause in re.split(r"[，,。；;！!？?]", q):
+            if not _is_weather_text(clause):
+                continue
+            if _ROUTE_SPLIT_PATTERN.search(clause) or re.search(r"[从自]", clause):
+                continue
+            clause_hits = [
+                (clause.find(city), -len(city), city)
+                for city in common_cities
+                if city in clause
+            ]
+            if clause_hits:
+                clause_hits.sort()
+                return clause_hits[0][2]
 
         # 「从北京去纽约的天气」：行程问句问的是目的地一侧，按最早出现的
         # 城市会答成出发地（纽约不是内置常见城市时尤其明显）
@@ -416,12 +481,8 @@ class InformationQueryAgent(AgentBase):
 
         # 「我在北京，上海天气怎么样」「下周去上海出差，北京天气怎么样」：
         # 天气词所在分句里的城市才是被问的城市，不能按全文最早出现选
-        weather_words = (
-            "天气", "气温", "温度", "下雨", "预报", "weather", "forecast",
-        )
         for clause in re.split(r"[，,。；;！!？?]", q):
-            lowered_clause = clause.lower()
-            if not any(word in lowered_clause for word in weather_words):
+            if not _is_weather_text(clause):
                 continue
             clause_hits = [
                 (clause.find(city), -len(city), city)
@@ -440,7 +501,8 @@ class InformationQueryAgent(AgentBase):
         # 去掉问句前缀、时间词与对比措辞；「纽约到巴黎」「规划去东京」问的是
         # 目的地一侧，「东京和大阪」「东京的行程」取第一个城市
         head_parts = re.split(
-            r"(?:的?天气|气温|温度|下雨|预报|怎么样|如何|情况|对比|weather|forecast)",
+            r"(?:的?天气|气温|温度|湿度|下雨|降雨|有雨|下雪|降雪|预报|"
+            r"多少度|几度|热不热|冷不冷|怎么样|如何|情况|对比|weather|forecast)",
             q,
             maxsplit=1,
             flags=re.IGNORECASE,
@@ -449,6 +511,22 @@ class InformationQueryAgent(AgentBase):
         if not head.strip() and len(head_parts) == 2:
             # 「weather in London」：城市在天气词之后
             head = head_parts[1]
+        # 英文问句以天气词为锚点取「in/for/at + 首字母大写词组」：句首的
+        # What's / Hi / Please 不再被当成城市，Friday 这类星期名也不会
+        # 覆盖真实城市（「Weather in Tokyo on Friday」→ Tokyo）
+        if not re.search(r"[一-龥]", q):
+            anchored = re.search(
+                r"(?:weather|forecast)(?:\s+like)?\s+(?:in|for|at)\s+"
+                r"([A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*)*)",
+                q,
+            )
+            if anchored:
+                candidate = anchored.group(1).strip(" .'-")
+                if (
+                    len(candidate) >= 2
+                    and candidate.lower() not in _ENGLISH_STOPWORDS
+                ):
+                    return candidate
         head = _QUERY_PREFIX_PATTERN.sub("", head)
         head = _TIME_WORDS_PATTERN.sub("", head)
         head = _clean_city_head(head)
@@ -536,8 +614,12 @@ class InformationQueryAgent(AgentBase):
                         empty_backends += 1
                         logger.debug("DDGS backend %s returned no results", backend)
                         continue
-                    backend_errors.append(str(e))
-                    logger.warning(f"DDGS backend {backend} failed: {e}")
+                    backend_errors.append(redact_paths(e))
+                    logger.warning(
+                        "DDGS backend %s failed: %s",
+                        backend,
+                        _safe_log_text(redact_paths(e)),
+                    )
                     continue
 
             results = []
@@ -582,11 +664,17 @@ class InformationQueryAgent(AgentBase):
                 },
             }
         except Exception as e:
-            logger.error(f"Web search failed: {e}")
+            # 摘要模型的 5xx / 超时 / 401 等与搜索服务无关（DDGS 各后端异常
+            # 已在上面逐后端消化）：穿透给编排层退避重试与熔断记账
+            if is_retriable_error(e) or is_permanent_llm_error(e):
+                raise
+            logger.error(
+                "Web search failed: %s", _safe_log_text(redact_paths(e))
+            )
             return {
                 "query_type": "网络搜索",
                 "query_success": False,
-                "results": {"error": f"搜索失败: {e!s}"},
+                "results": {"error": f"搜索失败: {redact_paths(e)}"},
             }
 
     async def _summarize_search_results(self, query: str, results: list[dict]) -> str:
@@ -660,7 +748,9 @@ class InformationQueryAgent(AgentBase):
         except Exception as e:
             # 摘要模型超时 / 401 等不能伪装成 query_success=True 的空摘要：
             # 向上抛给 _web_search 标记失败，编排层才能按瞬时错误重试 / 计数
-            logger.error(f"Summarization failed: {e}")
+            logger.error(
+                "Summarization failed: %s", _safe_log_text(redact_paths(e))
+            )
             raise
 
         if not str(text or "").strip():

@@ -41,7 +41,8 @@ _upstream_slots = threading.BoundedSemaphore(_UPSTREAM_MAX_IN_FLIGHT)
 # 中文城市名的地理编码（language=zh）对境外城市排序很差：「罗马」只命中
 # 澳大利亚同名小镇、「东京」命中江苏村庄、「纽约」直接零结果。常去的境外
 # 城市用一个小型别名表改查英文名（language=en 的索引与排序准确）。只收录
-# 中文名——中文国内城市在 zh 索引里本来就准，不需要二次请求
+# 中文名——中文国内城市走 zh 索引的「裸名 / 市后缀」双变体补查（见
+# _geocode），不需要二次请求英文索引
 _CITY_ALIASES_ZH_EN = {
     "东京": "Tokyo",
     "大阪": "Osaka",
@@ -73,7 +74,9 @@ _CITY_ALIASES_ZH_EN = {
     "西雅图": "Seattle",
     "芝加哥": "Chicago",
     "波士顿": "Boston",
-    "华盛顿": "Washington",
+    # en 索引里特区名为 "Washington D.C."；查 "Washington" 会按「同名优先」
+    # 命中宾州同名小镇（PPLA2、人口 1.3 万），首都（PPLC）被排序键跳过
+    "华盛顿": "Washington D.C.",
     "拉斯维加斯": "Las Vegas",
     "温哥华": "Vancouver",
     "多伦多": "Toronto",
@@ -692,20 +695,35 @@ def _geocode_candidates(
     return [item for item in (geo.get("results") or []) if isinstance(item, dict)]
 
 
+def _city_name_variant(name: str) -> str:
+    """zh 索引的「裸名 / 市后缀」双变体：索引在两种写法间并不一致。
+
+    Open-Meteo 的 zh 地名索引里，部分地级市只登记「X市」（青岛市 / 厦门市），
+    部分只登记裸名（北京 / 杭州），同名村庄又大多以裸名存在。补查一个变体
+    可以在原名只命中村庄 / 零结果时拿到可信的行政中心。
+    """
+    if name.endswith("市"):
+        # 「沙市」这类本身以「市」结尾的两字地名去掉后会只剩单字，不补查
+        return name[:-1] if len(name) > 2 else ""
+    return f"{name}市" if len(name) >= 2 else ""
+
+
 def _geocode(name: str, timeout: float) -> dict[str, Any]:
     """城市名 → 地理编码最优匹配。
 
     中文名查 zh 索引；别名表里的境外城市同时查 en 索引并优先采用可信的
-    英文结果（zh 索引的境外城市排序/覆盖都不可靠）。
+    英文结果（zh 索引的境外城市排序/覆盖都不可靠）；国内城市的原名只命中
+    同名村庄 / 零结果时补查「裸名 / X市」变体，并只在可信候选里挑。
     """
-    if not _has_cjk(name):
-        candidates = _geocode_candidates(name, "en", timeout)
+    raw = name.strip()
+    if not _has_cjk(raw):
+        candidates = _geocode_candidates(raw, "en", timeout)
         if not candidates:
             raise WeatherError(f"未找到城市「{name}」")
-        return _best_geocode_match(name, candidates)
+        return _best_geocode_match(raw, candidates)
 
-    candidates = _geocode_candidates(name, "zh", timeout)
-    alias = _CITY_ALIASES_ZH_EN.get(name.strip())
+    candidates = _geocode_candidates(raw, "zh", timeout)
+    alias = _CITY_ALIASES_ZH_EN.get(raw)
     if alias:
         # 别名表里的中文境外城市一律以 en 索引为准：zh 索引里可能只有同名
         # 小城（「伦敦」→ 加拿大 London，人口 42 万，按人口门槛也会被当成
@@ -717,9 +735,17 @@ def _geocode(name: str, timeout: float) -> dict[str, Any]:
         ]
         if english:
             return _best_geocode_match(alias, english)
+    trusted = [item for item in candidates if _is_trusted_location(item)]
+    if not trusted:
+        variant = _city_name_variant(raw)
+        if variant:
+            extra = _geocode_candidates(variant, "zh", timeout)
+            extra_trusted = [item for item in extra if _is_trusted_location(item)]
+            if extra_trusted:
+                candidates, trusted = extra, extra_trusted
     if not candidates:
         raise WeatherError(f"未找到城市「{name}」")
-    return _best_geocode_match(name, candidates)
+    return _best_geocode_match(raw, trusted or candidates)
 
 
 def _fetch_weather_uncached(name: str, key: str, timeout: float) -> dict[str, Any]:

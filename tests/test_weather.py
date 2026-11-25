@@ -285,6 +285,10 @@ def _geo(city="北京"):
                 "latitude": 39.9,
                 "longitude": 116.4,
                 "timezone": "Asia/Shanghai",
+                # 省级行政中心 + 人口过百万：默认视为可信结果，不触发
+                # 「裸名 / X市」变体补查（该行为由专门的变体用例覆盖）
+                "population": 20000000,
+                "feature_code": "PPLC",
             }
         ]
     }
@@ -570,11 +574,12 @@ def test_failure_cache_prevents_repeat_requests(monkeypatch):
     weather.clear_weather_cache()
     with pytest.raises(weather.WeatherError, match="未找到城市"):
         weather.fetch_weather("不存在")
-    assert len(calls) == 1
+    # 裸名零结果后会补查「X市」变体：首轮共 2 次地理编码请求
+    assert len(calls) == 2
 
     with pytest.raises(weather.WeatherError, match="未找到城市"):
         weather.fetch_weather("不存在")
-    assert len(calls) == 1, "失败结果在 TTL 内不应重复请求上游"
+    assert len(calls) == 2, "失败结果在 TTL 内不应重复请求上游"
     print("✓ 失败结果短时缓存，避免重复请求上游")
 
 
@@ -640,23 +645,23 @@ def test_failure_cache_expires(monkeypatch):
     weather.clear_weather_cache()
     with pytest.raises(weather.WeatherError, match="未找到城市"):
         weather.fetch_weather("不存在")
-    assert len(calls) == 1
+    assert len(calls) == 2
 
     # 直接把失败条目的时间戳拨到 TTL 之外（Windows 上 sleep 精度不足 15.6ms）
     at, message = weather._failures["不存在"]
     weather._failures["不存在"] = (at - weather.FAILURE_TTL_SEC - 1, message)
     with pytest.raises(weather.WeatherError, match="未找到城市"):
         weather.fetch_weather("不存在")
-    assert len(calls) == 2, "失败缓存过期后应重新请求上游"
+    assert len(calls) == 4, "失败缓存过期后应重新请求上游"
     print("✓ 失败缓存过期后重试上游")
 
 
 def test_success_clears_cached_failure(monkeypatch):
-    responses = [{"results": []}, _geo("北京")]
+    recovered = {"ok": False}
 
     def fake_get(url, params=None, timeout=None, headers=None):
         if "geocoding" in url:
-            return _Response(responses.pop(0))
+            return _Response(_geo("北京") if recovered["ok"] else {"results": []})
         return _Response(_forecast())
 
     monkeypatch.setattr(weather.requests, "get", fake_get)
@@ -666,6 +671,7 @@ def test_success_clears_cached_failure(monkeypatch):
     with pytest.raises(weather.WeatherError, match="未找到城市"):
         weather.fetch_weather("北京")
     weather._failures.clear()  # 模拟缓存过期后上游恢复
+    recovered["ok"] = True
     data = weather.fetch_weather("北京")
     assert data["city"] == "北京"
     assert "北京" not in weather._failures
@@ -794,11 +800,11 @@ def test_stale_cache_expires(monkeypatch):
 
 
 def test_unknown_city_does_not_use_stale_cache(monkeypatch):
-    responses = [_geo("北京"), {"results": []}]
+    known = {"ok": True}
 
     def fake_get(url, params=None, timeout=None, headers=None):
         if "geocoding" in url:
-            return _Response(responses.pop(0))
+            return _Response(_geo("北京") if known["ok"] else {"results": []})
         return _Response(_forecast())
 
     monkeypatch.setattr(weather.requests, "get", fake_get)
@@ -809,6 +815,7 @@ def test_unknown_city_does_not_use_stale_cache(monkeypatch):
     at, result = weather._cache[key]
     weather._cache[key] = (at - weather.CACHE_TTL_SEC - 1, result)
 
+    known["ok"] = False
     with pytest.raises(weather.WeatherError, match="未找到城市"):
         weather.fetch_weather("北京")
     print("✓ 城市不存在时不使用旧缓存掩盖错误")
@@ -1257,6 +1264,163 @@ def test_peek_cached_weather_returns_fresh_entry():
         weather.clear_weather_cache()
     print("✓ peek_cached_weather 只返回新鲜缓存")
 
+def test_city_name_variant_guards(monkeypatch):
+    """裸名 / X市 变体：单字与「沙市」这类两字市名不补查。"""
+    assert weather._city_name_variant("青岛") == "青岛市"
+    assert weather._city_name_variant("青岛市") == "青岛"
+    assert weather._city_name_variant("沙市") == ""
+    assert weather._city_name_variant("中") == ""
+    assert weather._city_name_variant("") == ""
+    print("✓ 城市名变体生成边界正确")
+
+
+def test_geocode_prefers_trusted_city_variant_for_bare_name(monkeypatch):
+    """裸名只命中同名村庄时补查「X市」并在可信候选里选行政中心。"""
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        params = dict(params or {})
+        if "geocoding" in url:
+            calls.append((params.get("name"), params.get("language")))
+            if params.get("name") == "青岛":
+                # 同名村庄：无人口、非行政中心 → 不可信
+                return _Response(
+                    {
+                        "results": [
+                            {
+                                "name": "青岛",
+                                "latitude": 39.33,
+                                "longitude": 121.73,
+                                "timezone": "Asia/Shanghai",
+                                "feature_code": "PPL",
+                            }
+                        ]
+                    }
+                )
+            return _Response(
+                {
+                    "results": [
+                        {
+                            "name": "青岛市",
+                            "latitude": 36.07,
+                            "longitude": 120.38,
+                            "timezone": "Asia/Shanghai",
+                            "population": 9498000,
+                            "feature_code": "PPLA2",
+                        }
+                    ]
+                }
+            )
+        return _Response(_forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    data = weather.fetch_weather("青岛")
+    assert data["city"] == "青岛市"
+    assert calls == [("青岛", "zh"), ("青岛市", "zh")]
+    print("✓ 裸名命中同名村庄时补查「X市」可信候选")
+
+
+def test_geocode_variant_strips_city_suffix(monkeypatch):
+    """「杭州市」在 zh 索引零结果时补查裸名「杭州」。"""
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        params = dict(params or {})
+        if "geocoding" in url:
+            calls.append(params.get("name"))
+            if params.get("name") == "杭州":
+                return _Response(_geo("杭州"))
+            return _Response({"results": []})
+        return _Response(_forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    data = weather.fetch_weather("杭州市")
+    assert data["city"] == "杭州"
+    assert calls == ["杭州市", "杭州"]
+    print("✓ 「X市」零结果时回退裸名补查")
+
+
+def test_geocode_keeps_untrusted_candidates_when_variant_empty(monkeypatch):
+    """两个变体都只有不可信候选时保留原名结果（小镇 / 景区仍可查询）。"""
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        params = dict(params or {})
+        if "geocoding" in url:
+            calls.append(params.get("name"))
+            if params.get("name") == "某某镇":
+                return _Response(
+                    {
+                        "results": [
+                            {
+                                "name": "某某镇",
+                                "latitude": 30.0,
+                                "longitude": 120.0,
+                                "feature_code": "PPL",
+                            }
+                        ]
+                    }
+                )
+            return _Response({"results": []})
+        return _Response(_forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    data = weather.fetch_weather("某某镇")
+    assert data["city"] == "某某镇"
+    assert calls == ["某某镇", "某某镇市"]
+    print("✓ 变体补查失败时保留原名候选")
+
+
+def test_washington_alias_resolves_to_district_of_columbia(monkeypatch):
+    """「华盛顿」查 en 索引的 Washington D.C.，不能选中宾州同名小镇。"""
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        params = dict(params or {})
+        if "geocoding" in url:
+            calls.append((params.get("name"), params.get("language")))
+            if params.get("name") == "Washington D.C.":
+                return _Response(
+                    {
+                        "results": [
+                            {
+                                "name": "Washington D.C.",
+                                "latitude": 38.895,
+                                "longitude": -77.036,
+                                "timezone": "America/New_York",
+                                "population": 689545,
+                                "feature_code": "PPLC",
+                            }
+                        ]
+                    }
+                )
+            return _Response(
+                {
+                    "results": [
+                        {
+                            "name": "Washington",
+                            "latitude": 40.174,
+                            "longitude": -80.246,
+                            "timezone": "America/New_York",
+                            "population": 13497,
+                            "feature_code": "PPLA2",
+                        }
+                    ]
+                }
+            )
+        return _Response(_forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    data = weather.fetch_weather("华盛顿")
+    assert data["city"] == "Washington D.C."
+    assert ("Washington D.C.", "en") in calls
+    print("✓ 华盛顿解析到特区而非宾州同名小镇")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -1309,6 +1473,11 @@ if __name__ == "__main__":
         test_upstream_window_limits_rotating_cities,
         test_geocode_prefers_trusted_alias_for_foreign_city,
         test_geocode_skips_alias_for_trusted_chinese_city,
+        test_city_name_variant_guards,
+        test_geocode_prefers_trusted_city_variant_for_bare_name,
+        test_geocode_variant_strips_city_suffix,
+        test_geocode_keeps_untrusted_candidates_when_variant_empty,
+        test_washington_alias_resolves_to_district_of_columbia,
         test_quota_rejection_serves_stale_without_failure_cache,
         test_upstream_concurrency_gate_reports_busy,
         test_degraded_reuse_window_and_expiry,

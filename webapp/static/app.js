@@ -8,6 +8,12 @@ const AGENT_NAMES = {
   information_query: "信息查询",
   rag_knowledge: "知识库查询",
   memory_query: "记忆查询",
+  "trip-budget": "预算建议",
+  "packing-list": "行李清单",
+  "travel-checklist": "行前检查清单",
+  "local-transport": "市内交通建议",
+  "safety-tips": "安全提醒",
+  "trip-notes": "差旅贴士",
 };
 
 const INTENT_NAMES = {
