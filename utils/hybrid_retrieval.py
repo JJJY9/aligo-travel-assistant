@@ -180,8 +180,36 @@ class BM25Index:
         if not terms or not self.documents:
             return 0.0
         tf = Counter(tokenize(content))
-        total_idf = sum(idf for _, idf in terms)
-        matched_idf = sum(idf for term, idf in terms if tf.get(term))
+        matched = [(term, idf) for term, idf in terms if tf.get(term)]
+        if not matched:
+            return 0.0
+        # 跨词二元组（「磁悬浮怎么坐」里的 浮怎 / 么坐）是连续中文串按相邻
+        # 字切词的伪影、不在任何文档里：按 unseen IDF 计入覆盖度分母会把
+        # 真实命中的证据分稀释到 min_score 以下（内置库里 30 条官方问句有
+        # 20 条最高归一化 BM25 不足 0.5）。当本文档命中一个足够稀有的在库
+        # 查询词时，与该在库查询词共享字符的 OOV 二元组视为切词伪影、
+        # 不计入分母；真正的内容 OOV 词（与任何在库查询词都不共享字符，
+        # 如「结婚」「请假」）仍按 unseen 计入，保留「内容词全 OOV 时
+        # 基准不坍缩」的防护。
+        unseen = self._unseen_idf()
+        rare_hit = unseen > 0 and any(idf >= unseen / 2 for _, idf in matched)
+        in_library_chars: set[str] = set()
+        if rare_hit:
+            for term, _ in terms:
+                if term in self._idf:
+                    in_library_chars.update(term)
+        effective_terms = [
+            (term, idf)
+            for term, idf in terms
+            if not (
+                rare_hit
+                and term not in self._idf
+                and not term.isascii()
+                and set(term) & in_library_chars
+            )
+        ]
+        total_idf = sum(idf for _, idf in effective_terms)
+        matched_idf = sum(idf for _, idf in matched)
         if total_idf <= 0 or matched_idf <= 0:
             return 0.0
         coverage = matched_idf / total_idf

@@ -672,7 +672,23 @@ def test_knowledge_update_conflict_maps_409(monkeypatch):
         "expect_content": "旧内容",
         "expect_parts": 1,
         "expect_group": "",
+        "expect_metadata": None,
     }, captured
+    # 元数据轴的快照同样透传给存储层（另一会话只改分类时 409）
+    captured.clear()
+    response = client.put(
+        "/api/knowledge/documents/7",
+        json={
+            "content": "改动",
+            "metadata": {"category": "旧分类"},
+            "expect": "旧内容",
+            "expect_parts": 1,
+            "expect_group": "",
+            "expect_metadata": {"category": "旧分类"},
+        },
+    )
+    assert response.status_code == 409, response.text[:300]
+    assert captured["expect_metadata"] == {"category": "旧分类"}, captured
     print("✓ 知识编辑冲突返回 409 并透传快照")
 
 

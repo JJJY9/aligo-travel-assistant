@@ -1911,6 +1911,120 @@ def test_rag_no_retry_when_first_search_hits():
     print("✓ 首轮命中不再重检索")
 
 
+def test_rag_retries_when_first_hit_does_not_cover_simplified_terms():
+    """首轮只有擦边无关命中（>=阈值）：仍要触发简化查询重检并合并结果。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+
+    class _Agent(agent_class):
+        def __init__(self):
+            from agentscope.agent import AgentBase
+
+            AgentBase.__init__(self)
+            self.name = "RAGKnowledgeAgent"
+            self.initialized = True
+            self.model = _FakeModel()
+
+            class _Loader:
+                def get_skill_content(self, name):
+                    return ""
+
+            self.skill_loader = _Loader()
+
+    agent = _Agent()
+    calls: list[str] = []
+
+    def fake_search(query, k=None, s=False, hybrid=False, min_distance=None):
+        calls.append(str(query))
+        if len(calls) == 1:
+            return [
+                {
+                    "id": "1",
+                    "content": "高铁与飞机是常见出差交通方式",
+                    "metadata": {},
+                    "distance": 0.52,
+                }
+            ]
+        return [
+            {
+                "id": "2",
+                "content": "磁悬浮（8分钟到龙阳路）",
+                "metadata": {},
+                "distance": 0.62,
+            }
+        ]
+
+    agent.search_knowledge = fake_search
+    out = asyncio.run(
+        agent.reply(Msg(name="x", content="磁悬浮怎么坐？", role="user"))
+    )
+    payload = json.loads(out.content)
+    assert len(calls) == 2, calls
+    text = json.dumps(payload, ensure_ascii=False)
+    assert "磁悬浮" in text, "擦边误命中不能阻断救援重检"
+    print("✓ 边缘误命中仍触发简化查询重检索")
+
+
+def test_rag_bounded_query_uses_last_question_sentence():
+    """超长查询按末句（含疑问标记优先）检索，向量不再被截断丢问题。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+    agent = object.__new__(agent_class)
+
+    class _Tokenizer:
+        def tokenize(self, text):
+            return list(str(text))
+
+    class _Embedding:
+        tokenizer = _Tokenizer()
+        max_seq_length = 20
+
+    agent.embedding_model = _Embedding()
+    long_text = "我们聊了很多报销发票和平台促销的事情。" * 3 + "北京出差住宿标准是多少？"
+    bounded = agent._bounded_retrieval_query(long_text)
+    assert bounded.endswith("北京出差住宿标准是多少"), bounded
+    assert len(bounded) < len(long_text)
+    assert agent._bounded_retrieval_query("北京住宿标准？") == "北京住宿标准？"
+    print("✓ 超长查询按末句检索")
+
+
+def test_rag_assembled_documents_use_best_part_metadata_and_snippet():
+    """整组拼装的参考来源取命中分片：标题与片段不能固定指向 part 1。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+    agent = object.__new__(agent_class)
+    docs = [
+        {
+            "id": "p1",
+            "content": "一、北京首都机场交通指南",
+            "metadata": {
+                "group": "g",
+                "part": "1",
+                "parts": "2",
+                "title": "城市交通 (Part 1)",
+                "category": "交通",
+            },
+            "distance": 0.3,
+        },
+        {
+            "id": "p2",
+            "content": "上海浦东机场可乘磁悬浮 8 分钟到龙阳路",
+            "metadata": {
+                "group": "g",
+                "part": "2",
+                "parts": "2",
+                "title": "城市交通 (Part 2)",
+                "category": "交通",
+            },
+            "distance": 0.6,
+        },
+    ]
+    assembled = agent._assemble_grouped_documents(docs)
+    assert len(assembled) == 1
+    doc = assembled[0]
+    assert doc["metadata"]["title"] == "城市交通 (Part 2)"
+    assert "磁悬浮" in doc["snippet"]
+    assert doc["content"].startswith("一、北京"), "拼装正文仍按 part 升序"
+    print("✓ 整组文档参考来源取命中分片")
+
+
 def test_rag_grouped_documents_assembled():
     """多分片文档按 group/part 拼回整篇，重复 part 取高分者。"""
     agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")

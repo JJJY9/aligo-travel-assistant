@@ -29,6 +29,19 @@ from utils.console import configure_stdio
 from utils.text_chunker import split_text
 
 
+def _clip_meta_value(text: Any, limit: int = 200) -> str:
+    """元数据值限长（与 Web / 管理接口的 200 字上限同口径）。
+
+    file_path / parent_doc 原样写入绝对路径：部署目录较深（OneDrive /
+    长用户名）时超过 200 字，该文档在面板与 CLI 都会因元数据超长无法
+    编辑。保留尾部以保住文件名。
+    """
+    value = str(text)
+    if len(value) <= limit:
+        return value
+    return "…" + value[-(limit - 1):]
+
+
 # 动态加载同目录下的 agent.py
 def load_rag_agent_class():
     agent_script = current_dir / "agent.py"
@@ -127,9 +140,9 @@ def load_documents_from_directory(directory_path: str) -> tuple[list[dict], list
                     "category": category,
                     "title": f"{title} (Part {i+1})",
                     "source": "商旅知识库文档",
-                    "file_path": str(file_path),
+                    "file_path": _clip_meta_value(file_path),
                     "version": "2024版",
-                    "parent_doc": file_path.name,
+                    "parent_doc": _clip_meta_value(file_path.name),
                 }
                 if group_id:
                     metadata.update(

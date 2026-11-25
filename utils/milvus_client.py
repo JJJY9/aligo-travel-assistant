@@ -8,12 +8,60 @@
 """
 import logging
 import os
+import sys
 import threading
 import time
 import weakref
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+class MilvusLockedError(RuntimeError):
+    """知识库文件锁被另一个进程持有（通常是正在运行的 Web 服务）。"""
+
+
+def _lock_held_by_other_process(db_path: str) -> bool:
+    """探测 Milvus Lite 的 LOCK 文件是否被其它进程持有。
+
+    milvus-lite 把真正的 DataDirLockedError 吞成
+    ``ConnectionConfigException("Open local milvus failed")``，原因到不了
+    调用方；只能按 3.x 的目录布局直接对 ``LOCK`` 文件做一次非阻塞加锁
+    探测（2.x 是单文件库，没有 LOCK 子文件 → 返回 False）。
+    """
+    lock_path = os.path.join(str(db_path), "LOCK")
+    if not os.path.isfile(lock_path):
+        return False
+    try:
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return True
+            try:
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+            return False
+        import fcntl
+
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        return False
+    finally:
+        os.close(fd)
 
 # 已发放的最大实体 id（客户端对象 → (集合, 字段) → id）：弱引用键，避免
 # 不同测试 / 重连的新客户端因 CPython 复用 id() 而共享旧计数
@@ -66,7 +114,21 @@ def _create_client_with_retry(db_path: str) -> Any:
         return _create_client(db_path)
     except Exception:  # noqa: BLE001 - 仅对首次失败做一次短暂重试
         time.sleep(0.5)
-        return _create_client(db_path)
+        try:
+            return _create_client(db_path)
+        except Exception as exc:
+            # 锁被其它进程（通常是 Web 服务）持有：给出可操作的提示，
+            # 而不是把被吞掉原因的 "Open local milvus failed" 直接冒给
+            # 状态 / doctor / CLI 用户
+            if (
+                "open local milvus failed" in str(exc).lower()
+                and _lock_held_by_other_process(db_path)
+            ):
+                raise MilvusLockedError(
+                    "知识库正被另一个进程使用（例如正在运行的 Web 服务），"
+                    "请先停止该进程后重试"
+                ) from exc
+            raise
 
 
 def get_milvus_client(db_path: str) -> Any:

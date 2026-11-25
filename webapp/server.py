@@ -996,8 +996,12 @@ class KnowledgeUpdatePayload(KnowledgeDocumentPayload):
     expect: str | None = Field(default=None, max_length=JOINED_MAX_CHARS)
     expect_parts: int | None = Field(default=None, ge=1, le=100000)
     expect_group: str | None = Field(default=None, max_length=200)
+    # 元数据轴的乐观并发快照：另一会话只改分类 / 标题时同样返回 409
+    expect_metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] | None = Field(
+        default=None, max_length=10
+    )
 
-    @field_validator("metadata", mode="before")
+    @field_validator("metadata", "expect_metadata", mode="before")
     @classmethod
     def _drop_derived_chunk_keys(cls, value: object) -> object:
         """丢弃回传的派生分片元数据（part/parts/group）。
@@ -4872,6 +4876,7 @@ def create_app(model: Any = None) -> FastAPI:
                 expect_content=payload.expect,
                 expect_parts=payload.expect_parts,
                 expect_group=payload.expect_group,
+                expect_metadata=payload.expect_metadata,
             )
         except DocumentConflictError as exc:
             # 并发修改冲突可刷新后重试：不能混进 400 的「内容不合法」口径

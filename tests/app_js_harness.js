@@ -3114,6 +3114,74 @@ async function scenarioTripImportIcsPreview(source) {
   };
 }
 
+async function scenarioKbDedupeUnknownOutcome(source) {
+  // 清理重复：删除请求超时 / 断连（无状态码）时服务端可能已删除，
+  // 必须提示「可能已删除」并刷新列表
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    globalThis.__toasts = [];
+    globalThis.__kbRefreshes = 0;
+    globalThis.__kbDocRefreshes = 0;
+    toast = (message) => { __toasts.push(message); };
+    confirm = () => true;
+    refreshKnowledge = async () => { __kbRefreshes += 1; };
+    refreshKnowledgeDocuments = async () => { __kbDocRefreshes += 1; };
+    globalThis.__requests = [];
+    getJSON = (url) => new Promise((resolve, reject) => {
+      __requests.push({ resolve, reject });
+    });
+  `);
+  const promise = run("runKbDedupe()");
+  await tick();
+  env.__requests[0].resolve({ planned: 1, groups: 1, removed: 0, failed: [] });
+  await tick();
+  env.__requests[1].reject(new Error("请求超时，请稍后重试"));
+  await promise;
+  return {
+    text: run("els.kbEvalResult.textContent"),
+    refreshes: run("__kbRefreshes"),
+    doc_refreshes: run("__kbDocRefreshes"),
+    button: run("els.kbDedupe.textContent"),
+  };
+}
+
+async function scenarioKbUserSwitchDraft(source) {
+  // 切换用户时知识表单存在未保存草稿：先确认，拒绝则保留草稿不切换
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    state.userId = "u1";
+    state.busy = false;
+    els.userIdInput.value = "u2";
+    state.kbEditingId = null;
+    state.kbEditBaseline = "";
+    els.kbContent.value = "未保存的知识草稿";
+    els.kbCategory.value = "";
+    globalThis.__confirmCalls = 0;
+    globalThis.__confirmAnswer = false;
+    window.confirm = () => { __confirmCalls += 1; return __confirmAnswer; };
+    loadSessions = async () => {};
+    refreshStatus = () => {};
+    closeMemorySheet = () => {};
+    renderOverview = () => {};
+  `);
+  await run("saveUser()");
+  const rejected = run(`({
+    confirmCalls: __confirmCalls,
+    userId: state.userId,
+    draft: els.kbContent.value,
+  })`);
+  run("__confirmAnswer = true;");
+  await run("saveUser()");
+  const accepted = run(`({
+    confirmCalls: __confirmCalls,
+    userId: state.userId,
+    draft: els.kbContent.value,
+  })`);
+  return { rejected, accepted };
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -3216,6 +3284,10 @@ async function main() {
     payload = await scenarioTripExportQuality(source);
   } else if (scenario === "tripImportIcsPreview") {
     payload = await scenarioTripImportIcsPreview(source);
+  } else if (scenario === "kbDedupeUnknownOutcome") {
+    payload = await scenarioKbDedupeUnknownOutcome(source);
+  } else if (scenario === "kbUserSwitchDraft") {
+    payload = await scenarioKbUserSwitchDraft(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

@@ -214,6 +214,67 @@ def test_client_uses_dedicated_connection_on_pymilvus3(monkeypatch):
     assert "dedicated" not in captured["kwargs"], captured["kwargs"]
     print("✓ pymilvus 3 使用 dedicated 连接，2.x 不下发未知参数")
 
+def test_milvus_locked_error_has_actionable_message(monkeypatch):
+    """Open local milvus failed + LOCK 被占：翻译为可操作的锁占用提示。"""
+    from utils import milvus_client
+
+    db_path = "D:/tmp/locked-kb/milvus_lite.db"
+
+    def boom(path):
+        raise RuntimeError("Open local milvus failed")
+
+    monkeypatch.setattr(milvus_client, "_create_client", boom)
+    monkeypatch.setattr(
+        milvus_client, "_lock_held_by_other_process", lambda path: True
+    )
+    with pytest.raises(milvus_client.MilvusLockedError, match="另一个进程"):
+        milvus_client.get_milvus_client(db_path)
+    # 探测为 False（库损坏等其它原因）：保留原始错误
+    monkeypatch.setattr(
+        milvus_client, "_lock_held_by_other_process", lambda path: False
+    )
+    with pytest.raises(RuntimeError, match="Open local milvus failed"):
+        milvus_client.get_milvus_client(db_path + "-2")
+    print("✓ Milvus 锁占用翻译为可操作提示")
+
+
+def test_lock_probe_detects_and_releases(monkeypatch):
+    """LOCK 文件被持有时探测为 True；释放后为 False。"""
+    import tempfile
+    from pathlib import Path
+
+    from utils import milvus_client
+
+    db_dir = Path(tempfile.mkdtemp()) / "kb" / "milvus_lite.db"
+    db_dir.mkdir(parents=True)
+    lock_path = db_dir / "LOCK"
+    lock_path.write_bytes(b"\0")
+    assert milvus_client._lock_held_by_other_process(str(db_dir)) is False
+    fd = os.open(str(lock_path), os.O_RDWR)
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert milvus_client._lock_held_by_other_process(str(db_dir)) is True
+        if sys.platform == "win32":
+            import msvcrt
+
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    assert milvus_client._lock_held_by_other_process(str(db_dir)) is False
+    print("✓ LOCK 探测：持有为 True、释放为 False")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -234,6 +295,8 @@ if __name__ == "__main__":
         test_client_creation_retries_transient_failure,
         test_client_creation_retry_failure_propagates,
         test_client_uses_dedicated_connection_on_pymilvus3,
+        test_milvus_locked_error_has_actionable_message,
+        test_lock_probe_detects_and_releases,
     ):
         mp = pytest.MonkeyPatch()
         try:

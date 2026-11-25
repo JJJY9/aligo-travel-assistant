@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import re
 import logging
 import threading
 import time
@@ -444,53 +445,67 @@ def list_categories() -> list[dict[str, Any]]:
     ]
 
 
-def _restore_pieces(parts: Any, fallback: str) -> list[str]:
-    """还原分片：优先使用备份里的原始分片（保持边界），否则按拼接文本重切。
+def _restore_pieces_with_sources(
+    parts: Any, fallback: str
+) -> list[tuple[str, int | None]]:
+    """还原分片并保留来源下标：``[(分片文本, 原始分片下标或 None), ...]``。
 
     分片数量超过单批上限时，无分隔合并相邻分片（内容不变）以减少批内条目；
-    单个分片超过 400 字（旧数据）按语义边界切开。
+    单个分片超过 400 字（旧数据）按语义边界切开。重新切分 / 合并后，每个
+    输出分片映射回它在备份 ``parts`` 里的来源下标——逐片元数据（title 的
+    …(Part N) 等）据此对齐，而不是因为片数变化整组丢弃。
     """
-    raw: list[str] = []
+    raw: list[tuple[str, int | None]] = []
     if isinstance(parts, list):
         raw = [
-            str(piece).strip()
-            for piece in parts
+            (str(piece).strip(), index)
+            for index, piece in enumerate(parts)
             if isinstance(piece, str) and str(piece).strip()
         ]
     if not raw:
-        text = fallback.strip()
+        text = _normalize_newlines(fallback.strip())
         if not text:
             return []
         if len(text) <= _MAX_CONTENT_CHARS:
-            return [text]
+            return [(text, None)]
         return [
-            piece.strip()
+            (piece.strip(), None)
             for piece in split_text(text, _MAX_CONTENT_CHARS)
             if piece.strip()
         ]
-    pieces: list[str] = []
-    for piece in raw:
+    pieces: list[tuple[str, int | None]] = []
+    for piece, source in raw:
+        piece = _normalize_newlines(piece)
         if len(piece) <= _MAX_CONTENT_CHARS:
-            pieces.append(piece)
+            pieces.append((piece, source))
         else:
             pieces.extend(
-                sub.strip()
+                (sub.strip(), source)
                 for sub in split_text(piece, _MAX_CONTENT_CHARS)
                 if sub.strip()
             )
     if len(pieces) > _IMPORT_CHUNK:
-        merged: list[str] = []
+        merged: list[tuple[str, int | None]] = []
         buffer = ""
-        for piece in pieces:
+        buffer_source: int | None = None
+        for piece, source in pieces:
             if buffer and len(buffer) + len(piece) > _MAX_CONTENT_CHARS:
-                merged.append(buffer)
+                merged.append((buffer, buffer_source))
                 buffer = piece
+                buffer_source = source
             else:
+                if not buffer:
+                    buffer_source = source
                 buffer += piece
         if buffer:
-            merged.append(buffer)
+            merged.append((buffer, buffer_source))
         pieces = merged
     return pieces
+
+
+def _restore_pieces(parts: Any, fallback: str) -> list[str]:
+    """还原分片（兼容包装）：只返回文本，见 ``_restore_pieces_with_sources``。"""
+    return [piece for piece, _ in _restore_pieces_with_sources(parts, fallback)]
 
 
 def _validate_metadata_lengths(metadata: dict[str, Any]) -> None:
@@ -522,7 +537,11 @@ def _chunk_documents(
     的行首 / 行尾换行若原样入库，会把文档撑过 20000 字上限（导出→导入
     不再闭合）。``group_override`` 供备份还原沿用原组号，重试补齐残缺组
     时能按内容与编号续写。
+
+    换行统一为 LF：面板编辑读取 textarea 时 CRLF 会被浏览器归一，服务端
+    若保留 CRLF，原样保存的基线永远对不上（每次保存都误报并发冲突）。
     """
+    text = _normalize_newlines(text)
     chunks = (
         [text.strip()]
         if len(text) <= _MAX_CONTENT_CHARS
@@ -544,6 +563,14 @@ def _chunk_documents(
         if key not in _DERIVED_CHUNK_KEYS
     }
     _validate_metadata_lengths(base_meta)
+    # 与 Web 写接口同口径：NUL / 孤立代理项入库后，面板每次保存（整份
+    # metadata 随请求提交）都会被 422 拒绝，片段从此无法编辑
+    problem = _encoding_problem(text)
+    if problem:
+        raise ValueError(f"知识内容{problem}")
+    problem = _metadata_encoding_problem(base_meta)
+    if problem:
+        raise ValueError(problem)
     group_id = (
         (group_override or uuid.uuid4().hex[:12]) if len(chunks) > 1 else ""
     )
@@ -667,6 +694,16 @@ def _locked_user_snapshot(
     client: Any, doc_id: int, group: str
 ) -> tuple[str, dict[str, str]] | None:
     """锁内读取文档当前拼接正文与用户元数据（调用方已持 _WRITE_LOCK，不得再取锁）。"""
+    details = _locked_user_snapshot_details(client, doc_id, group)
+    if details is None:
+        return None
+    return details[0], details[1]
+
+
+def _locked_user_snapshot_details(
+    client: Any, doc_id: int, group: str
+) -> tuple[str, dict[str, str], list[dict[str, str]]] | None:
+    """快照 + 组内逐片用户元数据（按 part 升序，供整组重建保留逐片元数据）。"""
 
     def _user_meta(raw: Any) -> dict[str, str]:
         meta = _parse_metadata(raw)
@@ -685,8 +722,9 @@ def _locked_user_snapshot(
         )
         if not rows:
             return None
-        return str(rows[0].get("content", "")), _user_meta(rows[0].get("metadata"))
-    pieces: list[tuple[int, str]] = []
+        meta = _user_meta(rows[0].get("metadata"))
+        return str(rows[0].get("content", "")), meta, [meta]
+    pieces: list[tuple[int, str, dict[str, str]]] = []
     user_meta: dict[str, str] | None = None
     members = _group_member_ids(client, group)
     rows_by_id = _rows_by_ids(client, members)
@@ -699,8 +737,8 @@ def _locked_user_snapshot(
             part_no = _meta_int(meta.get("part"), 0)
         except (TypeError, ValueError):
             part_no = 0
-        pieces.append((part_no, str(row.get("content", ""))))
         row_meta = _user_meta(row.get("metadata"))
+        pieces.append((part_no, str(row.get("content", "")), row_meta))
         if member == int(doc_id):
             # 原样保存判定必须对「被点击的这一片」比较元数据：整组编辑的
             # 表单回填的是当前片。用扫描到的第一片会让从其它分片原样保存
@@ -710,12 +748,72 @@ def _locked_user_snapshot(
             user_meta = row_meta
     if user_meta is None:
         return None
-    pieces.sort(key=lambda pair: pair[0])
-    return "".join(text for _, text in pieces), user_meta
+    pieces.sort(key=lambda item: item[0])
+    return (
+        "".join(text for _, text, _ in pieces),
+        user_meta,
+        [meta for _, _, meta in pieces],
+    )
 
 
 class DocumentConflictError(ValueError):
     """编辑冲突：客户端载入的版本与服务端当前状态不一致（并发修改）。"""
+
+
+_PART_TITLE_RE = re.compile("^(.*?)([ 	]*)[（(]Part[ 	]*([0-9]+)[）)]$")
+
+
+def _apply_per_part_metadata(
+    documents: list[dict[str, Any]],
+    submitted: dict[str, str] | None,
+    per_part_metas: list[dict[str, str]],
+) -> None:
+    """整组重建时保留逐片用户元数据，只把真正改动的字段应用到全组。
+
+    面板「编辑整份文档」回填的是被点击分片的元数据；若把这份元数据原样
+    复制给每个新分片，内置文档的「… (Part N)」标题与导入备份里逐片不同
+    的 category/title 会被整体压平成被点击片的值。这里以旧第 i 片元数据
+    为底，仅把调用方相对「被点击片」（与提交值重合键最多的一片）改动过
+    的字段应用到所有分片；分片数变化时按同一约定重建标题的 Part 后缀。
+    """
+    if not per_part_metas:
+        return
+    wanted = {
+        str(key): str(value)
+        for key, value in (submitted or {}).items()
+        if key not in _DERIVED_CHUNK_KEYS
+    }
+
+    def _overlap(meta: dict[str, str]) -> int:
+        return sum(1 for key, value in wanted.items() if meta.get(key) == value)
+
+    reference = max(per_part_metas, key=_overlap)
+    changed = {
+        key: value for key, value in wanted.items() if reference.get(key) != value
+    }
+    removed = [key for key in reference if key not in wanted]
+    total = len(documents)
+    for index, document in enumerate(documents):
+        base = dict(
+            per_part_metas[index] if index < len(per_part_metas) else reference
+        )
+        for key in removed:
+            base.pop(key, None)
+        base.update(changed)
+        title = base.get("title")
+        if isinstance(title, str) and total > 1:
+            match = _PART_TITLE_RE.match(title)
+            if match:
+                base["title"] = (
+                    f"{match.group(1)}{match.group(2)}(Part {index + 1})"
+                )
+        # 派生键（group/part/parts 等）与编辑标记沿用本次重建的值
+        preserved = {
+            key: value
+            for key, value in (document.get("metadata") or {}).items()
+            if key in _DERIVED_CHUNK_KEYS or key == "user_edited"
+        }
+        document["metadata"] = {**base, **preserved}
 
 
 def update_document(
@@ -726,6 +824,7 @@ def update_document(
     expect_content: str | None = None,
     expect_parts: int | None = None,
     expect_group: str | None = None,
+    expect_metadata: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """按 id 覆盖更新知识片段（重新嵌入）；长内容其余分片以新记录追加。
 
@@ -734,6 +833,8 @@ def update_document(
     抛 :class:`DocumentConflictError`（Web 映射 409）——两个标签页同时
     编辑同一条目时，后保存者不会静默覆盖对方的修改，也不会在快照为
     单片、实际已被改成多分片时整组替换并删掉用户从未见过的分片。
+    ``expect_metadata`` 是进入编辑时载入的逐片元数据快照：另一会话只改
+    分类 / 标题时同样拒绝（否则旧快照会把对方的修改静默改回）。
 
     新拆分（带 group 元数据）的多分片记录按「整组替换」处理：先写新分片、
     再覆盖目标分片，最后删除同组的其余旧分片。顺序保证任一前缀失败时
@@ -763,7 +864,10 @@ def update_document(
             for key, value in (metadata or {}).items()
             if key not in _DERIVED_CHUNK_KEYS
         }
-        return text == current_text and wanted_meta == current_meta
+        return (
+            _normalize_newlines(text) == _normalize_newlines(current_text)
+            and wanted_meta == current_meta
+        )
 
     # 原样保存在读锁内先行判定：命中直接返回，不为一次 no-op 保存加载
     # （冷加载可能联网下载数十秒的）嵌入模型；未命中再走完整写路径，
@@ -833,7 +937,17 @@ def update_document(
         # 原样保存（内容与回填完全一致、元数据未变）直接返回：重新切片会把
         # 空行 / 换行合并（排版逐渐劣化、分片边界变化），还白白重建分片与
         # 向量；面板「不做修改直接保存」应是 no-op
-        snapshot = _locked_user_snapshot(client, int(doc_id), group)
+        snapshot_details = _locked_user_snapshot_details(
+            client, int(doc_id), group
+        )
+        snapshot = (
+            (snapshot_details[0], snapshot_details[1])
+            if snapshot_details is not None
+            else None
+        )
+        per_part_metas = (
+            snapshot_details[2] if snapshot_details is not None else []
+        )
         if snapshot is not None and _edit_unchanged(snapshot):
             return {
                 "status": "success",
@@ -845,11 +959,26 @@ def update_document(
         if (
             expect_content is not None
             and snapshot is not None
-            and expect_content.strip() != snapshot[0]
+            and _normalize_newlines(expect_content.strip())
+            != _normalize_newlines(snapshot[0])
         ):
             raise DocumentConflictError(
                 "知识片段已在其他会话被修改，请刷新后重新编辑"
             )
+        # 乐观并发（元数据轴）：另一会话只改了分类 / 标题时正文与结构
+        # 都一致，旧快照会把对方的修改静默覆盖
+        if expect_metadata is not None and snapshot is not None:
+            expected_meta = {
+                str(key): str(value)
+                for key, value in expect_metadata.items()
+                if key not in _DERIVED_CHUNK_KEYS
+            }
+            if expected_meta != snapshot[1]:
+                raise DocumentConflictError(
+                    "知识片段已在其他会话被修改（元数据已变化），"
+                    "请刷新后重新编辑"
+                )
+        _apply_per_part_metadata(documents, metadata, per_part_metas)
         # 旧组成员在写入前扫描：扫描失败时还没有插入任何新分片，不会留下
         # 无法补偿的孤儿新 group（此前覆盖目标后才扫描，失败即残留）
         old_ids: list[int] = []
@@ -984,6 +1113,7 @@ def _merge_exported_group(
     pieces: list[tuple[int, dict[str, Any]]],
     existing_counts: Counter[str],
     existing_group_texts: "Callable[[], set[str] | None] | None" = None,
+    existing_grouped_contents: "Callable[[], set[str] | None] | None" = None,
 ) -> tuple[dict[str, Any] | None, int]:
     """合并一个 group 的分片；返回 (合并后的记录, 因整组已存在而跳过的分片数)。
 
@@ -1082,11 +1212,20 @@ def _merge_exported_group(
             texts = existing_group_texts()
             if texts is not None and joined_text not in texts:
                 # 内容齐全但 part 顺序与库内任何组都不同：静默跳过会让
-                # 恢复后的文档仍是旧顺序，备份里的版本从未入库
-                raise ValueError(
-                    f"备份中的文档组内容与库内分片相同但顺序不同（group={key}）："
-                    "请整份编辑后重新导入"
-                )
+                # 恢复后的文档仍是旧顺序，备份里的版本从未入库。
+                # 例外：分片内容只以「无 group 独立片段」存在时没有组顺序
+                # 可言（旧版库升级后重导新版备份），按已存在处理——否则
+                # CLI 会把一次完整幂等的恢复报成「备份未能恢复」退出 1
+                grouped: set[str] | None = None
+                if existing_grouped_contents is not None:
+                    grouped = existing_grouped_contents()
+                if grouped is None or any(
+                    content in grouped for content in stripped_contents
+                ):
+                    raise ValueError(
+                        f"备份中的文档组内容与库内分片相同但顺序不同（group={key}）："
+                        "请整份编辑后重新导入"
+                    )
         # 整组已在库中（导出后原样恢复）：整组跳过，不重新拆分
         return None, len(contents)
     return (
@@ -1116,6 +1255,7 @@ def _regroup_exported_documents(
     existing: Iterable[str],
     problems: "list[dict[str, Any]] | None" = None,
     existing_group_texts: "Callable[[], set[str] | None] | None" = None,
+    existing_grouped_contents: "Callable[[], set[str] | None] | None" = None,
 ) -> tuple[list[Any], int]:
     """把导出备份里同一 group 的分片按 part 顺序拼回整篇文档。
 
@@ -1172,7 +1312,11 @@ def _regroup_exported_documents(
         pieces = sorted(grouped.get(key, []), key=lambda pair: pair[0])
         try:
             entry, skipped_count = _merge_exported_group(
-                key, pieces, existing_counts_base, existing_group_texts
+                key,
+                pieces,
+                existing_counts_base,
+                existing_group_texts,
+                existing_grouped_contents,
             )
         except ValueError as exc:
             if problems is None:
@@ -1545,6 +1689,48 @@ def _group_texts_from_layout(
     }
 
 
+def _grouped_contents_from_layout(
+    layout: dict[str, list[tuple[str, int, int]]],
+) -> set[str]:
+    """库内属于任意 group 的片段内容（判「组顺序冲突」用的存在性集合）。"""
+    contents: set[str] = set()
+    for content, entries in layout.items():
+        if any(group for group, _part, _parts in entries):
+            contents.add(content)
+    return contents
+
+
+def _restored_group_order_ok(
+    merged: list[Any],
+    existing_texts: set[str] | None,
+    grouped_contents: set[str] | None,
+) -> bool:
+    """备份里的组顺序是否与库内一致（快速判重 / 预览与写路径共用）。
+
+    备份组整篇文本不在库内任何组时：若它的分片内容只以「无 group 独立
+    片段」存在，就没有组顺序可言（旧版库升级后重导新版备份），按已存在
+    处理；只有分片已属于某个组、整篇却对不上才是真正的重排冲突。
+    """
+    if existing_texts is None:
+        return True
+    for item in merged:
+        if not isinstance(item, dict):
+            continue
+        group = str(item.get("__restored_group__") or "")
+        parts = item.get("__restored_parts__")
+        if not group or not isinstance(parts, list) or len(parts) < 2:
+            continue
+        pieces = [str(piece).strip() for piece in parts]
+        if "".join(pieces) in existing_texts:
+            continue
+        if grouped_contents is not None and not any(
+            piece in grouped_contents for piece in pieces
+        ):
+            continue
+        return False
+    return True
+
+
 def _restored_group_texts(merged: list[Any]) -> set[str]:
     """备份中多分片组按 part 顺序拼接后的文本。
 
@@ -1563,9 +1749,25 @@ def _restored_group_texts(merged: list[Any]) -> set[str]:
     return texts
 
 
+def _normalize_newlines(text: str) -> str:
+    """统一换行为 LF（与 text_chunker 的拆分口径一致）。
+
+    面板 textarea 读取时会把 CRLF 归一为 LF：库内保留 CRLF 的片段
+    （经导入 / 备份恢复写入）原样保存在面板永远对不上基线、每次保存
+    都被误报「已在其他会话被修改」。
+    """
+    return str(text).replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _encoding_problem(value: str) -> str | None:
-    """文本能否按 UTF-8 编码：孤立代理项（``"\\ud800"``）能通过 JSON 解析，
-    但嵌入模型 / Milvus 序列化阶段会抛 UnicodeEncodeError，让整批导入失败。"""
+    """文本能否按 UTF-8 编码且不含 NUL。
+
+    孤立代理项（``"\\ud800"``）能通过 JSON 解析，但嵌入模型 / Milvus
+    序列化阶段会抛 UnicodeEncodeError，让整批导入失败；NUL 则被 Web
+    写接口拒绝——导入 / CLI 若接受，这些片段在面板中永远无法保存。
+    """
+    if "\x00" in str(value):
+        return "包含 NUL 字符"
     try:
         value.encode("utf-8")
     except UnicodeEncodeError:
@@ -1790,19 +1992,20 @@ def import_documents(
                 restored_texts = _restored_group_texts(pre_merged)
                 if restored_texts:
                     try:
-                        existing_texts = _group_texts_from_layout(
-                            _existing_group_layout()
+                        layout_snapshot = _existing_group_layout()
+                        existing_texts = _group_texts_from_layout(layout_snapshot)
+                        grouped_contents = _grouped_contents_from_layout(
+                            layout_snapshot
                         )
                     except Exception as exc:  # noqa: BLE001 - 扫描失败按已存在处理
                         logger.warning(
                             "导入前布局扫描失败（%s），按已存在处理", exc
                         )
                         existing_texts = None
-                    if (
-                        existing_texts is not None
-                        and not restored_texts <= existing_texts
-                    ):
-                        order_ok = False
+                        grouped_contents = None
+                    order_ok = _restored_group_order_ok(
+                        pre_merged, existing_texts, grouped_contents
+                    )
                 if order_ok:
                     dropped = sum(_meta_int(item.get("parts"), 0) for item in pre_problems)
                     duplicate = len(_merged_piece_contents(pre_merged))
@@ -1891,6 +2094,17 @@ def import_documents(
                 )
             return layout_cache["texts"]
 
+        def _existing_grouped_contents() -> set[str] | None:
+            # 与 _existing_group_texts 共用一次布局扫描；扫描失败返回 None
+            if "grouped_contents" not in layout_cache:
+                layout = _group_layout()
+                layout_cache["grouped_contents"] = (
+                    None
+                    if layout is None
+                    else _grouped_contents_from_layout(layout)
+                )
+            return layout_cache["grouped_contents"]
+
         def _group_part_contents() -> dict[str, dict[int, set[str]]] | None:
             """group → {part 号: 该 part 在库内的内容集合}（整次导入只扫一次）。
 
@@ -1925,15 +2139,19 @@ def import_documents(
             if fully_existing:
                 restored_texts = _restored_group_texts(pre_merged)
                 if restored_texts:
-                    existing_texts = _existing_group_texts()
                     # 布局扫描失败时写层按「已存在」快捷返回（同口径）
-                    order_ok = existing_texts is None or restored_texts <= existing_texts
+                    order_ok = _restored_group_order_ok(
+                        pre_merged,
+                        _existing_group_texts(),
+                        _existing_grouped_contents(),
+                    )
             model_needed = not (fully_existing and order_ok)
         merged_items, group_skipped = _regroup_exported_documents(
             valid,
             existing,
             problems=problems,
             existing_group_texts=_existing_group_texts,
+            existing_grouped_contents=_existing_grouped_contents,
         )
         # 结构非法的组整组跳过：片数计入 skipped_invalid，明细给到调用方
         invalid += sum(_meta_int(item.get("parts"), 0) for item in problems)
@@ -1978,7 +2196,10 @@ def import_documents(
             if restored:
                 restored_parts = item.pop("__restored_parts__", None)
                 restored_metas = item.pop("__restored_metas__", None)
-                pieces = _restore_pieces(restored_parts, content)
+                pieces_with_sources = _restore_pieces_with_sources(
+                    restored_parts, content
+                )
+                pieces = [piece for piece, _ in pieces_with_sources]
                 stored_size = sum(len(piece) for piece in pieces)
                 if not pieces:
                     invalid += 1
@@ -2006,20 +2227,17 @@ def import_documents(
                         document_groups.append("")
                     continue
                 total_parts = len(pieces)
-                per_piece_metas: list[dict[str, Any] | None] = [None] * total_parts
-                if (
-                    isinstance(restored_metas, list)
-                    and len(restored_metas) == total_parts
-                ):
-                    per_piece_metas = [
-                        meta if isinstance(meta, dict) else None
-                        for meta in restored_metas
-                    ]
                 chunks: list[dict[str, Any]] = []
-                for index, piece in enumerate(pieces, start=1):
-                    # 逐片恢复各自的用户元数据（title 的 …(Part N) 等）；
-                    # 与分片数对不上（旧备份 / 重新切分）时退回基元数据
-                    extra_meta = per_piece_metas[index - 1]
+                for index, (piece, source_index) in enumerate(
+                    pieces_with_sources, start=1
+                ):
+                    # 逐片恢复各自的用户元数据（title 的 …(Part N) 等）：
+                    # 按「来源分片下标」对齐——旧备份被重新切分 / 合并时
+                    # 片数会变，不能因此整组回退成第一片的元数据
+                    extra_meta = None
+                    if isinstance(restored_metas, list) and source_index is not None:
+                        candidate = restored_metas[source_index]
+                        extra_meta = candidate if isinstance(candidate, dict) else None
                     if extra_meta is not None:
                         meta = {
                             str(meta_key)[:32]: str(meta_value)[:200]

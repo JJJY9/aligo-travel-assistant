@@ -181,6 +181,34 @@ def test_annotate_with_query_reference_does_not_auto_pass_top_hit():
     print("✓ 混合标注按查询覆盖面归一")
 
 
+def test_cross_word_bigrams_do_not_dilute_keyword_evidence():
+    """跨词二元组（浮怎 / 么坐）不计入覆盖度分母：真实命中不再被稀释。"""
+    docs = [
+        {"id": "1", "content": "磁悬浮（8分钟到龙阳路）"},
+        {"id": "2", "content": "高铁与飞机是常见出差交通方式"},
+        {"id": "3", "content": "一线城市住宿标准为每晚 500 元"},
+        # 填充片段把库规模抬到 10：df=1 的目标词 IDF 高于 unseen/2，
+        # 与内置库（141 分片）的稀有词量级一致
+        {"id": "4", "content": "报销需要发票与行程单，怎么办理见指南"},
+        {"id": "5", "content": "出差审批流程由直属领导确认"},
+        {"id": "6", "content": "酒店预订优先协议价"},
+        {"id": "7", "content": "机场贵宾厅使用规则"},
+        {"id": "8", "content": "火车票改签手续费说明"},
+        {"id": "9", "content": "差旅保险覆盖范围"},
+        {"id": "10", "content": "国际航班行李额度"},
+    ]
+    index = BM25Index(docs)
+    score = index.normalized_score("磁悬浮怎么坐", docs[0]["content"])
+    decoy = index.normalized_score("磁悬浮怎么坐", docs[1]["content"])
+    assert score > 0.5, score
+    assert decoy < 0.5
+    assert score > decoy
+    # 与在库查询词不共享字符的真实 OOV 内容词仍按 unseen IDF 计入
+    # （「结婚请假」的内容词都不在库）：防坍缩语义保持不变
+    assert index.normalized_score("结婚请假流程", docs[0]["content"]) < 0.1
+    print("✓ 跨词二元组不再稀释 BM25 证据分")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -197,4 +225,5 @@ if __name__ == "__main__":
     test_repeated_query_terms_do_not_inflate_bm25()
     test_annotate_uses_per_document_normalized_scores()
     test_annotate_with_query_reference_does_not_auto_pass_top_hit()
+    test_cross_word_bigrams_do_not_dilute_keyword_evidence()
     print("\n全部通过")

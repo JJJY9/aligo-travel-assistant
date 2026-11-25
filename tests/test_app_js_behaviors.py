@@ -570,6 +570,29 @@ def test_trips_export_button_uses_filtered_ics_endpoint():
     print("✓ 导出行程按钮按筛选走 format=ics")
 
 
+def test_kb_dedupe_unknown_outcome_refreshes():
+    """清理重复超时（结果未知）：提示可能已删除并刷新列表。"""
+    results = _run_harness("kbDedupeUnknownOutcome")
+    assert "可能已部分或全部删除" in results["text"], results
+    assert results["refreshes"] == 1
+    assert results["doc_refreshes"] == 1
+    assert results["button"] == "清理重复"
+    print("✓ 清理重复结果未知时提示并刷新")
+
+
+def test_kb_user_switch_warns_on_unsaved_draft():
+    """切换用户前确认知识表单草稿；拒绝保留草稿，确认后清空。"""
+    results = _run_harness("kbUserSwitchDraft")
+    rejected = results["rejected"]
+    assert rejected["confirmCalls"] == 1, rejected
+    assert rejected["userId"] == "u1", rejected
+    assert rejected["draft"] == "未保存的知识草稿", rejected
+    accepted = results["accepted"]
+    assert accepted["userId"] == "u2", accepted
+    assert accepted["draft"] == "", accepted
+    print("✓ 切换用户确认未保存知识草稿")
+
+
 def test_trip_export_quality_toasts():
     """行程导出：返程截断 / 回导会被跳过的数据必须 toast，缺头不得误报。"""
     results = _run_harness("tripExportQuality")
@@ -995,6 +1018,8 @@ if __name__ == "__main__":
     test_knowledge_actions_arbitrate_shared_result_bar()
     test_trip_import_file_decoding_and_size_guard()
     test_trips_export_button_uses_filtered_ics_endpoint()
+    test_kb_dedupe_unknown_outcome_refreshes()
+    test_kb_user_switch_warns_on_unsaved_draft()
     test_trip_export_quality_toasts()
     test_trip_import_ics_preview_labels_and_timezone()
     test_trips_dedupe_panel_flow()
