@@ -169,7 +169,14 @@ def next_entity_id(
         client.load_collection(collection_name)
     except Exception as exc:  # noqa: BLE001 - 2.x 无该调用；查询失败会在下面暴露
         logger.debug("load_collection before next id skipped: %s", exc)
-    max_id = 0
+    with _ID_LOCK:
+        per_client = _LAST_IDS.get(client)
+        watermark = (
+            per_client.get((collection_name, id_field), 0) if per_client else 0
+        )
+    # 水位单调不减：从已分配的进程内最大 id 起扫仍能找到更大 id，且不必
+    # 每次插入都从 0 重扫整库（批量导入时退化为 O(n²)）
+    max_id = watermark
     while True:
         rows = client.query(
             collection_name=collection_name,

@@ -65,6 +65,16 @@ def test_load_failure_still_queries():
     print("✓ load_collection 不可用时仍继续查询")
 
 
+def test_scans_from_known_watermark():
+    """已有进程内水位时从水位起扫，避免每次插入都从 0 重扫整库。"""
+    client = _FakeClient([{"id": 5}])
+    assert next_entity_id(client, "knowledge") == 6
+    assert next_entity_id(client, "knowledge") == 7
+    assert client.query_calls[0]["filter"] == "id >= 1"
+    assert client.query_calls[1]["filter"] == "id >= 7", client.query_calls
+    print("✓ 从进程内水位起扫 id")
+
+
 def test_client_creation_retries_transient_failure(monkeypatch):
     """另一进程刚释放文件锁时首次打开可能失败，应重试一次。"""
     from utils import milvus_client as mc
@@ -286,6 +296,7 @@ if __name__ == "__main__":
         test_empty_collection_starts_at_one,
         test_query_failure_propagates,
         test_load_failure_still_queries,
+        test_scans_from_known_watermark,
         test_large_collection_paginates_beyond_query_limit,
         test_next_entity_id_stops_without_progress,
         test_reset_and_shutdown_clients,

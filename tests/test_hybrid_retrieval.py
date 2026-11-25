@@ -209,6 +209,35 @@ def test_cross_word_bigrams_do_not_dilute_keyword_evidence():
     print("✓ 跨词二元组不再稀释 BM25 证据分")
 
 
+def test_bm25_equal_scores_tie_break_by_document_id():
+    """同分文档按 id 确定性排序，不依赖扫描 / 插入顺序。"""
+    index = BM25Index(
+        [
+            {"id": 3, "content": "住宿标准"},
+            {"id": 1, "content": "住宿标准"},
+            {"id": 2, "content": "住宿标准"},
+        ]
+    )
+    hits = index.search("住宿标准", top_k=3)
+    assert [doc["id"] for doc, _ in hits] == [1, 2, 3]
+    print("✓ BM25 同分按 id 确定性排序")
+
+
+def test_rrf_equal_scores_tie_break_is_deterministic():
+    """RRF 同分时按归一化键排序，不让插入顺序决定 top_k 边界。"""
+    fused = rrf_fuse([[{"id": "b"}], [{"id": "a"}]])
+    assert [doc["id"] for doc in fused] == ["a", "b"]
+    print("✓ RRF 同分确定性排序")
+
+
+def test_bm25_index_does_not_retain_token_lists():
+    """索引只保留长度与 Counter，不长期保存完整 token 列表。"""
+    index = BM25Index([{"id": 1, "content": "住宿标准"}])
+    assert not hasattr(index, "_tokens")
+    assert index.search("住宿标准", top_k=1)
+    print("✓ BM25 索引不保留 token 列表")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -226,4 +255,7 @@ if __name__ == "__main__":
     test_annotate_uses_per_document_normalized_scores()
     test_annotate_with_query_reference_does_not_auto_pass_top_hit()
     test_cross_word_bigrams_do_not_dilute_keyword_evidence()
+    test_bm25_equal_scores_tie_break_by_document_id()
+    test_rrf_equal_scores_tie_break_is_deterministic()
+    test_bm25_index_does_not_retain_token_lists()
     print("\n全部通过")

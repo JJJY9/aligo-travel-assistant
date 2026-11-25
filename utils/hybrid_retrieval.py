@@ -50,6 +50,17 @@ def tokenize(text: object) -> list[str]:
     return tokens
 
 
+def _doc_sort_key(doc: dict[str, Any]) -> tuple[int, Any]:
+    """同分文档的确定性次级排序键（数值 id 优先，其余按字符串）。"""
+    raw = doc.get("id")
+    if raw is not None:
+        try:
+            return (0, int(raw))
+        except (TypeError, ValueError):
+            pass
+    return (1, str(raw or "") or str(doc.get("content") or "")[:80])
+
+
 class BM25Index:
     """内存 Okapi BM25 索引（中文按二元组近似分词）。"""
 
@@ -62,14 +73,17 @@ class BM25Index:
         self.documents = list(documents)
         self.k1 = k1
         self.b = b
-        self._tokens = [
-            tokenize(doc.get("content")) for doc in self.documents
-        ]
-        self._doc_len = [len(tokens) for tokens in self._tokens]
+        # 逐篇切词后只保留长度与 Counter：完整 token 列表在初始化完成后
+        # 无人读取，保存在实例上会让缓存索引（TTL 内常驻）白白放大内存
+        self._doc_len: list[int] = []
+        self._tf: list[Counter[str]] = []
+        for doc in self.documents:
+            tokens = tokenize(doc.get("content"))
+            self._doc_len.append(len(tokens))
+            self._tf.append(Counter(tokens))
         self._avgdl = (
             sum(self._doc_len) / len(self._doc_len) if self._doc_len else 0.0
         )
-        self._tf = [Counter(tokens) for tokens in self._tokens]
         document_freq: Counter[str] = Counter()
         for tf in self._tf:
             document_freq.update(tf.keys())
@@ -109,7 +123,10 @@ class BM25Index:
                 )
             scores.append(score)
         ranked = sorted(
-            range(len(self.documents)), key=lambda index: scores[index], reverse=True
+            range(len(self.documents)),
+            # 同分时按 id 确定性排序：只按分数 + 文档插入序会让 top_k 边界
+            # 的归属随扫描行序 / 索引重建漂移
+            key=lambda index: (-scores[index], _doc_sort_key(self.documents[index])),
         )
         results: list[tuple[dict[str, Any], float]] = []
         for index in ranked[:top_k]:
@@ -239,7 +256,8 @@ def rrf_fuse(
     return [
         {**fused[key]["document"], "rrf_score": fused[key]["rrf_score"]}
         for key in sorted(
-            fused, key=lambda item: fused[item]["rrf_score"], reverse=True
+            fused,
+            key=lambda item: (-fused[item]["rrf_score"], item),
         )
     ]
 

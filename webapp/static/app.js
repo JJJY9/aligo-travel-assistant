@@ -5290,7 +5290,15 @@ async function refreshKnowledge() {
       : `知识库 · ${data.reason || "不可用"}`;
     els.knowledgeChip.appendChild(chip);
   } catch {
-    els.knowledgeChip.innerHTML = "";
+    // 瞬时失败（429 / 网络抖动 / 导入持锁 503）保留上一次有效状态，
+    // 与片段列表「失败保留已渲染数据」一致；从未成功加载过才提示未知
+    if (!els.knowledgeChip.firstElementChild) {
+      els.knowledgeChip.innerHTML = "";
+      const chip = document.createElement("span");
+      chip.className = "badge err";
+      chip.textContent = "知识库 · 状态未知";
+      els.knowledgeChip.appendChild(chip);
+    }
   }
 }
 
@@ -5514,7 +5522,9 @@ function renderKnowledgeDocuments(items, append) {
     empty.className = "kb-empty";
     empty.textContent = state.kbQuery
       ? "没有匹配的知识片段。"
-      : "还没有知识片段，可以在下方添加。";
+      : state.kbCategory
+        ? "该分类下没有知识片段。"
+        : "还没有知识片段，可以在下方添加。";
     els.kbList.appendChild(empty);
     return;
   }

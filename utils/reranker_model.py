@@ -31,27 +31,24 @@ def get_shared_cross_encoder(model_name: str) -> Any:
     name = str(model_name or "").strip()
     if not name:
         raise ValueError("重排模型名为空")
-    now = time.monotonic()
+    # 加载放在锁内（与 utils.embedding_model 同口径）：并发首载的其它
+    # 请求排队复用同一份模型，而不是各自构造一份 ~1GB 的 CrossEncoder
     with _LOCK:
         cached = _MODELS.get(name)
         if cached is not None:
             return cached
         failure = _FAILURES.get(name)
-        if failure is not None and (now - failure[0]) <= _LOAD_FAILURE_COOLDOWN_SEC:
+        if failure is not None and (
+            time.monotonic() - failure[0]
+        ) <= _LOAD_FAILURE_COOLDOWN_SEC:
             raise RuntimeError(f"重排模型加载失败（冷却中）：{failure[1]}")
-    try:
-        from sentence_transformers import CrossEncoder
+        try:
+            from sentence_transformers import CrossEncoder
 
-        model = CrossEncoder(name)
-    except Exception as exc:  # noqa: BLE001 - 调用方按增强项降级
-        with _LOCK:
+            model = CrossEncoder(name)
+        except Exception as exc:  # noqa: BLE001 - 调用方按增强项降级
             _FAILURES[name] = (time.monotonic(), exc)
-        raise
-    with _LOCK:
-        # 并发下可能已由其它线程放入缓存：以缓存中的实例为准，丢弃本次
-        existing = _MODELS.get(name)
-        if existing is not None:
-            return existing
+            raise
         _MODELS[name] = model
         _FAILURES.pop(name, None)
         logger.info("CrossEncoder 重排模型已加载并共享：%s", name)
