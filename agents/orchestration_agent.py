@@ -294,6 +294,28 @@ def _agent_error_text(data: dict[str, Any]) -> str:
     return ""
 
 
+def _redacted_agent_error_payload(data: dict[str, Any]) -> dict[str, Any]:
+    """复制技能错误 JSON 并遮蔽错误文本（会随回答展示、落库与导出）。
+
+    与 ``except`` 分支同一口径：上游网关的 401 响应体常回显 API Key 与
+    本机路径，结构化错误（顶层 error / 嵌套 results）同样必须先脱敏。
+    """
+    cleaned = dict(data)
+    for key in ("error", "message", "technical_error"):
+        value = cleaned.get(key)
+        if isinstance(value, str) and value:
+            cleaned[key] = redact_paths(value)
+    nested = cleaned.get("results")
+    if isinstance(nested, dict):
+        nested = dict(nested)
+        for key in ("error", "message"):
+            value = nested.get(key)
+            if isinstance(value, str) and value:
+                nested[key] = redact_paths(value)
+        cleaned["results"] = nested
+    return cleaned
+
+
 def _transient_agent_error(response: Any) -> str | None:
     """技能返回的错误 JSON 若像瞬时故障，返回错误文本以触发重试。"""
     content = getattr(response, "content", None)
@@ -1262,11 +1284,13 @@ class OrchestrationAgent(AgentBase):
             if isinstance(result, dict):
                 error_msg = _agent_error_text(result)
                 if error_msg:
+                    # 与下方 except 分支同口径：回答渲染 / 落库 / 导出前
+                    # 必须脱敏（瞬时分类已在 _transient_agent_error 用原文完成）
                     return {
                         "status": "error",
                         "agent_name": agent_name,
-                        "data": result,
-                        "message": error_msg,
+                        "data": _redacted_agent_error_payload(result),
+                        "message": redact_paths(error_msg),
                     }
 
             return {

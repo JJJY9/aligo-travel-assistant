@@ -5,6 +5,7 @@
 
 运行：python tests/test_lazy_agent_registry.py
 """
+import io
 import os
 import sys
 import tempfile
@@ -390,6 +391,19 @@ def test_cache_is_keyed_by_skill_name(monkeypatch):
     print("✓ 缓存按技能目录名统一")
 
 
+def test_console_can_be_injected(monkeypatch):
+    """调用方控制台可注入：CLI 的 Live 状态区需要接管技能加载提示的输出。"""
+    from rich.console import Console
+
+    buffer = io.StringIO()
+    injected = Console(file=buffer, force_terminal=False)
+    registry = LazyAgentRegistry(model="fake-model", cache={}, console=injected)
+    assert registry.console is injected
+    default = LazyAgentRegistry(model="fake-model", cache={})
+    assert default.console is not injected, "未注入时保持自建控制台（Web / 测试）"
+    print("✓ LazyAgentRegistry 支持注入调用方控制台")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -415,6 +429,7 @@ if __name__ == "__main__":
         test_console_output_failure_does_not_break_loading,
         test_module_executed_once_across_registries,
         test_agent_class_selection_ignores_imported_subclass,
+        test_console_can_be_injected,
         test_cache_is_keyed_by_skill_name,
         test_cached_agent_not_blocked_by_other_skill_slow_load,
     ):

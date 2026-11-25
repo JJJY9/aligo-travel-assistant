@@ -52,13 +52,14 @@ try:
     from agents.intention_agent import IntentionAgent
     from agents.orchestration_agent import OrchestrationAgent
     from config_agentscope import create_chat_model, init_agentscope
-    from context.memory_manager import MemoryManager
+    from context.memory_manager import MemoryManager, _trip_sort_key
 except Exception as exc:  # noqa: BLE001 - 依赖缺失时诊断命令仍要能运行
     _RUNTIME_IMPORT_ERROR = exc
     Console = _rich_markup = Prompt = Table = None  # type: ignore[assignment,misc]
     IntentionAgent = OrchestrationAgent = None  # type: ignore[assignment,misc]
     create_chat_model = init_agentscope = None  # type: ignore[assignment]
     MemoryManager = None  # type: ignore[assignment,misc]
+    _trip_sort_key = None  # type: ignore[assignment]
 
 
 def _markup_safe(value: object) -> str:
@@ -209,6 +210,9 @@ class AligoCLI:
         # 失败，避免把被吞掉的查询当成一次成功运行
         self._user_id_from_stdin = False
         self._processed_any_command = False
+        # 管道模式下是否有命令失败（异常或明确的失败返回）：EOF 收尾时
+        # 非零退出，脚本 / CI 不能把「没有回答的失败回合」当成功
+        self._command_failed = False
         self.memory_manager = None
         self.orchestrator = None
         self.intention_agent = None
@@ -257,16 +261,20 @@ class AligoCLI:
     def _prompt_user_id(self) -> str:
         """交互式询问用户 ID，并按与 Web 相同的规则校验。"""
 
+        is_tty = bool(getattr(sys.stdin, "isatty", lambda: True)())
         while True:
             try:
                 self._interrupt["at_prompt"] = True
                 try:
-                    value = (
-                        Prompt.ask(
-                            "用户ID", default="default_user", console=self.console
-                        ).strip()
-                        or "default_user"
+                    # 非终端不提供默认账号：前导空行会静默落到 default_user，
+                    # 真正的用户 ID 行则留在输入流里被当成第一条查询发给模型。
+                    # default=None 时 Rich 对空行返回 None（而非空串）
+                    raw_value = Prompt.ask(
+                        "用户ID",
+                        default="default_user" if is_tty else None,
+                        console=self.console,
                     )
+                    value = (raw_value or "").strip()
                 finally:
                     self._interrupt["at_prompt"] = False
             except KeyboardInterrupt:
@@ -289,11 +297,21 @@ class AligoCLI:
                     "请改用非交互子命令或接入终端后重试"
                 )
                 raise SystemExit(1) from None
+            if not value:
+                if not is_tty:
+                    # 管道里首行是空行 / 纯空白：与非法非空首行同口径直接
+                    # 失败，不能静默换账号、把后面的 ID 行当查询
+                    self.console.print(
+                        "[red]用户 ID 只能包含中文、字母、数字、下划线和短横线；"
+                        "当前输入不是终端，首行必须是合法的用户 ID[/red]"
+                    )
+                    raise SystemExit(1)
+                value = "default_user"
             if _valid_web_id(value):
-                if not getattr(sys.stdin, "isatty", lambda: True)():
+                if not is_tty:
                     self._user_id_from_stdin = True
                 return value
-            if not getattr(sys.stdin, "isatty", lambda: True)():
+            if not is_tty:
                 # 非交互管道里下一行是查询数据而不是身份重试：继续循环会把
                 # 「北京天气」之类的查询当作 ID 接受、真实查询被吞掉且以 0
                 # 退出——首个非法行直接报错，由用户显式修正输入
@@ -305,6 +323,45 @@ class AligoCLI:
             self.console.print(
                 "[red]用户 ID 只能包含中文、字母、数字、下划线和短横线[/red]"
             )
+
+    def _print_quarantine_notice(self, marker: str) -> None:
+        """打印记忆文件隔离提示（启动守卫与 REPL 内复检共用同一文案）。"""
+        if marker == _QUARANTINE_PENDING_DISPLAY:
+            self.console.print(
+                "[red]记忆文件损坏且隔离备份尚未完成（文件可能被"
+                "占用），请稍后重试或联系维护[/red]"
+            )
+        elif marker == _QUARANTINE_NO_BACKUP_DISPLAY:
+            self.console.print(
+                "[red]记忆文件损坏且未找到可用隔离备份（标记损坏"
+                "或备份已被清理），请稍后重试或联系维护[/red]"
+            )
+        else:
+            self.console.print(
+                f"[red]记忆文件损坏，已隔离备份到 {_markup_safe(marker)}"
+                "（当前会按空快照处理）[/red]"
+            )
+            self.console.print(
+                "[dim]请先运行 python cli.py user-import <用户ID> <备份文件> "
+                "恢复数据后重试[/dim]"
+            )
+
+    def _reload_long_term_checked(self) -> bool:
+        """重载长期记忆并复核隔离状态；隔离时提示并返回 False。
+
+        REPL 长驻期间记忆文件可能被其它进程 / 云同步 / 磁盘错误损坏并被
+        存储层隔离：reload_long_term 会把空快照实例静默换入，读命令与对话
+        若不复查，就会把「数据被隔离」显示成「没有数据」，或在空长期记忆
+        上跑完整轮 LLM 调用后才在落库处失败。
+        """
+        if self.memory_manager is None:
+            return True
+        self.memory_manager.reload_long_term()
+        quarantined = _manager_quarantine_marker(self.memory_manager)
+        if not quarantined:
+            return True
+        self._print_quarantine_notice(quarantined)
+        return False
 
     async def initialize_system(self):
         """初始化系统 - 使用懒加载优化启动速度"""
@@ -357,25 +414,7 @@ class AligoCLI:
                 self.memory_manager.long_term
             )
             if quarantined:
-                if quarantined == _QUARANTINE_PENDING_DISPLAY:
-                    self.console.print(
-                        "[red]记忆文件损坏且隔离备份尚未完成（文件可能被"
-                        "占用），请稍后重试或联系维护[/red]"
-                    )
-                elif quarantined == _QUARANTINE_NO_BACKUP_DISPLAY:
-                    self.console.print(
-                        "[red]记忆文件损坏且未找到可用隔离备份（标记损坏"
-                        "或备份已被清理），请稍后重试或联系维护[/red]"
-                    )
-                else:
-                    self.console.print(
-                        f"[red]记忆文件损坏，已隔离备份到 {_markup_safe(quarantined)}"
-                        "（当前会按空快照处理）[/red]"
-                    )
-                    self.console.print(
-                        "[dim]请先运行 python cli.py user-import <用户ID> <备份文件> "
-                        "恢复数据后再进入交互模式[/dim]"
-                    )
+                self._print_quarantine_notice(quarantined)
                 raise SystemExit(1)
 
             # 初始化意图识别智能体（必须预加载）
@@ -388,9 +427,12 @@ class AligoCLI:
             from agents.lazy_agent_registry import LazyAgentRegistry
             self._agent_cache = {}
             lazy_registry = LazyAgentRegistry(
-                model=self.model, 
+                model=self.model,
                 cache=self._agent_cache,
-                memory_manager=self.memory_manager
+                memory_manager=self.memory_manager,
+                # 复用 CLI 控制台：自建 Console 会绕过 Live 状态区渲染钩子，
+                # 技能加载提示拼到 spinner 行并残留伪状态
+                console=self.console,
             )
 
             # 预先加载关键智能体（可选，利用 preload）
@@ -429,6 +471,7 @@ class AligoCLI:
             try:
                 self.circuit_breaker.raise_if_open()
             except CircuitOpenError:
+                self._command_failed = True
                 self.console.print(
                     "\n[bold yellow]⚠ 服务暂时不可用，请稍后再试。[/bold yellow]\n",
                     style="dim"
@@ -454,8 +497,13 @@ class AligoCLI:
 
             # 每轮对话前重载长期记忆（与 Web 端一致）：记忆面板 / 其它进程刚写入的
             # 标题、偏好、行程必须进入本轮上下文，本进程的旧快照也不能在写回时
-            # 覆盖它们
+            # 覆盖它们。重载后复核隔离状态（文件可能在 REPL 长驻期间被外部损坏）：
+            # 命中即提示并中止本轮，避免在空长期记忆上白跑整轮 LLM、最后才在落库处失败
             await asyncio.to_thread(self.memory_manager.reload_long_term)
+            quarantined = _manager_quarantine_marker(self.memory_manager)
+            if quarantined:
+                self._print_quarantine_notice(quarantined)
+                return
 
             with self.console.status("正在理解需求…", spinner="dots"):
                 from agentscope.message import Msg
@@ -503,6 +551,7 @@ class AligoCLI:
                 try:
                     intention_data = json.loads(intention_result.content)
                 except json.JSONDecodeError:
+                    self._command_failed = True
                     self.console.print("❌ 无法理解您的需求，请重新描述", style="bold red")
                     return
                 # 模型输出可能含孤立代理项（截断 emoji 的 \ud800）：这里的数据
@@ -826,6 +875,10 @@ class AligoCLI:
 
         # 3. 智能筛选相关历史行程
         all_trips = self.memory_manager.long_term.get_trip_history(limit=None)
+        if all_trips and _trip_sort_key is not None:
+            # 与 Web 摘要窗口同口径：按出发日期升序，最近行程在尾部
+            # （存储层按插入 / id 升序返回，头部是最旧行程）
+            all_trips = sorted(all_trips, key=_trip_sort_key)
         if all_trips:
             # 筛选相关的行程（地点匹配）
             relevant_trips = []
@@ -841,8 +894,8 @@ class AligoCLI:
                 else:
                     other_trips.append(trip)
 
-            # 优先显示相关的，再补充最近的
-            trips_to_show = relevant_trips[:2] + other_trips[:1]  # 2条相关 + 1条最近
+            # 优先显示相关的，再补充最近的（排序后尾部是最新行程）
+            trips_to_show = relevant_trips[-2:] + other_trips[-1:]  # 2条相关 + 1条最近
 
             if trips_to_show:
                 summary_parts.append("\n【历史行程】")
@@ -1295,8 +1348,10 @@ class AligoCLI:
 
     def show_status(self):
         """显示当前状态"""
-        # 其它进程（Web 面板 / CLI）可能刚写入：先重载 JSON 快照
-        self.memory_manager.reload_long_term()
+        # 其它进程（Web 面板 / CLI）可能刚写入：先重载 JSON 快照；
+        # 文件在 REPL 长驻期间被隔离时提示并中止，不能把空快照当现状
+        if not self._reload_long_term_checked():
+            return
         # 记忆统计
         full_context = self.memory_manager.get_full_context()
         short_term_stats = full_context["short_term"]["statistics"]
@@ -1404,7 +1459,8 @@ class AligoCLI:
 
     def show_history(self):
         """显示历史行程"""
-        self.memory_manager.reload_long_term()
+        if not self._reload_long_term_checked():
+            return
         history = self.memory_manager.long_term.get_trip_history(10)
 
         if not history:
@@ -1434,7 +1490,8 @@ class AligoCLI:
 
     def show_preferences(self):
         """显示用户偏好"""
-        self.memory_manager.reload_long_term()
+        if not self._reload_long_term_checked():
+            return
         prefs = self.memory_manager.long_term.get_preference()
 
         table = Table(title="用户偏好", show_header=True, header_style="bold magenta")
@@ -1758,14 +1815,20 @@ class AligoCLI:
                         raise SystemExit(130) from None
                     self.console.print("\n使用 'exit' 退出", style="dim")
                 except CircuitOpenError:
+                    self._command_failed = True
                     self.console.print("\n[bold yellow]⚠ 服务暂时不可用，请稍后再试。[/bold yellow]", style="dim")
                 except Exception as e:
                     # 异常文本常含上游响应体：不转义会在 except 里二次抛
                     # MarkupError 终止整个交互会话；再兜一层 suppress 保证
-                    # 错误处理本身绝不打断 REPL
+                    # 错误处理本身绝不打断 REPL。脱敏后展示：响应体里可能
+                    # 回显 API Key 与本机路径（与 health / doctor 同口径）
+                    self._command_failed = True
                     with contextlib.suppress(Exception):
+                        from utils.log_redact import redact_paths
+
                         self.console.print(
-                            f"\n错误: {_terminal_safe(e)}", style="red"
+                            f"\n错误: {redact_paths(_terminal_safe(e))}",
+                            style="red",
                         )
         finally:
             if previous_handler is not None:
@@ -1783,6 +1846,20 @@ class AligoCLI:
                 await asyncio.sleep(0)
             except asyncio.CancelledError:
                 _clear_pending_cancel()
+
+        # 管道（非 TTY stdin）模式有命令失败：以非零退出，脚本 / CI
+        # 不能把「没有回答的失败回合」当成成功（交互终端行为不变）
+        exit_code = self._pipeline_exit_code()
+        if exit_code:
+            raise SystemExit(exit_code)
+
+    def _pipeline_exit_code(self) -> int:
+        """管道模式收尾的退出码：有命令失败时 1（交互终端恒为 0）。"""
+        if getattr(self, "_user_id_from_stdin", False) and getattr(
+            self, "_command_failed", False
+        ):
+            return 1
+        return 0
 
 
 def run_health_check_standalone(as_json: bool = False) -> int:
@@ -4387,6 +4464,18 @@ def _interactive_quarantine_marker(store: Any) -> str | None:
     if STORAGE_CONFIG.get("postgres_dsn"):
         return None
     return _recovered_corrupt_backup(store)
+
+
+def _manager_quarantine_marker(manager: Any) -> str | None:
+    """从 MemoryManager 探测隔离标记；替身 / 探测失败一律视为无隔离。
+
+    测试替身的 ``long_term`` 可能是故意抛错的 property；隔离探测失败不能
+    阻断读命令与对话（与启动守卫的 try/except 同口径）。
+    """
+    try:
+        return _interactive_quarantine_marker(getattr(manager, "long_term", None))
+    except Exception:  # noqa: BLE001 - 探测失败不阻断
+        return None
 
 
 class _QuarantinedMemoryError(RuntimeError):

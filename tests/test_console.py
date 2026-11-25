@@ -88,7 +88,12 @@ def test_auto_decode_nul_and_bomless_utf16le():
 
 
 def test_stdin_fallback_prefers_locale_under_pythonutf8(monkeypatch):
-    """PYTHONUTF8=1 时 stream.encoding 已是 utf-8，回退必须改用 locale 编码。"""
+    """PYTHONUTF8=1 时 stream.encoding 已是 utf-8，回退必须改用系统编码。
+
+    PEP 540 UTF-8 模式下 ``locale.getpreferredencoding(False)`` 同样返回
+    utf-8；回退探测必须走 ``locale.getencoding()``（3.11+，忽略 UTF-8 模式）
+    或 Windows ``GetACP``。
+    """
     import sys
 
     import utils.console as console_module
@@ -104,13 +109,43 @@ def test_stdin_fallback_prefers_locale_under_pythonutf8(monkeypatch):
     monkeypatch.setattr(sys, "stdin", _FakeInput())
     monkeypatch.setattr(sys, "stdout", io.StringIO())
     monkeypatch.setattr(sys, "stderr", io.StringIO())
+    # 两条都 patch：3.10 无 getencoding，3.11+ 优先 getencoding
+    monkeypatch.setattr("locale.getencoding", lambda: "cp936", raising=False)
     monkeypatch.setattr(
         "locale.getpreferredencoding", lambda do_setlocale=False: "cp936"
     )
     console_module.configure_stdio()
     assert isinstance(sys.stdin, console_module._AutoDecodeInput)
     assert sys.stdin._fallback == "cp936", sys.stdin._fallback
-    print("✓ PYTHONUTF8 下 stdin 回退使用 locale 编码")
+    print("✓ PYTHONUTF8 下 stdin 回退使用系统编码")
+
+
+def test_pythonutf8_mode_gbk_pipe_decoded_in_subprocess():
+    """真实 -X utf8 子进程 + GBK 字节：回退不能停留在 utf-8（Windows 中文）。"""
+    import locale
+
+    if sys.platform != "win32":
+        pytest.skip("GBK 管道仅在中文 Windows locale 下可复现")
+    getencoding = getattr(locale, "getencoding", None)
+    system_encoding = (
+        getencoding() if callable(getencoding) else locale.getpreferredencoding(False)
+    )
+    if str(system_encoding or "").lower().replace("-", "") not in {"cp936", "gbk"}:
+        pytest.skip(f"系统 locale 不是 CP936：{system_encoding!r}")
+    script = (
+        "import sys; sys.path.insert(0, r'%s'); "
+        "from utils.console import configure_stdio; configure_stdio(); "
+        "print(input())" % project_root
+    )
+    result = subprocess.run(
+        [sys.executable, "-X", "utf8", "-c", script],
+        input="张三\n".encode("gbk"),
+        capture_output=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    assert result.stdout.decode("utf-8").strip() == "张三"
+    print("✓ -X utf8 下 GBK 管道仍按系统编码解码")
 
 
 def test_readline_line_by_line():
@@ -297,7 +332,93 @@ def test_bomless_utf16le_stream_lines_decode():
     shim2 = _AutoDecodeInput(_PipeBuffer(payload_cjk), "gbk")
     assert shim2.readline() == "北京天气\n"
     assert shim2.readline() == "第二行\n"
-    print("✓ 无 BOM UTF-16LE 流式解码（含中文首行）")
+    # U+xx00 常用字（一 U+4E00 / 开 U+5F00 / 怀 U+6000）的低字节是 0x00、
+    # 落在偶数位：旧的「偶数位不能有零」判据会漏判并把后续行整体错位
+    for text in (
+        "alice\n第一天去北京\n",
+        "开心\n你好\n",
+        "怀旧\n第二天\n",
+        ("天" * 40) + "\n第二行\n",
+        ("张" * 50) + "\n第二行\n",
+    ):
+        payload = text.encode("utf-16-le")
+        shim3 = _AutoDecodeInput(_PipeBuffer(payload), "gbk")
+        decoded = "".join(iter(shim3.readline, ""))
+        assert decoded == text, (text[:10], decoded[:20])
+    print("✓ 无 BOM UTF-16LE 流式解码（含中文首行 / U+xx00 常用字 / 长首行）")
+
+
+def _readline_all(payload: bytes, fallback: str = "gbk", forced=None) -> str:
+    from utils.console import _AutoDecodeInput
+
+    shim = _AutoDecodeInput(_PipeBuffer(payload), fallback, forced)
+    return "".join(iter(shim.readline, ""))
+
+
+def test_gbk_utf8_ambiguous_first_line_is_rejected():
+    """GBK 双字节恰好是合法 UTF-8（唯一 / 一一 / 十）：首行不能静默改字。"""
+    import pytest as _pytest
+
+    for text in ("唯一", "一一", "十"):
+        payload = (text + "\n").encode("gbk")
+        with _pytest.raises(ValueError) as excinfo:
+            _readline_all(payload)
+        message = str(excinfo.value)
+        assert "编码歧义" in message and "ALIGO_STDIN_ENCODING" in message, message
+        assert text in message, "消息必须列出按 GBK 解码的候选"
+    # 显式编码跳过自动判定：GBK 原文还原
+    assert _readline_all("唯一\n第二行\n".encode("gbk"), forced="gbk") == (
+        "唯一\n第二行\n"
+    )
+    # 显式 UTF-8 还原另一种解释（西里尔 / 希腊字母）
+    assert _readline_all("唯一\n".encode("gbk"), forced="utf-8") == "Ψһ\n"
+    print("✓ GBK / UTF-8 歧义首行拒绝静默改字（可显式指定编码）")
+
+
+def test_gbk_ambiguity_on_later_lines_warns_once():
+    """首行是 ASCII 时，后续歧义行按 UTF-8 解析并只警告一次。"""
+    import contextlib
+
+    payload = b"alice\n" + "唯一\n".encode("gbk") + "再说\n".encode("gbk")
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        decoded = _readline_all(payload)
+    assert decoded.startswith("alice\n")
+    err = stderr.getvalue()
+    assert "编码歧义" in err and "ALIGO_STDIN_ENCODING" in err, err
+    # 第二行是 UTF-8 解释（非 GBK 原文），第三行 GBK 正常（不是合法 UTF-8）
+    assert "Ψһ" in decoded and decoded.endswith("再说\n"), repr(decoded)
+    print("✓ 后续歧义行警告一次并按 UTF-8 解析")
+
+
+def test_forced_stdin_encoding_from_environment(monkeypatch):
+    """ALIGO_STDIN_ENCODING 强制逐行解码（跳过 UTF-16 / 歧义自动判定）。"""
+    import sys
+
+    import utils.console as console_module
+
+    class _FakeInput:
+        encoding = "utf-8"
+        buffer = _PipeBuffer("唯一\n".encode("gbk"))
+        peek = buffer.peek
+
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(sys, "stdin", _FakeInput())
+    monkeypatch.setattr(sys, "stdout", io.StringIO())
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    monkeypatch.setenv("ALIGO_STDIN_ENCODING", "gbk")
+    console_module.configure_stdio()
+    assert isinstance(sys.stdin, console_module._AutoDecodeInput)
+    assert sys.stdin.readline() == "唯一\n"
+    # 非法编码：告警并忽略，不影响启动
+    monkeypatch.setenv("ALIGO_STDIN_ENCODING", "not-a-codec")
+    monkeypatch.setattr(sys, "stdin", _FakeInput())
+    console_module.configure_stdio()
+    assert isinstance(sys.stdin, console_module._AutoDecodeInput)
+    assert "ALIGO_STDIN_ENCODING" in sys.stderr.getvalue()
+    print("✓ ALIGO_STDIN_ENCODING 强制编码 / 非法值告警")
 
 
 def test_read_size_utf8_with_gbk_fallback_not_mojibake():
@@ -619,6 +740,14 @@ if __name__ == "__main__":
     finally:
         _mp.undo()
     test_utf16_readline_uses_single_chunk_reads()
+    test_pythonutf8_mode_gbk_pipe_decoded_in_subprocess()
+    test_gbk_utf8_ambiguous_first_line_is_rejected()
+    test_gbk_ambiguity_on_later_lines_warns_once()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_forced_stdin_encoding_from_environment(_mp)
+    finally:
+        _mp.undo()
     if _DIRECT_RUN_SKIP:
         print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
     print("\n全部通过")
