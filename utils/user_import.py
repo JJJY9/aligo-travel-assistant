@@ -25,7 +25,10 @@ from utils.chat_import import filter_import_messages, prepare_import_messages
 from utils.errors import ImportVolumeError, MemoryPersistenceError
 from utils.identifiers import is_valid_web_session_id
 from utils.json_safe import MAX_JSON_DEPTH
-from utils.preference_values import PREFERENCE_VALUE_MAX_CHARS
+from utils.preference_values import (
+    PREFERENCE_VALUE_MAX_CHARS,
+    has_preference_value,
+)
 from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_export import normalized_uid_token
 from utils.trip_import import (
@@ -1641,6 +1644,14 @@ def parse_user_export_data(
         problem = _text_problem(name) or _bad_text_in_value(value)
         if problem:
             errors.append(f"跳过第 {index} 个偏好：{problem}")
+            continue
+        if not has_preference_value(value):
+            # 空值 = 未设置：与 Web PUT / CLI pref-set 同口径拒绝。空值
+            # 偏好在面板 / 状态接口不可见却占用类型上限名额（面板无行
+            # 可删），落库后会形成「看不见的隐形偏好」
+            errors.append(
+                f"跳过第 {index} 个偏好：值为空（空值=未设置，清除请删除该偏好）"
+            )
             continue
         if _content_beyond_export_depth(value, _PREFERENCE_EXPORT_DEPTH):
             errors.append(

@@ -4211,7 +4211,9 @@ function renderOverview() {
       const edit = document.createElement("button");
       edit.type = "button";
       edit.title = "编辑偏好";
-      edit.setAttribute("aria-label", "编辑偏好");
+      // aria-label 带上偏好名：多行时读屏要能区分操作对象（title 保持
+      // 固定值，focusRowEdit 依赖 button[title="编辑偏好"] 定位）
+      edit.setAttribute("aria-label", `编辑偏好 ${label.textContent}`);
       edit.innerHTML = icon("edit");
       edit.addEventListener("click", () =>
         startEditPreference(
@@ -4223,9 +4225,11 @@ function renderOverview() {
       const remove = document.createElement("button");
       remove.type = "button";
       remove.title = "删除偏好";
-      remove.setAttribute("aria-label", "删除偏好");
+      remove.setAttribute("aria-label", `删除偏好 ${label.textContent}`);
       remove.innerHTML = icon("trash");
-      remove.addEventListener("click", () => deletePreference(key, label.textContent));
+      remove.addEventListener("click", () =>
+        deletePreference(key, label.textContent, row),
+      );
       actions.append(edit, remove);
 
       row.append(label, val, actions);
@@ -4729,6 +4733,21 @@ async function loadUpcomingWeather(city, startDate) {
 
 const LIST_PREF_TYPES = new Set(["hotel_brands", "airlines"]);
 
+// 偏好值序列化后的字符上限：与 PUT /api/preferences 的
+// _PREFERENCE_VALUE_MAX_JSON、utils.preference_values.PREFERENCE_VALUE_MAX_CHARS
+// 及存储 / CLI / 导入同一口径（此前前端硬编码 500，长偏好能看不能改）
+const PREFERENCE_VALUE_MAX_CHARS = 10000;
+
+function preferenceValueTooLarge(value) {
+  // 服务端按 JSON 序列化后的长度计（引号 / 转义 / 列表括号会略增），
+  // 前端在输入阶段就拦下，避免直接收到英文 422
+  try {
+    return JSON.stringify(value).length > PREFERENCE_VALUE_MAX_CHARS;
+  } catch {
+    return false;
+  }
+}
+
 function newPreferenceValue(type, text) {
   if (LIST_PREF_TYPES.has(type)) {
     const items = text
@@ -4770,6 +4789,34 @@ async function addPreference(event) {
     toast("请输入至少一个偏好项（不能只有分隔符）");
     return;
   }
+  let value = newPreferenceValue(type, text);
+  if (LIST_PREF_TYPES.has(type) && Array.isArray(value)) {
+    // 「添加偏好」对列表型偏好是追加语义：面板唯一的整值覆盖入口是行内
+    // 「编辑」。直接 PUT 覆盖会让既有品牌 / 航司静默丢失（存储层 PUT 是
+    // 整值替换，不合并）
+    const existing =
+      preferenceLatest.get(type) ??
+      (state.status && state.status.preferences
+        ? state.status.preferences[type]
+        : undefined);
+    const merged = Array.isArray(existing)
+      ? existing.filter(
+          (item) => item !== null && String(item).trim() !== "",
+        )
+      : existing !== undefined &&
+          existing !== null &&
+          String(existing).trim() !== ""
+        ? [existing]
+        : [];
+    for (const item of value) {
+      if (!merged.includes(item)) merged.push(item);
+    }
+    value = merged;
+  }
+  if (preferenceValueTooLarge(value)) {
+    toast(`偏好值过大（序列化后超过 ${PREFERENCE_VALUE_MAX_CHARS} 字符）`);
+    return;
+  }
   els.prefSubmit.disabled = true;
   els.prefCancel.disabled = true;
   try {
@@ -4778,7 +4825,7 @@ async function addPreference(event) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         user_id: state.userId,
-        value: newPreferenceValue(type, text),
+        value,
       }),
     });
     toast("偏好已保存");
@@ -4786,7 +4833,8 @@ async function addPreference(event) {
     if (els.prefType.value === type && els.prefValue.value.trim() === text) {
       resetPreferenceForm();
     }
-    await refreshStatus();
+    // 静默：失败时「刷新数据概览失败」不能覆盖刚显示的保存成功提示
+    await refreshStatus({ silentFailure: true });
   } catch (error) {
     toast(error.message);
   } finally {
@@ -4815,6 +4863,12 @@ function preferenceInputValue(value) {
   return String(value ?? "");
 }
 
+function preferenceBlurNeedsConfirm(currentValue, nextValue) {
+  // 与 save() 同口径：<input> 赋值会剥离 CR/LF，含换行的原始值直接比较
+  // 恒不相等（未修改也会被当成有改动）
+  return nextValue !== preferenceInputValue(currentValue).replace(/[\r\n]/g, "");
+}
+
 function preferenceOutputValue(original, text) {
   // 未做修改（输入框内容与回填一致）时沿用原值：对象 / 对象数组不会被
   // 字面量化成字符串（从对象变成 JSON 字符串同样是数据损坏）
@@ -4831,10 +4885,25 @@ function preferenceOutputValue(original, text) {
       }
     }
     // 与「添加偏好」保持一致：ASCII 逗号同样视为分隔符
-    return text
+    const parts = text
       .split(/[、，,]/)
       .map((item) => item.trim())
       .filter(Boolean);
+    // 数值 / 布尔列表按原元素类型回写：直接 split 会把 [1,2,3] 变成
+    // ["1","2","3"]（服务端契约支持数值列表原样往返，类型被静默改写）
+    if (original.length && original.every((item) => typeof item === "number")) {
+      if (!parts.every((part) => Number.isFinite(Number(part)))) {
+        return undefined;
+      }
+      return parts.map((part) => Number(part));
+    }
+    if (original.length && original.every((item) => typeof item === "boolean")) {
+      if (!parts.every((part) => /^(true|false)$/i.test(part))) {
+        return undefined;
+      }
+      return parts.map((part) => part.toLowerCase() === "true");
+    }
+    return parts;
   }
   if (original !== null && typeof original === "object") {
     try {
@@ -4864,9 +4933,13 @@ function startEditPreference(row, type, currentValue) {
 
   const input = document.createElement("input");
   input.className = "pref-input";
-  // 与「添加偏好」表单和 PUT /api/preferences 的 500 字上限对齐：
-  // 超限时在输入阶段就截断，而不是提交后收到英文 422
-  input.maxLength = 500;
+  // 与服务端序列化上限（10000 字符）及存储 / CLI / 导入口径一致：
+  // 此前硬编码 500，长偏好「能看不能改」
+  input.maxLength = PREFERENCE_VALUE_MAX_CHARS;
+  input.setAttribute(
+    "aria-label",
+    `偏好值：${PREF_NAMES[type] || type}（回车保存，Esc 取消）`,
+  );
   input.value = preferenceInputValue(currentValue);
   valueEl.replaceWith(input);
   input.focus();
@@ -4926,13 +4999,19 @@ function startEditPreference(row, type, currentValue) {
     const value = preferenceOutputValue(currentValue, text);
     if (value === undefined) {
       settled = false;
-      toast("对象型偏好请保持合法的 JSON 格式");
+      toast("偏好格式无效：对象请用合法 JSON，数值列表请填写数字");
       input.focus();
       return;
     }
     if (Array.isArray(value) && !value.length) {
       settled = false;
       toast("偏好内容不能为空");
+      input.focus();
+      return;
+    }
+    if (preferenceValueTooLarge(value)) {
+      settled = false;
+      toast(`偏好值过大（序列化后超过 ${PREFERENCE_VALUE_MAX_CHARS} 字符）`);
       input.focus();
       return;
     }
@@ -4949,9 +5028,28 @@ function startEditPreference(row, type, currentValue) {
       preferenceLatest.set(type, value);
       valueEl.textContent = formatPreferenceValue(value);
       if (input.isConnected) input.replaceWith(valueEl);
-      await refreshStatus();
+      // 静默：失败时「刷新数据概览失败」不能覆盖刚显示的保存成功提示
+      await refreshStatus({ silentFailure: true });
       focusRowEdit();
     } catch (error) {
+      const status = Number((error && error.status) || 0);
+      if (!status || status >= 500) {
+        // 无 HTTP 状态（超时 / 断连）或 5xx：PUT 是 UPSERT，请求可能已被
+        // 服务端执行。不能当作确定失败把显示与 preferenceLatest 留在旧值，
+        // 否则用户取消后再编辑会用旧值回填、下次保存把服务端已写入的新值
+        // 覆盖回去（与备份恢复 / 行程去重的「结果未知」口径一致）
+        settled = true;
+        toast(
+          `保存结果未知：${error.message}；服务端可能已保存，已按新值显示，` +
+            "请稍后刷新确认",
+        );
+        preferenceLatest.set(type, value);
+        valueEl.textContent = formatPreferenceValue(value);
+        if (input.isConnected) input.replaceWith(valueEl);
+        await refreshStatus({ silentFailure: true });
+        focusRowEdit();
+        return;
+      }
       settled = false;
       toast(`保存失败：${error.message}`);
       input.focus();
@@ -4970,11 +5068,20 @@ function startEditPreference(row, type, currentValue) {
     }
   });
   input.addEventListener("blur", () => {
-    if (!settled) cancel();
+    if (settled) return;
+    if (!preferenceBlurNeedsConfirm(currentValue, input.value)) {
+      // 未修改：静默还原
+      cancel();
+      return;
+    }
+    // 已修改：失焦不再静默丢弃草稿（点空白 / Tab / 关闭面板都会触发），
+    // 先确认是否保存；取消走原有的还原路径
+    if (window.confirm("偏好修改尚未保存，是否保存？")) save();
+    else cancel();
   });
 }
 
-async function deletePreference(type, label) {
+async function deletePreference(type, label, row) {
   if (!window.confirm(`删除偏好「${label}」？`)) return;
   try {
     await getJSON(
@@ -4984,9 +5091,22 @@ async function deletePreference(type, label) {
       { method: "DELETE" },
     );
     toast("偏好已删除");
-    await refreshStatus();
+    // 先本地移除并清掉最新值：refreshStatus 失败（静默）时不会留下已删除
+    // 的行，残留行再次「编辑」保存也不会用旧值把偏好 PUT 回来
+    preferenceLatest.delete(type);
+    if (row && row.isConnected) row.remove();
+    await refreshStatus({ silentFailure: true });
   } catch (error) {
-    toast(`删除失败：${error.message}`);
+    const status = Number((error && error.status) || 0);
+    // 超时 / 断连 / 5xx（PostgreSQL 提交后断连按 503 上报）：删除可能已在
+    // 服务端生效——先对账刷新并提示结果未知，避免残留行再编辑后复活
+    const unknownOutcome = !status || status >= 500;
+    toast(
+      unknownOutcome
+        ? `删除结果未知：${error.message}（已刷新，请确认偏好是否仍在）`
+        : `删除失败：${error.message}`,
+    );
+    if (unknownOutcome) await refreshStatus({ silentFailure: true });
   }
 }
 

@@ -101,6 +101,53 @@ def is_manageable_pref_type(pref_type: object) -> bool:
     return 0 < len(text) <= 64 and "/" not in text
 
 
+# 偏好拼进 LLM prompt 时的预算：单值截断 + 总量截断。偏好单值上限
+# 10000 字符、类型上限 200，全量原样拼接可达约 2MB，任何模型上下文都会
+# 超限：该账号的偏好抽取与每轮意图识别会持续失败（不是单次抖动）。
+PROMPT_PREFERENCE_VALUE_MAX_CHARS = 500
+PROMPT_PREFERENCE_TEXT_MAX_CHARS = 4000
+
+
+def _prompt_preference_text(value: Any) -> str:
+    if isinstance(value, (list, tuple)):
+        return ", ".join(str(item) for item in value)
+    return str(value)
+
+
+def preference_prompt_lines(
+    preferences: object,
+    *,
+    bullet: str = "•",
+    max_value_chars: int = PROMPT_PREFERENCE_VALUE_MAX_CHARS,
+    max_total_chars: int = PROMPT_PREFERENCE_TEXT_MAX_CHARS,
+) -> list[str]:
+    """把偏好格式化为带预算的 prompt 行（``• 类型: 值``）。
+
+    单值超过 ``max_value_chars`` 截断并加省略号；累计超过
+    ``max_total_chars`` 后不再输出值，但对剩余类型仍保留「值已省略」行
+    ——模型据此判断该字段已存在，不会把既有列表型偏好当首次设置而
+    replace 覆盖；类型名也放不下时以「（更多偏好已省略）」收尾。
+    """
+    if not isinstance(preferences, dict):
+        return []
+    lines: list[str] = []
+    used = 0
+    for key, value in preferences.items():
+        name = str(key)
+        text = _prompt_preference_text(value)
+        if len(text) > max_value_chars:
+            text = text[:max_value_chars] + "…"
+        line = f"{bullet} {name}: {text}"
+        if used + len(line) + 1 > max_total_chars:
+            line = f"{bullet} {name}: （值已省略）"
+            if used + len(line) + 1 > max_total_chars:
+                lines.append("（更多偏好已省略）")
+                break
+        lines.append(line)
+        used += len(line) + 1
+    return lines
+
+
 def preference_value_problem(value: Any) -> str | None:
     """偏好值能否落库：必须可 JSON 序列化且序列化后不超过上限。
 

@@ -319,6 +319,29 @@ def test_editor_round2_preferences_and_guards():
     assert data["prefCancelDuring"]["cancelDisabled"] is True, data["prefCancelDuring"]
     assert data["prefCancelAfter"]["cancelDisabled"] is False, data["prefCancelAfter"]
 
+    typed = data["typedLists"]
+    assert typed["numbers"] == [1, 2, 4], typed
+    assert "numbersInvalid" not in typed, "非数字必须返回未定义而不是字符串数组"
+    assert typed["booleans"] == [True, False], typed
+    assert "booleansInvalid" not in typed, typed
+
+    assert data["prefMaxChars"] == 10000, "偏好编辑框上限须与服务端 10000 一致"
+    assert data["addMerges"] == ["汉庭", "如家", "锦江"], data["addMerges"]
+    assert data["addScalar"] == "上海", data["addScalar"]
+
+    blur = data["blurPrompt"]
+    assert blur["changed"] is True and blur["unchanged"] is False, blur
+    assert blur["newline"] is False, "输入框剥离换行后与原文一致时不算修改"
+
+    unknown = data["deleteUnknown"]
+    assert any("删除结果未知" in item for item in unknown["toasts"]), unknown
+    assert unknown["refreshes"] == [{"silentFailure": True}], unknown
+
+    deleted = data["deleteSuccess"]
+    assert deleted["rowRemoved"] is True, "删除成功后必须本地移除该行"
+    assert deleted["latestHas"] is False, "删除后必须清掉 preferenceLatest"
+    assert deleted["refreshes"] == [{"silentFailure": True}], deleted
+
     kb = data["kbReclick"]
     assert kb["confirmCalls"] == 1, "同一行再次编辑且草稿已修改时必须确认"
     assert kb["kept"] == "用户新输入的草稿", kb

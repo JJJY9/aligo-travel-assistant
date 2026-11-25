@@ -772,8 +772,12 @@ class PostgresLongTermMemory:
 
     def get_preference(self, pref_type: str | None = None) -> Any:
         if pref_type is None:
+            # ORDER BY：无排序时行序未定义（UPDATE 会挪行版本），面板行序
+            # 每次编辑后跳动、备份 diff 出噪声；按 pref_type 排序命中主键
+            # 索引且编辑不变，顺序稳定（JSON 后端为稳定的插入序）
             rows = self._fetchall(
-                "SELECT pref_type, value FROM aligo_preferences WHERE user_id = %s",
+                "SELECT pref_type, value FROM aligo_preferences"
+                " WHERE user_id = %s ORDER BY pref_type",
                 (self.user_id,),
             )
             return {row[0]: row[1] for row in rows}
