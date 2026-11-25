@@ -1094,7 +1094,10 @@ class TripPayload(BaseModel):
     destination: str = Field(min_length=1, max_length=100)
     start_date: str = Field(pattern=_DATE_PATTERN)
     end_date: str | None = Field(default=None, pattern=_DATE_PATTERN)
-    purpose: str = Field(default="出差", max_length=100)
+    # None = 未显式提供（新行程落默认「出差」，命中既有行程时保留原目的）；
+    # 显式空串与省略同义。不能再用「出差」默认值：重复提交同一行程时会把
+    # 用户改过的目的重置成模板值（CLI / 对话路径在未提供时不写 purpose）
+    purpose: str | None = Field(default=None, max_length=100)
 
     @field_validator("destination")
     @classmethod
@@ -1110,7 +1113,9 @@ class TripPayload(BaseModel):
 
     @field_validator("origin", "purpose")
     @classmethod
-    def _strip_text(cls, value: str) -> str:
+    def _strip_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
         cleaned = value.strip()
         problem = _text_write_problem(cleaned)
         if problem:
@@ -6512,7 +6517,10 @@ def create_app(model: Any = None) -> FastAPI:
         日期（CLI / 旧客户端不变）。
         """
         response.headers.update(_enforce_read_rate_limit(state, request))
-        store = _open_long_term(user_id)
+        # strict：列表与 /api/status、导出 / 日历 / 去重、CLI 统一口径——
+        # PostgreSQL 已配置但故障时回退 JSON 会展示陈旧 / 缺失的行程，
+        # 与同屏的状态、导出结果不一致；改为可重试的 503（前端保留旧列表）
+        store = _open_long_term(user_id, strict=True)
         try:
             all_trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - 读取失败统一提示
@@ -6565,27 +6573,51 @@ def create_app(model: Any = None) -> FastAPI:
         # strict：PostgreSQL 故障期间不能把新增行程静默写进回退 JSON
         # （恢复后读 PG，行程「凭空消失」，与导入 / 删除的严格语义一致）
         store = _open_long_term(payload.user_id, strict=True)
-        created = False
         conflicts: list[dict[str, Any]] = []
         try:
-            before = len(store.get_trip_history(limit=None))
+            before_trips = store.get_trip_history(limit=None)
+            # 未显式提供目的时才套默认值：命中既有行程（同路线 + 同起止
+            # 日期）时不能把用户改过的目的重置成「出差」——CLI trip-add 与
+            # 对话编排在未提供目的时都不写 purpose 键。预判仅用于选默认值，
+            # 真正的去重在存储写锁内原子完成（竞态最坏退化为旧行为）
+            record: dict[str, Any] = {
+                "origin": payload.origin,
+                "destination": payload.destination,
+                "start_date": payload.start_date,
+                "end_date": payload.end_date,
+            }
+            purpose = payload.purpose
+            if purpose is None:
+                from utils.trip_import import trip_identity
+
+                will_update = any(
+                    trip.get("destination")
+                    and trip_identity(trip) == trip_identity(record)
+                    for trip in before_trips
+                )
+                if not will_update:
+                    purpose = "出差"
+            if purpose:
+                record["purpose"] = purpose
             # 不在锁外按「存量 >= 上限」预检：存储写锁内只拦「恰好在上限、
             # 本次确属新增」的写入（同身份重复提交按更新放行；已越限的
             # 历史账号继续可用），预检会把可去重更新误拒且与写层结论分叉
+            created_flag: list[bool] = []
             trip_id = store.save_trip_history(
-                {
-                    "origin": payload.origin.strip(),
-                    "destination": payload.destination.strip(),
-                    "start_date": payload.start_date,
-                    "end_date": payload.end_date,
-                    "purpose": payload.purpose.strip() or "出差",
-                },
+                record,
                 # 上限在存储写锁内复核：上面的长度预检挡不住并发创建，
                 # 越限后 /api/export 会因条数上限永久 413
                 max_total=MAX_TRIP_ENTRIES,
+                # 写锁内确定的「新增 / 更新」：锁外按长度差判断会被窗口
+                # 内其它请求的增删污染，误报已添加 / 已更新
+                created_out=created_flag,
             )
             trips = store.get_trip_history(limit=None)
-            created = len(trips) > before
+            created = (
+                created_flag[0]
+                if created_flag
+                else len(trips) > len(before_trips)
+            )
             # 按「id + 关键字段」定位本次保存的那条并按身份排除：历史里存在
             # 重复 trip_id 时，按 id 整条排除会连带隐藏其它行程的真实重叠
             saved_record = _find_saved_trip(

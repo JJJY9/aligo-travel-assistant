@@ -77,6 +77,20 @@ def trip_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:
     )
 
 
+def dedupe_identity(row: dict[str, Any]) -> tuple[str, str, str, str]:
+    """去重命令（trips-dedupe）使用的身份：路线字段再折叠大小写。
+
+    存储层的写入去重按原文比对（保留用户对目的地 / 出发地的写法差异），
+    但手工去重命令针对的是「视觉上就是同一趟」的历史重复：备份恢复按
+    保真保留了「 上海」/「Shanghai」这类原文，与面板后写的同一路线只差
+    首尾空白或大小写。首尾空白已由 ``normalize_identity_text`` 折叠，
+    这里只再折叠大小写（``casefold``）；内部空白 / 换行不折叠（
+    「北京 上海」与「北京\\n上海」仍是两条不同路线）。
+    """
+    destination, origin, start, end = trip_identity(row)
+    return (destination.casefold(), origin.casefold(), start, end)
+
+
 def _strict_date(value: str) -> "datetime | None":
     """严格 YYYY-MM-DD：不补零写法（2026-1-1）视为非法，避免绕过去重。"""
     try:

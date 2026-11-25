@@ -347,10 +347,13 @@ class _AddStore(_FakeStore):
         super().__init__(trips)
         self.saved = []
 
-    def save_trip_history(self, record):
+    def save_trip_history(self, record, **kwargs):
         self.saved.append(dict(record))
         trip_id = f"trip_{len(self.trips) + 1}"
         self.trips.append({**record, "trip_id": trip_id})
+        created_out = kwargs.get("created_out")
+        if created_out is not None:
+            created_out.append(True)
         return trip_id
 
 
@@ -560,7 +563,7 @@ def test_trip_add_store_failures(monkeypatch):
     assert "打开长期记忆失败" in data["error"]
 
     class _FailSave(_AddStore):
-        def save_trip_history(self, record):
+        def save_trip_history(self, record, **kwargs):
             raise RuntimeError("disk full")
 
     store = _FailSave([])

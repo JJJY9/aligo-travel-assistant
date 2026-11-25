@@ -1,4 +1,5 @@
 """行程日期解析、重叠判断与状态标签（Web / CLI 共用）。"""
+import functools
 import heapq
 import logging
 import re
@@ -7,21 +8,46 @@ from datetime import date, datetime
 from itertools import islice
 from typing import Any
 
+from utils.trip_export import normalize_identity_date
+
 logger = logging.getLogger(__name__)
+
+
+def _parse_trip_date(value: Any) -> datetime | None:
+    """按身份口径解析行程日期：补零 / 斜杠 / 全角数字先归一再 strptime。
+
+    只认 ``%Y-%m-%d`` 会让备份恢复按保真保留的斜杠日期（2026/03/12，
+    存储身份 / 导出 / 导入都视为合法日期）在冲突检测、状态徽标与统计里
+    静默消失；非真实日历日（2026-02-30）归一后仍被 strptime 拒绝。
+    """
+    text = normalize_identity_date(value)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+@functools.lru_cache(maxsize=8192)
+def _start_sort_key(raw: str) -> tuple[datetime, str]:
+    """冲突列表排序键（按解析后的出发日期），同一日期字符串只解析一次。
+
+    同一条行程会出现在多达 20 个视图的冲突列表里，逐视图 strptime 是
+    O(n×20) 的重复解析；缓存有界且只存日期字符串。
+    """
+    parsed = _parse_trip_date(raw)
+    return (parsed if parsed is not None else datetime.min, raw)
 
 
 def _start_sort_value(trip: dict[str, Any]) -> tuple[datetime, str]:
     """冲突列表排序键：按解析后的出发日期（未补零日期不再按字符串错序）。
 
-    历史数据支持 ``2026-1-5`` 这类未补零日期：字符串比较下
+    历史数据支持 ``2026-1-5`` / ``2026/3/12`` 这类写法：字符串比较下
     ``2026-1-15`` 会排在 ``2026-1-2`` 前面；无法解析的值统一排在最前，
     以原始文本稳定次序。
     """
-    raw = str(trip.get("start_date") or "")
-    try:
-        return datetime.strptime(raw, "%Y-%m-%d"), raw
-    except ValueError:
-        return datetime.min, raw
+    return _start_sort_key(str(trip.get("start_date") or ""))
 
 
 _WARNED_TRIP_ISSUES: set[tuple[str, str]] = set()
@@ -50,17 +76,26 @@ def _warn_trip_issue_once(
 def trip_interval(trip: dict[str, Any]) -> tuple[datetime, datetime] | None:
     """行程的日期区间（含首尾）；缺少或无法解析出发日期时返回 None。
 
-    返程日期非法（历史脏数据）时按出发当日计算并记录警告（同一脏值只记
-    一次）——此前完全静默，行程区间被截成单日却无从察觉。
+    日期按身份口径归一后解析：备份恢复按保真保留的斜杠日期（2026/03/12）
+    与未补零日期（2026-1-5）同口径参与冲突 / 状态 / 统计。返程日期非法
+    （历史脏数据）时按出发当日计算并记录警告（同一脏值只记一次）——此前
+    完全静默，行程区间被截成单日却无从察觉。
     """
-    try:
-        start = datetime.strptime(str(trip.get("start_date") or ""), "%Y-%m-%d")
-    except ValueError:
+    raw_start = trip.get("start_date")
+    start = _parse_trip_date(raw_start)
+    if start is None:
+        if raw_start:
+            _warn_trip_issue_once(
+                "unparsable-start",
+                raw_start,
+                "行程 %s 的出发日期无法解析（%r），不参与冲突 / 状态统计",
+                trip.get("trip_id"),
+                raw_start,
+            )
         return None
     raw_end = trip.get("end_date")
-    try:
-        end = datetime.strptime(str(raw_end or ""), "%Y-%m-%d")
-    except ValueError:
+    end = _parse_trip_date(raw_end)
+    if end is None:
         if raw_end:
             _warn_trip_issue_once(
                 "unparsable-end",

@@ -1923,7 +1923,9 @@ async function addTrip(event) {
     destination,
     start_date: startDate,
     end_date: els.tripEnd.value || null,
-    purpose: els.tripPurpose.value.trim() || "出差",
+    // 空目的按「未显式提供」发送：新增时后端落默认「出差」，命中既有
+    // 行程（重复提交同一趟）时保留用户改过的目的，不会被重置成模板值
+    purpose: els.tripPurpose.value.trim() || null,
   };
   const submitted = {
     editingId,
@@ -4630,10 +4632,12 @@ function todayISO() {
 }
 
 function normalizeISODate(value) {
-  // 只接受 YYYY-M-D 形态并补零：历史数据可能未补零（2026-1-5），
-  // 字符串字典序会把它们排错；非日期文本返回 null
+  // 只接受 YYYY-M-D / YYYY/M/D 形态并补零：历史数据可能未补零（2026-1-5）
+  // 或来自备份保真的斜杠写法（2026/3/12），字符串字典序会把它们排错；
+  // 斜杠与后端 trip_interval 的身份口径一致，否则后端显示了状态徽标、
+  // 前端却解析失败不出徽标
   const text = String(value || "").trim();
-  const match = text.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  const match = text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
   if (!match) return null;
   return `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
 }

@@ -455,6 +455,44 @@ def test_unscheduled_schedule_does_not_demand_full_coverage():
     print("✓ 未安排项不再与「必须覆盖」矛盾")
 
 
+def test_unscheduled_must_see_not_demanded_by_validation():
+    """求解器判为未安排的必去项不再被校验强制覆盖（不触发无意义的修复）。"""
+    module = _load_plan_module()
+    plan = _plan(
+        [
+            {
+                "day": 1,
+                "activities": [
+                    {"time": "09:00-10:00", "title": "故宫", "cost": 100},
+                    {"time": "10:30-11:30", "title": "天安门", "cost": 50},
+                    {"time": "13:00-14:00", "title": "颐和园", "cost": 80},
+                ],
+            }
+        ],
+        estimated_budget=230,
+    )
+    model = _ScriptedModel([plan])
+    agent = module.ItineraryPlanningAgent(
+        name="ItineraryPlanningAgent", model=model
+    )
+    out = asyncio.run(
+        agent.reply(
+            Msg(
+                name="orchestrator",
+                content=_payload("去北京玩1天，必去故宫、天安门、颐和园、圆明园"),
+                role="user",
+            )
+        )
+    )
+    result = json.loads(out.content)
+    assert result["validation"]["passed"] is True, result["validation"]
+    codes = [issue.get("code") for issue in result["validation"]["issues"]]
+    assert "must_see_missing" not in codes, codes
+    assert len(model.prompts) == 1, "诚实覆盖可行项时不应触发修复调用"
+    assert "无法安排" in model.prompts[0]
+    print("✓ 未安排项不再被校验强制覆盖（提示与校验同结论）")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -469,4 +507,5 @@ if __name__ == "__main__":
     test_repair_retries_use_latest_version()
     test_repair_prompt_keeps_valid_json_for_long_plan()
     test_unscheduled_schedule_does_not_demand_full_coverage()
+    test_unscheduled_must_see_not_demanded_by_validation()
     print("\n全部通过")

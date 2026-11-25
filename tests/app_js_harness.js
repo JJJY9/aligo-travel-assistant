@@ -435,6 +435,9 @@ function scenarioRender(source) {
     slice_emoji: invoke("sliceCodePoints", "😀😀😀", 2),
     pref_object: invoke("formatPreferenceValue", { a: 1 }),
     pref_list: invoke("formatPreferenceValue", ["汉庭", { b: 2 }]),
+    date_unpadded: invoke("normalizeISODate", "2026-1-5"),
+    date_slash: invoke("normalizeISODate", "2026/3/12"),
+    date_bad: invoke("normalizeISODate", "下周一"),
   };
 }
 

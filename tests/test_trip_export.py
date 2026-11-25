@@ -505,7 +505,10 @@ def test_identity_projection_matches_export_cleaning():
     assert normalize_identity_text("北京 上海") != normalize_identity_text(
         "北京\n上海"
     ), "空格与换行仍是不同身份"
-    print("✓ 身份投影 = 导出清洗投影（空格 ≠ 换行不变）")
+    # 首尾空白只在身份键上折叠：保真存量的「 上海 」与手输同一路线同身份
+    assert normalize_identity_text(" 上海 ") == normalize_identity_text("上海")
+    assert normalize_identity_text("\t北京\n") == normalize_identity_text("北京")
+    print("✓ 身份投影 = 导出清洗投影（空格 ≠ 换行不变，首尾空白折叠）")
 
 
 def test_export_strips_unicode_line_separators_and_counts_events():
