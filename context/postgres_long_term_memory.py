@@ -12,6 +12,7 @@ import contextlib
 import functools
 import logging
 import re
+import secrets
 import threading
 from collections import Counter
 from collections.abc import Callable
@@ -26,6 +27,7 @@ from utils.chat_import import (
 from utils.errors import MemoryPersistenceError, PartialImportError
 from utils.preference_values import merge_preference_value
 from utils.timestamps import localize_naive, parse_iso_datetime
+from utils.trip_export import normalized_uid_token
 
 
 def _pg_timestamp(value: str) -> str:
@@ -93,6 +95,11 @@ _SCHEMA_LOCK = threading.Lock()
 # 多实例同时首次启动时串行化建表（跨进程）；滚动发布中旧实例不持此锁，
 # 目录竞争错误按「对象已存在」容忍并重试一次
 _SCHEMA_ADVISORY_LOCK = "aligo:schema_ddl"
+# uid_token 列的进程内懒迁移标记：整批 _SCHEMA_SQL 可能因表结构锁等待
+# 超时被跳过（滚动发布 / 长事务），旧表还没有该列时行程接口会
+# UndefinedColumn；每个 DSN 首次触碰行程接口时补建一次
+_TRIP_UID_COLUMN_READY: set[str] = set()
+_TRIP_UID_COLUMN_LOCK = threading.Lock()
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS aligo_preferences (
@@ -116,6 +123,7 @@ CREATE TABLE IF NOT EXISTS aligo_trips (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 ALTER TABLE aligo_trips ADD COLUMN IF NOT EXISTS session_id TEXT;
+ALTER TABLE aligo_trips ADD COLUMN IF NOT EXISTS uid_token TEXT;
 CREATE INDEX IF NOT EXISTS idx_aligo_trips_user ON aligo_trips (user_id, id);
 
 CREATE TABLE IF NOT EXISTS aligo_trip_counters (
@@ -268,6 +276,29 @@ class PostgresLongTermMemory:
             # 等锁超时跳过 DDL 时不标记完成：下次构造重试
             if self._create_schema():
                 _SCHEMA_READY.add(key)
+
+    def _ensure_trip_uid_column(self) -> None:
+        """懒迁移：uid_token 列缺失时补建（DDL 整批被跳过 / 升级窗口）。
+
+        首次连接时整批 ``_SCHEMA_SQL``（含 ``ADD COLUMN uid_token``）可能
+        因表结构 advisory 锁等待超时被跳过，而本进程照常启用；若旧表尚无
+        该列，所有行程读写都会 UndefinedColumn（列表 / 导出 / 恢复 503）。
+        这里按 DSN 在进程内补建一次；``_execute`` 会先重跑一次整批建表
+        （幂等），成功后 ``_SCHEMA_READY`` 即覆盖本标记。
+        """
+        key = getattr(self, "dsn", "")
+        if not key:
+            # 测试 / 替身对象（object.__new__）没有 DSN：无从执行 DDL，跳过
+            return
+        if key in _SCHEMA_READY or key in _TRIP_UID_COLUMN_READY:
+            return
+        with _TRIP_UID_COLUMN_LOCK:
+            if key in _SCHEMA_READY or key in _TRIP_UID_COLUMN_READY:
+                return
+            self._execute(
+                "ALTER TABLE aligo_trips ADD COLUMN IF NOT EXISTS uid_token TEXT"
+            )
+            _TRIP_UID_COLUMN_READY.add(key)
 
     def _create_schema(self) -> bool:
         import psycopg
@@ -1346,6 +1377,7 @@ class PostgresLongTermMemory:
         count = len(trips)
         if not count:
             return 0, 0
+        self._ensure_trip_uid_column()
         from utils.trip_import import normalize_identity_date, normalize_identity_text
 
         def _key(
@@ -1375,22 +1407,26 @@ class PostgresLongTermMemory:
                     )
 
             rows = self._fetchall(
-                "SELECT id, trip_id, origin, destination, start_date, end_date "
+                "SELECT id, trip_id, origin, destination, start_date, end_date, uid_token "
                 "FROM aligo_trips WHERE user_id = %s ORDER BY id",
                 (self.user_id,),
             )
             index: dict[tuple[str, str, str, str], int] = {}
+            # 已占用行的 token（备份恢复更新分支：既有行缺失 token 时继承
+            # 备份里的合法值；既有合法 token 一律不覆盖）
+            token_by_id: dict[int, str] = {}
             # 已占用的 trip_id：备份原编号只在未被其它行程占用时沿用，
             # 否则两趟不同行程共享 trip_id（按 id 删除 / 更新会误伤）
             used_trip_ids: set[str] = set()
             max_number = 0
-            for row_id, trip_id, origin, destination, start, end in rows:
+            for row_id, trip_id, origin, destination, start, end, uid_token in rows:
                 trip_id_text = str(trip_id or "")
                 if trip_id_text:
                     used_trip_ids.add(trip_id_text)
                 match = re.fullmatch(r"trip_(\d+)", trip_id_text)
                 if match:
                     max_number = max(max_number, int(match.group(1)))
+                token_by_id[int(row_id)] = str(uid_token or "")
                 key = _key(destination, origin, start, end)
                 if key is not None:
                     index.setdefault(key, int(row_id))
@@ -1452,27 +1488,49 @@ class PostgresLongTermMemory:
                             and parse_iso_datetime(updated_timestamp) is not None
                             else None
                         )
+                        # 既有行缺失 token 时继承备份里的合法值（恢复后
+                        # 日历 UID 与备份一致）；既有合法 token 不覆盖
+                        incoming_token = normalized_uid_token(
+                            trip.get("uid_token")
+                        )
+                        inherit_token = bool(
+                            incoming_token
+                            and not normalized_uid_token(
+                                token_by_id.get(existing_id)
+                            )
+                        )
+                        token_set = ", uid_token = %s" if inherit_token else ""
+                        token_params = (
+                            (incoming_token,) if inherit_token else ()
+                        )
+                        if inherit_token:
+                            token_by_id[existing_id] = incoming_token
                         if "session_id" in trip:
                             self._execute(
                                 "UPDATE aligo_trips SET "
                                 "purpose = COALESCE(%s, purpose), "
                                 "session_id = %s, "
-                                "created_at = COALESCE(%s, now()) "
-                                "WHERE id = %s",
+                                "created_at = COALESCE(%s, now())"
+                                + token_set
+                                + " WHERE id = %s",
                                 (
                                     trip.get("purpose"),
                                     trip.get("session_id"),
                                     updated_at,
-                                    existing_id,
-                                ),
+                                )
+                                + token_params
+                                + (existing_id,),
                             )
                         else:
                             self._execute(
                                 "UPDATE aligo_trips SET "
                                 "purpose = COALESCE(%s, purpose), "
-                                "created_at = COALESCE(%s, now()) "
-                                "WHERE id = %s",
-                                (trip.get("purpose"), updated_at, existing_id),
+                                "created_at = COALESCE(%s, now())"
+                                + token_set
+                                + " WHERE id = %s",
+                                (trip.get("purpose"), updated_at)
+                                + token_params
+                                + (existing_id,),
                             )
                         _abort_if_reconnected()
                         updated += 1
@@ -1499,8 +1557,8 @@ class PostgresLongTermMemory:
                     )
                     inserted = self._fetchone(
                         "INSERT INTO aligo_trips "
-                        "(user_id, trip_id, origin, destination, start_date, end_date, purpose, session_id, created_at) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now())) RETURNING id",
+                        "(user_id, trip_id, origin, destination, start_date, end_date, purpose, session_id, uid_token, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, now())) RETURNING id",
                         (
                             self.user_id,
                             trip_id,
@@ -1510,6 +1568,10 @@ class PostgresLongTermMemory:
                             trip.get("end_date"),
                             trip.get("purpose"),
                             trip.get("session_id"),
+                            # 备份里的 token 合法时沿用（恢复后日历 UID 一致），
+                            # 缺失 / 非法时补发；去重更新路径不刷新既有 token
+                            normalized_uid_token(trip.get("uid_token"))
+                            or secrets.token_hex(8),
                             created_at,
                         ),
                         # 非幂等写入：连接在提交后丢失时无法区分是否已写入，重放会
@@ -1720,6 +1782,7 @@ class PostgresLongTermMemory:
         ``max_total`` 给出时在会话级 advisory lock 内拒绝新建超过上限
         （调用方锁外先读再写的检查挡不住并发创建）。
         """
+        self._ensure_trip_uid_column()
         # 与 JSON 后端同口径：未提供目的时原样保存（None），不写默认值
         purpose = trip_info.get("purpose")
         destination = trip_info.get("destination")
@@ -1884,8 +1947,8 @@ class PostgresLongTermMemory:
         self._execute(
             """
             INSERT INTO aligo_trips
-                (user_id, trip_id, origin, destination, start_date, end_date, purpose, session_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                (user_id, trip_id, origin, destination, start_date, end_date, purpose, session_id, uid_token)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 self.user_id,
@@ -1896,6 +1959,10 @@ class PostgresLongTermMemory:
                 trip_info.get("end_date"),
                 purpose,
                 trip_info.get("session_id"),
+                # 不可变 UID 标识：调用方传入的非法 / 缺失值一律补发，
+                # 导出端据此生成稳定的日历 UID（编辑行程不换事件身份）
+                normalized_uid_token(trip_info.get("uid_token"))
+                or secrets.token_hex(8),
             ),
             replay_safe=False,
         )
@@ -2064,15 +2131,19 @@ class PostgresLongTermMemory:
         Raises:
             ValueError: 更新后与另一条既有行程（同路线 + 同起止日期）重复
         """
+        self._ensure_trip_uid_column()
         with self._advisory_lock(f"aligo-trip-{self.user_id}"):
             start_conn = getattr(self, "_conn", None)
             row = self._fetchone(
-                "SELECT id, origin, destination, start_date, end_date "
+                "SELECT id, origin, destination, start_date, end_date, uid_token "
                 "FROM aligo_trips WHERE user_id = %s AND trip_id = %s",
                 (self.user_id, trip_id),
             )
             if not row:
                 return False
+
+            from utils.trip_import import normalize_identity_date, normalize_identity_text
+            from utils.trip_export import legacy_uid_inputs
 
             current = {
                 "origin": row[1],
@@ -2081,16 +2152,16 @@ class PostgresLongTermMemory:
                 "end_date": row[4],
             }
             merged = {**current, **fields}
+            # 与 JSON 后端 / 导出旧公式同一投影比较（身份归一会把
+            # 2026-1-5 与 2026-01-05 视为相同，但旧公式哈希的是原文）
+            uid_inputs_changed = legacy_uid_inputs(merged) != legacy_uid_inputs(current)
+
             destination = merged.get("destination")
             start_date = str(merged.get("start_date") or "")
             if destination and start_date:
-                from utils.trip_import import normalize_identity_date
-
                 # 与 save_trip_history / JSON 后端 _find_same_trip 的去重口径
                 # 一致：历史行可能是未补零日期（2026-1-5），SQL 等值比较会把
                 # 补零后的更新当成不重复；按路线取候选行后在 Python 侧归一比对
-                from utils.trip_import import normalize_identity_text
-
                 candidates = self._fetchall(
                     "SELECT id, start_date, end_date FROM aligo_trips "
                     "WHERE user_id = %s "
@@ -2126,7 +2197,7 @@ class PostgresLongTermMemory:
             # 冲突检查基于上面的读快照；连接重建后快照可能已过期，
             # 空档里其它实例可能已插入同行程或删掉本行，不能再按旧快照写
             self._abort_if_reconnected(start_conn)
-            updates = {
+            updates: dict[str, Any] = {
                 key: fields[key]
                 for key in (
                     "origin",
@@ -2137,6 +2208,15 @@ class PostgresLongTermMemory:
                 )
                 if key in fields
             }
+            # 历史行程没有 uid_token：只有本次真正改动了 UID 输入（路线 /
+            # 日期）才补发——这一刻旧公式本来也会换 UID，属一次性迁移；
+            # 只改目的 / 会话的编辑不补发（导出仍走旧公式，字节不变）
+            if (
+                updates
+                and not normalized_uid_token(row[5])
+                and uid_inputs_changed
+            ):
+                updates["uid_token"] = secrets.token_hex(8)
             if updates:
                 assignments = ", ".join(f"{key} = %s" for key in updates)
                 self._execute(
@@ -2149,8 +2229,10 @@ class PostgresLongTermMemory:
             return True
 
     def get_trip_history(self, limit: int | None = 10) -> list[dict[str, Any]]:
+        self._ensure_trip_uid_column()
         base = (
-            "SELECT trip_id, origin, destination, start_date, end_date, purpose, session_id, created_at "
+            "SELECT trip_id, origin, destination, start_date, end_date, purpose, "
+            "session_id, uid_token, created_at "
             "FROM aligo_trips WHERE user_id = %s"
         )
         if limit:
@@ -2159,8 +2241,19 @@ class PostgresLongTermMemory:
         else:
             rows = self._fetchall(base + " ORDER BY id", (self.user_id,))
 
-        return [
-            {
+        result: list[dict[str, Any]] = []
+        for (
+            trip_id,
+            origin,
+            destination,
+            start_date,
+            end_date,
+            purpose,
+            session_id,
+            uid_token,
+            created_at,
+        ) in rows:
+            record: dict[str, Any] = {
                 "trip_id": trip_id,
                 "origin": origin,
                 "destination": destination,
@@ -2170,8 +2263,13 @@ class PostgresLongTermMemory:
                 "session_id": session_id,
                 "timestamp": created_at.isoformat(),
             }
-            for trip_id, origin, destination, start_date, end_date, purpose, session_id, created_at in rows
-        ]
+            # 与 JSON 后端同形：历史行可能没有 token（导出走旧 UID 公式），
+            # 有值时随行程 / 备份一起返回
+            token = normalized_uid_token(uid_token)
+            if token:
+                record["uid_token"] = token
+            result.append(record)
+        return result
 
     def _frequent_destination_counts(self) -> dict[str, int]:
         """常去目的地计数：只统计出发日期可解析的行程。

@@ -490,7 +490,34 @@ def test_pg_and_json_trip_saves_match():
         assert json_frequent == sorted(
             json_frequent, key=lambda item: (-item[1], item[0])
         ), json_frequent
-        print("✓ JSON / PG 批量保存结果一致")
+        # uid_token 双后端一致：每条新行程都有合法 token，编辑日期后不变，
+        # 导出 UID 因 token 分支保持稳定（真实 PG 列 + JSON 字段）
+        from utils.trip_export import normalized_uid_token, render_trip_ics
+
+        def uid_of(store, trip):
+            text = render_trip_ics(trip, "json-parity")
+            return next(line for line in text.splitlines() if line.startswith("UID:"))
+
+        for store in (memory, json_store):
+            trips = store.get_trip_history(limit=None)
+            assert trips and all(
+                normalized_uid_token(trip.get("uid_token")) for trip in trips
+            ), [trip.get("uid_token") for trip in trips]
+            target = trips[0]
+            before_uid = uid_of(store, target)
+            token = target["uid_token"]
+            assert store.update_trip(
+                target["trip_id"],
+                {"start_date": "2027-01-05", "end_date": "2027-01-06"},
+            )
+            updated = next(
+                trip
+                for trip in store.get_trip_history(limit=None)
+                if trip.get("trip_id") == target["trip_id"]
+            )
+            assert updated["uid_token"] == token, "编辑日期不得更换 token"
+            assert uid_of(store, updated) == before_uid, "编辑后日历 UID 必须稳定"
+        print("✓ JSON / PG 批量保存结果一致（含 uid_token 稳定性）")
     finally:
         memory.close()
 
