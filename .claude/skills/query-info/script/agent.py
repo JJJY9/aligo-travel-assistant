@@ -663,4 +663,10 @@ class InformationQueryAgent(AgentBase):
             logger.error(f"Summarization failed: {e}")
             raise
 
-        return text.strip() if text else "无法生成摘要"
+        if not str(text or "").strip():
+            # 200 空响应（网关空 choices / content 为空）是上游瞬时故障：
+            # 与其它技能同口径抛 ConnectionError，由 _web_search 折叠为
+            # query_success=False，编排层才能重试 / 记失败，而不是把
+            # 「无法生成摘要」当成正常答案
+            raise ConnectionError("模型返回空响应")
+        return text.strip()

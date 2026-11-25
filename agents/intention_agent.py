@@ -129,11 +129,26 @@ _PERMANENT_ERROR_CODES = {
     "context_length_exceeded": 400,
 }
 
+# 字符串型瞬时错误码（同上，HTTP 200 + 错误体）：必须映射成 5xx/429，
+# 否则 is_retriable_error / is_permanent_llm_error 都判 False，一次本可
+# 重试恢复的上游抖动会被静默改写成默认 information_query 轮次
+_TRANSIENT_ERROR_CODES = {
+    "server_error": 500,
+    "internal_server_error": 500,
+    "api_error": 500,
+    "service_unavailable": 503,
+    "server_unavailable": 503,
+    "overloaded_error": 503,
+    "rate_limit_exceeded": 429,
+    "rate_limit_error": 429,
+}
+
 
 def _error_status_code(raw_code: Any, provider_error: dict) -> int | None:
     """从错误体的 code / status / type 提取状态码（int 或字符串形态）。"""
     for candidate in (
         raw_code,
+        provider_error.get("status"),
         provider_error.get("type"),
     ):
         if isinstance(candidate, int):
@@ -144,6 +159,8 @@ def _error_status_code(raw_code: Any, provider_error: dict) -> int | None:
                 return int(text)
             if text in _PERMANENT_ERROR_CODES:
                 return _PERMANENT_ERROR_CODES[text]
+            if text in _TRANSIENT_ERROR_CODES:
+                return _TRANSIENT_ERROR_CODES[text]
     return None
 
 

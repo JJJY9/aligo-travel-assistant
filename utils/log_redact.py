@@ -14,9 +14,18 @@ _URL_QUERY = re.compile(r"(?P<base>[a-zA-Z][\w+.-]*://[^\s?#]+)[?#][^\s]*")
 _BARE_USERINFO = re.compile(
     r"(?<![\w+.-])([A-Za-z0-9_.%+-]+):(?!//)([^\s?#]*@)"
 )
-# libpq 关键字形式（host=… password=…）与常见密钥字段
+# libpq 关键字形式（host=… password=…）、冒号分隔的 YAML / 请求头形态与
+# 常见密钥字段。引号允许出现在键名后 / 值前（JSON / dict repr）：
+# ``{"api_key": "…"}``、``'api_key': '…'``、``api-key: …`` 都要遮蔽
 _KEY_VALUE = re.compile(
-    r"(?i)((?:password|pwd|api[_-]?key|secret|token)\s*=\s*)[^\s;]+"
+    r"(?i)((?:password|pwd|api[_-]?key|secret|token)\s*['\"]?\s*[:=]\s*['\"]?)"
+    r"[^\s;,'\"}]+"
+)
+# 请求头形态：Authorization: Bearer/Basic/Token <凭据>（网关 4xx 常原样
+# 回显请求头）。裸 Bearer 不遮蔽——误伤面太大
+_AUTH_HEADER = re.compile(
+    r"(?i)((?:proxy-)?authorization\s*['\"]?\s*[:=]\s*['\"]?"
+    r"(?:bearer|basic|token)\s+)[^\s'\"},;]+"
 )
 # 裸密钥：网关错误体常原样引用请求密钥（如「Incorrect API key provided:
 # sk-…」）；健康检查 / doctor 把异常原文回显给调用方前必须遮蔽
@@ -97,6 +106,7 @@ def redact_secret(text: object) -> str:
     cleaned = _URL_USERINFO.sub(r"\g<scheme>***@", str(text))
     cleaned = _URL_QUERY.sub(r"\g<base>", cleaned)
     cleaned = _BARE_USERINFO.sub(r"\1:***@", cleaned)
+    cleaned = _AUTH_HEADER.sub(r"\1***", cleaned)
     cleaned = _KEY_VALUE.sub(r"\1***", cleaned)
     cleaned = _BARE_API_KEY.sub("***", cleaned)
     return cleaned

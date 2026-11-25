@@ -303,6 +303,28 @@ def test_human_response_escapes_markup():
     print("✓ 回答 / 智能体名中的方括号与关闭标签按原文显示")
 
 
+def test_display_tolerates_non_list_results():
+    """results 为对象 / 标量：展示预检不能先抛异常、丢掉整轮已完成的编排。"""
+    agent, buffer = _capture_console()
+    agent._display_agents_called(
+        {"results": {"agent_name": "GreetingAgent", "status": "success"}}
+    )
+    assert "GreetingAgent" in buffer.getvalue(), buffer.getvalue()
+
+    for malformed in (
+        {"results": ["oops", 3]},
+        {"results": "oops"},
+        {"results": 5},
+    ):
+        agent2, buffer2 = _capture_console()
+        agent2._display_agents_called(malformed)
+        assert "调用智能体" not in buffer2.getvalue(), buffer2.getvalue()
+        agent3, _ = _capture_console()
+        # 无结果时按既有文案输出，不抛异常
+        agent3._display_results(malformed)
+    print("✓ 展示预检容忍 results 对象 / 标量")
+
+
 def test_human_response_tolerates_malformed_itinerary():
     """非标准行程结构（字符串 / 字典 daily_plans / 非字典 meals）不能中断整轮。"""
     payloads = [
@@ -1310,6 +1332,7 @@ if __name__ == "__main__":
     test_human_response_escapes_markup()
     test_markup_safe_strips_controls_before_escaping()
     test_human_response_tolerates_malformed_itinerary()
+    test_display_tolerates_non_list_results()
     test_read_commands_reload_snapshot()
     test_summary_tolerates_legacy_nested_preference_and_trip_fields()
     test_process_query_reloads_long_term_each_turn()

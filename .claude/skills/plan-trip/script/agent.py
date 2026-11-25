@@ -16,8 +16,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 # sys.path.insert(0, str(project_root))
 
 from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
+from utils.access_log import MAX_LOG_TEXT, _safe_log_text
+from utils.log_redact import redact_secret
 from utils.json_parser import (
+    decode_json_array_at,
     extract_json_from_async_response,
+    has_unclosed_json_array,
     has_unclosed_json_object,
     iter_json_object_spans_with_repair,
     robust_json_parse,
@@ -289,7 +293,15 @@ def _label_phrase(label: str) -> str | None:
     if not parts:
         return None
     if any(part not in _LEAD_INS for part in parts[:-1]):
-        # 行内还有其它短语（示例：正式结果、说明：…）：不是纯标签行
+        # 行内还有其它短语（示例：正式结果、说明：…）：不是纯标签行。
+        # 但补充词开头、行内带叙述与 JSON 片段的尾注（「注：若需调整
+        # （例如 {"title": …}）请告知」）必须按补充说明处理——否则行内
+        # 片段顶掉更早的完整行程。含正式词的标签行仍按 neutral，防止
+        # 「注：以下是正式行程」这类终稿被降级。
+        if parts[0] in _SUPPLEMENT_LABELS and not any(
+            word in line for word in ("正式", "最终", "终稿", "结果如下", "实际")
+        ):
+            return parts[0]
         return None
     phrase = parts[-1]
     changed = True
@@ -304,6 +316,35 @@ def _label_phrase(label: str) -> str | None:
 
 
 _SENTENCE_PUNCT = "，。；、！？,;!?…"
+
+
+def _label_is_narrative_supplement(label: str) -> bool:
+    """标签是否为「叙述式尾注」：补充词开头、行内还有叙述文字。
+
+    例如「注：若需调整（例如 」——整行不是纯短语（``_label_phrase`` 的
+    早退分支返回补充词），但行内那个 JSON 片段不能顶掉更早的完整行程；
+    纯标签行（「补充：」「备注：」）不算叙述式，保留原有竞争语义。
+    """
+    line = ""
+    for item in label.splitlines():
+        cleaned = re.sub(r"```+\s*\w*\s*$", "", item).strip()
+        if cleaned:
+            line = cleaned
+    if not line:
+        return False
+    decoration_free = re.sub(r"[#*`【】\[\]（）>\-•\s]", "", line)
+    parts = [
+        part
+        for part in re.split(r"[:：=]", decoration_free.rstrip(":：="))
+        if part
+    ]
+    if len(parts) < 2 or parts[0] not in _SUPPLEMENT_LABELS:
+        return False
+    if not any(part not in _LEAD_INS for part in parts[:-1]):
+        return False
+    return not any(
+        word in line for word in ("正式", "最终", "终稿", "结果如下", "实际")
+    )
 
 
 def _label_kind(label: str) -> str:
@@ -330,6 +371,10 @@ def _label_kind(label: str) -> str:
     ):
         return "example"
     if phrase in _SUPPLEMENT_LABELS:
+        if _label_is_narrative_supplement(label):
+            # 叙述式尾注（行内带示例 JSON 片段）：与纯「补充：」区分，
+            # 选择阶段不让它顶掉真实候选（见 _select_plan_result）
+            return "supplement_narrative"
         return "supplement"
     if phrase in _FORMAL_LABELS:
         return "formal"
@@ -339,53 +384,10 @@ def _label_kind(label: str) -> str:
 def _decoded_array_at(text: str, index: int):
     """严格解析失败时按「括号配平 + 修复尾逗号 / 单引号」再试一次。
 
-    返回 ``(value, end)``；无法修复时返回 ``(None, None)``。"""
-    decoder = json.JSONDecoder()
-    try:
-        return decoder.raw_decode(text, index)
-    except json.JSONDecodeError:
-        pass
-    depth = 0
-    in_str = False
-    quote = ""
-    end = -1
-    previous = ""
-    for pos in range(index, len(text)):
-        ch = text[pos]
-        if in_str:
-            if ch == quote and previous != "\\":
-                in_str = False
-        elif ch in ("'", '"'):
-            in_str = True
-            quote = ch
-        elif ch == "[":
-            depth += 1
-        elif ch == "]":
-            depth -= 1
-            if depth == 0:
-                end = pos + 1
-                break
-        previous = ch
-    if end < 0:
-        return None, None
-    fragment = text[index:end]
-    # 不用正则（跨层转义易碎）：循环删尾逗号、单引号统一换双引号
-    repaired = fragment
-    while True:
-        updated = (
-            repaired.replace(",]", "]")
-            .replace(",}", "}")
-            .replace(", ]", "]")
-            .replace(", }", "}")
-        )
-        if updated == repaired:
-            break
-        repaired = updated
-    repaired = repaired.replace("'", '"')
-    try:
-        return json.loads(repaired), end
-    except json.JSONDecodeError:
-        return None, None
+    返回 ``(value, end)``；无法修复时返回 ``(None, None)``。修复实现见
+    :func:`utils.json_parser.decode_json_array_at`（字符串感知，不会改写
+    值里的撇号 / ",]" 字面量）。"""
+    return decode_json_array_at(text, index)
 
 
 def _iter_array_spans(text: str):
@@ -463,9 +465,16 @@ def _select_plan_result(text: str) -> dict | None:
         item
         for item in real
         if not (
-            item[2] == "supplement" and not _has_nonempty_daily_plans(item[0])
+            item[2] in ("supplement", "supplement_narrative")
+            and not _has_nonempty_daily_plans(item[0])
         )
     ] or real
+    # 叙述式尾注即使带排期内容也不能顶掉真实候选（「注：若需调整（例如
+    # {…}）请告知」）；显式纯标签「补充：」的完整候选仍按位置参与竞争
+    if any(item[2] != "supplement_narrative" for item in strong):
+        strong = [
+            item for item in strong if item[2] != "supplement_narrative"
+        ]
     if strong:
         chosen, chosen_end, _ = strong[-1]
     elif candidates and all(item[2] == "example" for item in candidates):
@@ -495,15 +504,39 @@ def _plan_repair_settings() -> tuple[bool, int]:
     return enabled, max(0, min(3, attempts))
 
 
+def _starts_with_unclosed_json_array(text: str) -> bool:
+    """原始文本是否以「被截断的顶层 JSON 数组」开头。
+
+    只按配平后的数组判定（``starts_with_json_array``）会漏掉缺 ``]`` 的
+    截断输出：元素对象全部配平，``has_unclosed_json_object`` 看不到未闭合
+    的 ``[``，对象扫描把最后一个元素当成行程成功返回。首个 ``{`` 在首个
+    ``[`` 之前（对象内部的数组字段）或 ``[`` 后不是 JSON 值起始符（前言
+    里的引用标记 ``参考[1``）时不在此列。
+    """
+    first_array = text.find("[")
+    if first_array == -1:
+        return False
+    first_object = text.find("{")
+    if first_object != -1 and first_object < first_array:
+        return False
+    probe = first_array + 1
+    while probe < len(text) and text[probe].isspace():
+        probe += 1
+    if probe < len(text) and text[probe] not in '{"[-tfn0123456789':
+        return False
+    return has_unclosed_json_array(text)
+
+
 def _parse_plan_text(text: str) -> dict:
     """把模型输出解析为行程结果对象；无法得到有效行程时抛 ValueError。
 
     兼容：标准 JSON / 尾随文本 / Markdown 代码块 / ``{"data": {...}}``
     包装 / 裸行程对象。具体候选选择规则见 ``_select_plan_result``。
     """
-    if starts_with_json_array(text):
+    if starts_with_json_array(text) or _starts_with_unclosed_json_array(text):
         # 数组输出会被 robust_json_parse 截成第一个元素仍按成功返回：
-        # 必须在解析前按原始文本判定顶层结构
+        # 必须在解析前按原始文本判定顶层结构（含被 max_tokens 截断、
+        # 缺右括号的数组——截断反而不能让非法格式通过）
         raise ValueError("行程规划结果顶层是 JSON 数组，不是行程对象")
 
     result = None
@@ -1018,11 +1051,19 @@ class ItineraryPlanningAgent(AgentBase):
                 # 5xx / 超时 / 限流等瞬时模型错误：穿透给编排层按契约重试；
                 # 401/402/403/404 等永久错误同样穿透并计入熔断
                 raise
-            logger.error(f"Itinerary planning failed: {e}")
+            logger.error(
+                "Itinerary planning failed: %s", redact_secret(str(e))
+            )
             # Ensure text is defined for logging even if extraction failed
             # 使用 locals().get 安全获取 text，防止 UnboundLocalError
             raw_text = locals().get('text', 'N/A')
-            logger.error(f"Raw response text (first 500 chars): {str(raw_text)[:500]}")
+            # 模型输出可能含裸换行 / 控制字符 / 凭据：单行化 + 脱敏后再写
+            # 日志，避免伪造日志行或把上游错误里的密钥打进应用日志
+            logger.error(
+                "Raw response text (first %d chars): %s",
+                MAX_LOG_TEXT,
+                _safe_log_text(redact_secret(str(raw_text)))[:MAX_LOG_TEXT],
+            )
 
             # 构建用户友好的错误消息
             error_detail = str(e)

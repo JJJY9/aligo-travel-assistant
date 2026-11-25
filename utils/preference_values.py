@@ -1,6 +1,12 @@
 """偏好值合并（列表语义，JSON / PostgreSQL / 编排器共用）。"""
+import json
 import re
 from typing import Any
+
+# 单个偏好值序列化后的字符上限：与 Web PUT /api/preferences 的
+# _PREFERENCE_VALUE_MAX_JSON、CLI 偏好编辑、备份恢复同一口径。超过后
+# 该偏好在面板 / CLI 永远无法编辑，还会持续撑大每轮意图 prompt。
+PREFERENCE_VALUE_MAX_CHARS = 10000
 
 # 旧版字典格式偏好里的说明性键：模型附带 note/message 等时不能被当成
 # 偏好类型落库 / 回显 / 进入后续批次上下文（三处消费口径必须一致）
@@ -93,3 +99,21 @@ def is_manageable_pref_type(pref_type: object) -> bool:
         # 控制字符 / 行分隔符会被写进 INFO 日志（%0A 伪造日志行）与面板路径
         return False
     return 0 < len(text) <= 64 and "/" not in text
+
+
+def preference_value_problem(value: Any) -> str | None:
+    """偏好值能否落库：必须可 JSON 序列化且序列化后不超过上限。
+
+    返回问题描述（给日志 / 错误用），可落库时返回 None。上限与 Web PUT、
+    CLI 偏好编辑、备份恢复同一口径——模型写入绕过上限后，该偏好会变成
+    面板 / CLI 永远无法编辑的「僵尸值」，还会持续撑大每轮意图 prompt。
+    """
+    try:
+        serialized = json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return "偏好值不是可序列化的 JSON"
+    if len(serialized) > PREFERENCE_VALUE_MAX_CHARS:
+        return (
+            f"偏好值过大（序列化后超过 {PREFERENCE_VALUE_MAX_CHARS} 字符）"
+        )
+    return None

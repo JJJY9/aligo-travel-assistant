@@ -57,6 +57,22 @@ def test_render_failure_falls_back_to_raw_content(monkeypatch):
     print("✓ 渲染异常安全回退原文")
 
 
+def test_object_results_rendered_not_placeholder():
+    """results 为对象的历史消息（旧编排 / 补充导入）显示答案而非占位文案。"""
+    item = {
+        "agent_name": "information_query",
+        "status": "success",
+        "data": {"answer": "北京明天晴"},
+    }
+    content = json.dumps(
+        {"status": "completed", "results": item}, ensure_ascii=False
+    )
+    rendered = render_stored_message({"role": "assistant", "content": content})
+    assert "北京明天晴" in rendered, rendered
+    assert rendered != "已处理您的请求。", rendered
+    print("✓ results 为对象的历史消息显示答案")
+
+
 def test_render_escapes_lone_surrogates():
     """旧 JSON 文本里的 \\ud800 在渲染出口转义，会话详情 / 导出不再 500。"""
     content = (
@@ -82,6 +98,7 @@ if __name__ == "__main__":
     test_assistant_plain_text_is_raw()
     test_assistant_orchestration_json_rendered()
     test_assistant_bad_json_falls_back()
+    test_object_results_rendered_not_placeholder()
     test_render_escapes_lone_surrogates()
     _mp = pytest.MonkeyPatch()
     try:

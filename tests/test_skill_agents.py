@@ -4235,6 +4235,160 @@ def test_memory_query_prompt_has_date_and_truncates_dialogue():
     assert "X" * 1300 not in prompt, "最近对话必须逐条截断"
     print("✓ 记忆查询带日期且对话截断")
 
+def test_event_collection_narrative_tail_does_not_displace_extraction():
+    """叙述式尾注（「注：若日期不同（例如 {…}）请说明」）不顶掉完整抽取。"""
+    formal = (
+        '{"origin": "上海", "destination": "杭州", "start_date": "2026-03-10", '
+        '"end_date": "2026-03-12", "duration_days": 3, "trip_purpose": "出差", '
+        '"missing_info": [], "extracted_count": 6}'
+    )
+    for tail in (
+        '\n注：若日期不同（例如 {"start_date": "2026-03-12"}）请说明',
+        ' 注：若日期不同（例如 {"start_date": "2026-03-12"}）请说明',
+        '\n（注：日期示例 {"start_date": "2026-03-12"}）',
+    ):
+        data = _event_reply(f"结果：{formal}" + tail)
+        assert data.get("destination") == "杭州", (tail, data)
+        assert data.get("start_date") == "2026-03-10", (tail, data)
+    # 纯标签「备注：」行为不变
+    data = _event_reply(f"结果：{formal}\n备注：{{\"start_date\": \"2026-03-12\"}}")
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：叙述式尾注不顶掉完整抽取")
+
+
+def test_event_collection_multiple_objects_in_array_rejected():
+    """顶层数组含多个事项对象：无法确定单一提取，按错误降级而不是只取最后一个。"""
+    payload = (
+        '[{"origin": "北京", "destination": "上海", "start_date": "2026-03-10"},'
+        '{"origin": "广州", "destination": "深圳", "start_date": "2026-03-12"}]'
+    )
+    data = _event_reply(payload)
+    assert data.get("error"), data
+    # 单元素数组维持现有容错
+    single = '[{"destination": "杭州", "start_date": "2026-03-10"}]'
+    data = _event_reply(single)
+    assert data.get("destination") == "杭州", data
+    print("✓ 事项收集：多对象数组拒绝、单元素数组仍兼容")
+
+
+def test_plan_trip_truncated_top_level_array_rejected():
+    """被 max_tokens 截断（缺 ]）的顶层数组同样按格式错误拒绝，不能只取元素。"""
+    two = (
+        '[{"title": "第一天", "daily_plans": [{"day": 1}]}, '
+        '{"title": "第二天", "daily_plans": [{"day": 2}]}'
+    )
+    data = _plan_trip_reply(two)
+    assert data.get("error"), data
+    assert "第二天" not in json.dumps(data, ensure_ascii=False), data
+    data = _plan_trip_reply('[{"title": "第一天", "daily_plans": [{"day": 1}]},')
+    assert data.get("error"), data
+    # 闭合数组仍按既有语义拒绝
+    data = _plan_trip_reply(two + "]")
+    assert data.get("error"), data
+    print("✓ 行程规划：截断的顶层数组被拒绝")
+
+
+def test_plan_trip_narrative_tail_does_not_replace_plan():
+    """同行叙述尾注里的 plan 形状片段不顶掉真实行程。"""
+    full = (
+        '{"itinerary": {"title": "杭州3日游", "daily_plans": '
+        '[{"day": 1}, {"day": 2}, {"day": 3}]}}'
+    )
+    tail = '\n注：若需调整（例如 {"title": "杭州3日游", "duration": "3天"}）请告知'
+    data = _plan_trip_reply(full + tail)
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州3日游", data
+    assert len(data["itinerary"]["daily_plans"]) == 3, data
+    # 叙述式尾注里带完整 itinerary 片段同样不得顶替
+    tail2 = (
+        '\n注：备选方案（例如 {"itinerary": {"title": "备选", '
+        '"daily_plans": [{"day": 1}]}}）请告知'
+    )
+    data = _plan_trip_reply(full + tail2)
+    assert data.get("error") is None, data
+    assert data["itinerary"]["title"] == "杭州3日游", data
+    print("✓ 行程规划：叙述式尾注不顶掉真实行程")
+
+
+def test_preference_array_repair_preserves_string_contents():
+    """偏好数组修复不能改写值里的撇号 / ",]" 字面量，单引号数组仍能修复。"""
+    payload = (
+        '[{"type": "note", "value": "use [1,] here"}, '
+        '{"type": "seat", "value": "window"},]'
+    )
+    data = _pref_reply(payload)
+    dumped = json.dumps(data, ensure_ascii=False)
+    assert "use [1,] here" in dumped, data
+    assert "window" in dumped, data
+    data = _pref_reply('[{"type": "hotel_brands", "value": "McDonald\'s"},]')
+    assert "McDonald's" in json.dumps(data, ensure_ascii=False), data
+    data = _pref_reply("[{'type': 'airlines', 'value': '东航'},]")
+    assert "东航" in json.dumps(data, ensure_ascii=False), data
+    print("✓ 偏好：数组修复保留字符串内容")
+
+
+def test_query_info_empty_summary_is_error():
+    """摘要模型 200 空响应按瞬时失败抛出，不能伪装成正常答案。"""
+    module = _load_skill_module("query-info")
+
+    class _EmptyModel:
+        async def __call__(self, messages, **kwargs):
+            return ""
+
+    agent = object.__new__(module.InformationQueryAgent)
+    agent.model = _EmptyModel()
+    agent.skill_loader = type(
+        "L", (), {"get_skill_content": staticmethod(lambda _n: "")}
+    )()
+    results = [{"title": "t", "href": "https://example.com", "body": "b"}]
+    with pytest.raises(ConnectionError):
+        asyncio.run(agent._summarize_search_results("问题", results))
+
+    class _BlankModel:
+        async def __call__(self, messages, **kwargs):
+            return "   \n "
+
+    agent.model = _BlankModel()
+    with pytest.raises(ConnectionError):
+        asyncio.run(agent._summarize_search_results("问题", results))
+    print("✓ 查询信息：摘要空响应按瞬时失败抛出")
+
+
+def test_plan_trip_failure_log_is_single_line_and_redacted():
+    """解析失败日志：模型输出的换行 / 控制字符被单行化，密钥被遮蔽。"""
+    import logging as _logging
+
+    module = _load_skill_module("plan-trip")
+    records: list[_logging.LogRecord] = []
+
+    class _Capture(_logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture(level=_logging.ERROR)
+    module.logger.addHandler(handler)
+    try:
+        bad = (
+            "not json\n2026-11-12 ERROR webapp.server - FORGED "
+            "api_key: sk-abcdefghijklmnop"
+        )
+        data = _plan_trip_reply(bad)
+        assert data.get("error"), data
+    finally:
+        module.logger.removeHandler(handler)
+    raw = [
+        record.getMessage()
+        for record in records
+        if "Raw response text" in record.getMessage()
+    ]
+    assert raw, [record.getMessage() for record in records]
+    message = raw[0]
+    assert "\n" not in message and "\r" not in message, repr(message)
+    assert chr(0x2028) not in message and chr(0x2029) not in message
+    assert "sk-abcdefghijklmnop" not in message, message
+    print("✓ 行程规划失败日志单行化且脱敏")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理

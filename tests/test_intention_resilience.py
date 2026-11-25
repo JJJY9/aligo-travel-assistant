@@ -85,6 +85,32 @@ def test_http_200_error_body_is_llm_error():
     cases = [
         ({"error": {"code": 429, "message": "rate limited"}}, True, False),
         ({"error": {"code": 401, "message": "auth failed"}}, False, True),
+        # 字符串型瞬时错误码（网关 200 + server_error / overloaded）：
+        # 必须按可重试处理，不能静默降级为默认信息查询
+        (
+            {
+                "error": {
+                    "type": "server_error",
+                    "code": None,
+                    "message": "The server had an error",
+                }
+            },
+            True,
+            False,
+        ),
+        ({"error": {"code": "overloaded_error", "message": "Overloaded"}}, True, False),
+        (
+            {"error": {"code": "service_unavailable", "message": "Service Unavailable"}},
+            True,
+            False,
+        ),
+        (
+            {"error": {"code": "rate_limit_exceeded", "message": "slow down"}},
+            True,
+            False,
+        ),
+        # 永久方向保持不变
+        ({"error": {"code": "invalid_api_key", "message": "bad key"}}, False, True),
     ]
     for body, retriable, permanent in cases:
         agent = IntentionAgent(

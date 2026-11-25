@@ -240,8 +240,13 @@ class CheckpointStore:
         result: Any,
         *,
         scope: str | None = None,
+        task_digest: str | None = None,
     ) -> None:
-        """记录某个子步骤的结果（读-改-写在进程锁内完成）。"""
+        """记录某个子步骤的结果（读-改-写在进程锁内完成）。
+
+        ``task_digest`` 可选：记录该步骤对应的任务摘要（计划字段哈希），
+        复用方据此确认「同键重试的计划没有变化」；不传时保持旧行为。
+        """
         with self._lock:
             state = self._load_unlocked(key) or {}
             steps = state.get("steps")
@@ -249,6 +254,12 @@ class CheckpointStore:
                 steps = {}
             steps[str(step)] = result
             state["steps"] = steps
+            if task_digest is not None:
+                step_keys = state.get("step_keys")
+                if not isinstance(step_keys, dict):
+                    step_keys = {}
+                step_keys[str(step)] = task_digest
+                state["step_keys"] = step_keys
             self._write_unlocked(key, state, scope)
 
     def clear_scope(self, scope: str) -> int:

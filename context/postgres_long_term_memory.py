@@ -25,7 +25,7 @@ from utils.chat_import import (
     session_dedupe_key,
 )
 from utils.errors import MemoryPersistenceError, PartialImportError
-from utils.preference_values import merge_preference_value
+from utils.preference_values import merge_preference_value, preference_value_problem
 from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_export import normalized_uid_token
 
@@ -717,6 +717,11 @@ class PostgresLongTermMemory:
             # 保留类型：JSON 存储层加载时会把列表值展开成独立偏好类型，
             # 两个后端口径一致；Web PUT / CLI pref-set / 导入解析均已拒绝
             raise ValueError("preferences 是保留的偏好类型，请使用具体类型名")
+        # 与 JSON 后端 / Web / CLI / 备份恢复同一口径：超限值落库后该偏好
+        # 永远无法在面板 / CLI 编辑，还会持续撑大每轮意图 prompt
+        problem = preference_value_problem(value)
+        if problem:
+            raise ValueError(problem)
         with self._preference_lock(pref_type):
             with self._preference_cap_lock():
                 self._enforce_preference_cap(pref_type)

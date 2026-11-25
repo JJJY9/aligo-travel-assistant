@@ -25,6 +25,7 @@ from utils.preference_values import (
 )
 from utils.user_query import extract_user_query
 from utils.json_parser import (
+    decode_json_array_at,
     extract_json_from_async_response,
     has_unclosed_json_object,
     iter_json_object_spans_with_repair,
@@ -614,53 +615,10 @@ def _empty_array_is_formal(text: str, start: int, end: int) -> bool:
 def _decoded_array_at(text: str, index: int):
     """严格解析失败时按「括号配平 + 修复尾逗号 / 单引号」再试一次。
 
-    返回 ``(value, end)``；无法修复时返回 ``(None, None)``。"""
-    decoder = json.JSONDecoder()
-    try:
-        return decoder.raw_decode(text, index)
-    except json.JSONDecodeError:
-        pass
-    depth = 0
-    in_str = False
-    quote = ""
-    end = -1
-    previous = ""
-    for pos in range(index, len(text)):
-        ch = text[pos]
-        if in_str:
-            if ch == quote and previous != "\\":
-                in_str = False
-        elif ch in ("'", '"'):
-            in_str = True
-            quote = ch
-        elif ch == "[":
-            depth += 1
-        elif ch == "]":
-            depth -= 1
-            if depth == 0:
-                end = pos + 1
-                break
-        previous = ch
-    if end < 0:
-        return None, None
-    fragment = text[index:end]
-    # 不用正则（跨层转义易碎）：循环删尾逗号、单引号统一换双引号
-    repaired = fragment
-    while True:
-        updated = (
-            repaired.replace(",]", "]")
-            .replace(",}", "}")
-            .replace(", ]", "]")
-            .replace(", }", "}")
-        )
-        if updated == repaired:
-            break
-        repaired = updated
-    repaired = repaired.replace("'", '"')
-    try:
-        return json.loads(repaired), end
-    except json.JSONDecodeError:
-        return None, None
+    返回 ``(value, end)``；无法修复时返回 ``(None, None)``。修复实现见
+    :func:`utils.json_parser.decode_json_array_at`（字符串感知，不会改写
+    值里的撇号 / ",]" 字面量）。"""
+    return decode_json_array_at(text, index)
 
 
 def _iter_array_spans(text: str):
