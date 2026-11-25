@@ -406,7 +406,21 @@ function scenarioRender(source) {
     id_reserved_com1: invoke("isValidId", "com1"),
     id_ok_console: invoke("isValidId", "console"),
     id_astral_33: invoke("isValidId", "𝐀".repeat(33)),
+    id_astral_60: invoke("isValidId", "𝐀".repeat(60)),
+    id_astral_61: invoke("isValidId", "𝐀".repeat(61)),
     id_astral_65: invoke("isValidId", "𝐀".repeat(65)),
+    session_device_name: invoke("isValidSessionId", "con"),
+    session_export_reserved: invoke("isValidSessionId", "export"),
+    session_bad_chars: invoke("isValidSessionId", "bad id!"),
+    crlf_heading: invoke(
+      "renderMarkdown",
+      "## 标题" + String.fromCharCode(13, 10) + "正文",
+    ),
+    crlf_fence: invoke(
+      "renderMarkdown",
+      "```" + String.fromCharCode(13, 10) + "code" + String.fromCharCode(13, 10) + "```",
+    ),
+    cr_only: invoke("renderMarkdown", "## 标题" + String.fromCharCode(13) + "正文"),
     sentinel_injection: invoke(
       "renderInline",
       "x0y 0 z"
@@ -1958,6 +1972,7 @@ async function scenarioSessionSearchFailure(source) {
     };
     renderHistory = () => {};
     toast = (text) => { (globalThis.__toasts ||= []).push(text); };
+    els.historySearch = { value: "new" };
   `);
   const promise = run('loadSessions("new", { reset: true })');
   const request = await waitRequest(env);
@@ -1965,6 +1980,7 @@ async function scenarioSessionSearchFailure(source) {
   await promise;
   const single = {
     searchQuery: run("state.searchQuery"),
+    searchInput: run("els.historySearch.value"),
     sessions: run("state.sessions.map((s) => s.session_id)"),
     toasts: run("globalThis.__toasts || []"),
   };
@@ -1990,7 +2006,27 @@ async function scenarioSessionSearchFailure(source) {
   run("loadMoreSessions()");
   await tick();
   const moreBlocked = env.__requests.length === 0;
-  return { single, superseded, moreBlocked };
+
+  // 加载更多返回空页且 total=0（其它标签页 / CLI 已删光）：不能保留旧 total
+  run(`
+    state.searchQuery = "old";
+    state.sessionsLoadedQuery = "old";
+    state.showArchived = false;
+    state.sessionsLoadedArchived = false;
+    state.sessions = Array.from({ length: 50 }, (_, i) => ({ session_id: "s-" + i, title: "t" }));
+    state.sessionsOffset = 50;
+    state.sessionTotal = 300;
+  `);
+  const morePromise = run("loadMoreSessions()");
+  const moreRequest = await waitRequest(env);
+  moreRequest.resolve({ sessions: [], total: 0 });
+  await morePromise;
+  const emptyPage = {
+    total: run("state.sessionTotal"),
+    count: run("state.sessions.length"),
+    offset: run("state.sessionsOffset"),
+  };
+  return { single, superseded, moreBlocked, emptyPage };
 }
 
 async function scenarioSilentRestoreWindow(source) {
@@ -2318,9 +2354,22 @@ async function scenarioUserBackupRestore(source) {
   results.partial_refreshes = run("__refreshes");
 
   run(`getJSON = async () => { throw __makeErr("内部错误", 500); };`);
-  run("__toasts.length = 0;");
+  run("__toasts.length = 0; __refreshes = 0;");
   await run("importUserBackup()");
   results.failure_toasts = run("__toasts.slice()");
+  results.failure_refreshes = run("__refreshes");
+  // 4xx：服务端明确拒绝，按普通失败处理、不刷新
+  run(`getJSON = async () => { throw __makeErr("恢复被拒绝", 409); };`);
+  run("__toasts.length = 0; __refreshes = 0;");
+  await run("importUserBackup()");
+  results.failure_4xx_toasts = run("__toasts.slice()");
+  results.failure_4xx_refreshes = run("__refreshes");
+  // 连接中断（无状态码）：结果未知，提示并刷新
+  run(`getJSON = async () => { throw new Error("Failed to fetch"); };`);
+  run("__toasts.length = 0; __refreshes = 0;");
+  await run("importUserBackup()");
+  results.network_toasts = run("__toasts.slice()");
+  results.network_refreshes = run("__refreshes");
 
   // 成功但刷新失败：全部静默（allSettled），刷新错误不能覆盖恢复摘要
   run(`getJSON = async () => __importResult;`);
@@ -3182,6 +3231,166 @@ async function scenarioKbUserSwitchDraft(source) {
   return { rejected, accepted };
 }
 
+async function scenarioFrontendDetailFixes(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  // 未落库提问与草稿合并
+  run('els.input.value = "草稿";');
+  run('restoreDraftText("你好");');
+  const merged = run("els.input.value");
+  run('els.input.value = "";');
+  run('restoreDraftText("你好");');
+  const restored = run("els.input.value");
+
+  // 重命名输入框打开：结束刷新登记待补，收尾后正常刷新
+  run(`
+    __loads = 0;
+    loadSessions = async () => { __loads += 1; };
+    state.historyRefreshPending = false;
+    document.querySelector = (sel) => (sel === ".hi-input" ? {} : null);
+  `);
+  await run("refreshSessionsAfterTurn()");
+  const pending = run("({ pending: state.historyRefreshPending, loads: __loads })");
+  run('document.querySelector = () => null; state.historyRefreshPending = false;');
+  await run("refreshSessionsAfterTurn()");
+  const refreshed = run("({ pending: state.historyRefreshPending, loads: __loads })");
+
+  // 归档视图下进入新对话
+  run('state.showArchived = true; updateArchivedToggle = () => { globalThis.__toggle = (globalThis.__toggle || 0) + 1; };');
+  run("leaveArchivedViewForNewConversation();");
+  const archived = run("({ show: state.showArchived, toggles: globalThis.__toggle || 0 })");
+
+  // 同一行再次点编辑：有改动要确认，拒绝保留；未改动不弹
+  run(`
+    __confirmCalls = 0; __confirmAnswer = false;
+    confirm = () => { __confirmCalls += 1; return __confirmAnswer; };
+    state.tripEditingId = "trip_1";
+    els.tripForm.hidden = false;
+    els.tripOrigin.value = "北京"; els.tripDestination.value = "用户改的目的地";
+    els.tripStart.value = "2026-12-01"; els.tripEnd.value = ""; els.tripPurpose.value = "私人";
+  `);
+  run('startEditTrip({ trip_id: "trip_1", origin: "北京", destination: "上海", start_date: "2026-11-20", end_date: "", purpose: "出差" });');
+  const tripReclick = run("({ calls: __confirmCalls, destination: els.tripDestination.value })");
+  run(`
+    __confirmCalls = 0;
+    els.tripDestination.value = "上海"; els.tripStart.value = "2026-11-20"; els.tripPurpose.value = "出差";
+  `);
+  run('startEditTrip({ trip_id: "trip_1", origin: "北京", destination: "上海", start_date: "2026-11-20", end_date: "", purpose: "出差" });');
+  const tripReclickClean = run("__confirmCalls");
+
+  // 刷新在途 / 失败时旧行编辑：回填最近一次服务端保存值
+  run(`
+    state.tripLatest.set("trip_1", { trip_id: "trip_1", origin: "北京", destination: "杭州", start_date: "2026-12-02", end_date: "", purpose: "会议" });
+    __confirmAnswer = true;
+    state.tripEditingId = null;
+    startEditTrip({ trip_id: "trip_1", origin: "北京", destination: "上海", start_date: "2026-11-20", end_date: "", purpose: "出差" });
+  `);
+  const tripLatestView = run("els.tripDestination.value");
+  run("state.tripLatest.clear();");
+  return { merged, restored, pending, refreshed, archived, tripReclick, tripReclickClean, tripLatestView };
+}
+
+async function scenarioUserSwitchFormsDraft(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    state.userId = "u1"; state.busy = false; els.userIdInput.value = "u2";
+    state.kbEditingId = null; els.kbContent.value = "";
+    state.tripEditingId = null; els.tripForm.hidden = false;
+    els.tripDestination.value = "杭州"; els.tripStart.value = "2026-12-01";
+    els.prefValue.value = "汉庭";
+    __confirmCalls = 0; __confirmAnswer = false;
+    window.confirm = () => { __confirmCalls += 1; return __confirmAnswer; };
+    loadSessions = async () => {}; refreshStatus = () => {};
+    closeMemorySheet = () => {}; renderOverview = () => {};
+    resetTripForm = () => { els.tripDestination.value = ""; els.tripStart.value = ""; };
+    resetPreferenceForm = () => { els.prefValue.value = ""; };
+  `);
+  await run("saveUser()");
+  const rejected = run(`({
+    confirmCalls: __confirmCalls,
+    userId: state.userId,
+    destination: els.tripDestination.value,
+    pref: els.prefValue.value,
+  })`);
+  run("__confirmAnswer = true;");
+  await run("saveUser()");
+  const accepted = run(`({
+    userId: state.userId,
+    destination: els.tripDestination.value,
+    pref: els.prefValue.value,
+  })`);
+  return { rejected, accepted };
+}
+
+async function scenarioTripDedupeUnknown(source) {
+  const results = {};
+  for (const [key, status] of [["timeout", 0], ["partial503", 503]]) {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      __toasts = []; __refreshed = 0; __reset = 0;
+      confirm = () => true;
+      refreshStatus = async () => { __refreshed += 1; };
+      resetTripForm = () => { __reset += 1; state.tripEditingId = null; };
+      state.userId = "u1"; state.tripEditingId = "trip_1";
+      bindEvents();
+      __pendingReq = [];
+      getJSON = (url, options) =>
+        new Promise((resolve, reject) => { __pendingReq.push({ resolve, reject }); });
+    `);
+    run("els.tripsDedupe.click();");
+    await tick();
+    run("__pendingReq[0].resolve({ would_remove: 2, ambiguous_ids: [] });");
+    await tick();
+    const errorExpr = status
+      ? `(() => { const e = new Error("删除过程中失败：已删除 1 条"); e.status = 503; return e; })()`
+      : `new Error("请求超时，请稍后重试")`;
+    run(`__pendingReq[1].reject(${errorExpr});`);
+    for (let i = 0; i < 50; i += 1) {
+      await tick();
+      if (!run("els.tripsDedupe.disabled")) break;
+    }
+    results[key] = run(`({
+      toasts: __toasts.slice(),
+      refreshed: __refreshed,
+      reset: __reset,
+      editing: state.tripEditingId,
+      button: els.tripsDedupe.textContent,
+    })`);
+  }
+  return results;
+}
+
+async function scenarioKbPendingCancel(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    __req = [];
+    __toasts = [];
+    confirm = () => false;
+    els.kbEvalResult.hidden = true;
+    els.kbEvalResult.textContent = "";
+    els.kbEvalResult.classList.remove("warn");
+    getJSON = (url, options) =>
+      new Promise((resolve, reject) => { __req.push({ url, resolve, reject }); });
+  `);
+  const evalPromise = run("runKbEval()");
+  await tick();
+  const duringEval = run("els.kbEvalResult.textContent");
+  const dedupePromise = run("runKbDedupe()");
+  await tick();
+  run("__req[1].resolve({ planned: 2, groups: 1, removed: 0, failed: [] });");
+  await dedupePromise;
+  const afterCancel = run("({ text: els.kbEvalResult.textContent, hidden: els.kbEvalResult.hidden })");
+  run(`__req[0].resolve({
+    total: 30, hit1: 0.6, hit3: 0.9, hit5: 1, mrr: 0.8, rows: [],
+  });`);
+  await evalPromise;
+  const final = run("({ text: els.kbEvalResult.textContent, hidden: els.kbEvalResult.hidden })");
+  return { duringEval, afterCancel, final };
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -3288,6 +3497,14 @@ async function main() {
     payload = await scenarioKbDedupeUnknownOutcome(source);
   } else if (scenario === "kbUserSwitchDraft") {
     payload = await scenarioKbUserSwitchDraft(source);
+  } else if (scenario === "frontendDetailFixes") {
+    payload = await scenarioFrontendDetailFixes(source);
+  } else if (scenario === "userSwitchFormsDraft") {
+    payload = await scenarioUserSwitchFormsDraft(source);
+  } else if (scenario === "tripDedupeUnknown") {
+    payload = await scenarioTripDedupeUnknown(source);
+  } else if (scenario === "kbPendingCancel") {
+    payload = await scenarioKbPendingCancel(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
