@@ -35,7 +35,7 @@ class LazyAgentRegistry:
     自动扫描 .claude/skills 下的技能目录，动态加载 script/agent.py
     """
 
-    def __init__(self, model, cache: dict, memory_manager=None):
+    def __init__(self, model, cache: dict, memory_manager=None, console: Console | None = None):
         """
         初始化懒加载注册器
 
@@ -43,11 +43,15 @@ class LazyAgentRegistry:
             model: 共享的 LLM 模型实例
             cache: 用于缓存已加载智能体的字典
             memory_manager: 记忆管理器 (可选，用于注入给需要它的 Agent)
+            console: 调用方控制台（CLI 传入自己的 Live 状态区控制台）。自建
+                Console 会在 Rich Live 状态行刷新期间直接写底层流，把
+                「正在加载技能」提示拼到 spinner 行上并在状态结束后残留伪
+                状态行；注入后写入走 Live 的渲染钩子，作为干净的行显示。
         """
         self.model = model
         self.cache = cache
         self.memory_manager = memory_manager
-        self.console = Console()
+        self.console = console if console is not None else Console()
         # 同一注册器的「查缓存 → 加载 → 写缓存」串行化：并发请求同一技能
         # 不会各实例化一份、向不同调用方返回不同实例
         self._load_lock = threading.RLock()

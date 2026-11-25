@@ -40,10 +40,22 @@ class _AutoDecodeInput:
     # 的字节语义与方法签名与文本包装冲突）
     closed = False
 
-    def __init__(self, buffer: Any, fallback_encoding: str = "utf-8") -> None:
+    def __init__(
+        self,
+        buffer: Any,
+        fallback_encoding: str = "utf-8",
+        forced_encoding: str | None = None,
+    ) -> None:
         self._buffer = buffer
         self._fallback = fallback_encoding or "utf-8"
-        # None=尚未判定；"auto"=逐行判断；"utf-8-sig"=BOM；"utf-16"=行已拆好
+        # ALIGO_STDIN_ENCODING：显式指定逐行解码的编码，跳过自动判定
+        # （GBK「唯一 / 一一 / 十」等双字节序列恰好也是合法 UTF-8，
+        # 自动判定无法区分；显式编码是唯一可靠的出路）
+        self._forced = forced_encoding or ""
+        self._first_line_checked = False
+        self._ambiguity_warned = False
+        # None=尚未判定；"auto"=逐行判断；"utf-8-sig"=BOM；"utf-16"=行已拆好；
+        # "forced"=按显式编码逐行解码
         self._mode: str | None = None
         self._lines: list[str] = []
         # UTF-16 输入按固定大小分块读取（无 size 的 read() 会一直阻塞到 EOF，
@@ -77,11 +89,16 @@ class _AutoDecodeInput:
     def _ensure_mode(self) -> None:
         if self._mode is not None:
             return
+        if self._forced:
+            self._mode = "forced"
+            return
         head = b""
         peek = getattr(self._buffer, "peek", None)
         if callable(peek):
             try:
-                head = bytes(peek(64)[:64])
+                # 64 字节窗口会把较长的 UTF-16LE 首行（>31 个汉字）的换行
+                # 高字节切出样本；peek 不会为凑满窗口阻塞，放大到 4KB
+                head = bytes(peek(4096)[:4096])
             except Exception:  # noqa: BLE001 - peek 失败按逐行判断
                 head = b""
         if head[:2] in (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE):
@@ -108,25 +125,31 @@ class _AutoDecodeInput:
 
     @staticmethod
     def _looks_like_bomless_utf16le(head: bytes) -> bool:
-        """无 BOM 的 UTF-16LE 探测：奇数位出现 0x00 且偶数位没有。
+        """无 BOM 的 UTF-16LE 探测。
 
-        ASCII 文本的 UTF-16LE 是「字符 + 0x00」；中文文本的换行
-        （0x0A 0x00）落在样式尾部同样给出奇数位 0x00。GBK / UTF-8
-        文本不会包含 0x00 字节，因此该组合不会误判。
+        强信号是 UTF-16LE 的换行码元 ``0x0A 0x00``（GBK / UTF-8 文本不会
+        包含 0x00 字节）。没有换行时退回「奇数位零字节不少于偶数位」：
+        ASCII 文本是「字符 + 0x00」，中文常用字（一 U+4E00、开 U+5F00…）
+        的低字节也是 0x00 但落在偶数位——因此不能再要求偶数位没有零，
+        否则含这些字的首行会被漏判、后续按字节切行整体错位。
         """
         if len(head) < 4:
-            if len(head) == 2:
-                return head[0] != 0 and head[1] == 0
-            return False
+            # 短前缀里出现 NUL 只可能是 UTF-16（GBK / UTF-8 不含 0x00）
+            return b"\x00" in head
+        if b"\n\x00" in head:
+            return True
         sample = head[0::2]
         high = head[1::2]
-        return high.count(0) >= 1 and sample.count(0) == 0
+        return high.count(0) >= 1 and high.count(0) >= sample.count(0)
 
     def _is_utf16(self) -> bool:
         return self._mode in ("utf-16", "utf-16-le")
 
     def _decode_line(self, raw: bytes) -> str:
-        if self._mode == "utf-8-sig":
+        if self._mode == "forced":
+            # 显式编码（ALIGO_STDIN_ENCODING）：不做任何自动判定
+            line = raw.decode(self._forced, errors="replace")
+        elif self._mode == "utf-8-sig":
             line = raw.decode("utf-8-sig", errors="replace")
         else:
             line = ""
@@ -155,6 +178,50 @@ class _AutoDecodeInput:
         # NUL 不是命令行文本：残留时剔除（否则 "exit\0" 不匹配 exit，
         # 会被当成自然语言查询连同 NUL 发给模型）
         return line.replace("\x00", "")
+
+    def _check_encoding_ambiguity(self, raw: bytes, first_line: bool) -> None:
+        """GBK 与 UTF-8 同时「严格可解」但结果不同：拒绝静默改字。
+
+        GBK 有大量双字节序列恰好是合法 UTF-8（「唯一 / 一一 / 十 / 没 /
+        说」等），逐行「UTF-8 优先」会把它们静默解成西里尔 / 希腊字母——
+        用户 ID 行落到另一个合法账号。仅当回退编码不是 UTF-8 家族、且
+        两种解码都成功但结果不同才算歧义：首行抛 ValueError（CLI 的
+        用户 ID 提示路径会给出两种候选与 ALIGO_STDIN_ENCODING 指引），
+        后续行向 stderr 警告一次并维持 UTF-8 优先。
+        """
+        if self._mode != "auto" or self._forced:
+            return
+        normalized = (
+            self._fallback.lower().replace("-", "").replace("_", "")
+        )
+        if normalized in {"utf8", "utf"}:
+            return
+        try:
+            as_utf8 = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return
+        try:
+            as_fallback = raw.decode(self._fallback)
+        except (UnicodeDecodeError, LookupError):
+            return
+        if as_utf8 == as_fallback:
+            return
+        if first_line:
+            raise ValueError(
+                "stdin 编码歧义：同一行按 UTF-8 解码为 "
+                f"{as_utf8.rstrip()!r}、按 {self._fallback} 解码为 "
+                f"{as_fallback.rstrip()!r}；请设置 "
+                "ALIGO_STDIN_ENCODING=utf-8 或 "
+                f"ALIGO_STDIN_ENCODING={self._fallback} 后重试"
+            )
+        if not self._ambiguity_warned:
+            self._ambiguity_warned = True
+            print(
+                "警告：stdin 行存在编码歧义（UTF-8 / "
+                f"{self._fallback}），已按 UTF-8 解析；"
+                "可设置 ALIGO_STDIN_ENCODING 指定编码",
+                file=sys.stderr,
+            )
 
     def _needs_more_bytes(self, raw: bytes) -> bool:
         """块尾是否切断了多字节字符（UTF-8 与回退编码分别判定）。
@@ -269,6 +336,9 @@ class _AutoDecodeInput:
             raw = self._buffer.readline()
             if not raw:
                 return ""
+            first_line = not self._first_line_checked
+            self._first_line_checked = True
+            self._check_encoding_ambiguity(raw, first_line)
             line = self._decode_line(raw)
         if size is None or size < 0:
             return line
@@ -461,16 +531,36 @@ def configure_stdio(probe_stdin: bool = True) -> None:
     buffer = getattr(stream, "buffer", None)
     if buffer is None or not callable(getattr(buffer, "readline", None)):
         return
+    forced = os.environ.get("ALIGO_STDIN_ENCODING", "").strip()
+    if forced:
+        try:
+            codecs.lookup(forced)
+        except LookupError:
+            print(
+                f"警告：ALIGO_STDIN_ENCODING={forced!r} 不是有效编码，已忽略",
+                file=sys.stderr,
+            )
+            forced = ""
     fallback = getattr(stream, "encoding", None) or ""
     normalized = fallback.lower().replace("-", "").replace("_", "")
     if not normalized or normalized in {"utf8", "utf"}:
         # PYTHONUTF8 / PYTHONIOENCODING=utf-8 时 stream.encoding 已是 utf-8：
         # 拿它当回退等于没有回退，GBK 管道字节永远解不出来、被替换成乱码。
-        # 回退改为 locale 编码（Windows 常见 cp936）
+        # 回退改为系统 locale 编码（Windows 常见 cp936）。注意 PEP 540
+        # UTF-8 模式下 locale.getpreferredencoding(False) 同样返回 utf-8，
+        # 必须用 locale.getencoding()（3.11+，忽略 UTF-8 模式）或 GetACP
         try:
             import locale
 
-            locale_fallback = locale.getpreferredencoding(False) or ""
+            get_locale_encoding = getattr(locale, "getencoding", None)
+            if callable(get_locale_encoding):
+                locale_fallback = get_locale_encoding() or ""
+            elif sys.platform == "win32":
+                import ctypes
+
+                locale_fallback = f"cp{ctypes.windll.kernel32.GetACP()}"
+            else:
+                locale_fallback = locale.getpreferredencoding(False) or ""
         except Exception:  # noqa: BLE001 - 探测失败退回 utf-8
             locale_fallback = ""
         locale_normalized = locale_fallback.lower().replace("-", "").replace("_", "")
@@ -479,6 +569,6 @@ def configure_stdio(probe_stdin: bool = True) -> None:
     if not fallback:
         fallback = "utf-8"
     try:
-        sys.stdin = _AutoDecodeInput(buffer, fallback)
+        sys.stdin = _AutoDecodeInput(buffer, fallback, forced or None)
     except Exception:  # noqa: BLE001 - 包装失败保持原流
         pass

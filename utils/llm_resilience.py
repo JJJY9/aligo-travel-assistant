@@ -160,7 +160,11 @@ async def retry_with_backoff(
             delay = min(delay, max_delay_sec)
             logger.warning(
                 "LLM call failed (attempt %d/%d), retry in %.1fs: %s",
-                attempt + 1, max_retries + 1, delay, e,
+                attempt + 1,
+                max_retries + 1,
+                delay,
+                # 上游响应体常回显 API Key / 内部地址：日志与终端同口径脱敏
+                redact_secret(str(e)),
             )
             await asyncio.sleep(delay)
     if last_exc is None:

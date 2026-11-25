@@ -445,6 +445,33 @@ def test_failure_aggregated_as_partial_failure():
     print("✓ 单智能体失败聚合为 partial_failure")
 
 
+def test_structured_skill_error_json_is_redacted():
+    """技能把异常吞进 error JSON：回答 / 落库 / 导出前必须脱敏。"""
+    canary = "sk-LEAKCANARY0123456789"
+    path = "C:\\Users\\alice\\private\\key.txt"
+    orchestrator = OrchestrationAgent(
+        agent_registry={
+            "query_info": _StubAgent(
+                "query_info",
+                {
+                    "query_success": False,
+                    "results": {
+                        "error": f"搜索失败: 401 {canary} {path}",
+                        "message": f"读取 {path} 失败",
+                    },
+                },
+            )
+        }
+    )
+    schedule = [{"agent_name": "query_info", "priority": 1}]
+    result = json.loads(asyncio.run(orchestrator.reply(_intent(schedule))).content)
+    text = json.dumps(result, ensure_ascii=False)
+    assert canary not in text, "API Key 不能进入回答 / 落库数据"
+    assert "alice" not in text, "本机路径不能进入回答 / 落库数据"
+    assert result["status"] == "partial_failure", result
+    print("✓ 结构化技能错误 JSON 在聚合前脱敏")
+
+
 def test_agent_duration_and_progress_events():
     """agent_done 事件与聚合结果都带上单个智能体耗时（非恒 0）"""
     events: list[dict] = []

@@ -1,4 +1,5 @@
 import os
+import sys
 
 import yaml
 
@@ -66,14 +67,14 @@ class SkillLoader:
         返回格式: { "skill-name": { "name": "...", "description": "..." } }
         """
         if not os.path.exists(self.skills_dir):
-            print(f"Warning: Skills directory {self.skills_dir} not found.")
+            print(f"Warning: Skills directory {self.skills_dir} not found.", file=sys.stderr)
             return {}
 
         try:
             entries = os.listdir(self.skills_dir)
         except OSError as exc:
             # 目录不可读（权限 / 磁盘故障）：技能清单为空而不是抛 PermissionError
-            print(f"Warning: cannot list skills directory {self.skills_dir}: {exc}")
+            print(f"Warning: cannot list skills directory {self.skills_dir}: {exc}", file=sys.stderr)
             return {}
 
         for skill_name in entries:
@@ -85,13 +86,14 @@ class SkillLoader:
                     continue
                 md_file = os.path.join(skill_path, "SKILL.md")
                 if not os.path.exists(md_file):
-                    print(f"Warning: missing SKILL.md in {skill_path}, skipped.")
+                    print(f"Warning: missing SKILL.md in {skill_path}, skipped.", file=sys.stderr)
                 if os.path.exists(md_file):
                     skill_info = self._parse_skill_md(md_file)
                     if not skill_info:
                         print(
                             f"Warning: SKILL.md of {skill_name} has no valid "
-                            "frontmatter, skipped."
+                            "frontmatter, skipped.",
+                            file=sys.stderr,
                         )
                     if skill_info:
                         # name 必须是字符串：frontmatter 写错类型时退回目录名，
@@ -120,19 +122,20 @@ class SkillLoader:
                 try:
                     data = yaml.safe_load(yaml_content)
                 except yaml.YAMLError as e:
-                    print(f"Error parsing YAML in {file_path}: {e}")
+                    print(f"Error parsing YAML in {file_path}: {e}", file=sys.stderr)
                     return None
                 # frontmatter 不是映射（如整段是字符串 / 列表）时跳过，
                 # 否则后续 .get() 会抛 AttributeError 让所有技能加载失败
                 if not isinstance(data, dict):
                     print(
-                        f"Warning: frontmatter of {file_path} is not a mapping, skipped."
+                        f"Warning: frontmatter of {file_path} is not a mapping, skipped.",
+                        file=sys.stderr,
                     )
                     return None
                 return data
             return None
         except Exception as e:
-            print(f"Error reading {file_path}: {e}")
+            print(f"Error reading {file_path}: {e}", file=sys.stderr)
             return None
 
     def get_skill_prompt(self, skill_mapping: dict[str, str] | None = None) -> str:
@@ -190,7 +193,8 @@ class SkillLoader:
                 entries = os.listdir(self.skills_dir)
             except OSError as exc:
                 print(
-                    f"Warning: cannot list skills directory {self.skills_dir}: {exc}"
+                    f"Warning: cannot list skills directory {self.skills_dir}: {exc}",
+                    file=sys.stderr,
                 )
                 return None
             for dirname in entries:
@@ -215,6 +219,6 @@ class SkillLoader:
                 content = f.read()
             return _strip_frontmatter(content)
         except Exception as e:
-            print(f"Error reading skill content {target_path}: {e}")
+            print(f"Error reading skill content {target_path}: {e}", file=sys.stderr)
             return None
 

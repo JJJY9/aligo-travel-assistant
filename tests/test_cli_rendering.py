@@ -394,9 +394,11 @@ def test_skill_loader_warns_missing_manifest(tmp_path, capsys):
     (no_fm / "SKILL.md").write_text("没有 frontmatter 的内容", encoding="utf-8")
     loader = SkillLoader(str(tmp_path))
     loader.load_skills()
-    captured = capsys.readouterr().out
-    assert "missing SKILL.md" in captured
-    assert "no valid" in captured
+    # 诊断输出必须走 stderr：stdout 要留给 --json 等机器可读输出
+    captured = capsys.readouterr()
+    assert "missing SKILL.md" in captured.err
+    assert captured.out == "", "--json 命令的 stdout 不能被技能加载警告污染"
+    assert "no valid" in captured.err
     print("✓ 技能缺 SKILL.md / frontmatter 时有警告")
 
 

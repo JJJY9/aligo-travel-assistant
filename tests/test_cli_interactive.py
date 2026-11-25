@@ -124,7 +124,8 @@ def test_repl_error_markup_is_escaped(monkeypatch):
 
     async def boom(text):
         raise RuntimeError(
-            "[/red] boom [link=https://evil.example]点我[/link]"
+            "[/red] boom [link=https://evil.example]点我[/link] "
+            "sk-LEAKCANARY0123456789 C:\\Users\\secret-user\\private\\key.txt"
         )
 
     monkeypatch.setattr(agent, "initialize_system", fake_init)
@@ -136,7 +137,10 @@ def test_repl_error_markup_is_escaped(monkeypatch):
     assert "[/red] boom" in text, "关闭标签必须按原文显示"
     assert "[link=" in text
     assert "\x1b]8;" not in text, "不能把异常文本渲染成终端超链接"
-    print("✓ 主循环兜底错误按原文显示（不再二次 MarkupError）")
+    assert "sk-LEAKCANARY" not in text, "上游回显的 API Key 必须脱敏"
+    assert "secret-user" not in text, "本机路径必须脱敏"
+    assert agent._command_failed is True
+    print("✓ 主循环兜底错误按原文显示并脱敏（不再二次 MarkupError）")
 
 
 def test_history_table_strips_terminal_controls():
@@ -1165,6 +1169,111 @@ _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_interactive_memory_follows_data_root": "需要 tmp_path 夹具",
 }
 
+def test_nontty_blank_first_line_is_rejected():
+    """管道首行空行 / 纯空白：直接失败，不能换账号并把 ID 行当查询。"""
+    for payload in (
+        b"\nalice\nstatus\n",
+        b"\r\nalice\r\nstatus\r\n",
+    ):
+        result = _run_cli(payload)
+        output = (result.stdout + result.stderr).decode("utf-8", errors="replace")
+        assert result.returncode == 1, output
+        # Rich 会按终端宽度折行：去掉空白后再比对完整提示
+        normalized = "".join(output.split())
+        assert "首行必须是合法的用户ID" in normalized, output
+        assert "就绪(用户:alice)" not in normalized, output
+    print("✓ 管道空首行直接失败（不静默落到 default_user）")
+
+
+def test_pipeline_exit_code_reflects_command_failure():
+    """管道模式命令失败时收尾退出码为 1；交互终端恒为 0。"""
+    agent = cli.AligoCLI.__new__(cli.AligoCLI)
+    agent._user_id_from_stdin = True
+    agent._command_failed = False
+    assert agent._pipeline_exit_code() == 0
+    agent._command_failed = True
+    assert agent._pipeline_exit_code() == 1
+    agent._user_id_from_stdin = False
+    assert agent._pipeline_exit_code() == 0, "交互终端不受管道退出码影响"
+    print("✓ 管道失败的退出码")
+
+
+def test_summary_prefers_recent_trips():
+    """长期记忆摘要注入最近的行程（与 Web 摘要窗口同口径）。"""
+
+    class _LongTerm:
+        def get_preference(self):
+            return {}
+
+        def get_trip_history(self, limit=None):
+            # 存储层按插入顺序返回：最旧在前
+            return [
+                {
+                    "origin": "上海",
+                    "destination": "广州",
+                    "start_date": "2020-01-01",
+                    "purpose": "旧行程",
+                },
+                {
+                    "origin": "上海",
+                    "destination": "深圳",
+                    "start_date": "2025-01-01",
+                    "purpose": "中间行程",
+                },
+                {
+                    "origin": "上海",
+                    "destination": "成都",
+                    "start_date": "2026-11-01",
+                    "purpose": "最新行程",
+                },
+            ]
+
+    class _Memory:
+        long_term = _LongTerm()
+
+        async def get_long_term_summary_async(self, max_messages=50):
+            return ""
+
+    agent = cli.AligoCLI.__new__(cli.AligoCLI)
+    agent.memory_manager = _Memory()
+    summary = asyncio.run(agent._get_long_term_summary("从上海出发"))
+    assert "成都" in summary and "深圳" in summary, summary
+    assert "广州" not in summary, "最旧行程不应挤掉最近的行程"
+    print("✓ 摘要注入最近行程（不是最旧）")
+
+
+def test_read_commands_stop_on_quarantine():
+    """REPL 长驻期间记忆文件被隔离：读命令提示并中止，不显示空数据。"""
+
+    class _LongTerm:
+        def get_active_quarantine_backup(self):
+            return "C:/data/u.json.corrupt-1"
+
+        def get_trip_history(self, limit=None):
+            raise AssertionError("隔离状态不应读取行程")
+
+        def get_preference(self):
+            raise AssertionError("隔离状态不应读取偏好")
+
+    class _Memory:
+        def __init__(self):
+            self.long_term = _LongTerm()
+            self.reloads = 0
+
+        def reload_long_term(self):
+            self.reloads += 1
+
+    agent, buffer = _capture_console()
+    agent.memory_manager = _Memory()
+    agent.show_history()
+    agent.show_preferences()
+    output = buffer.getvalue()
+    assert "记忆文件损坏" in output, output
+    assert "暂无历史行程" not in output, "隔离不能被显示成没有数据"
+    assert agent.memory_manager.reloads == 2
+    print("✓ 隔离状态下读命令提示并中止")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -1267,6 +1376,10 @@ if __name__ == "__main__":
     finally:
         _mp.undo()
     test_nontty_single_line_query_is_not_swallowed()
+    test_nontty_blank_first_line_is_rejected()
+    test_pipeline_exit_code_reflects_command_failure()
+    test_summary_prefers_recent_trips()
+    test_read_commands_stop_on_quarantine()
     _mp = pytest.MonkeyPatch()
     try:
         test_pending_cancel_cleared_when_loop_ends_by_eof(_mp)

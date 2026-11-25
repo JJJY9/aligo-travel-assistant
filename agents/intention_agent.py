@@ -541,15 +541,23 @@ class IntentionAgent(AgentBase):
             # 可重试错误（超时/连接失败/429/5xx）向上抛出，
             # 交由 cli.py 的 retry_with_backoff 与熔断器处理（Issue #1）
             if is_retriable_error(e):
-                logger.error(f"Intent recognition failed (retriable): {e}")
+                logger.error(
+                    "Intent recognition failed (retriable): %s",
+                    _redact_error_text(e),
+                )
                 raise
             if is_permanent_llm_error(e):
                 # 非可重试的模型调用失败（401/402/403/404 等 4xx）：吞成默认
                 # 意图会让外层把「LLM 完全不可用」记为成功，熔断器与健康
                 # 检查永远看不到故障，必须同样上抛
-                logger.error(f"Intent recognition failed (permanent LLM error): {e}")
+                logger.error(
+                    "Intent recognition failed (permanent LLM error): %s",
+                    _redact_error_text(e),
+                )
                 raise
-            logger.error(f"Intent recognition failed: {e}")
+            logger.error(
+                "Intent recognition failed: %s", _redact_error_text(e)
+            )
             # 返回默认结果；reasoning 会随 _meta 落库与 SSE 下发，错误文本
             # 可能夹带上游网关的密钥 / 内部地址，必须先脱敏
             result = _default_intent_result(
