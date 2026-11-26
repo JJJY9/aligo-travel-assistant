@@ -48,6 +48,23 @@ def _fence_close(line: str, fence: str) -> bool:
     return not match.group(3).strip()
 
 
+def _fence_like(line: str, fence: str) -> bool:
+    """任意缩进（含制表符 / 4+ 空格）的围栏形行：渲染器可能在此关闭围栏。
+
+    ``_fence_close`` 只能证伪 0-3 个空格缩进的顶层形态；列表项等内容
+    容器的相对缩进、制表符按 tab stop 展开后都可能让这一形态在渲染器
+    一侧已是合法关围栏，而导出器仅凭文本无法确定。这类行一律按「可能
+    关闭」处理：本行保留原样（在渲染器里也是围栏行），其后内容转义。
+    """
+    if not fence:
+        return False
+    body = line.lstrip(" \t")
+    if not body.startswith(fence[0]):
+        return False
+    run = len(body) - len(body.lstrip(fence[0]))
+    return run >= len(fence) and not body[run:].strip()
+
+
 def _escape_inline_markdown(text: str) -> str:
     """转义单行文本里的 Markdown / HTML 元字符（代码内容不要经过本函数）。
 
@@ -145,9 +162,13 @@ def sanitize_body(text: str) -> str:
     - 结构隔离：正文里伪造的 ``---`` / ``## 标题`` / ``- 会话：…`` /
       ``### Aligo`` 只会是引用块内的文字，不能制造顶层会话段落或角色标题；
     - 代码围栏平衡：消息内未闭合的 ``` / ~~~ 在本条消息末尾补齐，后续
-      消息与会话不会被吞进同一个代码块；缩进围栏（列表项内）随容器
-      结束恢复转义；缩进更小的合法关围栏优先按关闭处理（不能重新当成
-      新开围栏）；
+      消息与会话不会被吞进同一个代码块；缩进围栏（列表项内）随容器结束
+      恢复转义；缩进更小的合法关围栏优先按关闭处理（不能重新当成新开围栏）；
+    - 围栏状态一旦出现无法判定的歧义（缩进变小、4+ 空格或制表符缩进的
+      围栏形行），本条消息余下内容全部转义：渲染器可能已按容器相对缩进
+      关闭了围栏，原样透传会放行原始 HTML；若它仍认为在围栏内，多转义
+      只损失代码样式，不会破坏安全。歧义后不再开 / 关围栏，避免把真实
+      关围栏重新解析成新开围栏；
     - 行内代码只保留同一行内成对的反引号；未配对反引号一律反斜杠转义
       （显示为字面反引号）：导出器对段落边界的推断与真实渲染器不可能
       完全一致，裸反引号一旦被渲染器与其它行配对，后续内容会被当作代码
@@ -163,9 +184,24 @@ def sanitize_body(text: str) -> str:
     rendered: list[str] = []
     fence = ""
     fence_indent = 0
+    # 围栏状态一旦出现无法判定的歧义（缩进变小、更深缩进或 Tab 的围栏
+    # 形行），本条消息余下内容一律转义：渲染器可能已随容器结束退出围栏，
+    # 原样输出会放行原始 HTML；若它仍在围栏内，多转义只是显示成字面量
+    degraded = False
     # 超大消息放弃行内代码配对（线性、始终安全）；常规消息保留同一行内配对
     fast_mode = len(text) > _MAX_INLINE_PAIRING_CHARS
+
+    def _escaped_line(line: str) -> str:
+        return _quote_line(
+            _escape_inline_markdown(line)
+            if fast_mode
+            else _escape_body_line(line)
+        )
+
     for line in lines:
+        if degraded:
+            rendered.append(_escaped_line(line))
+            continue
         if fence:
             if (
                 fence_indent
@@ -180,16 +216,31 @@ def sanitize_body(text: str) -> str:
                     fence = ""
                     fence_indent = 0
                     continue
-                # 列表项等容器内的围栏随容器结束：后续未缩进行是正文，
-                # 必须恢复转义（渲染器此时已退出围栏/列表上下文）
+                # 缩进变小且非合法关围栏：无法判定渲染器是随容器结束退出
+                # 了围栏（列表项），还是仍在围栏内（顶层 1-3 空格缩进的
+                # 围栏不会因普通行缩进变小而结束）。余下内容只能转义——
+                # 原样输出会在渲染器已退出围栏时放行原始 HTML
+                degraded = True
                 fence = ""
                 fence_indent = 0
-            else:
-                if _fence_close(line, fence):
-                    fence = ""
-                    fence_indent = 0
+                rendered.append(_escaped_line(line))
+                continue
+            if _fence_close(line, fence):
+                fence = ""
+                fence_indent = 0
                 rendered.append(_quote_line(line))
                 continue
+            if _fence_like(line, fence):
+                # 列表内容缩进 / 制表符展开后的围栏形行：渲染器可能按
+                # 容器相对缩进把它当关围栏，此后即为正文——保留本行后
+                # 进入降级转义，余下内容不再原样透传
+                degraded = True
+                fence = ""
+                fence_indent = 0
+                rendered.append(_quote_line(line))
+                continue
+            rendered.append(_quote_line(line))
+            continue
         opener = _fence_open(line)
         if opener:
             fence = opener

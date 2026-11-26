@@ -119,7 +119,14 @@ def test_safe_export_user_is_unique(monkeypatch=None):
         char.isalnum() or char in "_-"
         for char in cli._safe_export_user("张三-上海/2026")
     )
-    print("✓ 导出文件名对中文 / 超长用户唯一")
+    # 会话 / 行程 ID 分量：大小写变体不能落进同一文件；合法 64 字符
+    # 多字节 ID 不能把默认文件名撑过 NAME_MAX=255 字节
+    assert cli._safe_export_component("S1") != cli._safe_export_component("s1")
+    long_session = chr(0x10400) * 64
+    component = cli._safe_export_component(long_session)
+    assert len(component.encode("utf-8")) <= 31, component
+    assert all(char.isalnum() or char in "_-" for char in component)
+    print("✓ 导出文件名对中文 / 超长用户 / 会话 ID 唯一")
 
 
 def test_print_stdout_swallows_broken_pipe(monkeypatch):

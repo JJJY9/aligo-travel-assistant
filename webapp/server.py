@@ -22,7 +22,6 @@ import asyncio
 import bisect
 import contextlib
 import functools
-import hashlib
 import ipaddress
 import json
 import reprlib
@@ -3506,16 +3505,15 @@ def _invalidate_preference_caches() -> None:
 def _safe_filename(value: str, fallback: str = "aligo") -> str:
     """把用户 / 会话 ID 转为只含 ASCII 的安全下载文件名。
 
-    清洗后与原始值不同（中文 / 超长 ID）时追加短哈希：不同账号互相
-    撞名（``aligo____.json``）会在同一目录覆盖对方的备份（与 CLI
-    ``_safe_export_user`` 同一策略）。
+    与 CLI 导出共用同一实现（``utils.exporter.safe_export_component``）：
+    清洗后与原始值不同（中文 / 超长 ID）、大小写变体（``Alice`` /
+    ``alice`` 在大小写不敏感文件系统上撞同一目录项）或清洗名本身形如
+    ``<名>_<6 位 hex>``（与短哈希空间重叠）时追加短哈希——不同账号
+    不能得到同一文件名（脚本批量下载会在同一目录静默覆盖）。
     """
-    original = str(value or "")
-    cleaned = re.sub(r"[^A-Za-z0-9_-]", "_", original)[:24] or fallback
-    if cleaned != original:
-        digest = hashlib.sha1(original.encode("utf-8")).hexdigest()[:6]
-        cleaned = f"{cleaned}_{digest}"
-    return cleaned
+    from utils.exporter import safe_export_component
+
+    return safe_export_component(value, fallback)
 
 
 def _json_safe_value(value: Any) -> Any:

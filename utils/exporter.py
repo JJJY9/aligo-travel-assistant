@@ -5,6 +5,7 @@
 两份文件，便于用户备份、迁移或查看自己的数据。
 """
 import json
+import os
 import re
 from pathlib import Path
 from typing import Any
@@ -163,33 +164,43 @@ def render_markdown(data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def safe_export_user(user_id: str) -> str:
-    """导出文件名里的用户 ID：清洗非法字符，撞名风险时追加短哈希。
+def safe_export_component(value: str, fallback: str = "user") -> str:
+    """导出文件名里的单个标识分量：清洗非法字符，撞名风险时追加短哈希。
 
     大小写不敏感文件系统上 ``Alice`` / ``alice`` 是不同账号却解析到同一
     目录项；清洗后追加的 ``_<hex>`` 后缀与合法 ASCII ID 空间也重叠
     （如 张三 → ___ced07f，用户 ___ced07f 原样保留）。出现任一风险时
-    统一追加 user_id 的短哈希，展开后按大小写折叠仍唯一。
+    统一追加输入的短哈希，展开后按大小写折叠仍唯一。
     """
     import hashlib
     import re
 
-    safe = re.sub(r"[^A-Za-z0-9_-]", "_", user_id)[:24] or "user"
+    original = str(value or "")
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", original)[:24] or fallback
     risky = (
-        safe != user_id
+        safe != original
         # 大小写不敏感文件系统：Alice / alice 会撞到同一文件
         or safe != safe.lower()
         # 与「清洗后名 + _<6 hex>」的生成空间重叠
         or bool(re.search(r"_[0-9a-f]{6}$", safe))
     )
     if risky:
-        digest = hashlib.sha1(user_id.encode("utf-8")).hexdigest()[:6]
+        digest = hashlib.sha1(original.encode("utf-8")).hexdigest()[:6]
         safe = f"{safe}_{digest}"
     return safe
 
 
+def safe_export_user(user_id: str) -> str:
+    """导出文件名里的用户 ID（与 Web 端 ``_safe_filename`` 同一实现）。"""
+    return safe_export_component(user_id, "user")
+
+
 def _export_stem(data: dict[str, Any]) -> str:
-    """导出文件名主干：大小写折叠唯一 + 保留微秒（同秒两次导出不互相覆盖）。"""
+    """导出文件名主干：用户清洗名 + 导出时间（去分隔符）。
+
+    时间只提供毫秒级区分度；同名并发导出由 :func:`_claim_export_paths`
+    原子占名追加 ``-1`` / ``-2`` 后缀，不依赖时钟精度。
+    """
     timestamp = (
         str(data.get("exported_at", ""))
         .replace(":", "")
@@ -197,6 +208,35 @@ def _export_stem(data: dict[str, Any]) -> str:
     )
     user = safe_export_user(str(data.get("user_id", "user")) or "user")
     return f"{user}_{timestamp or 'export'}"
+
+
+def _claim_export_paths(out: Path, stem: str) -> tuple[Path, Path]:
+    """原子占用一对尚未存在的 ``(json, md)`` 路径。
+
+    时钟导出的 stem 只有约 1ms 分辨率：并发备份 / cron 重入会撞名，
+    而 ``os.replace`` 会静默覆盖先写者的快照。用 ``O_CREAT | O_EXCL``
+    建立空占位文件占住名字，任一文件已存在就试 ``<stem>-1``、
+    ``<stem>-2``…；占名成功后原子写覆盖占位文件（写失败由调用方清理）。
+    """
+    index = 0
+    while True:
+        name = stem if index == 0 else f"{stem}-{index}"
+        json_path = out / f"{name}.json"
+        md_path = out / f"{name}.md"
+        try:
+            fd = os.open(json_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            index += 1
+            continue
+        os.close(fd)
+        try:
+            fd = os.open(md_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            os.unlink(json_path)
+            index += 1
+            continue
+        os.close(fd)
+        return json_path, md_path
 
 
 def write_export_files(
@@ -212,11 +252,25 @@ def write_export_files(
     ``indent=2`` 序列化一次；普通调用方用 :func:`export_files` 包装。
     ``json_bytes`` 的字节必须等于 ``json.dumps(cleaned, ensure_ascii=False,
     indent=2).encode("utf-8")``（LF，无 BOM）。
+
+    ``stem`` 为空（时钟命名）时采用原子占名：同一毫秒内的并发 / 重试
+    导出各自得到 ``-1`` / ``-2`` 后缀的独立文件，不再静默互相覆盖。
     """
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     if stem is None:
-        stem = _export_stem(cleaned)
+        json_path, md_path = _claim_export_paths(out, _export_stem(cleaned))
+        try:
+            write_bytes_atomic(json_path, json_bytes)
+            write_text_atomic(md_path, render_markdown(cleaned), newline="\n")
+        except BaseException:
+            for leftover in (json_path, md_path):
+                try:
+                    os.unlink(leftover)
+                except OSError:
+                    pass
+            raise
+        return [json_path, md_path]
     json_path = out / f"{stem}.json"
     md_path = out / f"{stem}.md"
     write_bytes_atomic(json_path, json_bytes)

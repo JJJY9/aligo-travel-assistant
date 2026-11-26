@@ -3628,6 +3628,16 @@ def test_export_filenames_disambiguate_non_ascii_ids():
     assert first != second, (first, second)
     assert re_module.fullmatch(r"_+_[0-9a-f]{6}", first), first
     assert _safe_filename("alice") == "alice"
+    # 与 CLI safe_export_user 同一策略：大小写变体（大小写不敏感文件系统
+    # 上撞同一目录项）与「清洗后形如 <名>_<6 hex>」的重叠空间都要消歧
+    assert _safe_filename("Alice") != _safe_filename("alice"), (
+        _safe_filename("Alice"),
+        _safe_filename("alice"),
+    )
+    assert _safe_filename("张三") != _safe_filename("___ced07f"), (
+        _safe_filename("张三"),
+        _safe_filename("___ced07f"),
+    )
     long_id = "a" * 40
     cleaned = _safe_filename(long_id)
     assert len(cleaned) == 24 + 1 + 6 and cleaned.startswith("a" * 24), cleaned
