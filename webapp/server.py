@@ -108,7 +108,10 @@ from utils.rate_limit import CapacityRetry, create_rate_limiter
 from utils.session_ids import RESERVED_SESSION_IDS
 from utils.session_title import session_title_from_content
 from utils.redis_lock import DistributedLock
-from utils.stored_message import render_stored_message
+from utils.stored_message import (
+    render_stored_message,
+    render_stored_message_with_meta,
+)
 from utils.session_html import render_all_sessions_html, render_session_html
 from utils.session_markdown import (
     render_all_sessions_markdown,
@@ -5637,29 +5640,28 @@ def create_app(model: Any = None) -> FastAPI:
                 if message.get("role") == "user":
                     title = _session_title_from_content(message.get("content"))
                     break
+        rendered_messages = []
+        for message in messages:
+            rendered, meta = render_stored_message_with_meta(message)
+            rendered_messages.append(
+                {
+                    "role": message.get("role", "assistant"),
+                    "content": rendered,
+                    # 旧数据 / 手写记忆文件里的 _meta 可能含 NaN：原样放进
+                    # 响应会让 JSON 序列化（allow_nan=False）失败、该会话
+                    # 每次打开都 500，这里统一归一为 None
+                    "meta": _json_safe_value(meta),
+                    "timestamp": _aware_timestamp_text(
+                        message.get("timestamp", "")
+                    ),
+                }
+            )
         return _json_safe_value(
             {
                 "session_id": session_id,
                 "title": title or "新对话",
                 "archived": session_id in archived_ids,
-                "messages": [
-                    {
-                        "role": message.get("role", "assistant"),
-                        "content": _render_stored_message(message),
-                        # 旧数据 / 手写记忆文件里的 _meta 可能含 NaN：原样放进
-                        # 响应会让 JSON 序列化（allow_nan=False）失败、该会话
-                        # 每次打开都 500，这里统一归一为 None
-                        "meta": _json_safe_value(
-                            extract_turn_meta(str(message.get("content", "")))
-                        )
-                        if message.get("role") == "assistant"
-                        else None,
-                        "timestamp": _aware_timestamp_text(
-                            message.get("timestamp", "")
-                        ),
-                    }
-                    for message in messages
-                ],
+                "messages": rendered_messages,
             }
         )
 

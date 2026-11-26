@@ -2589,9 +2589,19 @@ def _import_user_data_locked(
     applied_archived: set[str] = set()
     msg_by_session: dict[str, int] = {}
 
-    for key, value in sections.get("preferences", {}).items():
-        store.save_preference(key, value)
-        result["preferences"] += 1
+    preferences = sections.get("preferences", {})
+    if preferences:
+        # JSON 后端逐条 save_preference 会各重载 + 整份原子写回：45k 消息的
+        # 账号单个偏好约 0.8s，200 个偏好要 160s。存储层有 write_batch 时
+        # 合成一次重载 + 一次写盘；PG 与测试替身没有该接口，维持逐条。
+        batch_factory = getattr(store, "write_batch", None)
+        batch_ctx = (
+            batch_factory() if callable(batch_factory) else contextlib.nullcontext()
+        )
+        with batch_ctx:
+            for key, value in preferences.items():
+                store.save_preference(key, value)
+                result["preferences"] += 1
     trips = sections.get("trips", [])
     if trips:
         # 被删除 / 保留字会话的行程关联：只清除目标库确实指向该会话的记录，

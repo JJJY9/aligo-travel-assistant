@@ -170,6 +170,19 @@ def test_derived_filenames_fit_name_max():
     print("✓ 最大合法 ID 的全部派生文件名均在 NAME_MAX 内")
 
 
+def test_word_char_cache_reuses_results():
+    """逐字符判定按字符缓存：同批会话的重复字符不再逐次跑正则。"""
+    from utils import identifiers
+
+    identifiers.is_web_word_char.cache_clear()
+    for _ in range(3):
+        assert is_valid_web_id("abc-123") is True
+    info = identifiers.is_web_word_char.cache_info()
+    assert info.misses == len(set("abc123")), info
+    assert info.hits > 0, info
+    print("✓ ID 字符判定缓存命中")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -183,4 +196,5 @@ if __name__ == "__main__":
     test_unassigned_codepoints_never_accepted()
     test_oversized_filename_ids_rejected()
     test_derived_filenames_fit_name_max()
+    test_word_char_cache_reuses_results()
     print("\n全部通过")

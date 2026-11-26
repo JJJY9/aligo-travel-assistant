@@ -224,6 +224,55 @@ def is_session_deleted(
         return False
 
 
+# 批量入口据此识别「单键实现已被测试替身 / 子类替换」，此时退回逐键语义
+_ORIGINAL_IS_SESSION_DELETED = is_session_deleted
+
+
+def is_sessions_deleted(
+    user_id: str, session_ids: Any, force: bool = False
+) -> set[str]:
+    """批量版 :func:`is_session_deleted`：流水线代替逐键 EXISTS。
+
+    CLI 备份恢复会按会话整批查询墓碑（备份可含数千个会话，且恢复前后各查
+    一轮）：逐键串行往返在 2ms RTT 下 3000 会话就要 7.8s，500/批流水线
+    只需 0.06s。测试替身覆盖了单键实现时按逐键语义执行（批量是纯优化，
+    不能绕过被替换的行为）。任一请求失败时冷却并只返回此前已确认命中的
+    会话——失败批次按「未删除」处理，与单键失败返回 False 一致。
+    """
+    ids = list(dict.fromkeys(str(sid) for sid in session_ids if sid))
+    if not ids:
+        return set()
+    single = is_session_deleted
+    if getattr(single, "__func__", single) is not _ORIGINAL_IS_SESSION_DELETED:
+        return {sid for sid in ids if single(user_id, sid)}
+    global _failure_until
+    client = _shared_client(force=force)
+    if client is None:
+        return set()
+    deleted: set[str] = set()
+    try:
+        pipeline_factory = getattr(client, "pipeline", None)
+        if callable(pipeline_factory):
+            chunk_size = 500
+            for start in range(0, len(ids), chunk_size):
+                chunk = ids[start : start + chunk_size]
+                pipe = pipeline_factory(transaction=False)
+                for session_id in chunk:
+                    pipe.exists(deleted_key(user_id, session_id))
+                for session_id, found in zip(chunk, pipe.execute()):
+                    if found:
+                        deleted.add(session_id)
+        else:
+            # 测试桩 / 精简客户端没有 pipeline：退回逐键 EXISTS
+            for session_id in ids:
+                if client.exists(deleted_key(user_id, session_id)):
+                    deleted.add(session_id)
+    except Exception as exc:  # noqa: BLE001 - 墓碑读取失败按未删除处理
+        _failure_until = time.monotonic() + _FAILURE_COOLDOWN_SEC
+        logger.warning("读取共享删除墓碑失败：%s", exc)
+    return deleted
+
+
 def reassert_session_deleted(
     user_id: str,
     session_id: str,

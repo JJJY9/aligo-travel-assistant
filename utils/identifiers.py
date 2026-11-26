@@ -8,6 +8,7 @@ Python ``re`` 的 ``\\w`` 是 ``str.isalnum()``（含上标数字这类 No），
 在 Web 全部端点 422、无法打开也无法删除。这里用 unicodedata 复刻 Rust
 语义，供 CLI 导入 / 脚本复用。
 """
+import functools
 import unicodedata
 
 try:  # regex 是 transformers 的传递依赖；缺失时退回 unicodedata 近似
@@ -15,10 +16,15 @@ try:  # regex 是 transformers 的传递依赖；缺失时退回 unicodedata 近
 except ImportError:  # pragma: no cover - 轻量环境
     _regex = None
 
+# 预编译单字符匹配：is_web_word_char 对每个字符各调一次 fullmatch，导入
+# 数万消息的会话 ID 校验曾把一半以上解析时间花在逐字符重新编译正则上
+_WORD_RE = _regex.compile(r"\w") if _regex is not None else None
+
 # 零宽连接符（ZWNJ / ZWJ）：Rust \w 把 Join_Control 计为单词字符
 _JOIN_CONTROLS = (chr(0x200C), chr(0x200D))
 
 
+@functools.lru_cache(maxsize=4096)
 def is_web_word_char(char: str) -> bool:
     """Rust 正则 ``\\w`` 的字符判定（pydantic-core 校验 ID 的同一集合）。
 
@@ -39,7 +45,8 @@ def is_web_word_char(char: str) -> bool:
         # 让 Web 更宽，不会造成不可打开的账号 / 会话
         if unicodedata.category(char) == "Cn":
             return False
-        return _regex.fullmatch(r"\w", char) is not None
+        assert _WORD_RE is not None
+        return _WORD_RE.fullmatch(char) is not None
     if char in _JOIN_CONTROLS:
         return True
     if char.isalpha():

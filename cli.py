@@ -3727,7 +3727,7 @@ def run_user_import_standalone(
     # 共享 Redis 墓碑（Web 的进程内墓碑表不跨进程），未配置 REDIS_URL 时
     # 无法感知其它进程刚删除的会话。
     from utils.session_ids import RESERVED_SESSION_IDS
-    from utils.tombstones import is_session_deleted
+    from utils.tombstones import is_sessions_deleted
     from utils.user_import import (
         _store_export_snapshot,
         drop_sessions,
@@ -3743,11 +3743,12 @@ def run_user_import_standalone(
         for trip in sections.get("trips") or []
         if trip.get("session_id")
     }
+    deleted_sessions = is_sessions_deleted(user_id, candidate_sessions)
     skipped_sessions = {
         session_id
         for session_id in candidate_sessions
         if session_id in RESERVED_SESSION_IDS
-        or is_session_deleted(user_id, str(session_id))
+        or str(session_id) in deleted_sessions
     }
     active_sessions = set(candidate_sessions) - skipped_sessions
     if skipped_sessions:
@@ -3822,11 +3823,7 @@ def run_user_import_standalone(
                 )
                 # 写库期间其它实例可能删除某个会话：最后再查一次共享墓碑
                 # 并整会话回滚，避免迟到的删除被恢复写回
-                late_deleted = {
-                    session_id
-                    for session_id in active_sessions
-                    if is_session_deleted(user_id, str(session_id))
-                }
+                late_deleted = is_sessions_deleted(user_id, active_sessions)
                 rolled_back_sessions: set[str] = set()
                 for session_id in sorted(late_deleted):
                     try:

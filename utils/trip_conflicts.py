@@ -13,6 +13,20 @@ from utils.trip_export import normalize_identity_date
 logger = logging.getLogger(__name__)
 
 
+@functools.lru_cache(maxsize=16384)
+def _parse_iso_date(text: str) -> datetime | None:
+    """解析归一后的 ``YYYY-MM-DD``；同一日期串只 strptime 一次。
+
+    ``/api/status`` 对全量行程做三遍日期解析、``/api/trips`` 每页对全池算
+    冲突，真实账号上限 5000 条（起止两种日期串）：缓存键恒为 str，覆盖
+    2×5000 后留有余量，顺序扫描也不会互相 thrash。
+    """
+    try:
+        return datetime.strptime(text, "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
 def _parse_trip_date(value: Any) -> datetime | None:
     """按身份口径解析行程日期：补零 / 斜杠 / 全角数字先归一再 strptime。
 
@@ -23,10 +37,7 @@ def _parse_trip_date(value: Any) -> datetime | None:
     text = normalize_identity_date(value)
     if not text:
         return None
-    try:
-        return datetime.strptime(text, "%Y-%m-%d")
-    except ValueError:
-        return None
+    return _parse_iso_date(text)
 
 
 @functools.lru_cache(maxsize=8192)
