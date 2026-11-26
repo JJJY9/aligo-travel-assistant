@@ -25,6 +25,7 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
+from utils.access_log import _safe_log_text
 from utils.log_redact import redact_paths
 from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
 from utils.json_parser import extract_json_from_async_response
@@ -257,7 +258,8 @@ class MemoryQueryAgent(AgentBase):
                 # 层重试与熔断记账，不能伪装成一条「成功」的空回答
                 raise ConnectionError("模型返回空响应")
 
-            logger.info(f"Memory query answered: {user_query[:50]}")
+            # 用户提问原文不以 INFO 明文进日志（#587 隐私口径），只记长度
+            logger.info("Memory query answered (len=%d)", len(user_query))
 
             result = {
                 "status": "success",
@@ -279,9 +281,14 @@ class MemoryQueryAgent(AgentBase):
                 # 瞬时错误交给编排层重试；401/402/403/404 等永久错误
                 # 同样穿透并计入熔断，不能吞成 error JSON
                 raise
-            logger.error(f"Memory query failed: {e}")
+            logger.error(
+                "Memory query failed: %s", _safe_log_text(redact_paths(e))
+            )
             import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(
+                "Traceback: %s",
+                _safe_log_text(redact_paths(traceback.format_exc())),
+            )
 
             return Msg(
                 name=self.name,

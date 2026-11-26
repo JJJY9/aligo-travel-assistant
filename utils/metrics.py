@@ -1,9 +1,11 @@
 """进程内请求指标（无第三方依赖）。
 
-中间件为 ``/api`` 路由请求与 Host 白名单拒绝的探测记录计数与耗时；首页、
-静态资源与 ``/metrics`` 抓取本身不计入（``GET /api/metrics`` 返回快照），
-便于本地观测与压测。耗时 P50 / P95 基于最近 ``MAX_DURATION_SAMPLES`` 个
-请求（内存有界）。多进程 / 多实例部署时各进程独立统计（见 README 已知限制）。
+中间件为 ``/api`` 路由请求与 Host 白名单拒绝的探测记录计数与状态；耗时
+分布只统计真实经过路由的请求——Host 拒绝与未匹配路径的 404 不受限流、
+可被扫描无限次触发，只计请求数，避免稀释 P50 / P95。首页、静态资源与
+``/metrics`` 抓取本身不计入（``GET /api/metrics`` 返回快照），便于本地
+观测与压测。耗时 P50 / P95 基于最近 ``MAX_DURATION_SAMPLES`` 个请求
+（内存有界）。多进程 / 多实例部署时各进程独立统计（见 README 已知限制）。
 """
 import math
 import re
@@ -75,11 +77,14 @@ class RequestMetrics:
         status: int,
         elapsed_ms: float,
         streaming: bool = False,
+        count_only: bool = False,
     ) -> None:
         """记录一次请求。
 
         ``streaming=True``（SSE 长连接）时只计请求数与状态，不计入耗时
         统计——流式会话的整段持续时间会把延迟分位完全支配。
+        ``count_only=True`` 用于 Host 拒绝探测与未匹配路径的 404：它们不受
+        限流、可被无限次触发，计入最近样本窗口会把 P50 / P95 稀释到近 0。
         """
         # 路径由 uvicorn percent-decode，可能含控制字符；指标 key 里清理掉
         safe_path = re.sub(r"[\x00-\x1f\x7f]", "?", str(path))[:200]
@@ -99,7 +104,7 @@ class RequestMetrics:
                 self._by_path[safe_path] += 1
             else:
                 self._by_path[_OTHER] += 1
-            if not streaming:
+            if not streaming and not count_only:
                 self._duration_sum_ms += elapsed
                 self._duration_count += 1
                 self._duration_max_ms = max(self._duration_max_ms, elapsed)

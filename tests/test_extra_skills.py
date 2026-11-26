@@ -144,6 +144,52 @@ def test_extra_skill_non_transient_error_returns_error():
     print("✓ 扩展技能确定性错误按错误状态返回")
 
 
+def test_extra_skill_error_log_is_redacted():
+    """扩展技能的失败日志：密钥 / 路径 / 上游 URL 遮蔽，换行单行化。"""
+    import logging
+
+    class _BadModel(_Model):
+        async def __call__(self, messages, **kwargs):
+            raise ValueError(
+                "失败 https://internal.example/v1?token=SECRET123 "
+                "C:\\Users\\alice\\secret.txt\n伪造日志行"
+            )
+
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    agent = agent_class(model=_BadModel())
+    records: list[str] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    logger = logging.getLogger("utils.simple_skill")
+    handler = _Capture(level=logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        out = asyncio.run(
+            agent.reply(
+                Msg(
+                    name="orchestrator",
+                    content=json.dumps(
+                        {"context": {"rewritten_query": "预算"}}
+                    ),
+                    role="user",
+                )
+            )
+        )
+    finally:
+        logger.removeHandler(handler)
+    assert records, "失败日志必须落盘"
+    for message in records:
+        assert "SECRET123" not in message, message
+        assert "alice" not in message, message
+        assert "\n" not in message and "\r" not in message, message
+        assert "<路径>" in message and "http(s)://***" in message, message
+    assert json.loads(out.content)["status"] == "error"
+    print("✓ 扩展技能失败日志脱敏且单行化")
+
+
 def test_extra_skill_prompt_combines_skill_md_and_system_prompt():
     """SKILL.md 与子类 system_prompt 都要进入指令（此前 system_prompt 是死代码）。"""
     agent_class = _load("trip-budget", "TripBudgetAgent")
@@ -424,6 +470,7 @@ if __name__ == "__main__":
     test_extra_skill_empty_model_response_is_retriable()
     test_extra_skill_permanent_llm_error_propagates()
     test_extra_skill_non_transient_error_returns_error()
+    test_extra_skill_error_log_is_redacted()
     test_extra_skill_prompt_combines_skill_md_and_system_prompt()
     test_extra_skill_unwraps_json_envelope()
     test_extra_skill_unwraps_fenced_json_envelope()

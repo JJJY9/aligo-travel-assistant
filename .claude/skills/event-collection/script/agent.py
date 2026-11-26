@@ -19,7 +19,9 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
+from utils.access_log import _safe_log_text
 from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
+from utils.log_redact import redact_paths
 from utils.user_query import extract_user_query
 from utils.json_parser import (
     decode_json_array_at,
@@ -898,11 +900,14 @@ class EventCollectionAgent(AgentBase):
                 # 瞬时模型错误交给编排层重试；401/402/403/404 等永久错误
                 # 同样穿透并计入熔断，不能吞成 error JSON
                 raise
-            logger.error(f"Event collection failed: {e}")
+            safe_error = redact_paths(e)
+            logger.error(
+                "Event collection failed: %s", _safe_log_text(safe_error)
+            )
             result = {
                 "missing_info": ["所有信息"],
                 "extracted_count": 0,
-                "error": str(e)
+                "error": safe_error
             }
 
         # 返回JSON字符串格式

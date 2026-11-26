@@ -2854,6 +2854,42 @@ def test_chat_stream_error_event_redacts_internal_details(monkeypatch):
     print("✓ SSE 错误事件脱敏内部异常文本")
 
 
+def test_redacted_exc_log_text_masks_key_in_traceback():
+    """兜底日志文本（含 traceback）必须先脱敏，否则 exc_info 会绕开参数。"""
+    from webapp.server import _redacted_exc_log_text
+
+    key = "sk-CANARY1234567890abcdef"
+    try:
+        raise RuntimeError(
+            f"Error code: 401 - Incorrect API key provided: {key}"
+        )
+    except RuntimeError as exc:
+        text = _redacted_exc_log_text(exc)
+    assert key not in text, text
+    assert "***" in text and "RuntimeError" in text, text
+    assert "Traceback" in text, "保留栈帧便于排查"
+
+
+def test_chat_stream_error_log_is_redacted(monkeypatch, caplog):
+    """流式兜底日志不能把网关回显的 API Key 写进应用日志。"""
+    import logging
+
+    canary = "sk-CANARY1234567890abcdef"
+    with caplog.at_level(logging.WARNING):
+        message = _stream_error_message(
+            monkeypatch,
+            RuntimeError(
+                "Error code: 401 - Incorrect API key provided: "
+                f"{canary}. upstream"
+            ),
+        )
+    assert canary not in message
+    assert "服务器内部错误" in message
+    assert canary not in caplog.text, caplog.text
+    assert "***" in caplog.text
+    print("✓ 流式兜底日志脱敏上游密钥")
+
+
 def test_chat_stream_user_facing_error_keeps_curated_message(monkeypatch):
     """UserFacingError 是给用户看的固定文案，应原样返回。"""
     from utils.errors import UserFacingError
@@ -9622,9 +9658,14 @@ def test_host_rejection_is_secured_and_counted():
         # 扫描器直接打 / 也要计入（非 /api 路径平时不记访问日志）
         root = client.get("/", headers={"Host": "evil.example.com"})
         assert root.status_code == 400
+        missing = client.get("/api/definitely-not-a-route")
+        assert missing.status_code == 404
         snapshot = REQUEST_METRICS.snapshot()
         assert snapshot["by_status"].get("400") == 2, snapshot
+        assert snapshot["by_status"].get("404") == 1, snapshot
         assert snapshot["by_path"].get("__host_rejected__") == 2, snapshot
+        assert snapshot["by_path"].get("__unmatched__") == 1, snapshot
+        assert snapshot["duration_samples"] == 0, "探测流量不进入延迟分位"
         print("✓ Host 拒绝 400 计入指标且带安全头")
     finally:
         REQUEST_METRICS.reset()

@@ -235,6 +235,38 @@ def test_delete_failure_returns_1(monkeypatch):
     print("✓ 删除过程中失败返回 1")
 
 
+def test_delete_failure_redacts_internal_paths(monkeypatch):
+    """CLI 与 Web 同一实现：失败原因里的锁文件绝对路径同样遮蔽。"""
+    import json as _json
+
+    path_message = (
+        r"无法获取文件锁：C:\Users\alice\AppData\Local\aligo"
+        r"\data\memory\u1.json.lock"
+    )
+
+    class _PathFailStore(_FakeStore):
+        def delete_trip(self, trip_id):
+            raise RuntimeError(path_message)
+
+    fake = _PathFailStore([_trip("trip_1"), _trip("trip_2")])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda user_id, path, **kwargs: fake
+    )
+    code, out = _run("u1")
+    assert code == 1 and "删除过程中失败" in out
+    assert "alice" not in out, out
+    assert "<路径>" in out, out
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_dedupe_standalone("u1", as_json=True)
+    payload = _json.loads(out.getvalue())
+    assert code == 1 and payload["ok"] is False
+    assert "alice" not in payload["error"], payload
+    assert "<路径>" in payload["error"], payload
+    print("✓ trips-dedupe 失败原因脱敏内部路径")
+
+
 def test_pg_configured_but_json_fallback(monkeypatch):
     """PostgreSQL 配置错误时工厂会回退 JSON，维护命令必须拒绝执行。"""
     from config import STORAGE_CONFIG
@@ -577,6 +609,7 @@ if __name__ == "__main__":
         test_skips_group_when_keeper_deleted_concurrently,
         test_json_backend_reloads_before_keeper_recheck,
         test_delete_failure_returns_1,
+        test_delete_failure_redacts_internal_paths,
         test_pg_configured_but_json_fallback,
         test_dry_run_does_not_delete,
         test_main_rejects_unknown_flags,

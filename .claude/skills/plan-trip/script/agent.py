@@ -885,7 +885,12 @@ class ItineraryPlanningAgent(AgentBase):
                 return None
             return _parse_plan_text(str(text))
         except Exception as exc:  # noqa: BLE001 - 修复失败保留原结果
-            logger.warning("行程校验修复失败，保留原行程：%s", exc)
+            # 修复轮同样会拿到网关错误体（可能回显密钥 / 换行）：与主路径
+            # 同口径脱敏 + 单行化
+            logger.warning(
+                "行程校验修复失败，保留原行程：%s",
+                _safe_log_text(redact_secret(str(exc))),
+            )
             return None
 
     async def reply(self, x: Msg | list[Msg] | None = None) -> Msg:
@@ -1152,7 +1157,8 @@ class ItineraryPlanningAgent(AgentBase):
                 # 401/402/403/404 等永久错误同样穿透并计入熔断
                 raise
             logger.error(
-                "Itinerary planning failed: %s", redact_secret(str(e))
+                "Itinerary planning failed: %s",
+                _safe_log_text(redact_secret(str(e)))[:MAX_LOG_TEXT],
             )
             # Ensure text is defined for logging even if extraction failed
             # 使用 locals().get 安全获取 text，防止 UnboundLocalError

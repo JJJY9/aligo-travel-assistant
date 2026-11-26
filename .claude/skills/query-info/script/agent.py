@@ -196,7 +196,9 @@ class InformationQueryAgent(AgentBase):
         result = None
         weather_failure = None
         if self._is_weather_query(user_query):
-            logger.info(f"Weather query: {user_query}")
+            # 用户提问原文（可能含具体住址 / 单位）不以 INFO 明文进日志：
+            # 长度足以定位「查询有多长」，内容不影响排查（#587 隐私口径）
+            logger.info("Weather query (len=%d)", len(user_query))
             try:
                 result = await self._weather_query(user_query)
             except Exception as e:
@@ -211,7 +213,7 @@ class InformationQueryAgent(AgentBase):
             logger.warning("Weather query unavailable, falling back to web search")
 
         if result is None or not result.get("query_success"):
-            logger.info(f"Web search query: {user_query}")
+            logger.info("Web search query (len=%d)", len(user_query))
             try:
                 result = await self._web_search(user_query)
             except Exception as e:
@@ -265,7 +267,9 @@ class InformationQueryAgent(AgentBase):
             # （记忆读写 / 落库 / 会话构造都在默认执行器上）
             data = await loop.run_in_executor(_WEATHER_EXECUTOR, fetch_weather, city)
         except WeatherError as e:
-            logger.warning(f"Weather query failed: {e}")
+            logger.warning(
+                "Weather query failed: %s", _safe_log_text(redact_paths(e))
+            )
             message = str(e)
             results: dict[str, Any] = {"message": message}
             if message.startswith("未找到城市"):

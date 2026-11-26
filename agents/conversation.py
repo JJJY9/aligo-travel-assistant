@@ -36,6 +36,7 @@ from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.errors import MemoryPersistenceError, UserFacingError
 from utils.json_safe import sanitize_json
 from utils.llm_resilience import retry_with_backoff
+from utils.log_redact import redact_secret
 from utils.paths import default_data_root
 from utils.preference_values import has_preference_value, preference_prompt_lines
 from utils.result_formatter import normalize_results, result_to_markdown
@@ -1046,8 +1047,10 @@ class ConversationRuntime:
 
         try:
             summary = await self.memory.get_long_term_summary_async(max_messages=30)
-        except Exception:  # noqa: BLE001 - 摘要失败只降级本轮上下文
-            logger.warning("读取长期会话总结失败，本轮上下文降级", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - 摘要失败只降级本轮上下文
+            logger.warning(
+                "读取长期会话总结失败，本轮上下文降级: %s", redact_secret(exc)
+            )
             summary = ""
         if summary:
             memory_parts.append(f"【历史会话总结】\n{summary}")
@@ -1060,9 +1063,10 @@ class ConversationRuntime:
         if callable(recent_summary_getter):
             try:
                 recent_summary = await recent_summary_getter(max_turns=10)
-            except Exception:  # noqa: BLE001 - 摘要失败只降级本轮上下文
+            except Exception as exc:  # noqa: BLE001 - 摘要失败只降级本轮上下文
                 logger.warning(
-                    "读取最近对话摘要失败，本轮上下文降级", exc_info=True
+                    "读取最近对话摘要失败，本轮上下文降级: %s",
+                    redact_secret(exc),
                 )
                 recent_summary = ""
             if recent_summary:

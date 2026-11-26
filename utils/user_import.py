@@ -622,8 +622,11 @@ def merged_backup_limit_problem(
     try:
         existing_kb = _existing_knowledge_rows()
     except MemoryPersistenceError as exc:
+        from utils.log_redact import redact_paths
+
         logger.warning(
-            "合并预检：读取现有知识库失败（%s），知识轴不可核对", exc
+            "合并预检：读取现有知识库失败（%s），知识轴不可核对",
+            redact_paths(exc),
         )
         existing_kb = None
         unverified_reason = (

@@ -4713,6 +4713,145 @@ def test_plan_trip_failure_log_is_single_line_and_redacted():
     print("✓ 行程规划失败日志单行化且脱敏")
 
 
+def test_plan_trip_repair_failure_log_is_redacted():
+    """校验修复轮的失败日志同样脱敏 + 单行化（与主失败路径同口径）。"""
+    import logging as _logging
+
+    module = _load_skill_module("plan-trip")
+    records: list[_logging.LogRecord] = []
+
+    class _Capture(_logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture(level=_logging.WARNING)
+    module.logger.addHandler(handler)
+    key = "sk-abcdef1234567890XYZ"
+    try:
+        class _Model:
+            async def __call__(self, messages, **kwargs):
+                raise RuntimeError(
+                    "Error code: 401 - gateway\n"
+                    f"Incorrect API key provided: {key}"
+                )
+
+        agent = module.ItineraryPlanningAgent(name="x", model=_Model())
+        result = asyncio.run(
+            agent._repair_plan(  # noqa: SLF001 - 直接覆盖修复轮日志分支
+                "probe", [{"code": "days", "message": "日期不完整"}]
+            )
+        )
+        assert result is None
+    finally:
+        module.logger.removeHandler(handler)
+    messages = [
+        record.getMessage()
+        for record in records
+        if "行程校验修复失败" in record.getMessage()
+    ]
+    assert messages, [record.getMessage() for record in records]
+    assert key not in messages[0], messages[0]
+    assert "\n" not in messages[0] and "\r" not in messages[0], messages[0]
+    print("✓ 行程校验修复失败日志单行化且脱敏")
+
+
+def test_preference_error_payload_is_redacted():
+    """偏好技能的错误 JSON 不能带本机路径 / 上游 URL / 网关回显的密钥。"""
+    agent_class = _load_skill("preference", "PreferenceAgent")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            raise ValueError(
+                r"失败 C:\Users\alice\secret\db.sqlite "
+                "https://gw.internal/v1?key=SECRET123 "
+                "Incorrect API key provided: sk-abcdefghijklmnop"
+            )
+
+    agent = agent_class(
+        name="PreferenceAgent", model=_Model(), memory_manager=_PrefMemoryForNewTests()
+    )
+    agent.skill_loader = _PrefLoaderForNewTests()
+    out = asyncio.run(
+        agent.reply(Msg(name="user", content="我搬家到上海了", role="user"))
+    )
+    data = json.loads(out.content)
+    text = json.dumps(data, ensure_ascii=False)
+    assert data.get("has_preferences") is False, data
+    assert "alice" not in text and "gw.internal" not in text, text
+    assert "sk-abcdefghijklmnop" not in text and "SECRET123" not in text, text
+    assert "<路径>" in text and "http(s)://***" in text, text
+    print("✓ 偏好错误 JSON 已脱敏")
+
+
+def test_event_collection_error_payload_is_redacted():
+    """事项收集技能的错误 JSON 同样不能回显内部路径 / 上游 URL。"""
+    agent_class = _load_skill("event-collection", "EventCollectionAgent")
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            raise ValueError(
+                r"失败 C:\Users\alice\secret\db.sqlite "
+                "https://gw.internal/v1?key=SECRET123"
+            )
+
+    agent = agent_class(name="EventCollectionAgent", model=_Model())
+    out = asyncio.run(
+        agent.reply(Msg(name="user", content="12 月 1 日去杭州出差", role="user"))
+    )
+    data = json.loads(out.content)
+    text = json.dumps(data, ensure_ascii=False)
+    assert data.get("error"), data
+    assert "alice" not in text and "gw.internal" not in text, text
+    assert "SECRET123" not in text, text
+    assert "<路径>" in text and "http(s)://***" in text, text
+    print("✓ 事项收集错误 JSON 已脱敏")
+
+
+def test_query_info_does_not_log_user_query_content():
+    """查询信息技能以 INFO 记录用户原话会泄露住址 / 单位：只记长度。"""
+    import logging as _logging
+
+    module = _load_skill_module("query-info")
+    sentinel = "我下周住杭州西湖区文三路某酒店想问天气"
+    records: list[str] = []
+
+    class _Capture(_logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    class _Model:
+        async def __call__(self, messages, **kwargs):
+            return "晴"
+
+    agent = module.InformationQueryAgent(model=_Model())
+
+    async def _fake_weather(query):
+        return {
+            "query_type": "天气查询",
+            "query_success": True,
+            "results": {"answer": "晴"},
+        }
+
+    agent._weather_query = _fake_weather  # noqa: SLF001 - 桩掉外部天气接口
+    handler = _Capture(level=_logging.INFO)
+    old_level = module.logger.level
+    module.logger.setLevel(_logging.INFO)
+    module.logger.addHandler(handler)
+    try:
+        out = asyncio.run(
+            agent.reply(Msg(name="user", content=sentinel, role="user"))
+        )
+    finally:
+        module.logger.removeHandler(handler)
+        module.logger.setLevel(old_level)
+    assert json.loads(out.content).get("query_success") is True
+    assert records, "应有天气查询 INFO 日志"
+    for message in records:
+        assert sentinel not in message, message
+    assert any("Weather query (len=" in message for message in records), records
+    print("✓ 查询信息日志不含用户提问原文")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理
