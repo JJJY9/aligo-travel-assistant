@@ -998,6 +998,42 @@ def test_json_migration_drops_blank_preference_values():
     print("✓ 加载时丢弃空值偏好条目")
 
 
+def test_json_migration_drops_unmanageable_preference_types():
+    """面板 / CLI 无法寻址的偏好类型在加载时丢弃。
+
+    空串 / 含 "/" 的键在面板路径里 404，控制字符或原始长度 >64 的键
+    422：用户既改不了也删不掉，却永久占用类型上限名额（满额后新增一律
+    409，只能手改数据文件）。读入时与 Web / CLI 的类型校验同口径丢弃。
+    """
+    import json
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+
+    directory = tempfile.mkdtemp()
+    user_id = f"json-pref-type-{uuid.uuid4().hex[:8]}"
+    with open(
+        os.path.join(directory, f"{user_id}.json"), "w", encoding="utf-8"
+    ) as handle:
+        json.dump(
+            {
+                "preferences": [
+                    {"type": "", "value": "空键"},
+                    {"type": "   ", "value": "纯空白"},
+                    {"type": "line\nbreak", "value": "控制字符"},
+                    {"type": "a" * 65, "value": "超长"},
+                    {"type": "slash/type", "value": "斜杠"},
+                    {"type": "ok", "value": "北京"},
+                ]
+            },
+            handle,
+            ensure_ascii=False,
+        )
+    store = LongTermMemory(user_id, directory)
+    assert store.get_preference() == {"ok": "北京"}
+    print("✓ 加载时丢弃无法管理的偏好类型")
+
+
 def test_pg_preference_cap_serializes_across_types(monkeypatch):
     """用户级写锁：A 持锁复核上限期间，另一个实例的新类型写入必须等待，
     不能读到「上限减一」后各自插入。"""

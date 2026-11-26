@@ -29,6 +29,12 @@ _FORMULA_PREFIXES = _FORMULA_CHARS + ("\t", "\r", "\n")
 # （int() 会把它们解析成等价数值，输出再统一格式化为纯 ASCII）
 _IDENTITY_DATE_RE = re.compile(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})")
 
+# X-ALIGO-TRIP-END 携带的原始返程日期上限（导入端同值）：附加属性是回导
+# 身份键的唯一载体，超出 100 字字段上限的脏值若不携带，回导会把返程压成
+# 出发当日、按新身份重复新增行程（去重键随之改变，trips-dedupe 清不掉）。
+# 该属性导入端只忽略、不拒事件，故按 DESCRIPTION 机器段的 2000 字符扫描界。
+_MAX_ICS_X_ATTR_CHARS = 2000
+
 
 def _identity_projection(text: str) -> str:
     """导出清洗的投影（身份键与渲染输出共用同一口径）。
@@ -276,9 +282,9 @@ def _trip_ics_event_lines(trip: dict[str, Any], user_id: str) -> list[str] | Non
         normalized_raw_end = normalize_identity_date(
             _clean_trip_value(raw_end)
         )
-        # 超长脏值与导入端字段上限同口径：超出时宁可不带（回导退化为
-        # 单日），也不能让导入端因为一个附加属性拒绝整条事件
-        if normalized_raw_end and len(normalized_raw_end) <= 100:
+        # 上限与导入端同值（_MAX_ICS_X_ATTR_CHARS）：导入端对超长属性只
+        # 忽略、不拒事件，放宽到机器段扫描界可保证带值回导时身份键不变
+        if normalized_raw_end and len(normalized_raw_end) <= _MAX_ICS_X_ATTR_CHARS:
             restored_end = normalized_raw_end
     description = (
         f"Aligo 行程：{escape_ics_machine_field(_clean_trip_value(trip.get('origin')))} → "

@@ -50,6 +50,16 @@ const PREF_NAMES = {
   budget_level: "预算等级",
 };
 
+// 偏好类型 → 显示名。必须按自有属性查找：`PREF_NAMES[type] || type` 会把
+// constructor / toString / __proto__ 等原型链成员当成真值，行标签与删除
+// 确认框显示函数源码，用户无法辨认该行
+function prefDisplayName(type) {
+  const key = String(type);
+  return Object.prototype.hasOwnProperty.call(PREF_NAMES, key)
+    ? PREF_NAMES[key]
+    : key;
+}
+
 // 偏好类型 → 最近一次已知值。渲染和保存成功后都更新：编辑按钮若只用
 // 渲染时闭包里的旧值，刷新失败后再点编辑会回填旧值、再次保存把刚成功
 // 的新值静默覆盖回去
@@ -371,6 +381,7 @@ const els = {
   storageChips: byId("storageChips"),
   knowledgeChip: byId("knowledgeChip"),
   kbList: byId("kbList"),
+  kbListStatus: byId("kbListStatus"),
   kbSearch: byId("kbSearch"),
   kbCategoryFilter: byId("kbCategoryFilter"),
   kbMore: byId("kbMore"),
@@ -4462,10 +4473,19 @@ async function loadExpandedTrips(options = {}) {
 async function refreshStatus(options = {}) {
   const requestId = (statusRequestId += 1);
   const userId = state.userId;
+  // tz：用量按浏览器时区分桶与取「近 7 天」窗口（服务端可能是 UTC，
+  // 否则今天 0-8 点 / 跨时区时「今天」高亮与合计窗口整体偏移）
+  let zone = "";
+  try {
+    zone = Intl.DateTimeFormat().resolvedOptions().timeZone || "";
+  } catch {
+    zone = "";
+  }
   try {
     const data = await getJSON(
       // today：next_trip / 概览与状态徽标同口径（服务端可能 UTC）
-      `/api/status?user_id=${encodeURIComponent(userId)}&today=${todayISO()}`,
+      `/api/status?user_id=${encodeURIComponent(userId)}&today=${todayISO()}` +
+        (zone ? `&tz=${encodeURIComponent(zone)}` : ""),
       undefined,
       30000,
     );
@@ -4548,6 +4568,12 @@ function renderOverview() {
     if (Array.isArray(value)) return value.length > 0;
     return value !== null && value !== undefined && value !== "";
   });
+  // /api/status 是权威快照：清掉已删除 / 已清空类型的合并基线，否则下一次
+  // 「添加偏好」会用旧列表整值 PUT，把另一标签页 / CLI 已删除的条目复活
+  const presentPrefTypes = new Set(preferences.map(([key]) => key));
+  for (const type of Array.from(preferenceLatest.keys())) {
+    if (!presentPrefTypes.has(type)) preferenceLatest.delete(type);
+  }
   if (!preferences.length) {
     els.overview.innerHTML =
       '<div class="empty">还没有偏好记录。聊天时告诉我「我喜欢住汉庭」，我会记住。</div>';
@@ -4559,7 +4585,7 @@ function renderOverview() {
       row.dataset.prefType = key;
       const label = document.createElement("span");
       label.className = "pref-name";
-      label.textContent = PREF_NAMES[key] || key;
+      label.textContent = prefDisplayName(key);
       const val = document.createElement("span");
       val.className = "pref-value";
       val.textContent = formatPreferenceValue(value);
@@ -4831,7 +4857,11 @@ function renderOverview() {
   els.storageChips.innerHTML = "";
   const storage = status.storage || {};
   const chips = [
-    storage.short_term === "redis" ? "短期记忆 · Redis" : "短期记忆 · 进程内",
+    storage.short_term === "redis"
+      ? storage.short_term_degraded
+        ? "短期记忆 · Redis（降级中）"
+        : "短期记忆 · Redis"
+      : "短期记忆 · 进程内",
     storage.long_term === "postgres" ? "长期记忆 · PostgreSQL" : "长期记忆 · JSON",
   ];
   chips.forEach((text) => {
@@ -4841,7 +4871,8 @@ function renderOverview() {
     els.storageChips.appendChild(chip);
   });
   const fallback =
-    (storage.short_term_configured && storage.short_term !== "redis") ||
+    (storage.short_term_configured &&
+      (storage.short_term !== "redis" || Boolean(storage.short_term_degraded))) ||
     (storage.long_term_configured && storage.long_term !== "postgres");
   if (fallback) {
     const warn = document.createElement("span");
@@ -4970,6 +5001,18 @@ function normalizeISODate(value) {
   const text = String(value || "").trim();
   const match = text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
   if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  // 形状合法但非真实日历日（备份保真可带入 2026-02-31 / 2026-12-32）：
+  // 后端 strptime 失败时按「无日期」处理（不出徽标、status 筛选与统计
+  // 不计入），前端必须同口径，否则行上显示「已结束」而筛选/导出查不到。
+  // 用算术判断而不是 Date 往返比较：JS 会把 0-99 年映射到 1900+，与
+  // Python strptime 对 0001-0099 年的接受口径不一致
+  if (year < 1 || year > 9999 || month < 1 || month > 12 || day < 1) return null;
+  const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const monthDays = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (day > monthDays[month - 1]) return null;
   return `${match[1]}-${match[2].padStart(2, "0")}-${match[3].padStart(2, "0")}`;
 }
 
@@ -5315,7 +5358,7 @@ function startEditPreference(row, type, currentValue) {
   input.maxLength = PREFERENCE_VALUE_MAX_CHARS;
   input.setAttribute(
     "aria-label",
-    `偏好值：${PREF_NAMES[type] || type}（回车保存，Esc 取消）`,
+    `偏好值：${prefDisplayName(type)}（回车保存，Esc 取消）`,
   );
   input.value = preferenceInputValue(currentValue);
   valueEl.replaceWith(input);
@@ -5416,6 +5459,11 @@ function startEditPreference(row, type, currentValue) {
       if (state.userId === requestUserId) {
         preferenceLatest.set(type, value);
         valueEl.textContent = formatPreferenceValue(value);
+        // 同步状态快照：收尾 refreshStatus 失败时 renderOverview 会用旧
+        // state.status 把刚保存的值回滚，并把缓存一起覆盖回旧值
+        if (state.status && state.status.preferences) {
+          state.status.preferences[type] = value;
+        }
       }
       if (input.isConnected) input.replaceWith(valueEl);
       // 静默：失败时「刷新数据概览失败」不能覆盖刚显示的保存成功提示
@@ -5436,6 +5484,9 @@ function startEditPreference(row, type, currentValue) {
         if (state.userId === requestUserId) {
           preferenceLatest.set(type, value);
           valueEl.textContent = formatPreferenceValue(value);
+          if (state.status && state.status.preferences) {
+            state.status.preferences[type] = value;
+          }
         }
         if (input.isConnected) input.replaceWith(valueEl);
         await refreshStatus({ silentFailure: true });
@@ -5484,8 +5535,13 @@ async function deletePreference(type, label, row) {
     );
     toast("偏好已删除");
     // 先本地移除并清掉最新值：refreshStatus 失败（静默）时不会留下已删除
-    // 的行，残留行再次「编辑」保存也不会用旧值把偏好 PUT 回来
+    // 的行，残留行再次「编辑」保存也不会用旧值把偏好 PUT 回来。状态快照
+    // 同步删除，否则刷新失败后 renderOverview 会让已删行复活、并把旧值
+    // 写回「添加偏好」的合并基线
     preferenceLatest.delete(type);
+    if (state.status && state.status.preferences) {
+      delete state.status.preferences[type];
+    }
     if (row && row.isConnected) row.remove();
     await refreshStatus({ silentFailure: true });
   } catch (error) {
@@ -5551,7 +5607,12 @@ function applyTheme(theme) {
 function updateThemeButton() {
   const dark = currentTheme() === "dark";
   els.themeToggle.innerHTML = icon(dark ? "sun" : "moon");
-  els.themeToggle.title = dark ? "切换到浅色" : "切换到深色";
+  const label = dark ? "切换到浅色主题" : "切换到深色主题";
+  els.themeToggle.title = label;
+  // 固定 aria-label「切换主题」无法让读屏得知当前档位：同步可访问名与
+  // pressed 状态（与 archivedToggle 同款写法）
+  els.themeToggle.setAttribute("aria-label", label);
+  els.themeToggle.setAttribute("aria-pressed", String(dark));
 }
 
 function isMobile() {
@@ -5594,7 +5655,14 @@ function toggleSidebar() {
         )].find((el) => el.offsetParent !== null) || null;
     }
   } else {
+    // 收起时焦点若正停在被收起（即将 inert）的侧栏里，浏览器会把焦点
+    // 重置到 body，下一次 Tab 从文档顶部重来：先记下再在施加 inert 后
+    // 还给顶栏菜单按钮（所有宽度可见，再激活即可展开）
+    const hadFocusInside =
+      document.activeElement instanceof HTMLElement &&
+      els.sidebar.contains(document.activeElement);
     const collapsed = els.app.classList.toggle("side-collapsed");
+    if (collapsed && hadFocusInside) focusTarget = els.menuBtn;
     try {
       safeStorageSet("local", "aligo.sideCollapsed", collapsed ? "1" : "0");
     } catch {
@@ -5612,6 +5680,12 @@ function syncSidebarA11y() {
     : els.app.classList.contains("side-collapsed");
   els.sidebar.toggleAttribute("inert", hidden);
   els.sidebar.setAttribute("aria-hidden", hidden ? "true" : "false");
+  // 顶栏与侧栏的开关按钮同步展开状态：静态标签「展开/收起侧栏」不反映
+  // 当前状态，读屏无法得知按下后会往哪个方向变化
+  if (els.menuBtn) els.menuBtn.setAttribute("aria-expanded", String(!hidden));
+  if (els.collapseSidebar) {
+    els.collapseSidebar.setAttribute("aria-expanded", String(!hidden));
+  }
 }
 
 function closeMobileSidebar() {
@@ -5762,6 +5836,7 @@ async function refreshKnowledgeDocuments(
     state.kbLoadedCategory = category;
     state.kbListFailed = false;
     renderKnowledgeDocuments(data.items || [], false);
+    announceKbListSummary();
     // 恢复滚动位置：重建 DOM 后浏览器会把 overflow 容器归零
     els.kbList.scrollTop = scrollTop;
   } catch (error) {
@@ -5775,6 +5850,7 @@ async function refreshKnowledgeDocuments(
       if (!silentFailure) toast(error.message);
     } else {
       els.kbList.textContent = error.message;
+      if (els.kbListStatus) els.kbListStatus.textContent = error.message;
       state.kbItems = [];
       state.kbOffset = 0;
       state.kbTotal = 0;
@@ -5818,6 +5894,7 @@ async function loadMoreKnowledgeDocuments() {
     // 每次仍以同一个 offset 请求，加载更多永远只返回同一窗口
     state.kbOffset += (data.items || []).length;
     renderKnowledgeDocuments(data.items || [], true);
+    announceKbListSummary();
     els.kbList.focus();
   } catch (error) {
     if (seq === kbListSeq && !state.kbSemanticMode) toast(error.message);
@@ -5864,6 +5941,30 @@ function knowledgePreview(content, query) {
   return `${startIndex > 0 ? "…" : ""}${chars.slice(startIndex, end).join("")}${
     end < chars.length ? "…" : ""
   }`;
+}
+
+// 列表本身承载可交互按钮，不能当实时区（role=status 会把整份列表重复
+// 朗读、打断输入）：只在独立的隐藏节点播报一行摘要
+function announceKbListSummary() {
+  if (!els.kbListStatus) return;
+  const shown = state.kbItems.length;
+  const total = state.kbTotal;
+  let next;
+  if (!shown) {
+    next = state.kbQuery
+      ? "没有匹配的知识片段。"
+      : state.kbCategory
+        ? "该分类下没有知识片段。"
+        : "还没有知识片段，可以在下方添加。";
+  } else {
+    next = state.kbQuery
+      ? `匹配 ${total} 条，已显示 ${shown} 条`
+      : `共 ${total} 条，已显示 ${shown} 条`;
+  }
+  // 内容相同不重复播报：刷新 / 翻页频繁触发，重复写入会反复朗读
+  if (els.kbListStatus.textContent !== next) {
+    els.kbListStatus.textContent = next;
+  }
 }
 
 function renderKnowledgeDocuments(items, append) {

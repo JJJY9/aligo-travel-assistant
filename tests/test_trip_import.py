@@ -697,6 +697,46 @@ def test_ics_roundtrip_unparsable_end_uses_machine_description():
     print("✓ 无法解析的返程日期经 X 属性往返（身份闭合，日历仍单日）")
 
 
+def test_ics_long_unparsable_end_keeps_identity():
+    """超过 100 字字段上限的脏返程日期仍需经 X 属性回导。
+
+    否则回导把返程压成出发当日、身份键改变，重复导入会新增一条重复
+    行程（去重键不同，trips-dedupe 也清不掉）。属性上限与导入端同为
+    _MAX_ICS_X_ATTR_CHARS；超出该界的属性只被忽略、事件本身不丢。
+    """
+    from utils.trip_export import _MAX_ICS_X_ATTR_CHARS
+    from utils.trip_import import trip_identity
+
+    long_end = "待定" + "x" * 99  # 101 字符：超过字段上限、低于属性上限
+    assert len(long_end) == 101
+    trip = {
+        "trip_id": "t-long-end",
+        "origin": "",
+        "destination": "上海",
+        "start_date": "2026-12-05",
+        "end_date": long_end,
+        "purpose": "出差",
+    }
+    text = render_trips_ics([trip], "u1")
+    unfolded = text.replace("\r\n ", "")
+    assert f"X-ALIGO-TRIP-END:{long_end}" in unfolded
+    rows, errors = parse_trips_ics(text)
+    assert errors == [], errors
+    assert len(rows) == 1, rows
+    assert rows[0]["end_date"] == long_end, rows[0]
+    assert trip_identity(rows[0]) == trip_identity(trip), "往返身份必须闭合"
+
+    huge_end = "待定" + "y" * (_MAX_ICS_X_ATTR_CHARS + 10)
+    trip2 = dict(trip, trip_id="t-huge-end", end_date=huge_end)
+    text2 = render_trips_ics([trip2], "u1")
+    assert "X-ALIGO-TRIP-END" not in text2
+    rows2, errors2 = parse_trips_ics(text2)
+    assert errors2 == [], errors2
+    assert len(rows2) == 1, "属性超限只忽略属性，事件不能丢"
+    assert rows2[0]["end_date"] == "2026-12-05"
+    print("✓ 超长脏返程日期经 X 属性回导（属性上限 2000）")
+
+
 def test_ics_old_file_without_x_attr_falls_back():
     """旧导出文件（无 X-ALIGO-TRIP-END）行为不变：回导为单日。"""
     trip = {
@@ -1691,6 +1731,7 @@ if __name__ == "__main__":
     test_ics_structure_errors_do_not_duplicate_events()
     test_ics_quoted_tzid_parameter_is_unquoted()
     test_ics_roundtrip_unparsable_end_uses_machine_description()
+    test_ics_long_unparsable_end_keeps_identity()
     test_ics_old_file_without_x_attr_falls_back()
     test_ics_calendar_dtend_only_edit_is_honored()
     test_ics_dirty_dates_use_x_attribute_only_when_needed()

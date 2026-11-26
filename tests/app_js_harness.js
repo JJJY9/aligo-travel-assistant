@@ -447,6 +447,8 @@ function scenarioRender(source) {
     date_unpadded: invoke("normalizeISODate", "2026-1-5"),
     date_slash: invoke("normalizeISODate", "2026/3/12"),
     date_bad: invoke("normalizeISODate", "下周一"),
+    date_invalid_calendar: invoke("normalizeISODate", "2026-02-31"),
+    date_leap_valid: invoke("normalizeISODate", "2024-02-29"),
   };
 }
 
@@ -3173,12 +3175,17 @@ async function scenarioEditorsRound2(source) {
     row.className = "pref-row";
     els.overview.appendChild(row);
     preferenceLatest.set("home_location", "上海");
+    state.status = { preferences: { home_location: "上海" } };
     globalThis.__row = row;
   `);
   await run('deletePreference("home_location", "常住地", __row)');
   results.deleteSuccess = run(`({
     rowRemoved: __row.removed === true,
     latestHas: preferenceLatest.has("home_location"),
+    statusHas: Boolean(
+      state.status && state.status.preferences &&
+      Object.prototype.hasOwnProperty.call(state.status.preferences, "home_location")
+    ),
     refreshes: __refreshes.slice(),
     toasts: __toasts.slice(),
   })`);
@@ -3428,7 +3435,143 @@ async function scenarioFrontendDetailFixes(source) {
   `);
   const tripLatestView = run("els.tripDestination.value");
   run("state.tripLatest.clear();");
-  return { merged, restored, pending, refreshed, archived, tripReclick, tripReclickClean, tripLatestView };
+
+  // 偏好显示名按自有属性查表：constructor / toString 等原型链成员名
+  // 不能显示成函数源码
+  const prefDisplay = run(`({
+    known: prefDisplayName("home_location"),
+    constructorKey: prefDisplayName("constructor"),
+    toStringKey: prefDisplayName("toString"),
+    unknown: prefDisplayName("custom_type"),
+  })`);
+
+  // /api/status 是权威快照：renderOverview 回收已缺席类型的合并基线，
+  // 否则下一次「添加偏好」会用旧列表整值 PUT，把已删除条目复活
+  run(`
+    __toasts = [];
+    globalThis.__putBodies = [];
+    preferenceLatest.clear();
+    preferenceLatest.set("hotel_brands", ["汉庭", "如家"]);
+    preferenceLatest.set("home_location", "上海");
+    state.status = {
+      preferences: { home_location: "北京" },
+      trips: [],
+      statistics: {},
+      usage: {},
+      storage: {},
+    };
+    state.tripsAll = [];
+    state.tripsAllTotal = 0;
+    state.tripsExpanded = false;
+    els.storageChips.children.length = 0;
+    renderOverview();
+  `);
+  const pruned = run(`({
+    hotelHas: preferenceLatest.has("hotel_brands"),
+    homeLatest: preferenceLatest.get("home_location"),
+  })`);
+  run(`
+    getJSON = async (url, options) => {
+      __putBodies.push(JSON.parse(options.body).value);
+      return {};
+    };
+    refreshStatus = async () => {};
+    els.prefValue.value = "锦江";
+    els.prefType.value = "hotel_brands";
+  `);
+  await run("addPreference({ preventDefault() {} })");
+  const prunedPut = run("__putBodies[0]");
+
+  // 存储后端 chip 与顶栏同口径：运行中降级要显示「降级中」并给回退提示
+  run(`
+    state.status = {
+      preferences: {},
+      trips: [],
+      statistics: {},
+      usage: {},
+      storage: {
+        short_term: "redis",
+        short_term_configured: true,
+        short_term_degraded: true,
+        long_term: "postgres",
+      },
+    };
+    els.storageChips.children.length = 0;
+    renderOverview();
+  `);
+  const degradedChips = run(
+    "els.storageChips.children.map((node) => String(node.textContent))",
+  );
+
+  // 主题按钮暴露当前状态：aria-pressed 与可访问名随深浅色变化
+  run(`
+    globalThis.__themeAttrs = {};
+    els.themeToggle.setAttribute = (key, value) => { __themeAttrs[key] = value; };
+    document.documentElement.dataset.theme = "dark";
+    updateThemeButton();
+  `);
+  const themeDarkAttrs = run(
+    "({ label: globalThis.__themeAttrs['aria-label'], pressed: globalThis.__themeAttrs['aria-pressed'] })",
+  );
+  run("document.documentElement.dataset.theme = 'light'; updateThemeButton();");
+  const themeLightAttrs = run(
+    "({ label: globalThis.__themeAttrs['aria-label'], pressed: globalThis.__themeAttrs['aria-pressed'] })",
+  );
+
+  // 侧栏开关按钮的 aria-expanded 随收起 / 展开同步
+  run(`
+    globalThis.__menuAttrs = {};
+    els.menuBtn.setAttribute = (key, value) => { __menuAttrs[key] = value; };
+    els.app.classList.remove("side-collapsed");
+    syncSidebarA11y();
+  `);
+  const sidebarExpanded = run("globalThis.__menuAttrs['aria-expanded']");
+  run("els.app.classList.add('side-collapsed'); syncSidebarA11y();");
+  const sidebarCollapsed = run("globalThis.__menuAttrs['aria-expanded']");
+
+  // 知识列表摘要播报：内容相同不重复写入（避免反复朗读）
+  run(`
+    globalThis.__kbStatus = [];
+    els.kbListStatus = {
+      _value: "",
+      set textContent(value) {
+        if (value !== this._value) {
+          this._value = value;
+          __kbStatus.push(value);
+        }
+      },
+      get textContent() {
+        return this._value;
+      },
+    };
+    state.kbQuery = "";
+    state.kbCategory = "";
+    state.kbTotal = 12;
+    state.kbItems = [1, 2, 3, 4, 5];
+    announceKbListSummary();
+    announceKbListSummary();
+  `);
+  const kbAnnounce = run("__kbStatus.slice()");
+
+  return {
+    merged,
+    restored,
+    pending,
+    refreshed,
+    archived,
+    tripReclick,
+    tripReclickClean,
+    tripLatestView,
+    prefDisplay,
+    pruned,
+    prunedPut,
+    degradedChips,
+    themeDarkAttrs,
+    themeLightAttrs,
+    sidebarExpanded,
+    sidebarCollapsed,
+    kbAnnounce,
+  };
 }
 
 async function scenarioUserSwitchFormsDraft(source) {
