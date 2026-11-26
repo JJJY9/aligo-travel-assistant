@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import math
 import statistics
 from typing import Any, Callable, Iterable
 
@@ -36,6 +37,11 @@ def evaluate_case(
 ) -> dict[str, Any]:
     """对单条用例做规则验收（可选 Judge），返回通过与否及原因。"""
     reasons: list[str] = []
+    # 预测侧显式报错（输出无法解析 / 单条调用失败）：空意图集合与问候类
+    # 的期望集合相等，不能按「意图匹配」白送通过
+    prediction_error = str(prediction.get("error") or "").strip()
+    if prediction_error:
+        reasons.append(f"预测不可用：{prediction_error}")
     expected = _intents(case.get("expected_intents"))
     predicted = _intents(prediction.get("intents"))
     intents_ok = expected == predicted
@@ -65,6 +71,14 @@ def evaluate_case(
     if judge is not None:
         try:
             score = judge(case, str(prediction.get("answer") or ""))
+            if score is not None:
+                # 归一化放在 try 内：非数字返回值（字符串 / 容器）此前会在
+                # 保护块外抛 ValueError 让整轮评测崩溃
+                score = float(score)
+                if not math.isfinite(score):
+                    # NaN / Infinity 混入会让 judge_mean 变成 NaN，
+                    # 且 ``nan < 阈值`` 恒为 False 把用例静默判通过
+                    raise ValueError(f"非有限分数 {score!r}")
         except Exception as exc:  # noqa: BLE001 - Judge 失败按未评分处理
             score = None
             reasons.append(f"Judge 调用失败：{type(exc).__name__}")
@@ -73,8 +87,12 @@ def evaluate_case(
             if judge_score < JUDGE_PASS_SCORE:
                 reasons.append(f"Judge 分数 {judge_score:.2f} < {JUDGE_PASS_SCORE}")
 
-    passed = intents_ok and not missing and not forbidden and not (
-        judge_score is not None and judge_score < JUDGE_PASS_SCORE
+    passed = (
+        not prediction_error
+        and intents_ok
+        and not missing
+        and not forbidden
+        and not (judge_score is not None and judge_score < JUDGE_PASS_SCORE)
     )
     return {
         "id": case.get("id"),

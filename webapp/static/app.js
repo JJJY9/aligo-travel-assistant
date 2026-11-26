@@ -4229,19 +4229,26 @@ async function refreshMetrics() {
     const data = await getJSON("/api/metrics");
     const requests = data.requests || {};
     const total = Number(requests.requests_total || 0);
+    // 耗时磁贴以计时样本数为准：SSE 长连接只计入请求数、不进耗时统计，
+    // 纯流式流量下 total>0 而 duration_samples=0（后端用 0.0 哨兵表示
+    // 「没测过」），按 total 判断会把「无样本」渲染成 0 ms
+    const samples =
+      requests.duration_samples === undefined
+        ? total
+        : Number(requests.duration_samples || 0);
     const tiles = [
-      ["请求总数", total.toLocaleString("zh-CN")],
+      ["API 请求数", total.toLocaleString("zh-CN")],
       [
         "平均耗时",
-        total ? `${Math.round(Number(requests.avg_duration_ms || 0))} ms` : "—",
+        samples ? `${Math.round(Number(requests.avg_duration_ms || 0))} ms` : "—",
       ],
       [
         "最大耗时",
-        total ? `${Math.round(Number(requests.max_duration_ms || 0))} ms` : "—",
+        samples ? `${Math.round(Number(requests.max_duration_ms || 0))} ms` : "—",
       ],
       [
         "P95 耗时",
-        total ? `${Math.round(Number(requests.p95_duration_ms || 0))} ms` : "—",
+        samples ? `${Math.round(Number(requests.p95_duration_ms || 0))} ms` : "—",
       ],
       [
         "熔断器",

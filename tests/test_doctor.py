@@ -122,6 +122,22 @@ def test_model_dir_follows_rag_config(monkeypatch):
     print("✓ 嵌入模型目录与 RAG 技能同一解析口径")
 
 
+def test_model_dir_follows_runtime_data_root(monkeypatch, tmp_path):
+    """wheel / ALIGO_DATA_DIR 部署：模型放在运行期数据目录下时 doctor 也能找到。"""
+    from config import RAG_CONFIG
+    from utils import paths as paths_module
+    from utils.doctor import _default_model_dir
+
+    monkeypatch.setitem(
+        RAG_CONFIG, "embedding_model", "data/models/custom-test-embed"
+    )
+    monkeypatch.setattr(paths_module, "default_data_root", lambda: tmp_path)
+    runtime = tmp_path / "data" / "models" / "custom-test-embed"
+    runtime.mkdir(parents=True)
+    assert _default_model_dir() == runtime
+    print("✓ 嵌入模型目录跟随运行期数据目录")
+
+
 def test_version_consistency(monkeypatch):
     from utils import version as version_module
 
@@ -259,6 +275,24 @@ def test_model_files_missing_metadata_warns():
     assert result.status == STATUS_WARN
     assert "modules.json" in result.detail
     print("✓ 缺少 modules.json → 警告（提示 mean pooling 回退）")
+
+
+def test_model_files_fast_tokenizer_without_vocab_is_ok():
+    """fast tokenizer 模型不需要 vocab.txt，不能误报 mean pooling 回退。"""
+    d = Path(tempfile.mkdtemp())
+    for f in [
+        "config.json",
+        "model.safetensors",
+        "tokenizer.json",
+        "modules.json",
+        "1_Pooling/config.json",
+    ]:
+        p = d / f
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("x", encoding="utf-8")
+    result = check_model_files(d)
+    assert result.status == STATUS_OK, result.detail
+    print("✓ 仅有 fast tokenizer 的模型 → 通过")
 
 
 def test_knowledge_base_missing():
@@ -713,6 +747,27 @@ def test_dependencies_missing_rag(monkeypatch):
     print("✓ RAG 依赖缺失 → 警告")
 
 
+def test_dependencies_rag_subdependency_missing(monkeypatch):
+    """RAG 包在但子依赖（torch）缺失 → 警告「已找到但无法加载」。"""
+    import importlib.util
+
+    real = importlib.util.find_spec
+
+    def fake(name, *args, **kwargs):
+        if name in {"pymilvus", "sentence_transformers", "milvus_lite"}:
+            return object()
+        if name in {"torch", "transformers", "numpy", "faiss"}:
+            return None if name == "torch" else object()
+        return real(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib.util, "find_spec", fake)
+    results = check_dependencies()
+    rag = next(item for item in results if item.name == "RAG 依赖")
+    assert rag.status == STATUS_WARN
+    assert "无法加载" in rag.detail and "torch" in rag.detail
+    print("✓ RAG 子依赖缺失 → 警告")
+
+
 def test_storage_redis_ping_failure(monkeypatch):
     """describe_backends 报告 Redis 后端但 ping 失败 → 警告（不是静默可用）。"""
     from config import STORAGE_CONFIG
@@ -954,6 +1009,7 @@ _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_version_check_wheel_mode_checks_static": "需要 tmp_path 夹具",
     "test_version_check_handles_non_utf8_files": "需要 tmp_path 夹具",
     "test_version_check_detects_static_version_mismatch": "需要 tmp_path 夹具",
+    "test_model_dir_follows_runtime_data_root": "需要 tmp_path 夹具",
     "test_doctor_rejects_unknown_flag": "需要 capsys 夹具",
 }
 
@@ -967,6 +1023,7 @@ if __name__ == "__main__":
     test_model_files_missing_dir()
     test_model_files_complete()
     test_model_files_missing_metadata_warns()
+    test_model_files_fast_tokenizer_without_vocab_is_ok()
     test_model_files_missing_required_fail()
     test_model_files_alternative_formats_ok()
     test_knowledge_base_missing()
@@ -988,6 +1045,7 @@ if __name__ == "__main__":
         test_llm_connectivity_branches,
         test_python_version_below_requirement,
         test_dependencies_missing_rag,
+        test_dependencies_rag_subdependency_missing,
         test_storage_redis_ping_failure,
         test_storage_postgres_probe_failure,
         test_skills_root_without_scripts,

@@ -43,6 +43,9 @@ function makeNode() {
       this.children.push(child);
       return child;
     },
+    append(...nodes) {
+      for (const node of nodes) this.children.push(node);
+    },
     insertBefore(child) {
       return child;
     },
@@ -1737,6 +1740,42 @@ async function scenarioCopy(source) {
     focus_restored: previous.focusCalls,
     toasts: env.__toasts,
   };
+}
+
+async function scenarioMetricsPanel(source) {
+  const results = {};
+  const payloads = {
+    sseOnly: {
+      requests_total: 3,
+      duration_samples: 0,
+      avg_duration_ms: 0,
+      max_duration_ms: 0,
+      p95_duration_ms: 0,
+    },
+    sampled: {
+      requests_total: 3,
+      duration_samples: 2,
+      avg_duration_ms: 12.4,
+      max_duration_ms: 30,
+      p95_duration_ms: 20,
+    },
+  };
+  for (const [key, requests] of Object.entries(payloads)) {
+    const env = buildEnv(source);
+    runIn(env, 'els.metricsStats = document.createElement("div");');
+    const promise = runIn(env, "refreshMetrics()");
+    await tick();
+    env.__requests[0].resolve({
+      requests,
+      circuit_breaker: { state: "closed" },
+    });
+    await promise;
+    results[key] = runIn(
+      env,
+      "els.metricsStats.children.map((box) => box.children.map((node) => String(node.textContent)))"
+    );
+  }
+  return results;
 }
 
 async function scenarioDeleteTurn(source) {
@@ -3720,6 +3759,8 @@ async function main() {
     payload = await scenarioStopReconcileQueue(source);
   } else if (scenario === "openSessionGuards") {
     payload = await scenarioOpenSessionGuards(source);
+  } else if (scenario === "metricsPanel") {
+    payload = await scenarioMetricsPanel(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

@@ -103,6 +103,29 @@ def test_failure_when_agent_import_breaks(monkeypatch):
     print("✓ 智能体模块导入失败 → 友好失败（退出码 1）")
 
 
+def test_error_detail_is_redacted(monkeypatch):
+    """评测失败原因不能把本机路径 / 密钥原文带到终端与 CI 日志。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status(True))
+
+    class _LeakyAgent:
+        def __init__(self, **kwargs):
+            raise RuntimeError(
+                "load failed at D:\\Users\\someone\\models\\x with key sk-abc123DEF456"
+            )
+
+    monkeypatch.setattr(rag_knowledge_agent, "RAGKnowledgeAgent", _LeakyAgent)
+    code, out = _run(monkeypatch)
+    assert code == 1
+    assert "sk-abc123DEF456" not in out
+    assert "D:\\Users\\someone" not in out
+    code, out = _run(monkeypatch, as_json=True)
+    payload = json.loads(out)
+    assert code == 1
+    assert "sk-abc123DEF456" not in payload["error"]
+    assert "D:\\Users\\someone" not in payload["error"]
+    print("✓ 评测失败原因脱敏（路径 / 密钥）")
+
+
 class _FakeAgent:
     initialized = True
 
@@ -283,6 +306,7 @@ if __name__ == "__main__":
         test_failure_on_infra_error,
         test_failure_when_agent_init_raises,
         test_failure_when_agent_import_breaks,
+        test_error_detail_is_redacted,
         test_failure_when_search_backend_raises,
         test_pass_and_fail_thresholds,
         test_min_hit5_flag_changes_threshold,

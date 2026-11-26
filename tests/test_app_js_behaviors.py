@@ -1127,6 +1127,20 @@ def test_open_session_guards_deleting_and_unknown_empty():
     print("✓ openSession 删除在途 / 未知空会话守卫")
 
 
+def test_metrics_panel_uses_duration_samples():
+    """纯 SSE 流量（有请求数、无计时样本）时耗时磁贴显示 —，而不是 0 ms。"""
+    results = _run_harness("metricsPanel")
+    sse = {str(label): value for value, label in results["sseOnly"]}
+    assert sse["API 请求数"] == "3", sse
+    for label in ("平均耗时", "最大耗时", "P95 耗时"):
+        assert sse[label] == "—", sse
+    sampled = {str(label): value for value, label in results["sampled"]}
+    assert sampled["平均耗时"] == "12 ms", sampled
+    assert sampled["最大耗时"] == "30 ms", sampled
+    assert sampled["P95 耗时"] == "20 ms", sampled
+    print("✓ 运行指标面板按计时样本数判断耗时")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -1207,4 +1221,5 @@ if __name__ == "__main__":
     test_user_switch_clears_preference_cache()
     test_stop_reconcile_deferred_until_next_turn_ends()
     test_open_session_guards_deleting_and_unknown_empty()
+    test_metrics_panel_uses_duration_samples()
     print("\n全部通过")

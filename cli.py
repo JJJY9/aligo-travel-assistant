@@ -2127,7 +2127,12 @@ def run_doctor_standalone(
     else:
         # rich 缺失时退回纯文本：依赖缺失本身也要能被如实看到
         for item in results:
-            print(f"[{item.status}] {item.name}: {item.detail}")
+            # 详情常含上游错误原文：与表格分支同口径剥掉 ANSI/OSC 控制序列，
+            # 不让伪造的终端指令随错误文本回显
+            print(
+                f"[{item.status}] {_plain_safe(item.name)}: "
+                f"{_plain_safe(item.detail)}"
+            )
         text, _style = summarize(results)
         print(text)
     return 1 if failed else 0
@@ -2373,6 +2378,7 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
         0 评测完成且 hit@5 达标（或知识库未初始化，跳过）；1 未达标或后端故障
     """
     from utils.knowledge_stats import knowledge_status
+    from utils.log_redact import redact_paths
 
     status = knowledge_status()
     if not status.get("available"):
@@ -2413,16 +2419,17 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
                 )
             return 1
         # 读取失败 / 文件锁占用等属于基础设施故障，不能当作“跳过”并返回成功
+        safe_reason = redact_paths(reason)
         if as_json:
             print(
                 json.dumps(
-                    {"ok": False, "skipped": False, "reason": reason},
+                    {"ok": False, "skipped": False, "reason": safe_reason},
                     ensure_ascii=False,
                     indent=2,
                 )
             )
         else:
-            print(f"评测失败：知识库不可用（{reason}）")
+            print(f"评测失败：知识库不可用（{_plain_safe(safe_reason)}）")
         return 1
 
     try:
@@ -2431,16 +2438,20 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
 
         agent = RAGKnowledgeAgent(collection_name=status["collection"])
     except Exception as exc:  # noqa: BLE001 - 依赖 / 技能加载失败与 Agent 初始化同口径
+        # 异常文本可能回显 API Key / 本机路径：与交互路径同口径先脱敏
+        detail = redact_paths(exc)
         if as_json:
             print(
                 json.dumps(
-                    {"ok": False, "error": f"无法初始化 RAG Agent: {exc}"},
+                    {"ok": False, "error": f"无法初始化 RAG Agent: {detail}"},
                     ensure_ascii=False,
                     indent=2,
                 )
             )
         else:
-            print(f"评测失败：无法初始化 RAG Agent（{exc}）")
+            print(
+                f"评测失败：无法初始化 RAG Agent（{_plain_safe(detail)}）"
+            )
         return 1
     if not agent.initialized:
         if as_json:
@@ -2467,16 +2478,17 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
             min_score=float(RAG_CONFIG.get("min_score", 0.5)),
         )
     except Exception as exc:  # noqa: BLE001 - 检索后端故障不能报成 0% 命中
+        detail = redact_paths(exc)
         if as_json:
             print(
                 json.dumps(
-                    {"ok": False, "error": f"检索后端不可用：{exc}"},
+                    {"ok": False, "error": f"检索后端不可用：{detail}"},
                     ensure_ascii=False,
                     indent=2,
                 )
             )
         else:
-            print(f"评测失败：检索后端不可用（{exc}）")
+            print(f"评测失败：检索后端不可用（{_plain_safe(detail)}）")
         return 1
     passed = result["hit5"] >= min_hit5
     if as_json:
