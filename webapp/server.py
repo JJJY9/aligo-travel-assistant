@@ -5012,7 +5012,10 @@ def create_app(model: Any = None) -> FastAPI:
     @app.get("/api/weather")
     async def weather(
         request: Request,
-        city: str = Query(..., min_length=1, max_length=50, pattern=r"^[^\x00-\x1F\x7F]*$"),
+        # 与行程目的地（TripPayload.destination / 导入 / 前端 maxlength）同为
+        # 100 字：写成行程的目的地必须能查天气，50 字上限会让 51-100 字的
+        # 目的地固定 422、面板静默不显示天气
+        city: str = Query(..., min_length=1, max_length=100, pattern=r"^[^\x00-\x1F\x7F]*$"),
     ) -> JSONResponse:
         """目的地天气（Open-Meteo，无 API Key；专用线程池，进程内缓存 10 分钟）。"""
         _reject_cross_site_side_effect(request)

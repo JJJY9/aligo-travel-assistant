@@ -289,6 +289,11 @@ def test_render_markdown_caps_oversized_message():
     assert data["userCut"] is True, data
     assert data["userCappedLength"] < 260000, data["userCappedLength"]
     assert data["userNormalUntouched"] is True, data
+    # 截断点落在代理对中间时不能产出孤立代理（浏览器显示 U+FFFD）
+    assert data["emojiCapLone"] is False, "用户气泡截断不能劈开代理对"
+    assert data["emojiMdLone"] is False, "Markdown 截断不能劈开代理对"
+    assert data["emojiCapSuffix"] is True, data
+    assert data["emojiCapLength"] == 200007, data["emojiCapLength"]
     print("✓ Markdown / 用户气泡渲染长度上限")
 
 
@@ -385,6 +390,18 @@ def test_frontend_detail_fixes():
     assert display["constructorKey"] == "constructor", "原型链成员名必须按原键回退"
     assert display["toStringKey"] == "toString", display
     assert display["unknown"] == "custom_type", display
+    agents = data["agentDisplay"]
+    assert agents["constructorKey"] == "constructor", agents
+    assert agents["protoKey"] == "__proto__", agents
+    assert agents["upperConstructor"] == "Constructor", agents
+    assert agents["known"] == "预算建议", agents
+    assert agents["unknown"] == "Greeting_Agent", agents
+    assert agents["intentsConstructor"] == "constructor", agents
+    assert agents["intentsProtoList"] == "__proto__、toString、valueOf", agents
+    assert agents["intentsObject"] == "constructor", agents
+    assert agents["intentsKnown"] == "行程规划", agents
+    assert "constructor" in agents["badge"], agents["badge"]
+    assert "native code" not in agents["badge"], agents["badge"]
     pruned = data["pruned"]
     assert pruned["hotelHas"] is False, "权威快照里已缺席的类型必须回收合并基线"
     assert pruned["homeLatest"] == "北京", pruned
@@ -847,6 +864,9 @@ def test_send_message_http_error_not_connection_interruption():
         assert data["reconcileCalls"] == [], data
         assert data["healthText"] != "连接异常", data
         assert data.get("healthClass") != "health err", data
+        # 本轮必然未落库：输入框已被清空，必须把提问放回草稿，否则切走
+        # 会话后正文只剩会随消息区重建消失的临时气泡
+        assert data["input"] == "你好", data
     print("✓ HTTP 错误不再触发停止对账 / 连接异常")
 
 
@@ -1290,6 +1310,188 @@ def test_metrics_panel_uses_duration_samples():
     print("✓ 运行指标面板按计时样本数判断耗时")
 
 
+def test_stop_reconcile_preserves_registration_across_switch():
+    """停止后切走会话：待对账登记保留，回到该会话时再对账。"""
+    data = _run_harness("stopReconcileParked")
+    assert data["parked"] == "deferred", data
+    assert data["after_parked"]["pending"] == 1, data["after_parked"]
+    assert data["after_parked"]["requests"] == 0, data["after_parked"]
+    # 在另一个会话里 flush：不丢弃登记，也不发请求 / 不动当前界面
+    assert data["after_flush"]["pending"] == 1, data["after_flush"]
+    assert data["after_flush"]["requests"] == 0, data["after_flush"]
+    # 回到 s1 打开会话：调度补对账
+    assert data["opened"] is True, data
+    assert data["flushes"] == 1, data
+    assert data["pending_after_open"] == 1, data
+    print("✓ 停止对账登记跨会话保留并在回到会话时补跑")
+
+
+def test_stop_reconcile_single_flight():
+    """600ms 定时器与 flush 并发对账同一回合时只执行一条链。"""
+    data = _run_harness("stopReconcileSingle")
+    assert data["impl_calls"] == 1, data
+    assert data["second"] == "deferred", data
+    assert data["first"] == "deferred", data
+    assert data["pending"] == 1, data
+    print("✓ 停止对账同一回合去重（单飞）")
+
+
+def test_delete_inflight_session_restores_edit_entry():
+    """删除在途会话作废其加载后，必须补回当前会话的编辑入口。"""
+    data = _run_harness("editChipRestore")
+    assert data["initial"] == 1, data
+    assert data["during_load"] == 0, data
+    assert data["after_delete"] == 1, "作废在途加载后必须补回编辑入口"
+    assert data["session_id"] == "B", data
+    assert data["session_loading"] is False, data
+    print("✓ 删除作废会话加载后恢复编辑入口")
+
+
+def test_trip_late_response_respects_request_user():
+    """行程删除 / 编辑 404 的迟到响应不能清掉新用户正在编辑的同号行程。"""
+    data = _run_harness("tripLateUserGuard")
+    deleted = data["deleteSwitched"]
+    assert deleted["editing"] == "trip_1", deleted
+    assert deleted["destination"] == "B-杭州", deleted
+    assert deleted["submit"] == "保存修改", deleted
+    assert not any("行程已删除" in item for item in deleted["toasts"]), deleted
+    control = data["deleteSameUser"]
+    assert control["editing"] is None, control
+    assert control["submit"] == "保存行程", control
+    assert any("行程已删除" in item for item in control["toasts"]), control
+
+    added = data["addSwitched"]
+    assert added["editing"] == "trip_1", added
+    assert added["destination"] == "B-杭州", added
+    assert added["submit"] == "保存修改", added
+    assert not any("已被删除" in item for item in added["toasts"]), added
+    add_control = data["addSameUser"]
+    assert add_control["editing"] is None, add_control
+    assert add_control["submit"] == "保存行程", add_control
+    print("✓ 行程迟到响应按发起账号守卫")
+
+
+def test_send_blocked_while_current_session_deleting():
+    """当前会话删除在途时拒绝发送；删除的是别的会话时不影响。"""
+    data = _run_harness("deleteInFlightSend")
+    assert data["before"]["busy"] is False, data["before"]
+    blocked = data["blocked"]
+    assert blocked["fetchCalls"] == 0, blocked
+    assert blocked["input"] == "追问", "被拦截时不能清空草稿"
+    assert any("会话正在删除" in item for item in blocked["toasts"]), blocked
+    after = data["after_delete"]
+    assert after["fetchCalls"] == 1, after
+    assert after["lastBody"]["session_id"] is None, after
+    other = data["other_session"]
+    assert other["fetchCalls"] == 1, other
+    assert other["body"]["session_id"] == "s1", other
+    print("✓ 删除在途会话拦截发送")
+
+
+def test_trip_import_partial_failure_reconciles():
+    """导入部分失败 / 超时后必须刷新面板（服务端可能已写入）。"""
+    data = _run_harness("tripImportFailure")
+    partial = data["partial"]
+    assert any("导入部分失败" in item for item in partial["toasts"]), partial
+    assert not any(item.startswith("导入行程失败") for item in partial["toasts"]), (
+        "503 部分失败是服务端原文提示，不能加通用失败前缀"
+    )
+    assert partial["refreshCalls"] == 1, partial
+    assert partial["refreshOptions"][0].get("silentFailure") is True, partial
+    assert partial["buttonText"] == "导入行程", partial
+    assert partial["buttonDisabled"] is False, partial
+
+    timeout = data["timeout"]
+    assert any("服务端可能仍在写入" in item for item in timeout["toasts"]), timeout
+    assert timeout["refreshCalls"] == 1, timeout
+
+    bad = data["badRequest"]
+    assert bad["toasts"] == ["导入行程失败：bad request"], bad
+    assert bad["refreshCalls"] == 0, bad
+
+    switched = data["switched"]
+    assert switched["refreshCalls"] == 0, "切号后不能把旧用户的结果刷进新用户界面"
+    assert any("已切换用户" in item for item in switched["toasts"]), switched
+    print("✓ 行程导入部分失败 / 超时后对账刷新")
+
+
+def test_user_switch_storage_failure_warns_and_keeps_old_account():
+    """浏览器拒绝存储时切换仍生效，但提示必须说明重载会回退。"""
+    data = _run_harness("userSwitchStorageBlocked")
+    switched = data["switched"]
+    assert switched["userId"] == "bob", switched
+    assert switched["local"] == "alice", "不得静默覆盖旧账号"
+    assert switched["toasts"], switched
+    assert "未能保存" in switched["toasts"][0], switched
+    assert switched["toasts"][0] != "已切换用户", switched
+    assert data["reload"] == "alice", data
+    print("✓ 切换用户存储失败时明确提示且不谎称持久化")
+
+
+def test_delete_session_late_response_keeps_new_user_list():
+    """A 的删除成功响应迟到且已切到 B：不能改 B 的列表 / 总数 / 游标。"""
+    data = _run_harness("deleteSessionLateResponse")
+    switched = data["switched"]
+    assert switched["sessions"] == ["y", "z"], switched
+    assert switched["total"] == 2, switched
+    assert switched["offset"] == 2, switched
+    assert not any("会话已删除" in item for item in switched["toasts"]), switched
+    control = data["sameUser"]
+    assert control["sessions"] == [], control
+    assert control["total"] == 0, control
+    assert control["offset"] == 0, control
+    assert any("会话已删除" in item for item in control["toasts"]), control
+    print("✓ 删除会话迟到响应按发起账号守卫")
+
+
+def test_delete_session_unknown_outcome_reconciles():
+    """删除响应中断（超时 / 5xx）时按服务端列表对账，而不是谎称失败。"""
+    data = _run_harness("sessionDeleteUnknown")
+    timeout = data["timeout"]
+    assert timeout["sessions"] == ["B"], timeout
+    assert timeout["total"] == 1, timeout
+    assert timeout["offset"] == 1, timeout
+    assert timeout["sessionId"] is None, timeout
+    assert timeout["welcome"] >= 1, timeout
+    assert any("已按服务端列表确认" in item for item in timeout["toasts"]), timeout
+    server = data["serverError"]
+    assert server["sessions"] == ["B"], server
+    conflict = data["conflict"]
+    assert conflict["list_requests"] == 0, "409 是确定失败，不应额外对账"
+    assert any(item.startswith("删除失败") for item in conflict["toasts"]), conflict
+    assert conflict["sessions"] == ["A", "B"], conflict
+    print("✓ 删除会话结果未知时对账")
+
+
+def test_trip_filter_failure_does_not_claim_match_count():
+    """展开行程刷新失败保留旧列表时，计数不能声称新条件匹配 N 条。"""
+    data = _run_harness("tripFilterFailureStale")
+    failed = data["failed"]
+    assert failed["count"] == "筛选加载失败，列表为上次结果", failed
+    assert "匹配 312" not in failed["count"], failed
+    assert failed["rows"] > 0, "失败时必须保留旧列表"
+    assert any("加载行程列表失败" in item for item in failed["toasts"]), failed
+    silent = data["silent"]
+    assert silent["count"] == "筛选加载失败，列表为上次结果", silent
+    assert silent["toasts"] == [], silent
+    assert data["recovered"] == "匹配 1 条", data
+    print("✓ 行程筛选失败时计数不再假装匹配")
+
+
+def test_edit_delete_unknown_outcome_message():
+    """编辑重发的删除请求超时 / 5xx：提示结果未知而不是确定失败。"""
+    data = _run_harness("editDeleteOutcome")
+    for case in ("timeout", "serverError"):
+        item = data[case]
+        assert any("结果未知" in text for text in item["toasts"]), item
+        assert not any(text.startswith("编辑失败") for text in item["toasts"]), item
+        assert item["saveText"] == "保存并重新发送", item
+        assert item["saveDisabled"] is False, item
+    conflict = data["conflict"]
+    assert any(text.startswith("编辑失败") for text in conflict["toasts"]), conflict
+    print("✓ 编辑重发删除结果未知的提示")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -1378,4 +1580,15 @@ if __name__ == "__main__":
     test_webapp_round_interaction_fixes()
     test_webapp_round_semantic_stash_and_truncation()
     test_metrics_panel_uses_duration_samples()
+    test_stop_reconcile_preserves_registration_across_switch()
+    test_stop_reconcile_single_flight()
+    test_delete_inflight_session_restores_edit_entry()
+    test_trip_late_response_respects_request_user()
+    test_send_blocked_while_current_session_deleting()
+    test_trip_import_partial_failure_reconciles()
+    test_user_switch_storage_failure_warns_and_keeps_old_account()
+    test_delete_session_late_response_keeps_new_user_list()
+    test_delete_session_unknown_outcome_reconciles()
+    test_trip_filter_failure_does_not_claim_match_count()
+    test_edit_delete_unknown_outcome_message()
     print("\n全部通过")

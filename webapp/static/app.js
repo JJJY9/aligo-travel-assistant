@@ -17,10 +17,14 @@ const AGENT_NAMES = {
 };
 
 // 大小写不敏感：历史消息的 _meta 可能保存了 Trip-Budget / Packing-List 等
-// 模型输出的混合大小写变体，精确键查找会退化为显示英文目录名
+// 模型输出的混合大小写变体，精确键查找会退化为显示英文目录名。
+// 必须按自有属性查找：constructor / __proto__ 等原型链成员会被当成真值，
+// 界面显示成函数源码或 [object Object]
 function agentDisplayName(name) {
   const key = String(name || "").trim().toLowerCase();
-  return AGENT_NAMES[key] || name;
+  return Object.prototype.hasOwnProperty.call(AGENT_NAMES, key)
+    ? AGENT_NAMES[key]
+    : name;
 }
 
 const INTENT_NAMES = {
@@ -158,6 +162,10 @@ const state = {
   tripsFilter: "",
   // 行程状态筛选（active / upcoming / past）：与面板状态徽标同一口径
   tripsStatusFilter: "",
+  // 展开列表内容对应的筛选快照：刷新失败保留旧列表时，计数文案不能
+  // 假装旧结果就是新条件的匹配
+  tripsLoadedFilter: "",
+  tripsLoadedStatus: "",
   sessionTotal: 0,
   // 会话分页游标：与 kbOffset 同一口径，按「已向服务端取回的条数」前进；
   // 用「已显示条数」在头部并发插入整页时会永远卡在同一个窗口
@@ -414,6 +422,10 @@ const els = {
 
 let welcomeTemplate = null;
 let sessionLoadToken = 0;
+// 正在对账的停止回合（sessionId + turnId）：600ms 定时器与回合结束后的
+// flushPendingStoppedTurns 会同时轮询同一回合，无互斥时一次停止放大成
+// 两套 10 次详情 GET 与重复 toast
+const reconcilingStoppedTurns = new Set();
 // 每次会话加载的 AbortController：新加载开始即中止上一次在途请求。
 // 旧请求的结果本就会按 token 丢弃，主动中止还能让等待它 settle 的调用方
 // （启动恢复）立即返回，不会把 state.ready 卡到旧请求超时
@@ -491,6 +503,21 @@ function clampText(text, max) {
 function sliceCodePoints(text, max) {
   const chars = Array.from(String(text || ""));
   return chars.length > max ? `${chars.slice(0, max).join("")}…` : String(text || "");
+}
+
+// 按 UTF-16 码元上限截断，但截断点落在代理对中间时少留一个高位代理，
+// 避免产生孤立代理（浏览器按 U+FFFD 显示）。O(1)：这里处理的正是接近
+// 50MB 的超长消息，不能整段转成码点数组
+function capAtCodePointBoundary(text, max) {
+  const source = String(text ?? "");
+  if (source.length <= max) return source;
+  let end = max;
+  const last = source.charCodeAt(end - 1);
+  const next = source.charCodeAt(end);
+  if (last >= 0xd800 && last <= 0xdbff && next >= 0xdc00 && next <= 0xdfff) {
+    end -= 1;
+  }
+  return source.slice(0, end);
 }
 
 function clockNow() {
@@ -746,7 +773,7 @@ function renderMarkdown(text) {
   if (source.length > MAX_MARKDOWN_CHARS) {
     // 备份恢复允许单条消息接近 50MB：整段同步转义 + 正则扫描会在打开
     // 会话时把主线程冻结数秒。截断显示，完整内容仍保留在存储与导出里
-    source = source.slice(0, MAX_MARKDOWN_CHARS);
+    source = capAtCodePointBoundary(source, MAX_MARKDOWN_CHARS);
     truncated = true;
   }
   const lines = source.split("\n");
@@ -935,7 +962,7 @@ function capRenderText(text) {
   // renderMarkdown 的 MAX_MARKDOWN_CHARS 截断，这里此前遗漏）
   const source = String(text == null ? "" : text);
   return source.length > MAX_MARKDOWN_CHARS
-    ? source.slice(0, MAX_MARKDOWN_CHARS) + "…（已截断显示）"
+    ? capAtCodePointBoundary(source, MAX_MARKDOWN_CHARS) + "…（已截断显示）"
     : source;
 }
 
@@ -1078,6 +1105,11 @@ function startEditUserNode(node, originalText) {
       toast("会话正在加载，请稍候");
       return;
     }
+    if (currentSessionDeleting()) {
+      // 删除在途时先删后会与 DELETE 交错：本轮被一并删除或拿到 409
+      toast("会话正在删除，请稍候");
+      return;
+    }
     const text = input.value.trim();
     if (!text) {
       toast("提问不能为空");
@@ -1113,7 +1145,14 @@ function startEditUserNode(node, originalText) {
       saving = false;
       input.dataset.saving = "0";
       setBusy(false);
-      toast(`编辑失败：${error.message}`);
+      // 无状态码（超时 / 断网）或 5xx（网关 502/504、响应前上游挂掉）：
+      // 删除上一轮的请求可能已在服务端执行，不能当确定失败让用户在旧视图上重试
+      const status = Number((error && error.status) || 0);
+      if (!status || status >= 500) {
+        toast("编辑请求结果未知：上一轮可能已被删除，请刷新页面确认后再试");
+      } else {
+        toast(`编辑失败：${error.message}`);
+      }
       save.disabled = false;
       cancel.disabled = false;
       save.textContent = "保存并重新发送";
@@ -1322,6 +1361,10 @@ async function retryFailed(node, text) {
     toast("会话正在加载，请稍候");
     return;
   }
+  if (currentSessionDeleting()) {
+    toast("会话正在删除，请稍候");
+    return;
+  }
   // 停止 / 断网后服务端可能已把这一轮落库（对账被重试点击抢先跳过）：
   // 重发前按 client_turn_id 精确确认，已保存则刷新历史而不是再发一条
   const turnId = (node && node.dataset && node.dataset.turnId) || "";
@@ -1410,6 +1453,10 @@ async function regenerate(node, text) {
     toast("会话正在加载，请稍候");
     return;
   }
+  if (currentSessionDeleting()) {
+    toast("会话正在删除，请稍候");
+    return;
+  }
   // 未保存的编辑确认必须在删除服务端上一轮之前：确认可取消，之后的
   // deleteLastTurn + node.remove 是破坏性的
   if (!confirmDiscardPendingEdit("重新生成")) return;
@@ -1446,10 +1493,11 @@ async function regenerate(node, text) {
     } catch (error) {
       setBusy(false);
       restoreChip();
-      // 超时 / 断网（无 HTTP 状态）：DELETE 可能已在服务端执行，不能
+      // 无状态码（超时 / 断网）或 5xx：DELETE 可能已在服务端执行，不能
       // 谎称「失败」让用户当没发生过
-      if (!Number((error && error.status) || 0)) {
-        toast("重新生成请求超时，结果未知；请刷新页面确认后再重试");
+      const status = Number((error && error.status) || 0);
+      if (!status || status >= 500) {
+        toast("重新生成请求结果未知；请刷新页面确认后再重试");
       } else {
         toast(`重新生成失败：${error.message}`);
       }
@@ -1713,6 +1761,8 @@ async function toggleTripsExpanded() {
     if (requestId !== tripsRequestId || userId !== state.userId) return;
     state.tripsAll = data.trips || [];
     state.tripsAllTotal = Number(data.total || state.tripsAll.length);
+    state.tripsLoadedFilter = query;
+    state.tripsLoadedStatus = status;
     state.tripsExpanded = true;
     renderOverviewUnlessEditing();
   } catch (error) {
@@ -1772,6 +1822,9 @@ async function importTripsFromFile(file) {
   // 解码 / 网络等待期间用户可能切换用户：导入必须落在选择文件时所属的用户
   const userId = state.userId;
   let imported = false;
+  // 结果不确定但服务端可能已写入（503 部分失败 / 客户端超时）：按钮复位后
+  // 也要刷新面板，否则已落库的行程在列表里不可见
+  let reconcile = false;
   try {
     if (file.size > 2 * 1024 * 1024) {
       toast("文件过大（上限 2 MB），请拆分后再导入");
@@ -1891,7 +1944,22 @@ async function importTripsFromFile(file) {
       );
       imported = true;
     } catch (error) {
-      toast(`导入行程失败：${error.message}`);
+      const status = Number((error && error.status) || 0);
+      const message = String((error && error.message) || error);
+      if (status === 503 && message.includes("导入部分失败")) {
+        // 服务端逐行提交后中途失败：已提交部分必须对账，否则面板停在
+        // 旧列表。服务端文案已含已提交条数与「可安全重跑」，不再加前缀
+        toast(message);
+        reconcile = true;
+      } else if (!status && message.includes("超时")) {
+        // 客户端放弃等待不代表服务端没在写（单 worker 执行器不可取消）
+        toast(
+          "导入请求超时：服务端可能仍在写入，请稍后重新打开面板确认结果（首次任务结束前重试可能提示「已有导入任务在处理」）",
+        );
+        reconcile = true;
+      } else {
+        toast(`导入行程失败：${message}`);
+      }
     }
   } finally {
     if (button) {
@@ -1901,10 +1969,14 @@ async function importTripsFromFile(file) {
     }
   }
   // 状态刷新可能等待慢接口：放在按钮复位之后，成功提示不会被「导入中…」卡住
-  if (imported) {
-    // 刷新失败由这里静默处理：否则「刷新数据概览失败」会覆盖导入成功提示，
-    // 用户会误以为行程没写进去
-    await refreshStatus({ silentFailure: true });
+  if (imported || reconcile) {
+    if (state.userId !== userId) {
+      // 导入落在选择文件时的用户：刷新只对当前用户的界面有意义
+      toast(`已切换用户：导入结果属于用户 ${userId}，切回后重新打开面板即可看到`);
+    } else {
+      // 刷新失败由这里静默处理：否则「刷新数据概览失败」会覆盖导入结果提示
+      await refreshStatus({ silentFailure: true });
+    }
   }
 }
 
@@ -2078,12 +2150,15 @@ async function addTrip(event) {
   } catch (error) {
     if (editingId && error.status === 404) {
       // 编辑目标已被其它标签页 / CLI 删除：退出编辑态（保留当前字段作为
-      // 新增草稿），否则「保存修改」永远 404（与知识库保存 404 同口径）
-      toast(`${error.message}（该行程已被删除，已退出编辑，可重新添加）`);
-      if (state.tripEditingId === editingId) {
-        state.tripEditingId = null;
-        els.tripSubmit.textContent = "保存行程";
-        els.tripEnd.dataset.hadInvalid = "";
+      // 新增草稿），否则「保存修改」永远 404（与知识库保存 404 同口径）。
+      // 期间已切换用户：结果属于原用户，不能提示 / 改动新用户正在编辑的表单
+      if (state.userId === requestUserId) {
+        toast(`${error.message}（该行程已被删除，已退出编辑，可重新添加）`);
+        if (state.tripEditingId === editingId) {
+          state.tripEditingId = null;
+          els.tripSubmit.textContent = "保存行程";
+          els.tripEnd.dataset.hadInvalid = "";
+        }
       }
       await refreshStatus({ silentFailure: true });
     } else {
@@ -2328,14 +2403,22 @@ async function _runUserBackupImport(file, targetUser) {
 
 /* ---------- 执行路线 ---------- */
 
+// 与 prefDisplayName / agentDisplayName 同口径：意图名来自模型输出，
+// 原型链成员（constructor / __proto__）不能当映射值
+function intentDisplayName(key) {
+  return Object.prototype.hasOwnProperty.call(INTENT_NAMES, key)
+    ? INTENT_NAMES[key]
+    : key;
+}
+
 function summarizeIntents(intents) {
   if (!Array.isArray(intents)) return "";
   const names = intents
     .map((item) => {
-      if (typeof item === "string") return INTENT_NAMES[item] || item;
+      if (typeof item === "string") return intentDisplayName(item);
       if (item && typeof item === "object") {
         const key = item.type || item.intent || item.name || "";
-        return INTENT_NAMES[key] || key;
+        return intentDisplayName(key);
       }
       return "";
     })
@@ -3428,6 +3511,17 @@ async function openSession(sessionId, options = {}) {
       scrollToBottom(true);
     }
     closeMobileSidebar();
+    // 用户回到带「待对账停止回合」的会话（停止后切走、再切回）：重新对账。
+    // setTimeout 0 让 flush 在 finally 复位 sessionLoading 之后执行；此时
+    // token / 会话都与登记一致，已落库则静默重载，未落库则把提问放回输入框
+    if (
+      !options.silent &&
+      state.pendingStoppedTurns.some((item) => item.sessionId === sessionId)
+    ) {
+      setTimeout(() => {
+        flushPendingStoppedTurns().catch(() => {});
+      }, 0);
+    }
     return true;
   } catch (error) {
     // 被后续加载主动中止：这不是失败，静默返回（finally 按 token 清理状态）
@@ -3555,6 +3649,22 @@ function startRenameSession(item, session, initialValue) {
   });
 }
 
+// 会话已被删除（成功响应或对账确认）：当前视图切回新对话状态。
+// 不用 newSession()：它会自增会话加载序号，把正在进行的其它会话切换一并作废
+function clearDeletedSessionView(sessionId) {
+  if (state.sessionId !== sessionId) return;
+  state.sessionId = null;
+  state.partialHistory = false;
+  state.renderedStart = null;
+  safeStorageRemove("session", "aligo.sessionId");
+  syncSessionControls();
+  setConversationTitle("新对话");
+  showWelcome();
+  // 删除归档会话后进入「新对话」状态：必须离开归档视图，
+  // 否则随后新建的会话不会出现在侧栏（与 newSession 同口径）
+  leaveArchivedViewForNewConversation();
+}
+
 async function deleteSession(sessionId) {
   if (state.busy) {
     toast("请等待当前回复完成");
@@ -3564,6 +3674,9 @@ async function deleteSession(sessionId) {
   // 成功路径，会把 sessionTotal / sessionsOffset 再各减一
   if (state.deletingSessions.has(sessionId)) return;
   if (!window.confirm("删除这个会话？聊天记录会从长期记忆中移除。")) return;
+  // 响应返回前可能已切换用户：迟到响应不能改写新用户的会话列表 / 总数 /
+  // 游标（会话按用户隔离，B 的列表与 A 的删除无关）
+  const requestUserId = state.userId;
   state.deletingSessions.add(sessionId);
   // 只在删除的正是「正在加载的会话」时作废这次加载；删除其它会话不能
   // 把用户刚点击的会话切换静默丢弃（之后消息会写进错误的会话）
@@ -3574,7 +3687,7 @@ async function deleteSession(sessionId) {
   }
   try {
     await getJSON(
-      `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(state.userId)}`,
+      `/api/sessions/${encodeURIComponent(sessionId)}?user_id=${encodeURIComponent(requestUserId)}`,
       { method: "DELETE" },
     );
     // 入口只作废了删除开始前的加载；DELETE 在途期间新发起的加载若已越过
@@ -3585,20 +3698,8 @@ async function deleteSession(sessionId) {
       state.sessionLoading = false;
       state.sessionLoadingId = null;
     }
-    if (state.sessionId === sessionId) {
-      // 不用 newSession()：它会自增会话加载序号，把正在进行的其它会话
-      // 切换一并作废
-      state.sessionId = null;
-      state.partialHistory = false;
-      state.renderedStart = null;
-      safeStorageRemove("session", "aligo.sessionId");
-      syncSessionControls();
-      setConversationTitle("新对话");
-      showWelcome();
-      // 删除归档会话后进入「新对话」状态：必须离开归档视图，
-      // 否则随后新建的会话不会出现在侧栏（与 newSession 同口径）
-      leaveArchivedViewForNewConversation();
-    }
+    if (state.userId !== requestUserId) return;
+    clearDeletedSessionView(sessionId);
     // 先本地移除会话行：随后刷新若失败（旧数据保留策略），不能留下
     // 一条点击后切到「新对话」的幽灵会话
     state.sessions = state.sessions.filter(
@@ -3614,13 +3715,46 @@ async function deleteSession(sessionId) {
     refreshStatus({ silentFailure: true }).catch(() => {});
     toast("会话已删除");
   } catch (error) {
-    toast(`删除失败：${error.message}`);
+    const status = Number((error && error.status) || 0);
+    if (status && status < 500) {
+      // 409（生成中）/ 422 / 429：确定失败，DELETE 没有执行
+      if (state.userId === requestUserId) toast(`删除失败：${error.message}`);
+      return;
+    }
+    // 超时 / 断连 / 代理 5xx：服务端可能已完成删除（墓碑先落库，重复
+    // 删除也返回 200）。切号后的迟到失败不属于当前用户，直接忽略
+    if (state.userId !== requestUserId) return;
+    const reconciled = await loadSessions(state.searchQuery, {
+      silentFailure: true,
+    });
+    const stillListed = state.sessions.some(
+      (item) => item.session_id === sessionId,
+    );
+    if (reconciled === true && !stillListed) {
+      clearDeletedSessionView(sessionId);
+      refreshStatus({ silentFailure: true }).catch(() => {});
+      toast("会话已删除（响应中断，已按服务端列表确认）");
+    } else if (reconciled === true) {
+      toast(`删除失败：${error.message}（已刷新，会话仍在，请重试）`);
+    } else {
+      toast(`删除结果未知：${error.message}；请刷新页面确认会话是否仍在`);
+    }
   } finally {
     state.deletingSessions.delete(sessionId);
+    // 入口 / 成功后作废在途会话加载时，被作废的 openSession 的 finally
+    // 因 token 不匹配不会再补回「编辑」入口，这里统一补一次
+    refreshEditButtons();
   }
 }
 
 /* ---------- 发送消息（SSE 流式） ---------- */
+
+// 当前会话正在删除（DELETE 在途）：删除成功会连本轮一起移除、失败则因
+// 用户锁 409。发送与「先删后发」的入口都必须先拦下。按会话 id 判定：
+// 删除的是侧栏其它会话时，向当前对话发送仍然合法
+function currentSessionDeleting() {
+  return Boolean(state.sessionId) && state.deletingSessions.has(state.sessionId);
+}
 
 function setBusy(busy) {
   state.busy = busy;
@@ -3658,6 +3792,10 @@ async function sendMessage(text, options = {}) {
   }
   if (state.sessionLoading) {
     toast("会话正在加载，请稍候");
+    return;
+  }
+  if (currentSessionDeleting()) {
+    toast("会话正在删除，请稍候");
     return;
   }
   if (state.partialHistory && state.sessionId) {
@@ -3822,11 +3960,14 @@ async function sendMessage(text, options = {}) {
     } else if (error && error.name === "HttpError") {
       // 服务端已明确响应（429 限流 / 503 锁占用 / 422 校验等）：不是连接
       // 中断。展示服务端原因，不执行停止对账（服务端没有执行本轮，重发
-      // 由用户决定），也不把顶栏健康状态改成「连接异常」
+      // 由用户决定），也不把顶栏健康状态改成「连接异常」。
+      // 本轮必然未落库：请求在途时输入框已被清空，提问的唯一副本就是
+      // 这条临时气泡——切走会话后气泡随消息区重建消失，必须回填草稿
       mutate(() => {
         assistant.trace.fail(error.message);
         assistant.fail(error.message);
       });
+      restoreDraftText(message);
     } else if (!terminal) {
       // 浏览器原生网络错误文案（Failed to fetch / Load failed）直接展示
       // 成英文且不解释，统一改成中文兜底
@@ -3966,10 +4107,9 @@ async function flushPendingStoppedTurns() {
   ) {
     return;
   }
-  // 会话已切换：旧会话的登记不能再打扰当前界面
-  state.pendingStoppedTurns = state.pendingStoppedTurns.filter(
-    (item) => item.sessionId === state.sessionId,
-  );
+  // 会话已切换：其它会话的登记不能动当前界面。登记本身必须保留——
+  // 停止时留在旧会话消息区的提问气泡会随 openSession 重建消失，只有
+  // 「回到该会话再对账」能把未落库的提问放回输入框
   for (const item of state.pendingStoppedTurns.slice()) {
     if (state.busy || state.sessionLoading) return;
     await reconcileStoppedTurn(
@@ -3983,23 +4123,26 @@ async function flushPendingStoppedTurns() {
 }
 
 async function reconcileStoppedTurn(sessionId, message, token, turnId, reason = "已停止") {
-  // 返回值区分「同一会话有新回合在跑、等结束后补跑」（deferred，保留登记）
-  // 与「已有结论」（含会话已切换 / 编辑中放弃）：只有前者保留待对账登记
-  const status = await reconcileStoppedTurnImpl(
-    sessionId,
-    message,
-    token,
-    turnId,
-    reason,
-  );
-  if (status !== "deferred") {
-    forgetStoppedTurn(sessionId, turnId);
-    // 用户已切走：其它会话的登记不再有意义
-    state.pendingStoppedTurns = state.pendingStoppedTurns.filter(
-      (item) => item.sessionId === state.sessionId,
+  // 返回值区分「暂不能动界面、等结束后补跑」（deferred，保留登记）与
+  // 「已有结论」：只有后者清除待对账登记
+  const key = `${sessionId}\u0000${turnId || ""}`;
+  if (reconcilingStoppedTurns.has(key)) return "deferred";
+  reconcilingStoppedTurns.add(key);
+  try {
+    const status = await reconcileStoppedTurnImpl(
+      sessionId,
+      message,
+      token,
+      turnId,
+      reason,
     );
+    if (status !== "deferred") {
+      forgetStoppedTurn(sessionId, turnId);
+    }
+    return status;
+  } finally {
+    reconcilingStoppedTurns.delete(key);
   }
-  return status;
 }
 
 async function reconcileStoppedTurnImpl(sessionId, message, token, turnId, reason = "已停止") {
@@ -4046,7 +4189,9 @@ async function reconcileStoppedTurnImpl(sessionId, message, token, turnId, reaso
   // 必须覆盖它，前 4 次 700ms 快速命中，之后放慢到 1.5s 直到 ~12 秒
   let sawValidResponse = false;
   for (let attempt = 0; attempt < 10; attempt += 1) {
-    if (!canSync()) return shouldDefer() ? "deferred" : "done";
+    // 会话已切换 / 新建对话：登记必须保留，等用户回到该会话时再对账；
+    // 同会话的 busy / token / 编辑中语义不变（编辑中放弃按 done 处理）
+    if (!canSync()) return !sameSession() || shouldDefer() ? "deferred" : "done";
     let data = null;
     try {
       data = await getJSON(
@@ -4060,7 +4205,9 @@ async function reconcileStoppedTurnImpl(sessionId, message, token, turnId, reaso
     sawValidResponse = sawValidResponse || Boolean(
       data && Array.isArray(data.messages),
     );
-    if (!canSync()) return shouldDefer() ? "deferred" : "done";
+    // 会话已切换 / 新建对话：登记必须保留，等用户回到该会话时再对账；
+    // 同会话的 busy / token / 编辑中语义不变（编辑中放弃按 done 处理）
+    if (!canSync()) return !sameSession() || shouldDefer() ? "deferred" : "done";
     if (data && Array.isArray(data.messages)) {
       const messages = data.messages;
       if (isPersisted(messages)) {
@@ -4115,7 +4262,9 @@ async function reconcileStoppedTurnImpl(sessionId, message, token, turnId, reaso
           // 确认请求超时 / 失败：落库结果未知
           confirmUnknown = true;
         }
-        if (!canSync()) return shouldDefer() ? "deferred" : "done";
+        // 会话已切换 / 新建对话：登记必须保留，等用户回到该会话时再对账；
+        // 同会话的 busy / token / 编辑中语义不变（编辑中放弃按 done 处理）
+        if (!canSync()) return !sameSession() || shouldDefer() ? "deferred" : "done";
         if (confirmUnknown) {
           // openSession 的重新拉取可能已渲染出刚落库的一轮：把提问塞回
           // 输入框会让用户重发、历史出现两条相同问答——只提示未知
@@ -4461,6 +4610,8 @@ async function loadExpandedTrips(options = {}) {
     if (requestId !== tripsRequestId || userId !== state.userId) return;
     state.tripsAll = tripsData.trips || [];
     state.tripsAllTotal = Number(tripsData.total || state.tripsAll.length);
+    state.tripsLoadedFilter = query;
+    state.tripsLoadedStatus = status;
   } catch (error) {
     if (requestId !== tripsRequestId || userId !== state.userId) return;
     // 保留旧列表：接口短暂失败不应把已展示的行程清空
@@ -4508,6 +4659,8 @@ async function refreshStatus(options = {}) {
       state.tripsExpanded = false;
       state.tripsAll = [];
       state.tripsAllTotal = 0;
+      state.tripsLoadedFilter = "";
+      state.tripsLoadedStatus = "";
     }
   } catch {
     if (requestId !== statusRequestId || userId !== state.userId) return;
@@ -4661,8 +4814,17 @@ function renderOverview() {
             : ""
         }`
       : "";
+    // 列表内容对应的是「加载时的筛选」，不是输入框里的新条件：刷新失败
+    // 会保留旧列表（不弹 toast 时尤其隐蔽），不能再声称「匹配 N 条」
+    const filtersLoaded =
+      state.tripsLoadedFilter === state.tripsFilter.trim() &&
+      state.tripsLoadedStatus === state.tripsStatusFilter;
     els.tripFilterCount.textContent =
-      statusText && !filterText ? statusText : countText;
+      !filtersLoaded && (filterText || statusValue)
+        ? "筛选加载失败，列表为上次结果"
+        : statusText && !filterText
+          ? statusText
+          : countText;
   }
   els.trips.innerHTML = "";
   if (!trips.length) {
@@ -4775,29 +4937,36 @@ function renderOverview() {
         event.stopPropagation();
         if (!window.confirm(`删除行程「${path.textContent}」？`)) return;
         remove.disabled = true;
+        // trip_id 按用户从 trip_1 起编号：迟到响应到达时用户可能已切换，
+        // 新账号的同号行程 / 正在编辑的表单不能被旧账号的结果清掉
+        const requestUserId = state.userId;
         try {
           await getJSON(
             `/api/trips/${encodeURIComponent(trip.trip_id)}?user_id=${encodeURIComponent(
-              state.userId,
+              requestUserId,
             )}`,
             { method: "DELETE" },
           );
-          toast("行程已删除");
-          // 正在编辑的就是这条行程：先退出编辑态，否则「保存修改」
-          // 永远 404 且表单没有取消入口
-          if (state.tripEditingId === trip.trip_id) resetTripForm();
+          if (state.userId === requestUserId) {
+            toast("行程已删除");
+            // 正在编辑的就是这条行程：先退出编辑态，否则「保存修改」
+            // 永远 404 且表单没有取消入口
+            if (state.tripEditingId === trip.trip_id) resetTripForm();
+          }
           // 先移除本地行：随后刷新若失败（旧数据保留策略），不能留下
           // 一条删除按钮永久禁用的幽灵行程
           row.remove();
           await refreshStatus({ silentFailure: true });
         } catch (error) {
           if (error.status === 404) {
-            toast("行程不存在，已刷新列表");
-            if (state.tripEditingId === trip.trip_id) resetTripForm();
+            if (state.userId === requestUserId) {
+              toast("行程不存在，已刷新列表");
+              if (state.tripEditingId === trip.trip_id) resetTripForm();
+            }
             row.remove();
             await refreshStatus({ silentFailure: true });
           } else {
-            toast(error.message);
+            if (state.userId === requestUserId) toast(error.message);
             remove.disabled = false;
           }
         }
@@ -7316,6 +7485,9 @@ async function saveUser() {
     toast("用户 ID 只能包含中文、字母、数字、下划线和短横线");
     return;
   }
+  // 长期身份是否成功落盘：失败时不能谎称「已切换用户」——重载 / 新标签页
+  // 会回退到上一个账号，后续对话写进别人的记忆
+  let userIdPersisted = true;
   if (value !== state.userId) {
     if (
       document.querySelector(".user-edit-input") ||
@@ -7341,12 +7513,11 @@ async function saveUser() {
     els.historySearch.value = "";
     state.searchQuery = "";
     clearTimeout(searchTimer);
-    try {
-      safeStorageSet("local", "aligo.userId", value);
-      safeStorageSet("session", "aligo.userId", value);
-    } catch {
-      /* 忽略 */
-    }
+    // 两个存储都必须实际写入（session 供当前标签页刷新，local 供重载 /
+    // 新标签页）；safeStorageSet 自身捕获异常并返回是否成功
+    const savedLocal = safeStorageSet("local", "aligo.userId", value);
+    safeStorageSet("session", "aligo.userId", value);
+    userIdPersisted = savedLocal;
     state.sessionId = null;
     state.partialHistory = false;
     state.renderedStart = null;
@@ -7378,6 +7549,8 @@ async function saveUser() {
     state.tripsAllTotal = 0;
     state.tripsFilter = "";
     state.tripsStatusFilter = "";
+    state.tripsLoadedFilter = "";
+    state.tripsLoadedStatus = "";
     // 合成状态可能因弹层关闭 / 切换用户丢失 compositionend：不清会永久
     // 跳过行程筛选刷新
     state.tripsComposing = false;
@@ -7402,7 +7575,11 @@ async function saveUser() {
     await loadSessions(state.searchQuery, { reset: true });
     refreshStatus();
   }
-  toast("已切换用户");
+  toast(
+    userIdPersisted
+      ? "已切换用户"
+      : "已切换用户（仅当前标签页有效）：浏览器未能保存用户 ID，重新打开页面会恢复原账号",
+  );
 }
 
 /* ---------- 输入框 ---------- */

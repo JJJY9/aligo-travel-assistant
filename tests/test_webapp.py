@@ -974,6 +974,24 @@ def test_weather_api(monkeypatch, caplog):
     print("✓ /api/weather 天气查询（成功 / 422 / 404 / 503，失败详情脱敏）")
 
 
+def test_weather_city_length_matches_trip_destination(monkeypatch):
+    """天气查询城市上限与行程目的地上限一致（100 字），否则长目的地静默无天气。"""
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "fetch_weather",
+        lambda city: {"city": city, "current": {}, "daily": []},
+    )
+    client = _client()
+    long_city = "长" * 60
+    data = client.get("/api/weather", params={"city": long_city})
+    assert data.status_code == 200, data.text
+    assert data.json()["city"] == long_city
+    assert client.get("/api/weather", params={"city": "x" * 101}).status_code == 422
+    print("✓ /api/weather 城市长度口径与行程目的地一致（100 字）")
+
+
 def test_weather_rate_limit(monkeypatch):
     """天气接口按客户端 IP 独立限流，空白城市不消耗额度。"""
     from utils.rate_limit import RateLimiter
