@@ -107,28 +107,33 @@ def test_session_ids_allow_windows_device_names():
     assert is_valid_web_session_id(None) is False
     print("✓ 会话 ID 允许设备保留名（用户 ID 仍拒绝）")
 
-def test_unassigned_codepoints_never_accepted():
-    """regex 模块的 Unicode 表可能新于 pydantic-core 的 Rust 表。
+def test_word_chars_match_web_engine():
+    """与 Web 的 Rust 正则在 Unicode 新增区逐字符一致（双向闭合）。
 
-    未在 Python 自带表（随解释器发布，通常不新于 Rust 表）中的字符一律
-    拒绝：CLI / 导入绝不能产出 Web 全部端点 422 的 ID（实测 Unicode 18
-    与 Rust ≈15.1 有上万字符判定相反，全部是「regex 接受而 Web 拒绝」）。
+    旧实现按 Python 自带 Unicode 表（3.12 = Unicode 15.0）拒绝「未分配」
+    字符，但 pydantic-core 的 Rust 表更新（15.1 起新增字母）：Web 能创建
+    的会话 ID 在备份恢复时被判非法、整会话消息被丢弃。这里以 Web 引擎
+    为准逐字符对比，两个方向的缺口都不允许存在。
     """
-    import unicodedata
-
-    probe = None
-    for codepoint in range(0x323B0, 0x32400):
-        char = chr(codepoint)
-        if unicodedata.category(char) == "Cn":
-            probe = char
-            break
-    if probe is None:
-        # 解释器的 Unicode 表已覆盖探测区间（未来 Python）：本用例无字符可测
-        print("— 解释器 Unicode 表已覆盖探测区间，跳过未分配码位用例")
-        return
-    assert is_valid_web_session_id("s" + probe) is False
-    assert is_valid_web_id("u" + probe) is False
-    print("✓ 未分配码位（regex 新表 / Rust 旧表分歧区）一律拒绝")
+    checked = 0
+    accepted = 0
+    for start, end in (
+        (0x2EBF0, 0x2EE70),  # CJK 扩展 I（Unicode 15.1 新增）
+        (0x323B0, 0x32400),  # 原未分配探测区
+        (0x1C80, 0x1CC0),  # 西里尔扩展增补
+        (0x0890, 0x08A0),  # 阿拉伯扩展增补
+    ):
+        for codepoint in range(start, end):
+            char = chr(codepoint)
+            expected = _web_accepts(char)
+            assert is_valid_web_session_id(char) is expected, hex(codepoint)
+            checked += 1
+            accepted += int(expected)
+    assert checked > 0
+    print(
+        f"✓ {checked} 个新增/边缘码位与 Web 引擎逐字符一致"
+        f"（{accepted} 个接受）"
+    )
 
 
 def test_oversized_filename_ids_rejected():
@@ -193,7 +198,7 @@ if __name__ == "__main__":
     test_prefixed_and_suffixed_fragments()
     test_windows_reserved_names_rejected()
     test_session_ids_allow_windows_device_names()
-    test_unassigned_codepoints_never_accepted()
+    test_word_chars_match_web_engine()
     test_oversized_filename_ids_rejected()
     test_derived_filenames_fit_name_max()
     test_word_char_cache_reuses_results()

@@ -888,17 +888,24 @@ class BodySizeLimitMiddleware:
 
         async def limited_receive() -> dict[str, Any]:
             nonlocal received, exceeded, timed_out, body_complete
-            if body_complete or read_timeout is None:
+            if body_complete:
                 return await receive()
-            remaining = read_deadline - time.monotonic()
-            if remaining <= 0:
-                timed_out = True
-                raise _BodyReadTimeout()
-            try:
-                message = await asyncio.wait_for(receive(), remaining)
-            except asyncio.TimeoutError:
-                timed_out = True
-                raise _BodyReadTimeout() from None
+            # 读体超时与字节计数必须解耦：/api/import 不套读体超时
+            # （端点自带 300 秒预算），但它的 64MB 上限同样只能靠这里的
+            # 实际读取量截断——分块传输没有 Content-Length，中间件若在
+            # 这一分支早退，任意大小的请求体都会被完整读入。
+            if read_timeout is None:
+                message = await receive()
+            else:
+                remaining = read_deadline - time.monotonic()
+                if remaining <= 0:
+                    timed_out = True
+                    raise _BodyReadTimeout()
+                try:
+                    message = await asyncio.wait_for(receive(), remaining)
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    raise _BodyReadTimeout() from None
             if message.get("type") == "http.request":
                 received += len(message.get("body") or b"")
                 if received > limit:
@@ -3033,6 +3040,22 @@ def _refund_rate_limit(
     except Exception as exc:  # noqa: BLE001 - 归还是尽力而为
         logger.warning(
             "归还对话限流额度失败: %s", _redacted_exc_log_text(exc)
+        )
+
+
+def _refund_kb_rate_limit(state: AligoWebApp, request: Request) -> None:
+    """归还一次知识库限流额度（零成本拒绝时使用）。
+
+    备份恢复先记账再做并发准入：准入失败（同来源已有导入 / 全局槽位已满）
+    时没有发生任何恢复工作，额度不能留在滑动窗口里——否则按「请稍后再试」
+    重试会耗尽共享的知识库桶，连隔离账号唯一的恢复入口都被 429。
+    """
+    client = _rate_identity(_client_host(request))
+    try:
+        state.kb_limiter.refund(client)
+    except Exception as exc:  # noqa: BLE001 - 归还是尽力而为
+        logger.warning(
+            "归还知识库限流额度失败: %s", _redacted_exc_log_text(exc)
         )
 
 
@@ -7971,23 +7994,27 @@ def create_app(model: Any = None) -> FastAPI:
         # 到读体超时，期间所有用户的导入都 503
         import_client = _rate_identity(_client_host(request))
         if not state.try_begin_import(import_client):
+            # 准入失败没有任何恢复工作：归还刚扣的知识库额度，并按可重试
+            # 口径给出 Retry-After（与对话忙 503 一致）
+            _refund_kb_rate_limit(state, request)
             raise HTTPException(
                 status_code=503,
                 detail=(
                     "该来源已有导入任务在处理，请稍后再试"
                     f"（请求 ID：{_request_id(request)}）"
                 ),
-                headers={"Connection": "close"},
+                headers={"Connection": "close", "Retry-After": "5"},
             )
         if not state.import_queue_slots.acquire(blocking=False):
             state.end_import(import_client)
+            _refund_kb_rate_limit(state, request)
             raise HTTPException(
                 status_code=503,
                 detail=(
                     "已有导入任务在处理，请稍后再试"
                     f"（请求 ID：{_request_id(request)}）"
                 ),
-                headers={"Connection": "close"},
+                headers={"Connection": "close", "Retry-After": "5"},
             )
         try:
             loop = asyncio.get_running_loop()
@@ -8204,33 +8231,33 @@ def create_app(model: Any = None) -> FastAPI:
                                             "请先删除不用的偏好后重试"
                                         ),
                                     )
-                        # 偏好之外再按「现有数据 + 备份」复核导出体积：
-                        # 恢复到接近上限的账号后仍可能永久 413。复用预检
-                        # 同一快照，避免第二次全量读取。知识轴无法核对
-                        # （现有库读不到 / 规划失败）时写入 skip 原因：
-                        # 本次不写知识段、如实上报，绝不放行未核对的
-                        # 全局知识库增长
-                        knowledge_unverified: dict[str, str] = {}
-                        merged_problem = merged_backup_limit_problem(
-                            store,
-                            sections,
-                            existing=snapshot,
-                            crlf=False,
-                            knowledge_unverified=knowledge_unverified,
-                        )
-                        if merged_problem:
-                            raise HTTPException(
-                                status_code=413,
-                                detail=(
-                                    f"恢复中止：{merged_problem}"
-                                    "（恢复后账号导出的备份将超过导入"
-                                    "上限，请先清理部分数据后重试）"
-                                ),
-                            )
-                        knowledge_skip_reason = knowledge_unverified.get(
-                            "reason", ""
-                        )
+                        # 合并体积复核：dry_run 需要它给出预览与知识跳过原因。
+                        # 非 dry_run 不在锁外再跑一次——import_user_data 会在
+                        # 导入互斥锁内先用更新快照执行同一复核（且在任何写入
+                        # 之前），锁外这次只会把全量知识库导出与 indent=2
+                        # 序列化重复一遍，备份不含知识时也一样。
+                        knowledge_skip_reason = ""
                         if dry_run:
+                            knowledge_unverified: dict[str, str] = {}
+                            merged_problem = merged_backup_limit_problem(
+                                store,
+                                sections,
+                                existing=snapshot,
+                                crlf=False,
+                                knowledge_unverified=knowledge_unverified,
+                            )
+                            if merged_problem:
+                                raise HTTPException(
+                                    status_code=413,
+                                    detail=(
+                                        f"恢复中止：{merged_problem}"
+                                        "（恢复后账号导出的备份将超过导入"
+                                        "上限，请先清理部分数据后重试）"
+                                    ),
+                                )
+                            knowledge_skip_reason = knowledge_unverified.get(
+                                "reason", ""
+                            )
                             return preview_user_import(
                                 store,
                                 sections,

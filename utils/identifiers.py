@@ -5,16 +5,34 @@ Web 的 ``_ID_PATTERN``（``^[\\w-]{1,64}$``）由 pydantic-core 用 Rust 正则
 Python ``re`` 的 ``\\w`` 是 ``str.isalnum()``（含上标数字这类 No），两者在
 组合符 / 零宽连接符与上标数字上相反——Web 可创建的会话（含零宽连接符）
 会被备份恢复判为「会话 ID 非法」而丢消息，导入可接受的会话（含上标数字）
-在 Web 全部端点 422、无法打开也无法删除。这里用 unicodedata 复刻 Rust
-语义，供 CLI 导入 / 脚本复用。
+在 Web 全部端点 422、无法打开也无法删除。
+
+为了两个方向的缺口都闭合，有 pydantic-core 时直接用 Web 校验的同一引擎
+（``^\\w$``）逐字符判定：它的 Unicode 表更新时（如 Unicode 15.1 新增
+字母）Web 能创建的 ID 也能通过导入校验，不会在恢复时被丢弃；Rust 拒绝
+的字符同样被拒绝，CLI 也不会产出 Web 无法寻址的 ID。
 """
 import functools
 import unicodedata
+
+try:  # pydantic-core 是 fastapi（pydantic v2）的既有依赖
+    from pydantic_core import SchemaValidator, core_schema
+except ImportError:  # pragma: no cover - 轻量环境
+    SchemaValidator = None  # type: ignore[assignment,misc]
+    core_schema = None  # type: ignore[assignment]
 
 try:  # regex 是 transformers 的传递依赖；缺失时退回 unicodedata 近似
     import regex as _regex
 except ImportError:  # pragma: no cover - 轻量环境
     _regex = None
+
+# 与 Web ``_ID_PATTERN`` 的字符类完全同源：单字符 ``^\w$`` 由同一引擎
+# （pydantic-core / Rust regex）判定，Unicode 表随部署环境自动对齐
+_WEB_WORD_VALIDATOR = (
+    SchemaValidator(core_schema.str_schema(pattern=r"^\w$"))
+    if SchemaValidator is not None and core_schema is not None
+    else None
+)
 
 # 预编译单字符匹配：is_web_word_char 对每个字符各调一次 fullmatch，导入
 # 数万消息的会话 ID 校验曾把一半以上解析时间花在逐字符重新编译正则上
@@ -28,21 +46,22 @@ _JOIN_CONTROLS = (chr(0x200C), chr(0x200D))
 def is_web_word_char(char: str) -> bool:
     """Rust 正则 ``\\w`` 的字符判定（pydantic-core 校验 ID 的同一集合）。
 
-    Rust（regex crate）的 ``\\w`` 是 Unicode 「Alphabetic + Mark + Nd + Pc +
-    Join_Control」复合集合：``str.isalpha()`` 只覆盖类别 L*，会漏掉
-    Other_Alphabetic（如带圈字母 Ⓐ）。有 ``regex`` 模块时直接用它的
-    Unicode ``\\w``（与 Rust 实测逐字符一致）；没有时退回 unicodedata 近似
-    （覆盖 L/M/Nd/Nl/全部 Pc/Join_Control）。
+    优先直接调用 pydantic-core 的同一正则引擎，保证「Web 能创建 ↔ 导入
+    能恢复」双向闭合；导入失败（轻量环境没有 pydantic-core）时退回
+    regex / unicodedata 近似。
     """
     if not char:
         return False
+    if _WEB_WORD_VALIDATOR is not None:
+        try:
+            _WEB_WORD_VALIDATOR.validate_python(char)
+            return True
+        except Exception:  # noqa: BLE001 - 校验失败即非单词字符
+            return False
     if _regex is not None:
-        # regex 模块打包的 Unicode 表可能新于 pydantic-core 的 Rust 表
-        # （实测 regex Unicode 18 与 Rust ≈15.1 有上万字符判定相反，全部是
-        # 「regex 接受而 Web 拒绝」）：未在 Python 自带表（随解释器发布，
-        # 通常不新于 Rust 表）中的字符一律拒绝——CLI / 导入绝不能产出
-        # Web 无法寻址（所有端点 422）的 ID。反向缺口（Rust 新增字符）只会
-        # 让 Web 更宽，不会造成不可打开的账号 / 会话
+        # 回退路径：regex 模块打包的 Unicode 表可能新于 pydantic-core 的
+        # Rust 表，未在 Python 自带表中的字符一律拒绝——CLI / 导入绝不能
+        # 产出 Web 无法寻址（所有端点 422）的 ID
         if unicodedata.category(char) == "Cn":
             return False
         assert _WORD_RE is not None

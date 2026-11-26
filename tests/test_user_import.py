@@ -1880,7 +1880,12 @@ def test_parse_rejects_content_deeper_than_export_saves():
     sections, errors = parse_user_export(json.dumps(payload))
     assert "hotel_brands" not in sections.get("preferences", {}), sections
     assert sections["preferences"].get("ok_list") == _nested(10, "如家")
-    assert any("超过导出保存深度" in error for error in errors), errors
+    # 深度 > 16 的偏好在与 Web PUT 同口径的校验里即被拒绝（错误文案
+    # 「嵌套过深（超过 16 层）」）；导出保存深度同样不得放行
+    assert any(
+        ("超过导出保存深度" in error) or ("嵌套过深" in error)
+        for error in errors
+    ), errors
     print("✓ 深于导出截断点的内容在导入时拒绝，已导出的 null 结尾备份仍可恢复")
 
 
@@ -4732,8 +4737,8 @@ def test_cli_import_uses_file_newline_for_size_axis(monkeypatch):
         assert code == 0, out
         assert captured == [
             ("sections", False),
-            ("merged", False),
-            # 导入层在互斥锁内再复核一次（同为 LF 口径）
+            # 导入层只在互斥锁内复核一次（同为 LF 口径）：锁外预检不再
+            # 重复执行整库合并复核
             ("merged", False),
         ], captured
     print("✓ CLI 导入体积轴固定 LF（与导出口径一致）")
@@ -5787,6 +5792,212 @@ def test_export_volume_warning_for_skipped_knowledge(monkeypatch):
     assert warning["knowledge_skipped_count"] == 3, warning
     assert "3 条" in warning["knowledge_skipped"]
     print("✓ 导出提示恢复时会跳过的知识行（组数不重复计数）")
+
+
+def test_parse_rejects_unmanageable_preference_keys():
+    """纯空白 / "." / ".." 偏好键在恢复时拒绝：前者会被 JSON 后端加载
+    迁移静默丢弃，后者在面板的路径式编辑 / 删除里被 URL 规范化成别的
+    路径，与「无法寻址即拒绝」的既有口径一致。"""
+    from utils.user_import import parse_user_export_data
+
+    sections, errors = parse_user_export_data(
+        {
+            "preferences": {
+                "   ": "v",
+                ".": "x",
+                "..": "y",
+                " home": "北京",
+                "home": "上海",
+            }
+        }
+    )
+    prefs = sections.get("preferences", {})
+    assert "   " not in prefs and "." not in prefs and ".." not in prefs, prefs
+    assert prefs.get(" home") == "北京" and prefs.get("home") == "上海"
+    assert sum("键名非法" in error for error in errors) == 3, errors
+    print("✓ 恢复拒绝纯空白与 . / .. 偏好键（可寻址性口径）")
+
+
+def test_parse_preference_depth_matches_web_put():
+    """偏好值嵌套深度与 Web PUT / CLI 同一上限（16 层）：导入接受更深
+    的值会形成「面板未修改直接保存就 422」的僵尸偏好。"""
+    from utils.user_import import parse_user_export_data
+
+    def nested(levels: int, leaf: str):
+        value: object = leaf
+        for _ in range(levels):
+            value = [value]
+        return value
+
+    sections, errors = parse_user_export_data(
+        {"preferences": {"ok": nested(16, "x"), "deep": nested(17, "x")}}
+    )
+    prefs = sections.get("preferences", {})
+    assert "ok" in prefs and "deep" not in prefs, prefs
+    assert any("嵌套过深" in error for error in errors), errors
+    print("✓ 偏好值嵌套深度与 Web PUT 同口径（16 层）")
+
+
+def test_parse_clears_unparseable_overlong_trip_end():
+    """ICS 身份载体上限 2000 字符：更长且无法解析的返程日期会在导出后
+    身份漂移、回导时重复新增行程，恢复端收口为单日并报错。"""
+    from utils.user_import import parse_user_export_data
+
+    sections, errors = parse_user_export_data(
+        {
+            "trip_history": [
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-05-01",
+                    "end_date": "x" * 2001,
+                }
+            ]
+        }
+    )
+    trips = sections.get("trips") or []
+    assert len(trips) == 1, (sections, errors)
+    assert not trips[0].get("end_date"), trips[0]
+    assert any("返程日期过长" in error for error in errors), errors
+    print("✓ 超长且无法解析的返程日期按单日恢复并报错")
+
+
+def test_parse_metadata_limit_is_lazy():
+    """知识片段 metadata 的 200 条上限必须惰性迭代：此前先把整个
+    metadata 字典物化成元组列表再切片，数百万键时纯放大内存。"""
+    from utils.user_import import parse_user_export_data
+
+    metadata = {f"k{index}": str(index) for index in range(5000)}
+    sections, errors = parse_user_export_data(
+        {"knowledge": [{"content": "hello", "metadata": metadata}]}
+    )
+    entries = sections.get("knowledge") or []
+    assert len(entries) == 1, (sections, errors)
+    cleaned = entries[0]["metadata"]
+    assert len(cleaned) == 200, len(cleaned)
+    assert "k0" in cleaned and "k199" in cleaned and "k200" not in cleaned
+    print("✓ metadata 上限只取前 200 条（惰性迭代）")
+
+
+def test_sections_limit_with_existing_skips_size_axis(monkeypatch):
+    """传入存量快照时体积轴交给合并复核：预检不再做一次必被丢弃的
+    sanitize 深拷贝 + indent=2 序列化（大备份的内存放大来源）。"""
+    from utils import user_import as module
+
+    calls = {"n": 0}
+
+    def counting_size(*args, **kwargs):
+        calls["n"] += 1
+        return 1
+
+    monkeypatch.setattr(module, "_backup_payload_size", counting_size)
+    sections = {
+        "messages": [
+            {
+                "session_id": "s1",
+                "role": "user",
+                "content": "hi",
+                "timestamp": "2026-01-01T00:00:00",
+            }
+        ],
+        "trips": [],
+        "preferences": {},
+        "titles": {},
+        "pinned": [],
+        "archived": [],
+    }
+    assert (
+        module.sections_limit_problem(sections, existing={}, crlf=False) is None
+    )
+    assert calls["n"] == 0, "existing 非空时预检不得再计算体积"
+    print("✓ 预检传存量快照时跳过体积轴（交给合并复核）")
+
+
+def test_merged_limit_mirrors_export_conservative_shape(monkeypatch):
+    """导入闸门必须镜像导出端的「恢复到新账号」保守形状：naive 时间戳
+    恢复后归一为 32 字符（每条 +6 字节），只按原始形状放行会让账号在
+    恢复成功后 /api/export 因保守估算永久 413。"""
+    from context.long_term_memory import LongTermMemory
+    from utils import user_import as module
+
+    monkeypatch.setattr(module, "MAX_BACKUP_BYTES", 118100)
+    monkeypatch.setattr(module, "_existing_knowledge_rows", lambda: [])
+    store = LongTermMemory(
+        "u-conservative", tempfile.mkdtemp(prefix="chailv_conservative_")
+    )
+    store.add_chat_messages(
+        [
+            {
+                "role": "user",
+                "content": "x" * 60,
+                "session_id": "s1",
+                # naive 26 字符：恢复后会被归一成带时区的 32 字符
+                "timestamp": "2026-11-01T09:00:00.123456",
+            }
+            for _ in range(600)
+        ]
+    )
+    existing = store.export_snapshot()
+    sections = {
+        "messages": [
+            {
+                "session_id": "s1",
+                "role": "user",
+                "content": "新增" * 30,
+                "timestamp": "2026-11-02T10:00:00.123456+08:00",
+            }
+            for _ in range(5)
+        ],
+        "trips": [],
+        "preferences": {},
+        "titles": {},
+        "pinned": [],
+        "archived": [],
+    }
+    problem = module.merged_backup_limit_problem(
+        store, sections, existing=existing, crlf=False
+    )
+    assert problem and "恢复后" in problem, problem
+    print("✓ 合并闸门镜像导出端的保守形状复核")
+
+
+def test_trip_import_default_purpose_keeps_concurrent_edit(monkeypatch):
+    """导入的默认目的「出差」只能在存储写锁内的新增分支补：锁外按陈旧
+    快照预填会把并发期间用户刚设置的 purpose 当成显式更新覆盖。"""
+    from context.long_term_memory import LongTermMemory
+    from utils.trip_import import import_trips_from_text
+
+    store = LongTermMemory(
+        "u-purpose-race", tempfile.mkdtemp(prefix="chailv_purpose_race_")
+    )
+    store.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-03",
+            "purpose": "面试",
+        }
+    )
+    real_get = store.get_trip_history
+    calls = {"n": 0}
+
+    def stale_get(limit=None):
+        # 第一次（导入读取历史）返回陈旧快照：同身份行程「尚不存在」
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return []
+        return real_get(limit=limit)
+
+    monkeypatch.setattr(store, "get_trip_history", stale_get)
+    import_trips_from_text(
+        store,
+        "origin,destination,start_date,end_date\n北京,上海,2026-12-01,2026-12-03\n",
+    )
+    rows = real_get(limit=None)
+    assert len(rows) == 1, rows
+    assert rows[0].get("purpose") == "面试", rows
+    print("✓ 行程导入的默认目的不覆盖并发设置的真实目的")
 
 
 if __name__ == "__main__":

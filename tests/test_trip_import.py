@@ -50,10 +50,16 @@ class _ImportStore:
         self.trips.append(new)
         return new["trip_id"]
 
-    def save_trip_histories(self, rows):
+    def save_trip_histories(self, rows, *, default_new_purpose=None):
         created = updated = 0
         for row in rows:
             hit = any(self._key(existing) == self._key(row) for existing in self.trips)
+            if (
+                not hit
+                and row.get("purpose") is None
+                and default_new_purpose is not None
+            ):
+                row = {**row, "purpose": default_new_purpose}
             self.save_trip_history(row)
             if hit:
                 updated += 1
@@ -342,7 +348,7 @@ def test_runner_reports_partial_import(monkeypatch):
 
     store = _ImportStore()
 
-    def failing_save(rows):
+    def failing_save(rows, **kwargs):
         raise PartialImportError("批量保存在第 2 条后失败：db down", 1, 1)
 
     store.save_trip_histories = failing_save

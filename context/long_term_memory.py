@@ -2452,7 +2452,12 @@ class LongTermMemory:
         return trip_id
 
     @_locked_mutation
-    def save_trip_histories(self, trips: list[dict[str, Any]]) -> tuple[int, int]:
+    def save_trip_histories(
+        self,
+        trips: list[dict[str, Any]],
+        *,
+        default_new_purpose: str | None = None,
+    ) -> tuple[int, int]:
         """批量保存行程（备份恢复 / 导入）：一次重载 + 一次原子写回。
 
         逐条调用 ``_apply_trip_locked`` 时，每条都要全量扫描历史找重复、
@@ -2460,6 +2465,10 @@ class LongTermMemory:
         分钟级。这里先建一次「去重键 → 记录」索引与最大编号，再逐条写入；
         语义与单条保存一致（同路线 + 同起止日期更新既有记录、未提供的
         目的 / 会话保留原值、删除后的编号不复用）。返回 ``(新增数, 更新数)``。
+
+        ``default_new_purpose`` 只作用于**本批新增**的记录（写入锁内、
+        重载之后判断）：调用方不能在锁外按陈旧快照预填默认目的——那会把
+        并发期间用户刚设置的 purpose 当成显式更新覆盖掉。
         """
         from utils.trip_import import normalize_identity_date, normalize_identity_text
 
@@ -2548,6 +2557,10 @@ class LongTermMemory:
                 "timestamp": datetime.now().isoformat(),
                 **row,
             }
+            # 默认目的只在新增分支、且重载后的快照确认没有同身份行时生效
+            # （更新分支保持在上面：purpose 为 None 不覆盖用户已设值）
+            if record.get("purpose") is None and default_new_purpose is not None:
+                record["purpose"] = default_new_purpose
             # 备份恢复的行可能自带 trip_id：未被其它行程占用时沿用原编号，
             # 并抬高编号水位（否则同批后续记录可能与旧编号冲突）；与既有
             # 行程冲突 / 非法时退回本次生成的新编号，保持 id 全局唯一

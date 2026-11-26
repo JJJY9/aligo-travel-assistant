@@ -3827,26 +3827,28 @@ def run_user_import_standalone(
                     f"恢复中止：{limit_problem}"
                     "（恢复后将无法再导出备份，请先清理或拆分备份文件）"
                 )
-            # 备份自身不超限不代表恢复后仍可导出：与账号既有数据合并后按
-            # 导出格式复核体积（与 Web /api/import 同口径；复用同一快照）。
+            # 合并体积复核只在预览时做：真正的写入由 import_user_data 在
+            # 导入互斥锁内先用更新快照执行同一复核（且在任何写入之前），
+            # 锁外再跑一次只会把全量知识库导出与序列化重复一遍。
             # 知识轴无法核对（现有库读不到 / 规划失败）时本次不写知识段、
             # 如实上报，绝不放行未核对的全局知识库增长
-            knowledge_unverified: dict[str, str] = {}
-            merged_problem = merged_backup_limit_problem(
-                store,
-                sections,
-                existing=snapshot,
-                crlf=False,
-                knowledge_unverified=knowledge_unverified,
-            )
-            if merged_problem:
-                return _fail(
-                    f"恢复中止：{merged_problem}"
-                    "（恢复后账号导出的备份将超过导入上限，"
-                    "请先清理数据或拆分备份）"
-                )
-            knowledge_skip_reason = knowledge_unverified.get("reason", "")
+            knowledge_skip_reason = ""
             if dry_run:
+                knowledge_unverified: dict[str, str] = {}
+                merged_problem = merged_backup_limit_problem(
+                    store,
+                    sections,
+                    existing=snapshot,
+                    crlf=False,
+                    knowledge_unverified=knowledge_unverified,
+                )
+                if merged_problem:
+                    return _fail(
+                        f"恢复中止：{merged_problem}"
+                        "（恢复后账号导出的备份将超过导入上限，"
+                        "请先清理数据或拆分备份）"
+                    )
+                knowledge_skip_reason = knowledge_unverified.get("reason", "")
                 counts = preview_user_import(
                     store, sections, knowledge_unverified=knowledge_skip_reason
                 )

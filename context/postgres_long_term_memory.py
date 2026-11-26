@@ -1410,7 +1410,12 @@ class PostgresLongTermMemory:
         logger.info("Deleted last turn of session %s (%s messages)", session_id, removed)
         return removed
 
-    def save_trip_histories(self, trips: list[dict[str, Any]]) -> tuple[int, int]:
+    def save_trip_histories(
+        self,
+        trips: list[dict[str, Any]],
+        *,
+        default_new_purpose: str | None = None,
+    ) -> tuple[int, int]:
         """批量保存行程（备份恢复 / 导入）：返回 ``(新增数, 更新数)``。
 
         逐条调用单条保存时，每条都要按路线查候选、并全量扫描 ``trip_id``
@@ -1419,6 +1424,10 @@ class PostgresLongTermMemory:
         历史行程构建「去重键 → 行 id」索引与编号水位，再逐条 UPDATE / INSERT；
         语义与单条保存一致（未补零日期归一、未提供的目的 / 会话保留原值、
         编号不复用）。计数直接来自本批操作，不再用锁外总数差推算。
+
+        ``default_new_purpose`` 只作用于本批新增的行（INSERT 时 purpose
+        为空才补）：调用方不能在锁外按陈旧快照预填，否则并发期间用户刚
+        设置的 purpose 会被当成显式更新覆盖。
         """
         count = len(trips)
         if not count:
@@ -1612,7 +1621,9 @@ class PostgresLongTermMemory:
                             destination,
                             trip.get("start_date"),
                             trip.get("end_date"),
-                            trip.get("purpose"),
+                            trip.get("purpose")
+                            if trip.get("purpose") is not None
+                            else default_new_purpose,
                             trip.get("session_id"),
                             # 备份里的 token 合法时沿用（恢复后日历 UID 一致），
                             # 缺失 / 非法时补发；去重更新路径不刷新既有 token
