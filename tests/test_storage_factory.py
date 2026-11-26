@@ -4404,6 +4404,57 @@ def test_delete_trips_verified_batches_single_write():
     print("✓ 批量复核删除一次落盘 / 身份不符跳过")
 
 
+def test_delete_trips_verified_ignores_missing_trip_id_rows():
+    """target 的 trip_id 为 "None" / 空串不能命中缺 id / null 的历史行。"""
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-none-id", storage_dir)
+    # 先走一次正常写入生成完整文件形状，再替换为缺 id / null 的历史脏行
+    memory.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+            "purpose": "出差",
+        }
+    )
+    path = Path(storage_dir) / "u-none-id.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["trip_history"] = [
+        {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+        },
+        {
+            "trip_id": None,
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+        },
+    ]
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    fresh = LongTermMemory("u-none-id", storage_dir)
+
+    target = {
+        "trip_id": "None",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-02",
+    }
+    removed, failure = fresh.delete_trips_verified([target])
+    assert (removed, failure) == (0, None)
+    assert len(fresh.get_trip_history(limit=None)) == 2
+    # 单条删除同样不能把无 id 行当成字面 "None"
+    assert fresh.delete_trip("None") is False
+    assert fresh.delete_duplicate_trip("None") is False
+    assert len(fresh.get_trip_history(limit=None)) == 2
+    print("✓ 批量 / 单条删除不命中缺失或 null 的 trip_id")
+
+
 def test_delete_dirty_date_trip_keeps_frequent_destinations():
     """删除日期不可解析的行程不能把合法城市的常去计数误清零。"""
     storage_dir = tempfile.mkdtemp()

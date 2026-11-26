@@ -1063,6 +1063,63 @@ def test_runner_errors(monkeypatch):
     print("✓ 非法用户 / 文件不存在 / 空备份失败")
 
 
+def test_runner_all_sessions_skipped_reports_failure(monkeypatch):
+    """备份条目全部落在保留字会话：不能报「已恢复」+ 退出 0。"""
+    payload = {
+        "chat_history": [
+            {
+                "role": "user",
+                "content": "保留字会话",
+                "timestamp": "2026-11-01T09:00:00",
+                "session_id": "export",
+            }
+        ],
+        "session_titles": {"export": "坏标题"},
+    }
+    path = _write_json(payload)
+    store = _real_store("u-skipped")
+    code, out = _run_import(monkeypatch, "u-skipped", path, store, as_json=True)
+    data = json.loads(out)
+    assert code == 1 and data["ok"] is False, data
+    assert "没有可恢复的数据" in data["error"], data
+    assert "保留字" in data["error"], data
+    assert store.get_chat_history(limit=None) == []
+
+    code, out = _run_import(monkeypatch, "u-skipped", path, store)
+    assert code == 1 and "已恢复" not in out, out
+
+    code, out = _run_import(
+        monkeypatch, "u-skipped", path, store, as_json=True, dry_run=True
+    )
+    assert code == 1, out
+
+    # 混合备份（保留字会话 + 正常会话）仍应成功并恢复正常会话
+    mixed = {
+        "chat_history": [
+            {
+                "role": "user",
+                "content": "坏会话",
+                "timestamp": "2026-11-01T09:00:00",
+                "session_id": "export",
+            },
+            {
+                "role": "user",
+                "content": "好会话",
+                "timestamp": "2026-11-01T09:01:00",
+                "session_id": "s-ok",
+            },
+        ]
+    }
+    mixed_path = _write_json(mixed)
+    code, out = _run_import(
+        monkeypatch, "u-mixed", mixed_path, store, as_json=True
+    )
+    data = json.loads(out)
+    assert code == 0 and data["ok"] is True, data
+    assert data["messages_added"] == 1, data
+    print("✓ 全部跳过会话的恢复报失败，混合备份仍成功")
+
+
 def test_runner_rejects_oversized_backup(monkeypatch):
     from utils import user_import as user_import_module
 

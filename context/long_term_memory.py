@@ -37,6 +37,7 @@ from utils.preference_values import (
     is_manageable_pref_type,
 )
 from utils.timestamps import chronological_key
+from utils.trip_dedupe import trip_id_text
 
 logger = logging.getLogger(__name__)
 
@@ -2490,9 +2491,9 @@ class LongTermMemory:
         max_number = int(stats.get("last_trip_number") or 0)
         for trip in history:
             key = _identity(trip)
-            trip_id_text = str(trip.get("trip_id") or "")
-            if trip_id_text:
-                used_trip_ids.add(trip_id_text)
+            existing_id = trip_id_text(trip.get("trip_id"))
+            if existing_id:
+                used_trip_ids.add(existing_id)
             if key is not None:
                 index.setdefault(key, trip)
             match = re.fullmatch(r"trip_(\d+)", str(trip.get("trip_id", "")))
@@ -2663,7 +2664,7 @@ class LongTermMemory:
         """删除一条历史行程并同步统计；返回是否删除。"""
         trips = self.data.get("trip_history", [])
         for index, trip in enumerate(trips):
-            if str(trip.get("trip_id", "")) == str(trip_id):
+            if trip_id_text(trip.get("trip_id")) == trip_id_text(trip_id):
                 self._drop_trip_row(trips, index)
                 logger.info(f"Deleted trip history: {trip_id}")
                 return True
@@ -2685,7 +2686,7 @@ class LongTermMemory:
         indices = [
             index
             for index, trip in enumerate(trips)
-            if str(trip.get("trip_id", "")) == str(trip_id)
+            if trip_id_text(trip.get("trip_id")) == trip_id_text(trip_id)
         ]
         if len(indices) < 2:
             return False
@@ -2715,22 +2716,22 @@ class LongTermMemory:
         removed = 0
         skipped = 0
         for target in targets:
-            trip_id = str(target.get("trip_id"))
+            trip_id = trip_id_text(target.get("trip_id"))
             if not trip_id:
                 continue
             want = dedupe_identity(target)
             matches = [
                 index
                 for index, trip in enumerate(trips)
-                if str(trip.get("trip_id")) == trip_id
+                if trip_id_text(trip.get("trip_id")) == trip_id
                 and dedupe_identity(trip) == want
             ]
             if not matches:
                 skipped += 1
                 continue
-            kept_id = str(target.get("kept_id") or "")
+            kept_id = trip_id_text(target.get("kept_id"))
             if kept_id and not any(
-                str(trip.get("trip_id")) == kept_id
+                trip_id_text(trip.get("trip_id")) == kept_id
                 and dedupe_identity(trip) == want
                 for trip in trips
             ):
@@ -2761,7 +2762,7 @@ class LongTermMemory:
             ValueError: 更新后与另一条既有行程（同路线 + 同起止日期）重复
         """
         for trip in self.data.get("trip_history", []):
-            if str(trip.get("trip_id", "")) != str(trip_id):
+            if trip_id_text(trip.get("trip_id")) != trip_id_text(trip_id):
                 continue
             merged = {**trip, **fields}
             # 端点侧校验基于锁外快照：分端并发更新（Web / CLI 各持旧

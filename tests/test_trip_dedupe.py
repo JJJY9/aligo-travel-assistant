@@ -422,6 +422,24 @@ def test_plan_skips_empty_trip_id_rows():
     print("✓ 空 trip_id 行不进入去重计划")
 
 
+def test_plan_treats_missing_and_null_trip_id_as_empty():
+    """缺 trip_id 键 / null 同样不可删除：不能按伪 id "None" 分组或报歧义。"""
+    missing = _trip("t1")
+    missing.pop("trip_id")
+    null_row = _trip(None)
+    # 同身份两行：不产生任何删除计划
+    plan = plan_trip_dedupe(_Store([dict(missing), dict(null_row)]))
+    assert plan["duplicate_entries"] == [], plan
+    assert plan["groups_with_duplicates"] == 0, plan
+    assert plan["ambiguous_ids"] == [], plan
+    # 内容不同的无 id 行也不能报成同一伪 id 的歧义
+    other = _trip(None, destination="广州")
+    plan = plan_trip_dedupe(_Store([dict(missing), other]))
+    assert plan["ambiguous_ids"] == [], plan
+    assert plan["duplicate_entries"] == [], plan
+    print("✓ 缺失 / null trip_id 归一为空串（假歧义消除）")
+
+
 def test_plan_skips_reload_without_candidates():
     """没有重复候选时不整份重载存储（聊天历史不再被无谓解析）。"""
     store = _Store([_trip("t1"), _trip("t2", destination="杭州")])
@@ -459,5 +477,6 @@ if __name__ == "__main__":
     test_plan_ignores_rows_without_destination()
     test_plan_groups_blank_end_with_missing_end()
     test_plan_skips_empty_trip_id_rows()
+    test_plan_treats_missing_and_null_trip_id_as_empty()
     test_plan_skips_reload_without_candidates()
     print("\n全部通过")

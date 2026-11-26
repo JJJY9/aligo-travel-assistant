@@ -40,9 +40,11 @@ from utils.llm_resilience import run_health_check as check_llm_health
 from utils.preference_values import (
     has_preference_value,
     is_manageable_pref_type,
+    preference_prompt_lines,
     preference_value_problem,
 )
 from utils.progress import format_progress_event
+from utils.trip_dedupe import trip_id_text
 from utils.session_title import (
     normalized_preview_from_content,
     session_title_from_content,
@@ -117,6 +119,33 @@ def _single_line_safe(value: object) -> str:
     列表行、标题回显与偏好值必须单行，否则存储内容可以用换行伪造列表行。
     """
     return " ".join(strip_terminal_controls(str(value)).split())
+
+
+_WHITESPACE_CHUNK = 1 << 20
+
+
+def _collapsed_whitespace(text: str) -> str:
+    """与 ``" ".join(text.split())`` 逐字符等价，按空白边界分块限制峰值内存。
+
+    导入允许 50MB 级单条消息：整条 ``split()`` 会为每个 token 各建一个
+    str（45M 字符单条消息实测峰值多出约 800MB）。这里只在空白边界切块，
+    token 不会被切开，输出与整条 split-join 完全一致。
+    """
+    n = len(text)
+    if n <= _WHITESPACE_CHUNK:
+        return " ".join(text.split())
+    pieces: list[str] = []
+    start = 0
+    while start < n:
+        end = min(start + _WHITESPACE_CHUNK, n)
+        # 块边界右移到空白之后：token 不会被切成两半
+        while end < n and not text[end].isspace():
+            end += 1
+        tokens = text[start:end].split()
+        if tokens:
+            pieces.append(" ".join(tokens))
+        start = end
+    return " ".join(pieces)
 
 
 def _display_width(value: object) -> int:
@@ -994,30 +1023,25 @@ class AligoCLI:
         """
         summary_parts = []
 
-        # 1. 用户偏好信息（始终加载）
-        prefs = self.memory_manager.long_term.get_preference()
-        if prefs:
-            pref_lines = ["【用户背景信息】（来自长期记忆，可用于推断缺失信息）"]
-
-            # 遍历所有偏好，全部加载
-            for pref_key, pref_value in prefs.items():
-                if has_preference_value(pref_value):  # 0 / False 也是合法偏好
-                    # 如果是列表，用逗号连接
-                    if isinstance(pref_value, list):
-                        items = [
-                            str(item)
-                            for item in pref_value
-                            if not (
-                                item is None
-                                or (isinstance(item, str) and not item.strip())
-                            )
-                        ]
-                        pref_lines.append(f"• {pref_key}: {', '.join(items)}")
-                    else:
-                        pref_lines.append(f"• {pref_key}: {pref_value}")
-
-            # 只有在有具体偏好内容时才添加
-            if len(pref_lines) > 1:
+        # 1. 用户偏好信息（始终加载）。存储读取放到线程池：PostgreSQL 后端
+        # 是同步网络往返，跑在事件循环线程上会让 Ctrl-C 长时间失效。
+        prefs = await asyncio.to_thread(
+            self.memory_manager.long_term.get_preference
+        )
+        if isinstance(prefs, dict) and prefs:
+            visible = {
+                key: value
+                for key, value in prefs.items()
+                if has_preference_value(value)  # 0 / False 也是合法偏好
+            }
+            if visible:
+                # 单值 / 总量预算与 Web 会话上下文同口径（500 / 4000）：
+                # 偏好合法上限 200 类型 × 10000 字符，全量原样拼接约 2MB，
+                # 每轮意图识别都会超上下文
+                pref_lines = [
+                    "【用户背景信息】（来自长期记忆，可用于推断缺失信息）"
+                ]
+                pref_lines.extend(preference_prompt_lines(visible))
                 summary_parts.extend(pref_lines)
 
         # 2. 使用LLM总结历史聊天记录
@@ -1026,8 +1050,10 @@ class AligoCLI:
             summary_parts.append("\n【历史会话总结】")
             summary_parts.append(chat_summary)
 
-        # 3. 智能筛选相关历史行程
-        all_trips = self.memory_manager.long_term.get_trip_history(limit=None)
+        # 3. 智能筛选相关历史行程（同为同步存储读取，放线程池避免阻塞循环）
+        all_trips = await asyncio.to_thread(
+            self.memory_manager.long_term.get_trip_history, None
+        )
         if all_trips and _trip_sort_key is not None:
             # 与 Web 摘要窗口同口径：按出发日期升序，最近行程在尾部
             # （存储层按插入 / id 升序返回，头部是最旧行程）
@@ -3788,6 +3814,7 @@ def run_user_import_standalone(
         or str(session_id) in deleted_sessions
     }
     active_sessions = set(candidate_sessions) - skipped_sessions
+    skipped_emptied_sections = False
     if skipped_sessions:
         for session_id in sorted(skipped_sessions):
             if session_id in RESERVED_SESSION_IDS:
@@ -3795,6 +3822,19 @@ def run_user_import_standalone(
             else:
                 errors.append(f"会话 {session_id} 最近被删除，已跳过其消息")
         drop_sessions(sections, skipped_sessions)
+        # has_user_data 是剔除前判定的：drop 后可能已无任何可恢复条目
+        skipped_emptied_sections = not any(
+            sections.get(key)
+            for key in (
+                "preferences",
+                "trips",
+                "messages",
+                "titles",
+                "pinned",
+                "archived",
+                "knowledge",
+            )
+        )
 
     # 与 Web /api/import 同口径复核「恢复后仍可导出」：紧凑备份按原始文件
     # 字节可能通过 50MB 预检，但按导出格式（indent=2）已超限——恢复成功后
@@ -3929,6 +3969,15 @@ def run_user_import_standalone(
     knowledge_error = str(counts.pop("knowledge_error", "") or "")
     incomplete = bool(counts.pop("recovery_incomplete", False))
     ok = not knowledge_error and not incomplete
+    if ok and skipped_emptied_sections:
+        # 备份条目全部落在墓碑期 / 保留字会话：本次没有恢复任何数据。
+        # 函数契约：没有可恢复的数据返回 1，不能以「已恢复」+ 退出码 0
+        # 让灾难恢复脚本把空恢复当成功
+        detail = "；".join(errors[:5])
+        return _fail(
+            "没有可恢复的数据（备份中的会话均处于墓碑期或使用了保留字，"
+            f"已全部跳过）{f'（{detail}）' if detail else ''}"
+        )
     if as_json:
         print(
             json.dumps(
@@ -4869,7 +4918,7 @@ def _session_summaries(store, *, needle: str = "") -> list[dict]:
                 raw_text = str(message.get("content", ""))
             else:
                 raw_text = render_stored_message(message)
-            content = " ".join(raw_text.split())
+            content = _collapsed_whitespace(raw_text)
             if content:
                 entry.setdefault("_parts", []).append(content)
                 if needle in content.lower():
@@ -6084,7 +6133,7 @@ def run_trip_calendar_standalone(
         if callable(close):
             close()
 
-    matches = [trip for trip in trips if str(trip.get("trip_id")) == trip_id]
+    matches = [trip for trip in trips if trip_id_text(trip.get("trip_id")) == trip_id]
     if len(matches) > 1:
         print("该 trip_id 对应多条行程，请先运行 python cli.py trips-dedupe 清理")
         return 1
@@ -6417,7 +6466,7 @@ def run_trip_delete_standalone(
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"读取行程失败：{exc}")
-        matches = [trip for trip in trips if str(trip.get("trip_id")) == trip_id]
+        matches = [trip for trip in trips if trip_id_text(trip.get("trip_id")) == trip_id]
         if len(matches) > 1:
             return _fail(
                 "该 trip_id 对应多条行程，请先运行 python cli.py trips-dedupe 清理"
@@ -6583,7 +6632,7 @@ def run_trip_update_standalone(
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"读取行程失败：{exc}")
-        matches = [trip for trip in trips if str(trip.get("trip_id")) == trip_id]
+        matches = [trip for trip in trips if trip_id_text(trip.get("trip_id")) == trip_id]
         if len(matches) > 1:
             return _fail(
                 "该 trip_id 对应多条行程，请先运行 python cli.py trips-dedupe 清理"
@@ -6647,7 +6696,7 @@ def run_trip_update_standalone(
             close()
 
     saved = next(
-        (trip for trip in trips if str(trip.get("trip_id")) == trip_id),
+        (trip for trip in trips if trip_id_text(trip.get("trip_id")) == trip_id),
         {"trip_id": trip_id, **merged},
     )
     conflicts = (
@@ -7239,7 +7288,12 @@ def _pref_value_problem(value: Any, depth: int = 0) -> str | None:
             if problem:
                 return problem
     elif isinstance(value, dict):
-        for item in value.values():
+        for key, item in value.items():
+            # 键同样会被 Web PUT / 备份恢复校验：含 NUL 的键能落库却无法在
+            # 面板原样保存，导出时还会被 strip_nul 静默改名（备份不再是原值）
+            key_problem = _pref_value_problem(str(key), depth + 1)
+            if key_problem:
+                return key_problem
             if not has_preference_value(item):
                 continue
             problem = _pref_value_problem(item, depth + 1)
@@ -7296,6 +7350,13 @@ def run_preference_set_standalone(
         # 与 Web PUT/DELETE /api/preferences/{type} 的 422 同口径：存储层
         # 加载时会把该键按旧格式展开，写入会静默改动其它偏好
         return _fail("preferences 是保留的偏好类型，请使用具体类型名")
+    if pref_type in (".", ".."):
+        # 面板用 /api/preferences/{encodeURIComponent(type)} 寻址，浏览器会把
+        # "." / ".." 规范化为别的路径；存储层加载也会按不可管理记录丢弃并
+        # 生成 .migrate-backup——本进程报成功、下一个进程偏好就消失。
+        # 与导入端 / 加载端同口径直接拒绝；pref-delete 仍放行，保留清理
+        # 历史脏行的入口
+        return _fail("偏好类型不能是 . 或 ..（面板路径无法寻址）")
     saved_value: Any = value.strip()
     if not has_preference_value(saved_value):
         return _fail("偏好值不能为空（清空请使用 pref-delete）")
@@ -7640,10 +7701,14 @@ def _main_impl():
     """原有入口实现（测试直接调用 main，包装层保证 Ctrl-C 语义一致）。"""
     # 一次性命令不读 stdin：跳过编码探测，避免已连接但无数据的管道卡住启动
     configure_stdio(probe_stdin=len(sys.argv) == 1)
-    if len(sys.argv) > 1 and not isinstance(sys.stdout, PipeSafeTextIO):
-        # 一次性命令同样可能被下游（| head）提前关闭：列表 / 导出 / JSON
-        # 输出全部走管道安全包装，不再打 traceback（与交互模式同一口径）
-        sys.stdout = PipeSafeTextIO(sys.stdout)
+    if len(sys.argv) > 1:
+        # 一次性命令同样可能被下游（| head）提前关闭：stdout / stderr 全部
+        # 走管道安全包装（导出「注意：」等告警也写 stderr），否则解释器
+        # 退出 flush 失败会以 120 结束，成功命令在脚本 / CI 中被判为失败
+        if not isinstance(sys.stdout, PipeSafeTextIO):
+            sys.stdout = PipeSafeTextIO(sys.stdout)
+        if not isinstance(sys.stderr, PipeSafeTextIO):
+            sys.stderr = PipeSafeTextIO(sys.stderr)
     if len(sys.argv) > 1:
         arg = sys.argv[1].strip().lower()
         if arg in {"--version", "-v"}:

@@ -31,6 +31,23 @@ def test_onetime_command_wraps_stdout_for_pipe_safety(monkeypatch):
     print("✓ 一次性命令 stdout 走管道安全包装")
 
 
+def test_onetime_command_wraps_stderr_for_pipe_safety(monkeypatch):
+    """一次性命令的 stderr 同样包装：2>&1 下游提前关闭时不再以 120 退出。"""
+    out_stream = io.StringIO()
+    err_stream = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out_stream)
+    monkeypatch.setattr(sys, "stderr", err_stream)
+    monkeypatch.setattr(sys, "argv", ["cli.py", "--version"])
+    with pytest.raises(SystemExit) as excinfo:
+        cli.main()
+    assert excinfo.value.code == 0
+    assert isinstance(sys.stderr, PipeSafeTextIO)
+    # 包装后的 stderr 写入照常落到底层流（告警文本不能丢）
+    sys.stderr.write("注意：告警")
+    assert err_stream.getvalue().endswith("注意：告警")
+    print("✓ 一次性命令 stderr 走管道安全包装")
+
+
 def test_is_pipe_error_predicate():
     """管道类错误识别：Errno 22/32 / BrokenPipe / winerror；磁盘错误不吞。"""
     assert is_pipe_error(BrokenPipeError()) is True
@@ -55,8 +72,12 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_onetime_command_wraps_stdout_for_pipe_safety(_mp)
-        _mp.undo()
-        test_is_pipe_error_predicate()
     finally:
-        pass
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_onetime_command_wraps_stderr_for_pipe_safety(_mp)
+    finally:
+        _mp.undo()
+    test_is_pipe_error_predicate()
     print("\n全部通过")

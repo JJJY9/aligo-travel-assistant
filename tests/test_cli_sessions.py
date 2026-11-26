@@ -1691,6 +1691,38 @@ def test_session_summaries_matches_legacy_and_defers_search_text(monkeypatch):
     print("✓ 会话摘要新实现与旧实现一致（搜索文本按需构建）")
 
 
+def test_collapsed_whitespace_chunk_equivalence(monkeypatch):
+    """分块折叠空白与整条 split-join 逐字符一致（含跨块 token / 各种空白）。"""
+    samples = [
+        "",
+        "   ",
+        "  前后空白  ",
+        "a\tb\r\nc\v\f d",
+        "中文　全角 NBSP",
+        "\x1c记录分隔\x1f单元分隔",
+        "超长单token" + "x" * 50,
+        "emoji😀 与 CJK 混合    多空格",
+        "a b  c   d",
+    ]
+    for chunk in (1, 2, 3, 5, 8):
+        monkeypatch.setattr(cli, "_WHITESPACE_CHUNK", chunk)
+        for sample in samples:
+            assert cli._collapsed_whitespace(sample) == " ".join(
+                sample.split()
+            ), (chunk, sample)
+    print("✓ 分块折叠空白与整条 split-join 等价")
+
+
+def test_session_summaries_search_uses_chunked_whitespace(monkeypatch):
+    """--query 命中文本走分块归一：大消息（>1MB）结果与旧实现一致。"""
+    payload = "ab " * 400_000  # 1.2M 字符：超过分块阈值
+    store = _FakeStore([_message("user", payload, "s1", "2026-11-04T10:00:00")])
+    fresh = cli._session_summaries(store, needle="abab")
+    legacy = _legacy_session_summaries(store)
+    assert fresh[0]["_parts"] == legacy[0]["_parts"]
+    print("✓ 搜索归一文本与旧实现一致（分块路径）")
+
+
 def test_session_summaries_equal_instant_keeps_later_original():
     """等 chronological_key 的不同原始串：updated_at 仍取后一条原文（>= 语义）。"""
     store = _FakeStore(

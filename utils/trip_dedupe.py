@@ -25,6 +25,15 @@ from utils.trip_import import (
 logger = logging.getLogger(__name__)
 
 
+def trip_id_text(value: object) -> str:
+    """trip_id 文本归一：None（缺键 / null）视为空串，0 等合法 falsy 值保留。
+
+    ``str(None)`` 得到 "None"，会让无 id 的历史行进入去重分组、报出假歧义，
+    或被 ``trip-delete ... None`` 当成可定位行删除。
+    """
+    return "" if value is None else str(value)
+
+
 def _identity(trip: dict[str, Any]) -> tuple[str, str, str, str] | None:
     """与存储层去重同一口径的行程身份；缺出发日期返回 None。"""
     start_date = normalize_identity_date(trip.get("start_date"))
@@ -61,7 +70,9 @@ def plan_trip_dedupe(store: Any) -> dict[str, Any]:
         Exception: 读取行程失败（调用方负责映射为 503 / 退出码）。
     """
     trips = store.get_trip_history(limit=None)
-    trip_ids = [str(trip.get("trip_id")) for trip in trips]
+    # 缺失键 / null 归一为空串（与 PG 后端一致）：str(None) 会得到 "None"，
+    # 让无 id 的历史行进入分组，报出假歧义甚至被当重复删除
+    trip_ids = [trip_id_text(trip.get("trip_id")) for trip in trips]
     # 每行身份只算一次：5000 行时分组 / 歧义 / 无日期 / 复核四处各算一遍
     # 是 4 倍的身份投影开销（实测约 0.4s 纯重复计算）
     identities = [_identity(trip) for trip in trips]
@@ -103,6 +114,10 @@ def plan_trip_dedupe(store: Any) -> dict[str, Any]:
     # 只差大小写的同 id 行仍交给人工，不自动删改用户写法不同的数据
     id_groups: dict[str, set[Any]] = {}
     for trip, trip_id, trip_key in zip(trips, trip_ids, identities):
+        if not trip_id:
+            # 空 id 的行不参与歧义判定：两条内容不同的无 id 行不能报成
+            # 同一伪 id 的歧义（README：空 trip_id 不进入计划）
+            continue
         marker: Any = (
             trip_key
             if trip_key is not None
@@ -139,7 +154,7 @@ def plan_trip_dedupe(store: Any) -> dict[str, Any]:
         if callable(reload):
             reload()
         fresh_ids = {
-            str(trip.get("trip_id"))
+            trip_id_text(trip.get("trip_id"))
             for trip in store.get_trip_history(limit=None)
         }
 
@@ -224,7 +239,7 @@ def apply_trip_dedupe(
     expected_by_target: dict[str, tuple[str, str, str, str]] = {}
     if verify:
         for item in verify:
-            trip_id = str(item.get("trip_id") or "")
+            trip_id = trip_id_text(item.get("trip_id"))
             if not trip_id:
                 continue
             expected_by_target[trip_id] = (
@@ -280,7 +295,7 @@ def apply_trip_dedupe(
                     }
                 )
                 fresh = {
-                    str(trip.get("trip_id")): trip
+                    trip_id_text(trip.get("trip_id")): trip
                     for trip in store.get_trip_history(limit=None)
                 }
                 kept_row = fresh.get(kept_id)
