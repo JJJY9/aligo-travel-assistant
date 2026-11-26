@@ -85,6 +85,32 @@ def test_max_entries_prunes_oldest():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_max_entries_prunes_per_owner():
+    """超限淘汰只动条目最多的用户：另一用户的检查点不能被挤出。
+
+    检查点是重试时复用已完成子智能体的依据，被挤出会让重试重复
+    调用模型（重复计费）。
+    """
+    store, root = _store(max_entries=2)
+    try:
+        store.save("bob:s1:t1:d", {"status": "ok"})
+        store.save("alice:s1:t1:d", {"status": "ok"})
+        store.save("alice:s2:t1:d", {"status": "ok"})  # alice 超限，淘汰自己最旧
+        assert store.load("bob:s1:t1:d")["status"] == "ok"
+        assert store.load("alice:s2:t1:d")["status"] == "ok"
+        assert store.load("alice:s1:t1:d") is None
+        assert len(store) == 2
+        # scope 提供的归属同样生效（key 不含 ':' 时取 scope 首段）
+        store.save("plain-key", {"status": "ok"}, scope="bob:s9")
+        assert store.load("alice:s2:t1:d") is not None
+        assert store.load("plain-key")["status"] == "ok"
+        assert store.load("bob:s1:t1:d") is None
+        assert len(store) == 2
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    print("✓ 检查点按用户公平淘汰")
+
+
 def test_key_is_hashed_on_disk():
     store, root = _store()
     try:
@@ -313,6 +339,7 @@ if __name__ == "__main__":
     test_ttl_expiry_removes_file()
     test_corrupted_file_is_cleaned()
     test_max_entries_prunes_oldest()
+    test_max_entries_prunes_per_owner()
     test_key_is_hashed_on_disk()
     test_raw_key_not_written_to_disk()
     test_default_root_follows_data_dir()

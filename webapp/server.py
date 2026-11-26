@@ -1086,7 +1086,10 @@ def _text_write_problem(value: object, depth: int = 0) -> str | None:
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
-    user_id: str = Field(default="web_user", pattern=_ID_PATTERN)
+    # 必须显式给用户：缺省回退固定账号会让省略字段的不同客户端共读写同一
+    # 份记忆（偏好 / 历史摘要进对方上下文、幂等键跨客户端回放）。其余数据
+    # 接口同样是必填（缺省 422）。
+    user_id: str = Field(pattern=_ID_PATTERN)
     session_id: str | None = Field(default=None, pattern=_ID_PATTERN)
     # 客户端生成的回合标识：写入助手消息的 _meta，停止 / 断网后的前端
     # 对账用它精确判断这一轮是否已落库（文本比较会把重复提问误判成已保存）
@@ -1695,9 +1698,14 @@ class AligoWebApp:
         )
         self.sessions: OrderedDict[str, _WebSession] = OrderedDict()
         # 被 LRU 淘汰会话的未结算 token 账目（失败回合没有消息承载
-        # _meta.usage）：按会话键结转给下次新建的同名会话，上限与会话缓存
-        # 相同（进程内、有界；进程重启后仍会丢失，见 README 用量口径）
-        self._pending_usage: OrderedDict[str, dict[str, Any]] = OrderedDict()
+        # _meta.usage）：按用户分桶、每人上限与会话缓存相同，再按会话键
+        # 结转给下次新建的同名会话。分桶保证一个用户的流量不会把另一
+        # 用户较早结转的账目挤出；外层桶数另有全局上限（进程内、有界；
+        # 进程重启后仍会丢失，见 README 用量口径）
+        self._pending_usage: dict[str, OrderedDict[str, dict[str, Any]]] = {}
+        # 结转表最多保留的用户桶数：大量一次性用户 ID 各留一笔账目也不
+        # 能让进程内表无界增长，超过时淘汰最早建桶的用户
+        self.max_pending_usage_users = 1000
         self.locks: dict[str, asyncio.Lock] = {}
         self._deleted_sessions: OrderedDict[str, tuple[float, str]] = OrderedDict()
         # mark/unmark/is_recently_deleted 会被 asyncio.to_thread 在线程池里执行，
@@ -1871,6 +1879,30 @@ class AligoWebApp:
     def _session_key(user_id: str, session_id: str) -> str:
         return f"{user_id}\n{session_id}"
 
+    @staticmethod
+    def _evict_user_fair_locked(
+        store: "OrderedDict[Any, Any]",
+        limit: int,
+        user_of: "Callable[[Any], str]",
+    ) -> None:
+        """容量裁剪按用户公平淘汰（调用方已持有对应锁）。
+
+        全局 FIFO 会让一个用户的大量删除把另一用户仍有效的墓碑挤出：
+        墓碑是删除保护的重要来源，被挤出的会话可能被迟到落库 / 导入恢复
+        写回。这里只淘汰条目最多的用户自己最旧的一条；同条目数时按全局
+        最旧条目的用户决胜，单用户场景仍是 FIFO。
+        """
+        while len(store) > limit:
+            counts: dict[str, int] = {}
+            for candidate in store:
+                owner = user_of(candidate)
+                counts[owner] = counts.get(owner, 0) + 1
+            victim_user = max(counts, key=lambda owner: counts[owner])
+            for candidate in store:
+                if user_of(candidate) == victim_user:
+                    del store[candidate]
+                    break
+
     def _evict_over_limit_locked(
         self, keep_key: str, evicted: list["_WebSession"]
     ) -> None:
@@ -1911,12 +1943,36 @@ class AligoWebApp:
         pending = take()
         if not pending:
             return
-        key = self._session_key(session.user_id, session.session_id)
         with self._sessions_lock:
-            self._pending_usage[key] = pending
-            self._pending_usage.move_to_end(key)
-            while len(self._pending_usage) > self.max_sessions:
-                self._pending_usage.popitem(last=False)
+            bucket = self._pending_usage.get(session.user_id)
+            if bucket is None:
+                bucket = self._pending_usage[session.user_id] = OrderedDict()
+            bucket[session.session_id] = pending
+            bucket.move_to_end(session.session_id)
+            # 只淘汰本用户自己的最旧条目：全局 FIFO 会让高流量用户把
+            # 别人的结转账目挤出，被挤出者的用量永久少记
+            while len(bucket) > self.max_sessions:
+                bucket.popitem(last=False)
+            while len(self._pending_usage) > self.max_pending_usage_users:
+                victim = next(
+                    (user for user in self._pending_usage if user != session.user_id),
+                    None,
+                )
+                if victim is None:
+                    break
+                del self._pending_usage[victim]
+
+    def _pop_pending_usage_locked(
+        self, user_id: str, session_id: str
+    ) -> dict[str, Any] | None:
+        """取出某会话结转的未结算用量（调用方必须持有 _sessions_lock）。"""
+        bucket = self._pending_usage.get(user_id)
+        if not bucket:
+            return None
+        carried = bucket.pop(session_id, None)
+        if not bucket:
+            self._pending_usage.pop(user_id, None)
+        return carried
 
     def get_session(
         self, user_id: str, session_id: str | None, mark_in_use: bool = False
@@ -2049,7 +2105,7 @@ class AligoWebApp:
                             session = candidate
                             self.sessions[key] = candidate
                             # 淘汰结转的未结算用量并入新实例（仍在 _sessions_lock 内）
-                            carried = self._pending_usage.pop(key, None)
+                            carried = self._pop_pending_usage_locked(user_id, session_id)
                             if carried:
                                 seed = getattr(
                                     getattr(candidate, "runtime", None),
@@ -2091,7 +2147,7 @@ class AligoWebApp:
         with self._sessions_lock:
             session = self.sessions.pop(key, None)
             # 删除语义下用量随会话消失：淘汰结转的账目不能再种回同名新会话
-            self._pending_usage.pop(key, None)
+            self._pop_pending_usage_locked(user_id, session_id)
         if session is not None:
             session.close()
 
@@ -2141,8 +2197,11 @@ class AligoWebApp:
                 now + self.tombstone_ttl_sec,
             )
             self._pending_shared_tombstones.move_to_end(key)
-            while len(self._pending_shared_tombstones) > self.max_tombstones:
-                self._pending_shared_tombstones.popitem(last=False)
+            self._evict_user_fair_locked(
+                self._pending_shared_tombstones,
+                self.max_tombstones,
+                lambda candidate: candidate[0],
+            )
 
     def replay_pending_tombstones(self, limit: int = 20) -> int:
         """Redis 恢复后补写故障期的共享墓碑与会话纪元（幂等）。
@@ -2243,8 +2302,11 @@ class AligoWebApp:
             ]
             for candidate in expired:
                 del self._deleted_sessions[candidate]
-            while len(self._deleted_sessions) > self.max_tombstones:
-                self._deleted_sessions.popitem(last=False)
+            self._evict_user_fair_locked(
+                self._deleted_sessions,
+                self.max_tombstones,
+                lambda candidate: candidate.split("\n", 1)[0],
+            )
         # 删除是低频关键路径：跳过失败冷却真实写入一次，冷却期静默跳过
         # 会让其它实例看不到这次删除（在途回合可把会话写回）
         client = self._shared_tombstones(force=True)

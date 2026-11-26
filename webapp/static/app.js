@@ -105,6 +105,9 @@ const state = {
   sessionId: safeStorageGet("session", "aligo.sessionId") || null,
   // 深链接里的会话 ID 被拒绝：init 时统一提示（此处 els 尚未定义）
   urlSessionRejected: false,
+  // 存储的用户 ID 被当前规则拒绝（规则收紧 / 历史非法值）：回退 web_user
+  // 但不静默，init 时提示用户修正（此处 els 尚未定义）
+  rejectedUserId: null,
   // 初始化请求完成前不允许发送：此时页面还没展示已保存会话的历史，
   // 发送会把消息写进一个界面从未展示过的旧会话
   ready: false,
@@ -204,6 +207,9 @@ const RESERVED_DEVICE_NAMES = new Set([
 // 启动后校验：历史遗留的非法 / 设备保留名 ID 会让所有请求 422、界面不可用
 function sanitizeStoredUserId() {
   if (isValidId(state.userId)) return;
+  // 保留回退（避免整页 422），但记下被拒值，init 时提示用户修正，
+  // 否则会静默切进共享默认账号且原账号数据从面板消失
+  state.rejectedUserId = state.userId;
   state.userId = "web_user";
   safeStorageRemove("session", "aligo.userId");
   safeStorageRemove("local", "aligo.userId");
@@ -5528,10 +5534,11 @@ function startEditPreference(row, type, currentValue) {
 
 async function deletePreference(type, label, row) {
   if (!window.confirm(`删除偏好「${label}」？`)) return;
+  const requestUserId = state.userId;
   try {
     await getJSON(
       `/api/preferences/${encodeURIComponent(type)}?user_id=${encodeURIComponent(
-        state.userId,
+        requestUserId,
       )}`,
       { method: "DELETE" },
     );
@@ -5539,10 +5546,13 @@ async function deletePreference(type, label, row) {
     // 先本地移除并清掉最新值：refreshStatus 失败（静默）时不会留下已删除
     // 的行，残留行再次「编辑」保存也不会用旧值把偏好 PUT 回来。状态快照
     // 同步删除，否则刷新失败后 renderOverview 会让已删行复活、并把旧值
-    // 写回「添加偏好」的合并基线
-    preferenceLatest.delete(type);
-    if (state.status && state.status.preferences) {
-      delete state.status.preferences[type];
+    // 写回「添加偏好」的合并基线。响应迟到且期间用户已切换时不能动新
+    // 用户的基线（与 addPreference / startEditPreference 同口径）
+    if (state.userId === requestUserId) {
+      preferenceLatest.delete(type);
+      if (state.status && state.status.preferences) {
+        delete state.status.preferences[type];
+      }
     }
     if (row && row.isConnected) row.remove();
     await refreshStatus({ silentFailure: true });
@@ -7289,7 +7299,13 @@ async function saveUser() {
     toast("请等待当前回复完成");
     return;
   }
-  const value = els.userIdInput.value.trim() || "web_user";
+  const raw = els.userIdInput.value.trim();
+  if (!raw) {
+    // 空输入不再隐式落到 web_user：共享默认账号往往已有别人的数据
+    toast("请输入用户 ID（留空不会切换账号）");
+    return;
+  }
+  const value = raw;
   if (RESERVED_DEVICE_NAMES.has(value.toLowerCase())) {
     // 设备保留名（con / nul / com1…）满足字符规则但不被服务端接受：
     // 固定文案会让用户反复改大小写仍无法成功
@@ -7305,9 +7321,14 @@ async function saveUser() {
       document.querySelector(".user-edit-input") ||
       kbFormDirty() ||
       tripFormDirty() ||
-      prefFormDirty()
+      prefFormDirty() ||
+      els.input.value.trim()
     ) {
-      if (!window.confirm("正在编辑的修改尚未保存，切换用户将丢弃修改。继续？")) {
+      if (
+        !window.confirm(
+          "当前有未保存的内容（含聊天草稿），切换用户将丢弃。继续？",
+        )
+      ) {
         return;
       }
     }
@@ -7334,6 +7355,10 @@ async function saveUser() {
     safeStorageRemove("session", "aligo.sessionId");
     syncSessionControls();
     setConversationTitle("新对话");
+    // 聊天草稿与其余表单同口径：上一用户未发送的文本不能留给新用户
+    // （输入框仍可回车，会按新用户的 user_id 发出）
+    els.input.value = "";
+    resizeInput();
     showWelcome();
     updateUserCard();
     state.showArchived = false;
@@ -7924,6 +7949,14 @@ async function init() {
     // 深链接里的会话 ID 非法（设备名会话可用；export 等保留字拒绝）
     state.urlSessionRejected = false;
     toast("链接中的会话 ID 无效，已忽略");
+  }
+  if (state.rejectedUserId) {
+    // 存储的用户 ID 被规则拒绝：已回退 web_user，提示用户修正或切回原账号
+    const rejected = String(state.rejectedUserId);
+    state.rejectedUserId = null;
+    const chars = Array.from(rejected);
+    const shown = chars.length > 24 ? `${chars.slice(0, 24).join("")}…` : rejected;
+    toast(`原用户 ID「${shown}」不符合当前规则，已临时切换到 web_user；请在「记忆与数据」中修正`);
   }
   updateThemeButton();
   restoreSidebar();

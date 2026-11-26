@@ -58,6 +58,34 @@ def test_lru_eviction():
     print("✓ 幂等缓存 LRU 淘汰")
 
 
+def test_eviction_is_per_user_fair():
+    """超限淘汰只动条目最多的用户：另一用户的条目不能被挤出。
+
+    断连回合的 __incomplete__ 标记被他人流量挤出后，重试会重复执行、
+    重复落库。
+    """
+    cache = IdempotencyCache(max_entries=3)
+    bob_key = make_key("bob", "s", "mark")
+    cache.put(bob_key, {"__incomplete__": True})
+    for index in range(4):
+        cache.put(make_key("alice", "s", f"k{index}"), {"v": index})
+    assert cache.get(bob_key) == {"__incomplete__": True}
+    assert len(cache) == 3
+
+    # 条目数不同时淘汰条目多的一方；同用户内部仍是标准 LRU
+    cache2 = IdempotencyCache(max_entries=2)
+    bob1 = make_key("bob", "s", "1")
+    bob2 = make_key("bob", "s", "2")
+    alice = make_key("alice", "s", "1")
+    cache2.put(bob1, {"v": 1})
+    cache2.put(alice, {"v": 2})
+    cache2.put(bob2, {"v": 3})  # bob 2 条 > alice 1 条：淘汰 bob1
+    assert cache2.get(bob2) == {"v": 3}
+    assert cache2.get(alice) == {"v": 2}
+    assert cache2.get(bob1) is None
+    print("✓ 幂等缓存按用户公平淘汰")
+
+
 def test_key_normalization_and_clear():
     """键去空白、限长；clear 后为空。"""
     key = make_key(" u1 ", " s1 ", " x " * 200)
@@ -115,6 +143,7 @@ if __name__ == "__main__":
     finally:
         mp.undo()
     test_lru_eviction()
+    test_eviction_is_per_user_fair()
     test_key_normalization_and_clear()
     test_key_binds_endpoint_and_message()
     test_discard_session_clears_all_forms()

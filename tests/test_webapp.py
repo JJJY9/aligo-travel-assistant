@@ -1169,6 +1169,22 @@ def test_status_survives_date_max_trip():
         _cleanup(user_id)
 
 
+def test_chat_requires_explicit_user_id():
+    """对话入口与其余数据接口同口径：user_id 必填，缺省 422。
+
+    缺省回退固定账号会让省略字段的不同客户端共读写同一份记忆
+    （偏好 / 历史摘要互相注入、幂等键跨客户端回放）。
+    """
+    client = _client()
+    response = client.post("/api/chat", json={"message": "你好"})
+    assert response.status_code == 422, response.text
+    detail = response.json().get("detail") or []
+    assert any("user_id" in str(item.get("loc", "")) for item in detail), detail
+    streamed = client.post("/api/chat/stream", json={"message": "你好"})
+    assert streamed.status_code == 422, streamed.text
+    print("✓ /api/chat 缺少 user_id 返回 422")
+
+
 def test_chat_returns_reply_and_usage():
     client = _client()
     # 固定 user_id 会把真实记忆文件写进仓库 data/memory 并跨轮次累积：
@@ -11612,6 +11628,48 @@ def test_tombstone_expired_entries_pruned_before_eviction():
     print("✓ 墓碑容量淘汰前先清理过期条目（过期键非最旧）")
 
 
+def test_tombstone_eviction_is_per_user_fair():
+    """容量淘汰按用户公平：一个用户的删除量不能挤掉另一用户仍有效的墓碑。
+
+    墓碑被挤出后，迟到落库 / 导入恢复可能把已删除的会话写回。
+    """
+    state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
+    state.max_tombstones = 3
+    try:
+        state.mark_deleted("bob", "b1")
+        state.mark_deleted("alice", "a1")
+        state.mark_deleted("alice", "a2")
+        state.mark_deleted("alice", "a3")  # alice 3 条超限：淘汰 alice 最旧
+        assert state.is_recently_deleted("bob", "b1") is True
+        assert state.is_recently_deleted("alice", "a2") is True
+        assert state.is_recently_deleted("alice", "a3") is True
+        assert len(state._deleted_sessions) <= state.max_tombstones
+    finally:
+        state.close_all()
+    print("✓ 墓碑容量按用户公平淘汰")
+
+
+def test_pending_shared_tombstone_eviction_is_fair():
+    """故障期待补写表同样按用户公平淘汰。"""
+    state = create_app(model=UsageTrackingModel(_FakeModel())).state.aligo
+    state.max_tombstones = 3
+    try:
+        with state._tombstone_lock:
+            state._pending_shared_tombstones.clear()
+        state._remember_pending_tombstone("bob", "b1", "t-b")
+        state._remember_pending_tombstone("alice", "a1", "t-a1")
+        state._remember_pending_tombstone("alice", "a2", "t-a2")
+        state._remember_pending_tombstone("alice", "a3", "t-a3")
+        pending = state._pending_shared_tombstones
+        assert ("bob", "b1") in pending
+        assert ("alice", "a1") not in pending
+        assert ("alice", "a3") in pending
+        assert len(pending) <= state.max_tombstones
+    finally:
+        state.close_all()
+    print("✓ 待补写墓碑按用户公平淘汰")
+
+
 def test_session_metadata_requires_existing_session():
     client = _client()
     user_id = _unique_user("web_test_ghost")
@@ -17119,6 +17177,35 @@ def test_lru_eviction_carries_pending_usage():
         state.close_all()
         _cleanup(user)
     print("✓ LRU 淘汰结转未结算用量")
+
+
+def test_pending_usage_carried_per_user():
+    """结转表按用户分桶：A 的会话抖动不能挤出 B 的未结算用量。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.max_sessions = 1
+    user_b = _unique_user("web_test_pending_user_b")
+    user_a = _unique_user("web_test_pending_user_a")
+    try:
+        first = state.get_session(user_b, "s-a")
+        first.runtime.seed_unsettled_usage({"calls": 1, "total_tokens": 999})
+        state.get_session(user_b, "s-b")  # 淘汰 s-a，账目结转给 B 的桶
+        for index in range(3):
+            session = state.get_session(user_a, f"a-{index}")
+            session.runtime.seed_unsettled_usage(
+                {"calls": index + 1, "total_tokens": 10}
+            )
+            state.get_session(user_a, f"next-{index}")  # 逐次淘汰并结转 A
+        rebuilt = state.get_session(user_b, "s-a")
+        assert rebuilt.runtime.take_pending_usage() == {
+            "calls": 1,
+            "total_tokens": 999,
+        }
+    finally:
+        state.close_all()
+        _cleanup(user_a)
+        _cleanup(user_b)
+    print("✓ 结转用量按用户分桶互不挤出")
 
 
 def test_weather_executor_threads_are_daemon_and_not_registered():

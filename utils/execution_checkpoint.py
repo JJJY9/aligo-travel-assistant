@@ -8,7 +8,11 @@
 - 每个键一个 JSON 文件（文件名 = SHA-256(key)），内容只存键哈希：键里
   带用户 / 会话标识，落盘原始值等于把个人数据写进运行期文件；
 - 原子写：同目录临时文件 → fsync → ``os.replace``；
-- TTL + 最大条目数：读取过期文件视为不存在并清理，写入后按 mtime 淘汰；
+- TTL + 最大条目数：读取过期文件视为不存在并清理，写入后超限按用户
+  公平淘汰——只淘汰条目最多的用户自己最旧的一条，任一用户的流量不能
+  把另一用户仍在 TTL 内的检查点挤出（被挤出的检查点会让重试重复执行
+  子智能体、重复调用模型）。归属按 key / scope 首段（用户）计，只存
+  哈希；无法解析归属的旧文件归入共享桶，仍按全局最旧淘汰；
 - 损坏文件按不存在处理并移出（不阻断调用方）；
 - 进程内互斥保证同进程并发写同一键不互相覆盖；跨进程写同一键不在本层
   承诺（多实例部署应按用户 / 请求分片或换 Redis 实现）。
@@ -54,6 +58,9 @@ class CheckpointStore:
         self.ttl_sec = max(0.0, float(ttl_sec))
         self.max_entries = max(1, int(max_entries))
         self._lock = threading.Lock()
+        # 文件名 → 归属哈希缓存：裁剪只在超限时读取负载解析归属，缓存后
+        # 稳态（容量已满、缓存已热）不再读盘
+        self._owner_cache: dict[str, str] = {}
         self.root.mkdir(parents=True, exist_ok=True)
         with self._lock:
             self._clean_temp_files()
@@ -102,18 +109,59 @@ class CheckpointStore:
                     path.unlink()
                 except OSError:
                     continue
+                self._owner_cache.pop(path.name, None)
                 continue
             try:
                 entries.append((path.stat().st_mtime, path))
             except OSError:
                 continue
+        live_names = {path.name for _, path in entries}
+        for name in list(self._owner_cache):
+            if name not in live_names:
+                self._owner_cache.pop(name, None)
         entries.sort()
+        if len(entries) <= self.max_entries:
+            return
+        # 只在超限时解析归属（缓存命中后不再读盘）；旧格式 / 无归属文件
+        # 按共享桶（空串）处理，仍按全局最旧淘汰
+        owners: dict[str, str] = {}
+        for _, path in entries:
+            name = path.name
+            cached = self._owner_cache.get(name)
+            if cached is None:
+                payload = self._read(path)
+                cached = (
+                    str(payload.get("owner_hash") or "")
+                    if isinstance(payload, dict)
+                    else ""
+                )
+            self._owner_cache[name] = cached
+            owners[name] = cached
         while len(entries) > self.max_entries:
-            _, path = entries.pop(0)
+            # 全局 FIFO 会让任一用户的写入把另一用户在途回合的检查点挤出，
+            # 重试因此重复执行子智能体：只淘汰条目最多的归属自己的最旧一条
+            counts: dict[str, int] = {}
+            for _, path in entries:
+                owner = owners.get(path.name, "")
+                counts[owner] = counts.get(owner, 0) + 1
+            victim_owner = max(counts, key=lambda owner: counts[owner])
+            index = next(
+                (
+                    position
+                    for position, (_, path) in enumerate(entries)
+                    if owners.get(path.name, "") == victim_owner
+                ),
+                None,
+            )
+            if index is None:  # 不可达；防御性回退到全局最旧
+                index = 0
+            _, path = entries.pop(index)
             try:
                 path.unlink()
             except OSError:
                 pass
+            self._owner_cache.pop(path.name, None)
+            owners.pop(path.name, None)
 
     def _clean_temp_files(self) -> None:
         """清理崩溃 / 断电遗留的临时文件（调用方已持有 ``self._lock``）。"""
@@ -125,20 +173,34 @@ class CheckpointStore:
             except OSError:
                 continue
 
+    @staticmethod
+    def _owner_bucket(key: str, scope: str | None) -> str:
+        """归属段：scope / key 第一个 ``:`` 之前的部分（通常是用户 ID）。
+
+        无法解析（无 scope 且 key 不含 ``:``）时返回空串，归入共享桶。
+        """
+        source = str(scope if scope else key)
+        head, sep, _ = source.partition(":")
+        return head if (scope or sep) else ""
+
     def _payload(
         self,
         key: str,
         state: dict[str, Any],
         scope: str | None = None,
+        owner_digest: str | None = None,
     ) -> dict[str, Any]:
         """落盘负载：只留键哈希，不把含用户 / 会话标识的原始键写进文件。
 
         ``scope``（``user:session``）同样只存哈希：会话删除时按它清理
-        检查点，不必落盘用户 / 会话标识。
+        检查点，不必落盘用户 / 会话标识。``owner_hash`` 供裁剪时按用户
+        公平淘汰，同样只存哈希。
         """
         payload = {**state, "key_hash": self._digest(key)}
         if scope:
             payload["scope_hash"] = self._digest(scope)
+        if owner_digest:
+            payload["owner_hash"] = owner_digest
         return payload
 
     def _write_unlocked(
@@ -148,8 +210,10 @@ class CheckpointStore:
         scope: str | None = None,
     ) -> None:
         """原子写入（调用方已持有 ``self._lock``）。"""
+        bucket = self._owner_bucket(key, scope)
+        owner_digest = self._digest(bucket) if bucket else ""
         path = self._path(key)
-        payload = self._payload(key, state, scope)
+        payload = self._payload(key, state, scope, owner_digest)
         fd, temp_name = tempfile.mkstemp(
             prefix=f".{path.name}.", suffix=".tmp", dir=self.root
         )
@@ -168,6 +232,7 @@ class CheckpointStore:
             except OSError:
                 pass
             raise
+        self._owner_cache[path.name] = owner_digest
         self._prune()
 
     def _cleanup_legacy_roots(self) -> None:
@@ -282,16 +347,19 @@ class CheckpointStore:
                 try:
                     path.unlink()
                     removed += 1
+                    self._owner_cache.pop(path.name, None)
                 except OSError:
                     continue
         return removed
 
     def clear(self, key: str) -> None:
         with self._lock:
+            path = self._path(key)
             try:
-                self._path(key).unlink()
+                path.unlink()
             except OSError:
                 pass
+            self._owner_cache.pop(path.name, None)
 
     def __len__(self) -> int:
         with self._lock:
