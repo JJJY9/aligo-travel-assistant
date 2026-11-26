@@ -1,8 +1,9 @@
 """进程内请求指标（无第三方依赖）。
 
-中间件为每个请求记录计数与耗时；``GET /api/metrics`` 返回快照，便于本地观测
-与压测。耗时 P50 / P95 基于最近 ``MAX_DURATION_SAMPLES`` 个请求（内存有界）。
-多进程 / 多实例部署时各进程独立统计（见 README 已知限制）。
+中间件为 ``/api`` 路由请求与 Host 白名单拒绝的探测记录计数与耗时；首页、
+静态资源与 ``/metrics`` 抓取本身不计入（``GET /api/metrics`` 返回快照），
+便于本地观测与压测。耗时 P50 / P95 基于最近 ``MAX_DURATION_SAMPLES`` 个
+请求（内存有界）。多进程 / 多实例部署时各进程独立统计（见 README 已知限制）。
 """
 import math
 import re
@@ -185,7 +186,7 @@ class RequestMetrics:
             uptime = time.monotonic() - self._started_at
 
         lines = [
-            "# HELP aligo_requests_total Total HTTP requests recorded by this process.",
+            "# HELP aligo_requests_total Total HTTP requests to /api routes (plus Host-rejected probes) recorded by this process; static assets, / and /metrics scrapes are not counted.",
             "# TYPE aligo_requests_total counter",
             f"aligo_requests_total {total}",
             "# HELP aligo_requests_by_status_total Requests grouped by HTTP status.",

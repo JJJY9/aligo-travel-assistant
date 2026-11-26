@@ -1,8 +1,9 @@
 """Personal Agent 分层评测用例生成（v2.0）。
 
-按 12 类场景模板 + 槽位变体确定性生成评测集（默认 500 条）：
+按 18 类场景模板 + 槽位变体确定性生成评测集（默认 500 条）：
 问候、行程规划、事项收集、偏好写入、偏好查询、记忆查询、政策 RAG、
-天气、网页搜索、多意图、缺失信息澄清、无关问题。
+天气、网页搜索、多意图、缺失信息澄清、无关问题，以及 v2 六个扩展
+技能（预算 / 行李 / 行前清单 / 市内交通 / 安全提示 / 差旅贴士）。
 
 生成结果只是「待评测用例」；回答由调用方注入的 predict 函数产生。
 """
@@ -106,10 +107,51 @@ _TEMPLATES: list[tuple[str, list[str], list[str], list[str]]] = [
         [],
     ),
     (
+        # 无关问题按「不调度任何智能体」计分（与问候同口径，intention_agent
+        # 允许纯闲聊返回空 agent_schedule）。模板必须是明确的闲聊 / 致谢类：
+        # 「今天股市怎么样」这类站外信息查询按提示词应调度 information_query，
+        # 混进来会让空集合期望必败。也不要期望 "other"：管线没有这个可调度
+        # 智能体，未知调度名会被过滤并按默认 information_query 兜底。
         "other",
-        ["今天股市怎么样", "给我讲个笑话", "你会写代码吗"],
-        ["other"],
+        ["给我讲个笑话", "你会写代码吗", "今天心情不错，谢谢你"],
         [],
+        [],
+    ),
+    (
+        "trip_budget",
+        ["帮我算算去{city}玩{days}天的预算", "去{city}出差{days}天大概要花多少钱"],
+        ["trip-budget"],
+        ["city"],
+    ),
+    (
+        "packing_list",
+        ["我{days}天后去{city}，要带什么行李", "去{city}出差需要带些什么"],
+        ["packing-list"],
+        ["city"],
+    ),
+    (
+        "travel_checklist",
+        ["出发去{city}前要做哪些准备", "帮我列个去{city}的行前检查清单"],
+        ["travel-checklist"],
+        ["city"],
+    ),
+    (
+        "local_transport",
+        ["到了{city}市内怎么去景点", "{city}市内交通怎么安排"],
+        ["local-transport"],
+        ["city"],
+    ),
+    (
+        "safety_tips",
+        ["去{city}出差要注意哪些安全事项", "{city}晚上出门安全吗"],
+        ["safety-tips"],
+        ["city"],
+    ),
+    (
+        "trip_notes",
+        ["去{city}出差有什么实用贴士", "第一次去{city}有什么注意事项"],
+        ["trip-notes"],
+        ["city"],
     ),
 ]
 
@@ -151,7 +193,7 @@ def _required_keywords(
 
 
 def build_cases(count: int = 500, seed: int = 7) -> list[dict[str, Any]]:
-    """确定性生成分层评测集（默认 500 条），覆盖全部 12 类场景。"""
+    """确定性生成分层评测集（默认 500 条），覆盖全部 18 类场景。"""
     if count < 0:
         raise ValueError("count 不能为负数")
     rng = random.Random(seed)

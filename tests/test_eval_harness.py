@@ -16,7 +16,7 @@ import pytest
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from utils.eval_cases import build_cases, dump_cases
+from utils.eval_cases import _TEMPLATES, build_cases, dump_cases
 from utils.eval_harness import evaluate_case, run_eval
 
 
@@ -86,6 +86,46 @@ def test_judge_score_and_failure():
     print("✓ Judge 分数与故障兜底")
 
 
+def test_judge_invalid_scores_are_unscored_not_crash():
+    """非数字 / NaN 分数按未评分处理：不能崩溃，也不能静默算通过后污染均值。"""
+    case = _case(required_keywords=[], forbidden_keywords=[])
+
+    def _text_judge(case, answer):
+        return "oops"
+
+    result = evaluate_case(
+        case, {"intents": ["itinerary_planning"], "answer": "ok"}, judge=_text_judge
+    )
+    assert result["judge_score"] is None
+    assert "Judge 调用失败" in " ".join(result["reasons"])
+
+    def _nan_judge(case, answer):
+        return float("nan")
+
+    result = evaluate_case(
+        case, {"intents": ["itinerary_planning"], "answer": "ok"}, judge=_nan_judge
+    )
+    assert result["judge_score"] is None
+    assert "Judge 调用失败" in " ".join(result["reasons"])
+    print("✓ 非法 Judge 分数按未评分处理")
+
+
+def test_prediction_error_is_failure_even_for_empty_expectations():
+    """带 error 标记的预测必须失败：空意图集合与问候类期望相等，不能白送通过。"""
+    case = _case(
+        category="greeting",
+        expected_intents=[],
+        required_keywords=[],
+        forbidden_keywords=[],
+    )
+    result = evaluate_case(
+        case, {"intents": [], "answer": "", "error": "预测异常：TimeoutError"}
+    )
+    assert result["passed"] is False
+    assert "预测不可用" in " ".join(result["reasons"])
+    print("✓ 预测 error 标记按失败计分")
+
+
 def test_empty_expected_intents_still_checked():
     """空期望意图（问候）也必须完全匹配，不能被跳过。"""
     case = _case(
@@ -128,21 +168,39 @@ def test_run_eval_aggregates_and_handles_errors():
     print("✓ 总体 / 分类汇总与预测异常")
 
 
-def test_build_cases_covers_twelve_categories():
+def test_build_cases_covers_all_categories():
     cases = build_cases(count=500)
     assert len(cases) == 500
     categories = {case["category"] for case in cases}
-    assert len(categories) == 12, categories
+    assert len(categories) == len(_TEMPLATES), categories
     assert len({case["id"] for case in cases}) == 500
     assert len({case["query"] for case in cases}) == 500
     for case in cases:
         assert isinstance(case["expected_intents"], list)
-        if case["category"] != "greeting":
+        # greeting / other 按「不调度任何智能体」计分
+        if case["category"] not in {"greeting", "other"}:
             assert case["expected_intents"], case
         assert isinstance(case["required_keywords"], list)
         assert isinstance(case["forbidden_keywords"], list)
     assert build_cases(count=500) == cases, "同参数生成必须确定性一致"
-    print("✓ 500 条分层用例：12 类、唯一 id / query、确定性")
+    print("✓ 500 条分层用例：全部类别、唯一 id / query、确定性")
+
+
+def test_build_cases_cover_every_runnable_skill():
+    """评测标注必须能被真实技能清单产出：新增 / 改名技能后题库不能悄悄漏测。"""
+    from utils.agent_names import canonical_agent_name
+    from utils.skill_paths import resolve_skills_root, skill_scripts
+
+    expected: set[str] = set()
+    for case in build_cases(count=500):
+        expected.update(case["expected_intents"])
+    skills = {
+        canonical_agent_name(name)
+        for name in skill_scripts(resolve_skills_root())
+    }
+    missing = skills - expected
+    assert not missing, f"评测用例未覆盖以下技能：{sorted(missing)}"
+    print("✓ 评测用例覆盖全部可调度技能")
 
 
 def test_dump_cases_jsonl_roundtrip():
@@ -169,8 +227,11 @@ if __name__ == "__main__":
     test_evaluate_case_passes()
     test_evaluate_case_reports_reasons()
     test_judge_score_and_failure()
+    test_judge_invalid_scores_are_unscored_not_crash()
+    test_prediction_error_is_failure_even_for_empty_expectations()
     test_empty_expected_intents_still_checked()
     test_run_eval_aggregates_and_handles_errors()
-    test_build_cases_covers_twelve_categories()
+    test_build_cases_covers_all_categories()
+    test_build_cases_cover_every_runnable_skill()
     test_dump_cases_jsonl_roundtrip()
     print("\n全部通过")

@@ -93,7 +93,36 @@ def check_dependencies() -> list[CheckResult]:
             "缺少: " + ", ".join(missing_rag) + "（知识库功能不可用；pip install -r requirements.txt）",
         )
     else:
-        rag_result = CheckResult("RAG 依赖", STATUS_OK, "pymilvus / sentence-transformers / milvus-lite 已安装")
+        # 包目录存在不代表可用：RAG 包的重型子依赖（torch / transformers /
+        # faiss）装坏时 import 会失败，而 find_spec 仍能找到它们。这里只做
+        # find_spec 级探测，不实际 import（torch 导入要数秒 / 数百 MB，且
+        # /api/doctor 在线程池里会被反复调用）。
+        sub_deps = {
+            "sentence-transformers": ("torch", "transformers"),
+            "milvus-lite": ("numpy", "faiss"),
+        }
+        broken_rag = [
+            f"{pkg}（缺少 {missing}）"
+            for pkg, deps in sub_deps.items()
+            for missing in [
+                dep for dep in deps if importlib.util.find_spec(dep) is None
+            ]
+        ]
+        if broken_rag:
+            rag_result = CheckResult(
+                "RAG 依赖",
+                STATUS_WARN,
+                "已找到但无法加载: "
+                + "、".join(broken_rag)
+                + "（RAG 功能不可用；pip install --force-reinstall -r requirements.txt）",
+            )
+        else:
+            rag_result = CheckResult(
+                "RAG 依赖",
+                STATUS_OK,
+                "pymilvus / sentence-transformers / milvus-lite 已找到"
+                "（子依赖 torch / transformers / numpy / faiss 探测通过）",
+            )
 
     return [core_result, rag_result]
 
@@ -397,10 +426,11 @@ def check_version_consistency() -> CheckResult:
 def _default_model_dir() -> Path:
     """按 RAG 技能的同一口径解析嵌入模型目录。
 
-    锚点取技能目录所在的安装根（源码安装 = 仓库根；wheel 安装 = sys.prefix，
-    技能装在 ``<root>/.claude/skills``），再拼 ``RAG_CONFIG["embedding_model"]``。
-    此前固定用本文件上两级的 ``data/models``：wheel 安装时不指向实际路径，
-    必然误报「未下载」。
+    与 ``RAGKnowledgeAgent._model_path_candidates`` 保持同序：config 模块
+    目录（源码仓库根）→ 运行期数据目录（wheel 用户目录 / ALIGO_DATA_DIR）
+    → 技能安装根 → 当前目录。只在两个锚点上解析时，wheel 安装或设置了
+    ``ALIGO_DATA_DIR`` 的部署里技能能按数据目录加载模型，doctor 却在
+    site-packages 下找不到，误报「未下载 / RAG 功能不可用」。
     """
     from utils.skill_paths import resolve_skills_root
 
@@ -412,25 +442,39 @@ def _default_model_dir() -> Path:
         configured = str(RAG_CONFIG.get("embedding_model") or "")
     except Exception:  # noqa: BLE001 - 配置缺失时退回默认目录名
         configured = ""
-    if configured:
-        candidate = Path(configured).expanduser()
-        if not candidate.is_absolute():
-            anchored = anchor / candidate
-            if anchored.exists():
-                return anchored
-            # 技能目录在仓库外（ALIGO_SKILLS_DIR）时锚点不是项目根：
-            # 再用 config 模块位置（项目代码所在目录）兜底
-            try:
-                import config as _config
-
-                fallback = Path(_config.__file__).resolve().parent / candidate
-                if fallback.exists():
-                    return fallback
-            except Exception:  # noqa: BLE001 - 兜底不可用时保持原锚点
-                pass
-            return anchored
+    candidate = (
+        Path(configured).expanduser()
+        if configured
+        else Path("data") / "models" / "bge-small-zh-v1.5"
+    )
+    if candidate.is_absolute():
         return candidate
-    return anchor / "data" / "models" / "bge-small-zh-v1.5"
+    for resolved in _model_dir_candidates(candidate, anchor):
+        if resolved.exists():
+            return resolved
+    # 都不存在：返回技能安装根口径（最接近历史行为，错误信息里的路径
+    # 仍是用户最可能放置模型的位置）
+    return anchor / candidate
+
+
+def _model_dir_candidates(candidate: Path, anchor: Path) -> list[Path]:
+    """相对嵌入模型路径的候选锚点（顺序与 RAG 技能一致）。"""
+    candidates: list[Path] = []
+    try:
+        import config as _config
+
+        candidates.append(Path(_config.__file__).resolve().parent / candidate)
+    except Exception:  # noqa: BLE001 - 独立运行时没有 config
+        pass
+    try:
+        from utils.paths import default_data_root
+
+        candidates.append(default_data_root() / candidate)
+    except Exception:  # noqa: BLE001 - 旧版本无 utils.paths
+        pass
+    candidates.append(anchor / candidate)
+    candidates.append(Path.cwd() / candidate)
+    return candidates
 
 
 _HF_MODEL_ID_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
@@ -468,7 +512,10 @@ def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
         ("model.safetensors", "pytorch_model.bin"),
         ("tokenizer.json", "vocab.txt", "spiece.model", "tokenizer.model"),
     )
-    recommended = ["modules.json", "1_Pooling/config.json", "vocab.txt"]
+    # mean pooling 回退警告只由 sentence-transformers 的元数据缺失引起；
+    # vocab.txt 不在推荐列表：fast tokenizer（tokenizer.json）模型本就不需要它，
+    # required_groups 也已按四种等价形态判定分词器满足
+    recommended = ["modules.json", "1_Pooling/config.json"]
 
     if not model_path.exists():
         return CheckResult(
