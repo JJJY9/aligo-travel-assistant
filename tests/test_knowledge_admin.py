@@ -3785,6 +3785,184 @@ def test_update_document_preserves_per_part_metadata(monkeypatch):
     print("✓ 整份编辑保留逐片元数据（Part 后缀重编号）")
 
 
+def test_update_document_uses_clicked_part_reference(monkeypatch):
+    """被点击片的元数据是权威参考：逐片不同时改动不被丢弃、不广播标题。
+
+    两片 title 相同、category 分别为 A / B；点第 2 片把分类改成 A（第 1 片
+    已有的值）。按「重合键最多」猜参考片会选中第 1 片，changed 为空、修改
+    被静默丢弃，接口仍返回成功。
+    """
+    from pathlib import Path
+
+    def _meta(part, category):
+        return json.dumps(
+            {
+                "part": str(part),
+                "parts": "2",
+                "group": "g-old",
+                "title": "出行标准",
+                "category": category,
+            },
+            ensure_ascii=False,
+        )
+
+    rows = [
+        {"id": 1, "content": "甲" * 400, "metadata": _meta(1, "A")},
+        {"id": 2, "content": "乙" * 100, "metadata": _meta(2, "B")},
+    ]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def __init__(self):
+            self.updated = None
+            self.added = []
+
+        def update_document(self, doc_id, content, metadata):
+            self.updated = (doc_id, content, metadata)
+            return {"status": "success", "id": doc_id}
+
+        def add_documents(self, documents):
+            self.added = documents
+            return {
+                "status": "success",
+                "ids": list(range(100, 100 + len(documents))),
+                "total_count": len(documents),
+            }
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    knowledge_admin.update_document(
+        2,
+        "甲" * 400 + "乙" * 100,
+        {"title": "出行标准", "category": "A"},
+        expect_parts=2,
+        expect_group="g-old",
+    )
+    metas = [agent.updated[2]] + [item["metadata"] for item in agent.added]
+    assert [m["category"] for m in metas] == ["A", "A"], (
+        "点击片改为另一片已有的值也必须写入全组"
+    )
+    assert [m["title"] for m in metas] == ["出行标准", "出行标准"], metas
+    print("✓ 整组编辑以点击片为参考（逐片不同时不丢改动）")
+
+
+def test_apply_per_part_metadata_reference_parameter():
+    """显式 reference 优先于重合键猜测（纯函数回归）。"""
+    documents = [
+        {"content": "a", "metadata": {}},
+        {"content": "b", "metadata": {}},
+    ]
+    per_part = [
+        {"title": "T", "category": "A"},
+        {"title": "T", "category": "B"},
+    ]
+    knowledge_admin._apply_per_part_metadata(
+        documents, {"title": "T", "category": "A"}, per_part, per_part[1]
+    )
+    metas = [doc["metadata"] for doc in documents]
+    assert [meta["category"] for meta in metas] == ["A", "A"], metas
+
+
+def test_metadata_key_cap_and_internal_keys():
+    """10 键上限在写入层同样执行；内部键（user_edited 等）不占额度。"""
+    ten = {f"k{index}": "v" for index in range(10)}
+    knowledge_admin._validate_metadata_lengths(ten)
+    with pytest.raises(ValueError, match="最多 10 个键"):
+        knowledge_admin._validate_metadata_lengths({**ten, "extra": "v"})
+    # 10 用户键 + 内部键：面板 / CLI 保存不得被键数上限误拒
+    knowledge_admin._validate_metadata_lengths(
+        {**ten, "user_edited": "1", "part": "1"}
+    )
+    documents = knowledge_admin._chunk_documents(
+        "内容", {**ten, "user_edited": "1"}
+    )
+    assert documents[0]["metadata"]["user_edited"] == "1"
+
+
+def test_bounded_metadata_keeps_internal_keys():
+    """导入清洗保留内部键、只截断用户键（导出→导入不丢编辑标记）。"""
+    metadata = {f"k{index}": str(index) for index in range(12)}
+    metadata.update(
+        {
+            "user_edited": "1",
+            "group": "g",
+            "part": "1",
+            "parts": "2",
+            "missing_parts": "2",
+        }
+    )
+    bounded = knowledge_admin._bounded_metadata(metadata)
+    assert sum(1 for key in bounded if key.startswith("k")) == 10
+    assert bounded["user_edited"] == "1"
+    assert bounded["group"] == "g"
+    assert "missing_parts" not in bounded, "检索诊断键不得入库"
+
+
+def test_update_document_legacy_whitespace_saved_as_unchanged(monkeypatch):
+    """库内片段带首尾空白时「原样保存」仍按 unchanged 返回，不误报 409。"""
+    from pathlib import Path
+
+    rows = [{"id": 7, "content": "  住宿标准 600 元  ", "metadata": "{}"}]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(
+        knowledge_admin,
+        "_get_agent",
+        lambda: pytest.fail("原样保存不应加载嵌入模型"),
+    )
+    result = knowledge_admin.update_document(
+        7,
+        "住宿标准 600 元",
+        {},
+        expect_content="  住宿标准 600 元  ",
+        expect_parts=1,
+        expect_group="",
+    )
+    assert result.get("unchanged") is True, result
+
+
+def test_import_problem_details_are_bounded(monkeypatch):
+    """导入逐组问题明细受 _PROBLEMS_MAX 约束，冲突片数仍完整累计。"""
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_PROBLEMS_MAX", 2)
+    groups = 4
+    # 库内已有同号组且内容完全不同：备份里每个组都会命中「整组内容不同」
+    layout: dict[str, list[tuple[str, int, int]]] = {}
+    documents = []
+    for index in range(groups):
+        group = f"g{index}"
+        layout[f"旧{index}甲"] = [(group, 1, 2)]
+        layout[f"旧{index}乙"] = [(group, 2, 2)]
+        documents.extend(
+            [
+                {
+                    "content": f"新{index}甲",
+                    "metadata": {"group": group, "part": "1", "parts": "2"},
+                },
+                {
+                    "content": f"新{index}乙",
+                    "metadata": {"group": group, "part": "2", "parts": "2"},
+                },
+            ]
+        )
+    monkeypatch.setattr(knowledge_admin, "_existing_group_layout", lambda: layout)
+    monkeypatch.setattr(
+        knowledge_admin, "_existing_contents", lambda: list(layout)
+    )
+    result = knowledge_admin.import_documents(documents, dry_run=True)
+    problems = result.get("skipped_groups") or []
+    assert len(problems) == 3, problems  # 2 条明细 + 1 条汇总
+    assert problems[-1]["group"] == ""
+    assert "明细过多未逐条展开" in problems[-1]["reason"], problems[-1]
+    assert result["skipped_conflict"] == groups * 2, result
+    assert sum(int(item.get("parts") or 0) for item in problems) == groups * 2
+
+
 def test_import_group_existing_as_ungrouped_pieces_is_duplicate(monkeypatch):
     """备份组内容已以无 group 独立片段存在：按已存在计，不报布局冲突。"""
     from pathlib import Path
@@ -3919,6 +4097,9 @@ if __name__ == "__main__":
     test_regroup_caps_problem_details()
     test_read_lock_times_out_when_write_in_progress()
     test_document_info_parses_parts_and_group()
+    test_apply_per_part_metadata_reference_parameter()
+    test_metadata_key_cap_and_internal_keys()
+    test_bounded_metadata_keeps_internal_keys()
     for case in (
         test_list_documents_parses_sorts_and_filters,
         test_list_documents_pages_full_scan,
@@ -3934,6 +4115,9 @@ if __name__ == "__main__":
         test_update_document_replaces_grouped_multipart,
         test_update_document_rejects_stale_expect_metadata,
         test_update_document_preserves_per_part_metadata,
+        test_update_document_uses_clicked_part_reference,
+        test_update_document_legacy_whitespace_saved_as_unchanged,
+        test_import_problem_details_are_bounded,
         test_import_group_existing_as_ungrouped_pieces_is_duplicate,
         test_import_rejects_nul_content_and_metadata,
         test_update_document_crlf_saved_from_panel_is_unchanged,

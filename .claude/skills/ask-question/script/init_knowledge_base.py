@@ -13,6 +13,7 @@ import json
 import os
 import shutil
 import sys
+import time
 import uuid
 from datetime import datetime
 from typing import Any
@@ -26,6 +27,7 @@ if str(project_root) not in sys.path:
 
 from config_agentscope import create_chat_model
 from utils.console import configure_stdio
+from utils.knowledge_paths import knowledge_path_encoding_hint
 from utils.text_chunker import split_text
 
 
@@ -200,8 +202,9 @@ def _collect_preserved_documents(
     返回 ``(可补写片段, 告警列表, 需要跳过的源文件)``；导出失败抛
     RuntimeError，调用方必须在删库之前中止（否则面板 / CLI 添加的知识会
     永久丢失）。被面板 / CLI 编辑过的内置文档（分片带 ``user_edited`` 标记）
-    按普通知识保留（去掉受管标记），其源文件返回给调用方跳过导入——否则
-    「重建 = 源文件重新导入」会把用户的编辑静默还原成原文。
+    原样保留（含受管标记），其源文件返回给调用方跳过导入——否则
+    「重建 = 源文件重新导入」会把用户的编辑静默还原成原文。保留标记让
+    之后每次重建都继续跳过源文件，直到用户在面板删除该文档。
     """
     try:
         from utils.knowledge_admin import export_documents
@@ -228,16 +231,13 @@ def _collect_preserved_documents(
                 # 未编辑的受管文档旧切分（文件已改动 / 删除）不能补写：
                 # 否则新旧两版长期共存，且旧分片会形成 parts 声明不符的残缺组
                 continue
-            # 用户在面板 / CLI 编辑过内置文档：编辑版作为普通知识保留（去掉
-            # 受管标记，后续重建不再当作过期内容），并记录源文件供调用方跳过
+            # 用户在面板 / CLI 编辑过内置文档：编辑版作为普通知识保留并
+            # 保留受管标记——下一次重建仍能识别为「被编辑的受管分片」，
+            # 继续跳过源文件；剥掉标记会让第二次重建把内置原文重新导回，
+            # 与编辑版并存（README 承诺的恢复方式是在面板删除该文档）
             file_path = str(metadata.get("file_path") or "")
             if file_path:
                 edited_files.add(file_path)
-            metadata = {
-                meta_key: meta_value
-                for meta_key, meta_value in metadata.items()
-                if meta_key not in {"source", "file_path", "user_edited"}
-            }
         entry = {"content": content, "metadata": metadata}
         group = str(metadata.get("group") or "")
         if group:
@@ -484,6 +484,65 @@ def _drop_collection_for_rebuild(knowledge_base_path: Path) -> None:
         client.drop_collection(COLLECTION_NAME)
 
 
+_UNREADABLE_MARKERS = (
+    # milvus-lite 3.x 索引 sidecar 缺失 / 损坏后 query 必报的错误
+    "in state",
+    "released",
+    # 旧 numpy pickle 在允许 pickle 关闭时无法加载
+    "allow_pickle",
+    # faiss 索引文件无法打开（Windows 非 ASCII 路径 / 索引损坏）
+    "fileiowriter",
+    "index build failed",
+)
+
+
+def _unreadable_collection_error(exc: BaseException) -> bool:
+    """导出失败是否由「集合确定不可加载」引起（而非锁 / 连接等瞬时问题）。
+
+    只有确定性不可读才允许走「移走旧库、重建」的恢复路径；锁 / 连接错误
+    通常意味着 Web 服务正在使用知识库，必须保持原有中止语义。
+    """
+    message = str(exc).lower()
+    if (
+        "lock" in message
+        or "connection" in message
+        or "open local milvus failed" in message
+    ):
+        return False
+    return any(marker in message for marker in _UNREADABLE_MARKERS)
+
+
+def _rename_unreadable_db(knowledge_base_path: Path) -> tuple[Path | None, str]:
+    """把无法加载的 ``milvus_lite.db`` 重命名为带时间戳的备份目录。
+
+    返回 ``(新路径, 错误信息)``；失败时新路径为 None。重命名前关闭共享
+    客户端，尽量释放 Windows 下会阻止目录改名的文件句柄。
+    """
+    db_path = knowledge_base_path / "milvus_lite.db"
+    if not db_path.exists():
+        return None, "milvus_lite.db 不存在"
+    target = db_path.with_name(
+        db_path.name + ".unreadable-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    )
+    try:
+        from utils.knowledge_admin import reset_knowledge_agent
+        from utils.milvus_client import shutdown_milvus_clients
+
+        shutdown_milvus_clients()
+        reset_knowledge_agent()
+    except Exception:  # noqa: BLE001 - 独立运行 / 旧版本无该 API
+        pass
+    last_error = ""
+    for _ in range(3):
+        try:
+            os.rename(db_path, target)
+            return target, ""
+        except OSError as exc:
+            last_error = str(exc)
+            time.sleep(0.3)
+    return None, last_error
+
+
 def _resolve_knowledge_base_path(skill_root: Path) -> Path:
     """初始化目标知识库目录。
 
@@ -536,6 +595,14 @@ def main() -> int:
         documents_dir = skill_root / "data" / "documents"
         knowledge_base_path = _resolve_knowledge_base_path(skill_root)
         source_knowledge_dir = _resolve_knowledge_source_dir(knowledge_base_path)
+
+        # Windows 非 ASCII 路径：milvus-lite 的索引写盘会失败，但同进程的
+        # 自检检索走内存索引、仍然「全部命中」——退出码 0 的库在重启后
+        # 不可加载。提前失败，保证 0 仍意味知识库跨进程可用
+        encoding_hint = knowledge_path_encoding_hint(knowledge_base_path)
+        if encoding_hint:
+            print(f"❌ {encoding_hint}")
+            return 1
 
         # 1. 先加载文档：任一文件失败在触碰知识库之前中止
         print(f"1. 从 {documents_dir} 加载文档...")
@@ -650,37 +717,72 @@ def main() -> int:
             )
             if collection_exists:
                 # 导出失败必须在删库之前中止：库内面板 / CLI 添加的片段
-                # 只存在于 Milvus，先删后导会永久丢失
+                # 只存在于 Milvus，先删后导会永久丢失。唯一的例外是集合
+                # 本身已无法加载（索引损坏 / 版本不兼容 / Windows 非 ASCII
+                # 路径）：此时导出必然失败，而状态接口会提示用户「重新运行
+                # 初始化脚本」——不恢复就永远卡死。把旧库改名保留后重建，
+                # 不删除任何可抢救的数据
+                collection_recovered = False
                 try:
                     preserved, warnings, edited_files = _collect_preserved_documents(
                         source_knowledge_dir
                     )
                 except RuntimeError as export_error:
-                    print(f"❌ {export_error}，已中止（知识库保持原样）")
-                    if created_knowledge_dir:
-                        _discard_created_library(knowledge_base_path)
-                    return 1
-                for warning in warnings:
-                    print(f"   ⚠️  {warning}")
-                preserved, backup_notes = _merge_preserved_backup(
-                    knowledge_base_path, preserved
-                )
-                for note in backup_notes:
-                    print(f"   ⚠️  {note}")
-                backup_path = _write_preserved_backup(
-                    knowledge_base_path, preserved
-                )
-                if preserved:
-                    print(f"   已导出 {len(preserved)} 个库内已有片段（重建后补写）")
-                print("   ⚠️  正在删除旧 Collection 并重建...")
-                rag_agent.milvus_client.drop_collection(rag_agent.collection_name)
-                rag_agent.milvus_client.create_collection(
-                    collection_name=rag_agent.collection_name,
-                    dimension=rag_agent.embedding_dim,
-                    metric_type="COSINE",
-                    auto_id=False,
-                )
-                print("   ✓ Collection 重建完成")
+                    if _unreadable_collection_error(export_error):
+                        print(f"   ⚠️  {export_error}")
+                        renamed, rename_error = _rename_unreadable_db(
+                            knowledge_base_path
+                        )
+                        if renamed is None:
+                            print(
+                                f"❌ 旧库无法自动移走（{rename_error}）；请停止占用它的"
+                                f"进程后手动把 {knowledge_base_path / 'milvus_lite.db'}"
+                                " 重命名或删除，再重新运行本脚本"
+                            )
+                            return 1
+                        print(
+                            f"   旧库已重命名为 {renamed}（保留备查），"
+                            "按当前嵌入模型重建..."
+                        )
+                        try:
+                            rag_agent = _build_agent(model, knowledge_base_path)
+                        except Exception as rebuild_exc:  # noqa: BLE001
+                            print(
+                                f"❌ 重建失败：{rebuild_exc}（旧库已备份为 {renamed}）"
+                            )
+                            return 1
+                        collection_recovered = True
+                    else:
+                        print(f"❌ {export_error}，已中止（知识库保持原样）")
+                        if created_knowledge_dir:
+                            _discard_created_library(knowledge_base_path)
+                        return 1
+                if not collection_recovered:
+                    for warning in warnings:
+                        print(f"   ⚠️  {warning}")
+                    preserved, backup_notes = _merge_preserved_backup(
+                        knowledge_base_path, preserved
+                    )
+                    for note in backup_notes:
+                        print(f"   ⚠️  {note}")
+                    backup_path = _write_preserved_backup(
+                        knowledge_base_path, preserved
+                    )
+                    if preserved:
+                        print(
+                            f"   已导出 {len(preserved)} 个库内已有片段（重建后补写）"
+                        )
+                    print("   ⚠️  正在删除旧 Collection 并重建...")
+                    rag_agent.milvus_client.drop_collection(
+                        rag_agent.collection_name
+                    )
+                    rag_agent.milvus_client.create_collection(
+                        collection_name=rag_agent.collection_name,
+                        dimension=rag_agent.embedding_dim,
+                        metric_type="COSINE",
+                        auto_id=False,
+                    )
+                    print("   ✓ Collection 重建完成")
 
         # 5. 写入文档（内置文件 + 重建前导出的已有片段）
         if edited_files:

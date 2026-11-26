@@ -585,7 +585,7 @@ python cli.py eval --json | jq -e '.skipped or (.ok and .hit5 >= 0.8)'
 
 > **排障提示**：启动时若出现 `No sentence-transformers model found ... mean pooling` 警告，说明本地模型目录缺少 `modules.json` / `1_Pooling/config.json` 等元数据文件（通常只复制了权重文件）。从 HuggingFace 下载完整模型仓库文件即可消除；`doctor` 会检查并提示。
 >
-> Milvus Lite 3.x 在**非 ASCII 路径**（例如用户名含中文的 `C:\Users\张三\...`）下可能无法写 Faiss 索引（`FileIOWriter ... No such file or directory`）。请把项目放在纯英文路径（如 `D:\Code\chailv`）后重新初始化知识库。
+> Milvus Lite 3.x 在**非 ASCII 路径**（例如用户名含中文的 `C:\Users\张三\...`）下可能无法写 Faiss 索引（`FileIOWriter ... No such file or directory`）。请把项目放在纯英文路径（如 `D:\Code\chailv`）后重新初始化知识库。wheel 安装时知识库默认在 `%LOCALAPPDATA%\aligo\data\rag_knowledge`，中文 Windows 用户名下同样命中该限制——唯一规避是把 `ALIGO_DATA_DIR`（或 `ALIGO_SKILLS_DIR`）指向纯英文目录；初始化脚本会提前失败并给出该提示，而不是「成功」后重启即不可用。
 
 ---
 
@@ -926,7 +926,7 @@ python -m webapp.server --port 8002   # 另一个进程 / 机器
 - **Milvus Lite 是单进程文件锁**：Web 服务运行且已打开知识库后，外部再运行 `init_knowledge_base.py` / `cli.py kb*` / `doctor` 会提示锁占用；请先停止 Web 服务再执行这些命令。`reset_milvus_client` 会关闭并重建共享客户端（关闭在锁内，避免并发拿到正在关闭的对象），但 milvus-lite 的本地 server / 数据库句柄不一定随 `close()` 释放，文件锁可能保持到进程退出；连接损坏后重建也可能复用旧 server——重连仍失败时请重启进程（Web 服务）。
 - **知识库目录在进程内固定**：`default_knowledge_dir()` 首次解析成功后固定在进程内（Skill 数据目录与项目根兼容目录二选一）——面板管理接口与 RAG 智能体始终使用同一个库，服务运行期间新建 / 迁移出另一个库目录不会出现「面板看似被清空、新增写进旧库」的分裂；切换库（重建 / 迁移）后请重启 Web 进程（或调用 `reset_default_knowledge_dir()`）。半初始化状态（库文件存在但集合缺失）下，管理接口与 `GET /api/knowledge`、`python cli.py doctor` 一致提示「集合不存在，请重新运行初始化脚本」。
 - **技能模块在进程内缓存**：`LazyAgentRegistry` 按技能脚本路径缓存已加载模块（同一技能的多个会话注册器共享模块与模块级状态）；运行中修改技能脚本 / SKILL.md 不会热更新，需重启进程生效（`ALIGO_SKILLS_DIR` 指向不同目录的技能互不串用）。
-- **非 ASCII 路径**：Milvus Lite 3.x 在含中文等非 ASCII 字符的目录下可能无法写入 Faiss 索引，建议把项目放在纯英文路径（如 `D:\Code\chailv`）。
+- **非 ASCII 路径**：Milvus Lite 3.x 在含中文等非 ASCII 字符的目录下无法写入 Faiss 索引（同进程自检走内存索引仍会「通过」，重启后集合不可加载）；建议把项目放在纯英文路径（如 `D:\Code\chailv`）。wheel 安装的知识库固定在 `%LOCALAPPDATA%\aligo\data\rag_knowledge`，中文用户名下同样命中——请把 `ALIGO_DATA_DIR`（或 `ALIGO_SKILLS_DIR`）指向纯英文目录后重建。初始化脚本会提前失败并给出提示；状态接口在加载失败时也会直接给出该原因。
 - **请求指标是进程内统计**：多实例部署时 `/api/metrics` 只反映当前进程；限流在配置 `REDIS_URL` 后由 Redis 共享计数，未配置时为进程内实现。
 - **天气缓存**：`/api/weather` 的成功结果 10 分钟新鲜缓存默认在进程内；配置 `REDIS_URL` 时同时写入共享缓存（`aligo:weather:<城市>`，10 分钟 TTL），多实例直接复用、不再各自请求上游，Redis 故障进入 60 秒本地冷却后退回进程内。共享负载带抓取时刻并做结构与有限数值校验，回填进程内缓存按真实年龄计（10 分钟窗口不会因回填翻倍、stale 兜底窗口不被拉长）；同城并发合并（单飞）与失败 / 降级缓存仍在各进程内：多实例同时未命中的首个请求仍可能各自访问上游一次；失败缓存不共享，避免一个实例的上游故障把其它实例钉死。
 - **天气地理编码的英文别名**：中文城市名走 Open-Meteo 的 `language=zh` 索引；该索引对境外城市覆盖与排序不可靠（同名小城 / 村庄会排在前面，如「罗马」只命中澳大利亚 Roma）。常用境外城市（61 个，如东京、伦敦、纽约、罗马、巴黎、首尔、悉尼）通过内置别名表改查英文索引；未收录的境外中文小地名仍可能解析不准，查不到或结果明显不符时请改用英文城市名（如 `London`）。

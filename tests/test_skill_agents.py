@@ -2235,8 +2235,12 @@ def test_rag_retries_when_first_hit_does_not_cover_simplified_terms():
     print("✓ 边缘误命中仍触发简化查询重检索")
 
 
-def test_rag_bounded_query_uses_last_question_sentence():
-    """超长查询按末句（含疑问标记优先）检索，向量不再被截断丢问题。"""
+def test_rag_bounded_query_uses_last_question_sentence(caplog):
+    """超长查询按末句（含疑问标记优先）检索，向量不再被截断丢问题。
+
+    日志只记长度：与 #587 隐私口径一致，用户问题原文（含控制字符）不得
+    以 WARNING 明文落盘。
+    """
     agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
     agent = object.__new__(agent_class)
 
@@ -2250,11 +2254,14 @@ def test_rag_bounded_query_uses_last_question_sentence():
 
     agent.embedding_model = _Embedding()
     long_text = "我们聊了很多报销发票和平台促销的事情。" * 3 + "北京出差住宿标准是多少？"
-    bounded = agent._bounded_retrieval_query(long_text)
+    with caplog.at_level("WARNING"):
+        bounded = agent._bounded_retrieval_query(long_text)
     assert bounded.endswith("北京出差住宿标准是多少"), bounded
     assert len(bounded) < len(long_text)
+    assert "北京出差住宿标准是多少" not in caplog.text, caplog.text
+    assert "改用末句检索" in caplog.text, caplog.text
     assert agent._bounded_retrieval_query("北京住宿标准？") == "北京住宿标准？"
-    print("✓ 超长查询按末句检索")
+    print("✓ 超长查询按末句检索（日志不含查询原文）")
 
 
 def test_rag_assembled_documents_use_best_part_metadata_and_snippet():

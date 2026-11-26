@@ -5994,6 +5994,9 @@ function renderKnowledgeDocuments(items, append) {
     const row = document.createElement("div");
     row.className = "pref-row kb-row";
     row.dataset.id = String(doc.id);
+    // 整组删除按 group 同步移除本地同组分片：收尾刷新失败时不能把
+    // 已删除的其它分片留成幽灵行
+    row.dataset.group = String((doc.metadata && doc.metadata.group) || "");
 
     const main = document.createElement("div");
     main.className = "kb-main";
@@ -6390,6 +6393,39 @@ async function runKbDedupe() {
       resetKnowledgeForm();
       toast("正在编辑的片段已被清理，已退出编辑");
     }
+    // 本地先移除真正删除成功的行：收尾刷新失败时会保留旧 DOM，
+    // 被清理的重复片段不能继续显示并可操作（与单条删除同口径）。
+    // skipped / failed 的 id 实际仍在库里，不能从列表抹掉
+    const skippedIds = new Set(skipped.map((item) => String(item && item.id)));
+    const failedIds = new Set(failed.map((item) => String(item && item.id)));
+    const dedupeDeletedIds = new Set(
+      [...removedIds]
+        .filter(
+          (id) => !skippedIds.has(String(id)) && !failedIds.has(String(id)),
+        )
+        .map((id) => String(id)),
+    );
+    if (dedupeDeletedIds.size) {
+      for (const id of dedupeDeletedIds) {
+        const row = els.kbList.querySelector(`.kb-row[data-id="${id}"]`);
+        if (row) row.remove();
+      }
+      state.kbItems = state.kbItems.filter(
+        (item) => !dedupeDeletedIds.has(String(item)),
+      );
+      if (state.kbTotal > 0) {
+        state.kbTotal = Math.max(
+          state.kbItems.length,
+          state.kbTotal - dedupeDeletedIds.size,
+        );
+      }
+      const note = els.kbList.querySelector(".kb-note");
+      if (note) {
+        note.textContent = state.kbQuery
+          ? `匹配 ${state.kbTotal} 条，已显示 ${state.kbItems.length} 条`
+          : `共 ${state.kbTotal} 条，已显示 ${state.kbItems.length} 条`;
+      }
+    }
     // 清理同样改变片段总数：知识库状态 chip 一并刷新
     await Promise.all([
       refreshKnowledge(),
@@ -6447,6 +6483,7 @@ function renderSemanticResults(query, results) {
     const row = document.createElement("div");
     row.className = "pref-row kb-row";
     row.dataset.id = String(doc.id);
+    row.dataset.group = String((doc.metadata && doc.metadata.group) || "");
     const main = document.createElement("div");
     main.className = "kb-main";
     const text = document.createElement("div");
@@ -6511,12 +6548,25 @@ async function removeKnowledgeDocument(doc) {
   );
   if (button) button.disabled = true;
   let removed = false;
+  // 整组删除：服务端返回实际删除的分片数（count）。收尾刷新失败时只能
+  // 依赖本地同步，否则同组其它分片留成幽灵行、总数少算 N-1
+  let deletedCount = 1;
+  const deletedIds = new Set([String(docId)]);
   try {
-    await getJSON(
+    const payload = await getJSON(
       `/api/knowledge/documents/${docId}${groupFlag ? "?group=1" : ""}`,
       { method: "DELETE" },
     );
     removed = true;
+    const group = String((metadata && metadata.group) || "");
+    if (wholeGroup && group) {
+      for (const other of els.kbList.querySelectorAll(".kb-row")) {
+        if (other.dataset.group === group) deletedIds.add(String(other.dataset.id));
+      }
+      const count = Number(payload && payload.count);
+      deletedCount =
+        Number.isFinite(count) && count > 0 ? count : deletedIds.size;
+    }
     toast(
       wholeGroup
         ? "已删除整组分片"
@@ -6546,13 +6596,16 @@ async function removeKnowledgeDocument(doc) {
     if (state.kbEditingId === docId || deletesEditingGroup) resetKnowledgeForm();
     // 先移除本地行与状态：收尾刷新失败会按「保留旧数据」策略不动 DOM，
     // 不能留下删除按钮已禁用、实际已不存在的幽灵片段（与行程删除同款）
-    if (row) row.remove();
+    for (const id of deletedIds) {
+      const target = els.kbList.querySelector(`.kb-row[data-id="${id}"]`);
+      if (target) target.remove();
+    }
     state.kbItems = state.kbItems.filter(
-      (item) => String(item) !== String(docId),
+      (item) => !deletedIds.has(String(item)),
     );
     // 计数只在刷新失败时才会用到：同步本地 total 与「共 N 条」备注
     if (state.kbTotal > 0) {
-      state.kbTotal = Math.max(state.kbItems.length, state.kbTotal - 1);
+      state.kbTotal = Math.max(state.kbItems.length, state.kbTotal - deletedCount);
     }
     const note = els.kbList.querySelector(".kb-note");
     if (note) {

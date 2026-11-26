@@ -1026,6 +1026,29 @@ def test_knowledge_delete_legacy_parts_without_group():
     print("✓ 旧版多分片删除不再带 group=1")
 
 
+def test_knowledge_group_delete_syncs_local_rows_on_refresh_failure():
+    """整组删除后刷新失败：同组分片本地移除，总数按 count 递减（无幽灵行）。"""
+    data = _run_harness("kbDeleteGroupGhost")
+    removed = dict(data["removed"])
+    assert removed == {"10": True, "9": True, "8": True, "5": False}, data
+    assert data["items"] == [5], data
+    assert data["total"] == 1, data
+    assert data["note"] == "共 1 条，已显示 1 条", data
+    print("✓ 整组删除本地同步同组分片（刷新失败无幽灵行）")
+
+
+def test_kb_dedupe_success_removes_rows_locally():
+    """清理重复成功但刷新失败：已删除行本地移除、计数同步，未删行保留。"""
+    data = _run_harness("kbDedupeLocalRemoval")
+    removed = dict(data["removed"])
+    assert removed == {"3": False, "2": True, "1": True}, data
+    assert data["items"] == [3], data
+    assert data["total"] == 1, data
+    assert data["note"] == "共 1 条，已显示 1 条", data
+    assert "已清理 2 条" in data["result"], data
+    print("✓ 清理重复后本地移除已删行（刷新失败仍可操作）")
+
+
 def test_user_backup_import_rejects_non_utf8():
     """面板恢复备份：GBK 等非 UTF-8 文件必须提示另存，不能静默损坏后导入。"""
     data = _run_harness("userBackupDecode")
@@ -1284,6 +1307,8 @@ if __name__ == "__main__":
     test_reconcile_confirms_after_open_session()
     test_knowledge_import_skip_summary_distinguishes_conflicts()
     test_knowledge_delete_legacy_parts_without_group()
+    test_knowledge_group_delete_syncs_local_rows_on_refresh_failure()
+    test_kb_dedupe_success_removes_rows_locally()
     test_user_backup_import_rejects_non_utf8()
     test_user_backup_restore_reports_recovery_incomplete()
     test_chat_done_persisted_signal()

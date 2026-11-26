@@ -2786,13 +2786,13 @@ def test_knowledge_category_filter_accepts_long_values(monkeypatch):
         return {"total": 0, "items": []}
 
     monkeypatch.setattr(server_module, "list_documents", fake_list)
-    long_category = "长分类" * 10  # 30 字，超过旧的 20 字上限
+    long_category = "长分类" * 80  # 240 字：历史超长分类仍必须可筛选
     response = _client().get(
         "/api/knowledge/documents", params={"category": long_category}
     )
     assert response.status_code == 200, response.text
     assert calls["category"] == long_category
-    print("✓ 分类筛选接受与写入上限一致的 200 字分类")
+    print("✓ 分类筛选接受库内历史超长分类（200 只约束新写入）")
 
 
 def test_chat_stream_rejects_deleted_session_with_404(monkeypatch):
@@ -9915,6 +9915,11 @@ def test_kb_list_is_not_live_region():
     assert re.search(r'id="kbListStatus"[^>]*role="status"', index_html), (
         "摘要播报节点必须带 role=status"
     )
+    # 常驻 hidden 的节点不在无障碍树里，aria-live 播报完全不生效：
+    # 必须用 .sr-only 视觉隐藏而不是 hidden 属性
+    status_tag = re.search(r'<div[^>]*id="kbListStatus"[^>]*>', index_html).group(0)
+    assert "hidden" not in status_tag, status_tag
+    assert "sr-only" in status_tag, status_tag
     print("✓ 知识列表不是实时区，摘要独立播报")
 
 
@@ -13540,6 +13545,77 @@ def test_knowledge_metadata_limits():
     )
     assert response.status_code == 422
     print("✓ 知识片段 metadata 键数 / 长度受限")
+
+
+def test_knowledge_update_drops_internal_metadata_keys(monkeypatch):
+    """get_document 回传的内部键不占用户 10 键额度（面板保存不再 422）。"""
+    from webapp import server as server_module
+
+    captured = {}
+
+    def fake_update(doc_id, content, metadata=None, **kwargs):
+        captured["metadata"] = metadata
+        return {"status": "success", "id": doc_id, "parts": 1}
+
+    monkeypatch.setattr(server_module, "update_document", fake_update)
+    user_keys = {f"k{index}": "v" for index in range(10)}
+    payload_meta = {
+        **user_keys,
+        "user_edited": "1",
+        "part": "1",
+        "parts": "2",
+        "group": "g",
+    }
+    response = _client().put(
+        "/api/knowledge/documents/1",
+        json={"content": "新内容", "metadata": payload_meta},
+    )
+    assert response.status_code == 200, response.text
+    assert captured["metadata"] == user_keys, captured
+    print("✓ 面板保存时内部元数据键被丢弃（10 用户键不触发 422）")
+
+
+def test_knowledge_status_degrades_on_dimension_mismatch(monkeypatch):
+    """维度与嵌入模型不一致时状态芯片不得显示健康（检索全部 503）。"""
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "knowledge_status",
+        lambda **kwargs: {
+            "available": True,
+            "documents": 3,
+            "dimension_mismatch": True,
+        },
+    )
+    response = _client().get("/api/knowledge")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["available"] is False
+    assert "维度" in body["reason"] and "重建" in body["reason"], body
+    print("✓ 维度不一致时 /api/knowledge 降级为不可用并给出重建指引")
+
+
+def test_knowledge_export_strips_nul(monkeypatch):
+    """专用导出剥离 NUL：否则导入端把该条目标为无效、导出→导入丢片段。"""
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "export_documents",
+        lambda: [
+            {
+                "content": "前" + chr(0) + "后",
+                "metadata": {"title": "标" + chr(0) + "题"},
+            }
+        ],
+    )
+    response = _client().get("/api/knowledge/export")
+    assert response.status_code == 200
+    assert chr(0) not in response.text
+    documents = response.json()["documents"]
+    assert documents == [{"content": "前后", "metadata": {"title": "标题"}}], documents
+    print("✓ 知识专用导出剥离 NUL（导出→导入不丢片段）")
 
 
 def test_kb_delete_grouped_fragment_maps_400(monkeypatch):

@@ -2309,6 +2309,123 @@ async function scenarioKbDelete(source) {
   return results;
 }
 
+async function scenarioKbDeleteGroupGhost(source) {
+  // 整组删除 + 收尾刷新失败：同组其余分片必须本地移除，总数按服务端
+  // count 递减，不能留下幽灵行 / 少算 N-1
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    const makeRow = (id, group) => ({
+      dataset: { id: String(id), group: group || "" },
+      removed: false,
+      querySelector: () => null,
+      remove() { this.removed = true; },
+    });
+    const rows = [makeRow(10, "g1"), makeRow(9, "g1"), makeRow(8, "g1"), makeRow(5, "")];
+    globalThis.__rows = rows;
+    globalThis.__note = { textContent: "" };
+    els.kbList = {
+      querySelector(selector) {
+        const match = /^\\.kb-row\\[data-id="(\\d+)"\\]$/.exec(selector);
+        if (match) {
+          return rows.find((row) => row.dataset.id === match[1] && !row.removed) || null;
+        }
+        if (selector === ".kb-note") return globalThis.__note;
+        return null;
+      },
+      querySelectorAll(selector) {
+        return selector === ".kb-row" ? rows.filter((row) => !row.removed) : [];
+      },
+      focus() {},
+    };
+    globalThis.__toasts = [];
+    toast = (message) => { __toasts.push(message); };
+    confirm = () => true;
+    state.kbItems = [10, 9, 8, 5];
+    state.kbTotal = 4;
+    state.kbQuery = "";
+    state.kbDeleting = new Set();
+    refreshKnowledge = async () => {};
+    refreshKnowledgeDocuments = async () => {};
+    getJSON = async (url, options) => {
+      if (options && options.method === "DELETE") {
+        return { id: 8, deleted: true, group: true, count: 3 };
+      }
+      return { total: 0, items: [], categories: [] };
+    };
+  `);
+  await run('removeKnowledgeDocument({id: 8, metadata: {parts: "3", group: "g1"}})');
+  return {
+    removed: env.__rows.map((row) => [row.dataset.id, row.removed]),
+    items: run("state.kbItems.slice()"),
+    total: run("state.kbTotal"),
+    note: run("__note.textContent"),
+    toasts: run("__toasts.slice()"),
+  };
+}
+
+async function scenarioKbDedupeLocalRemoval(source) {
+  // 清理重复成功但收尾刷新失败：真实删除的行必须本地移除，
+  // 已删除的重复片段不能继续显示并可操作
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    const makeRow = (id) => ({
+      dataset: { id: String(id), group: "" },
+      removed: false,
+      querySelector: () => null,
+      remove() { this.removed = true; },
+    });
+    const rows = [makeRow(3), makeRow(2), makeRow(1)];
+    globalThis.__rows = rows;
+    globalThis.__note = { textContent: "" };
+    els.kbList = {
+      querySelector(selector) {
+        const match = /^\\.kb-row\\[data-id="(\\d+)"\\]$/.exec(selector);
+        if (match) {
+          return rows.find((row) => row.dataset.id === match[1] && !row.removed) || null;
+        }
+        if (selector === ".kb-note") return globalThis.__note;
+        return null;
+      },
+      querySelectorAll(selector) {
+        return selector === ".kb-row" ? rows.filter((row) => !row.removed) : [];
+      },
+      focus() {},
+    };
+    els.memorySheet.hidden = false;
+    globalThis.__toasts = [];
+    toast = (message) => { __toasts.push(message); };
+    confirm = () => true;
+    state.kbEditingId = null;
+    state.kbItems = [3, 2, 1];
+    state.kbTotal = 3;
+    state.kbQuery = "";
+    refreshKnowledge = async () => {};
+    refreshKnowledgeDocuments = async () => {};
+    let call = 0;
+    getJSON = async () => {
+      call += 1;
+      if (call === 1) return { planned: 2, groups: 1 };
+      return {
+        removed: 2,
+        planned: 2,
+        failed: [],
+        skipped: [],
+        plan: [{ keep: 3, remove: [1, 2] }],
+      };
+    };
+  `);
+  await run("runKbDedupe()");
+  return {
+    removed: env.__rows.map((row) => [row.dataset.id, row.removed]),
+    items: run("state.kbItems.slice()"),
+    total: run("state.kbTotal"),
+    note: run("__note.textContent"),
+    result: run("els.kbEvalResult.textContent"),
+  };
+}
+
 async function scenarioUserBackupDecode(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
@@ -4181,6 +4298,10 @@ async function main() {
     payload = scenarioKbImportSummary(source);
   } else if (scenario === "kbDelete") {
     payload = await scenarioKbDelete(source);
+  } else if (scenario === "kbDeleteGroupGhost") {
+    payload = await scenarioKbDeleteGroupGhost(source);
+  } else if (scenario === "kbDedupeLocalRemoval") {
+    payload = await scenarioKbDedupeLocalRemoval(source);
   } else if (scenario === "userBackupDecode") {
     payload = await scenarioUserBackupDecode(source);
   } else if (scenario === "userBackupRestore") {

@@ -55,6 +55,25 @@ def test_export_writes_json(monkeypatch):
     print("✓ kb-export 写入 JSON（自动创建目录）")
 
 
+def test_export_strips_nul_for_round_trip(monkeypatch):
+    """kb-export 与 Web 同口径剥离 NUL：导出产物可被 kb-import 完整恢复。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "export_documents",
+        lambda: [{"content": "前" + chr(0) + "后", "metadata": {"title": "标"}}],
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp) / "kb.json"
+        code, _out = _capture(cli.run_knowledge_export_standalone, str(target))
+        assert code == 0
+        payload = json.loads(target.read_text(encoding="utf-8"))
+        assert payload["documents"] == [
+            {"content": "前后", "metadata": {"title": "标"}}
+        ], payload
+    print("✓ kb-export 剥离 NUL（导出→导入不丢片段）")
+
+
 def test_export_write_failure_reports(monkeypatch):
     """目标父路径是文件（不可创建目录）：写入失败明确报错并退出 1。"""
     import tempfile
@@ -655,6 +674,7 @@ if __name__ == "__main__":
     _tmp_registry.install()
     for case in (
         test_export_writes_json,
+        test_export_strips_nul_for_round_trip,
         test_export_sanitizes_non_finite,
         test_export_refuses_overwrite_without_force,
         test_kb_export_dispatch_strict,

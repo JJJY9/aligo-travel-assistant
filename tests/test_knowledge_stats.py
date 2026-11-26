@@ -240,8 +240,42 @@ def test_status_reports_unavailable_when_collection_cannot_load(tmp_path):
     assert "无法加载" in status["reason"], status
 
 
+def test_status_load_failure_appends_non_ascii_hint(monkeypatch, tmp_path):
+    """加载失败时把 Windows 非 ASCII 路径的真实原因带进 reason。"""
+
+    class _BrokenClient:
+        def has_collection(self, name):
+            return True
+
+        def load_collection(self, name):
+            raise ValueError("This file contains pickled (object) data")
+
+        def get_collection_stats(self, name):
+            return {"row_count": 1}
+
+    import utils.knowledge_stats as stats_module
+
+    db = tmp_path / "milvus_lite.db"
+    db.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(
+        stats_module, "get_milvus_client", lambda path: _BrokenClient()
+    )
+    monkeypatch.setattr(
+        stats_module,
+        "knowledge_path_encoding_hint",
+        lambda path: "路径含非 ASCII 字符，请设置 ALIGO_DATA_DIR",
+    )
+    status = knowledge_status(
+        db_path=str(db), include_path=False, detail_errors=False
+    )
+    assert status["available"] is False
+    assert "ALIGO_DATA_DIR" in status["reason"], status
+    print("✓ 加载失败 reason 附带非 ASCII 路径提示")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_status_reports_unavailable_when_collection_cannot_load": "需要 tmp_path 夹具",
+    "test_status_load_failure_appends_non_ascii_hint": "需要 tmp_path 夹具",
 }
 
 if __name__ == "__main__":
