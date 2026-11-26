@@ -3326,15 +3326,17 @@ def test_import_reads_export_snapshot_once(monkeypatch):
 
 def test_import_lock_volume_rejection_maps_to_413(monkeypatch):
     """锁内体积复核拒绝映射 413：ImportVolumeError 是 ValueError 子类，
-    except 顺序必须让子类分支先命中（此前 413 / 专用日志不可达）。"""
+    except 顺序必须让子类分支先命中（此前 413 / 专用日志不可达）。
+
+    非 dry_run 只在导入互斥锁内复核一次（锁外预检不再重复执行整库
+    合并复核），因此第一次调用即返回超限、必须映射 413。
+    """
     from utils import user_import as module
 
     calls = {"n": 0}
 
     def fake_merged(store, sections, **kwargs):
         calls["n"] += 1
-        if calls["n"] == 1:
-            return None  # 锁外预检通过（并发导入在锁内写入）
         return "约 60.0 MB 超过导入上限 50 MB"
 
     monkeypatch.setattr(module, "merged_backup_limit_problem", fake_merged)
@@ -3349,7 +3351,7 @@ def test_import_lock_volume_rejection_maps_to_413(monkeypatch):
         assert response.status_code == 413, response.text
         detail = response.json()["detail"]
         assert "恢复中止" in detail and "请求 ID" in detail, detail
-        assert calls["n"] >= 2, calls
+        assert calls["n"] == 1, calls
     finally:
         _cleanup(user_id)
     print("✓ 导入锁内体积拒绝返回 413（不是可重试 503 / 400）")
@@ -4680,7 +4682,7 @@ def test_trips_import_api(monkeypatch):
         def get_trip_history(self, limit=None):
             return list(self.existing)
 
-        def save_trip_histories(self, rows):
+        def save_trip_histories(self, rows, **kwargs):
             self.saved = list(rows)
             return (len(rows), 0)
 
@@ -4755,7 +4757,7 @@ def test_trips_import_api(monkeypatch):
 
     # 写入失败：503
     class _Boom(_Store):
-        def save_trip_histories(self, rows):
+        def save_trip_histories(self, rows, **kwargs):
             raise RuntimeError("db down")
 
     monkeypatch.setattr(
@@ -6223,7 +6225,7 @@ def test_import_partial_error_reports_counts(monkeypatch):
         def get_trip_history(self, limit=None):
             return []
 
-        def save_trip_histories(self, trips):
+        def save_trip_histories(self, trips, **kwargs):
             raise PartialImportError(
                 "批量保存在第 2 条后失败：connection lost", 1, 1
             )
@@ -6268,7 +6270,7 @@ def test_trips_import_partial_error_reports_counts(monkeypatch):
         def get_trip_history(self, limit=None):
             return []
 
-        def save_trip_histories(self, trips):
+        def save_trip_histories(self, trips, **kwargs):
             raise PartialImportError(
                 "批量保存在第 2 条后失败：db down", 1, 0
             )
@@ -12209,6 +12211,32 @@ def test_chunked_request_body_allowed_under_limit():
     print("✓ 分块传输的小请求正常处理")
 
 
+def test_chunked_import_body_too_large(monkeypatch):
+    """分块传输同样受 /api/import 的 64MB 上限约束。
+
+    /api/import 不套中间件的读体超时（端点自带 300 秒预算），但字节计数
+    必须照常执行：此前超时与计数被写成同一分支，分块上传可绕过上限把
+    任意大小的请求体读入内存。这里把上限缩到 1KB 验证。
+    """
+    from webapp import server as server_module
+
+    monkeypatch.setitem(
+        server_module._BODY_LIMIT_OVERRIDES, "/api/import", 1024
+    )
+    client = _client()
+    response = client.post(
+        "/api/import",
+        params={"user_id": _unique_user("web_import_chunked")},
+        content=[b"x" * 2048],
+        headers={"Content-Type": "application/json"},
+    )
+    assert "content-length" not in response.request.headers, "用例应走分块传输"
+    assert response.status_code == 413, response.text[:300]
+    assert "请求体过大" in response.json()["detail"]
+    assert response.headers.get("connection") == "close"
+    print("✓ /api/import 的分块请求体同样按实际读取量截断")
+
+
 def test_gzip_compression_excludes_sse():
     """静态资源与 JSON 启用 gzip；SSE 流保持原样（压缩会破坏实时进度）。"""
     from context.storage import create_long_term_memory
@@ -16766,25 +16794,37 @@ def test_import_same_source_concurrent_guard():
     user_id = _unique_user("web_import_inflight")
     # TestClient 的 TCP 对端固定为 "testclient"
     assert state.try_begin_import("testclient") is True
+    original_kb_limit = state.kb_limiter.limit
+    state.kb_limiter.limit = 1
     try:
-        response = client.post(
-            "/api/import",
-            params={"user_id": user_id},
-            json={
-                "backup": {
-                    "chat_history": [
-                        {
-                            "role": "user",
-                            "content": "导入守卫测试",
-                            "timestamp": "2026-11-01T09:00:00",
-                            "session_id": "s-inflight",
-                        }
-                    ]
-                }
-            },
+        try:
+            response = client.post(
+                "/api/import",
+                params={"user_id": user_id},
+                json={
+                    "backup": {
+                        "chat_history": [
+                            {
+                                "role": "user",
+                                "content": "导入守卫测试",
+                                "timestamp": "2026-11-01T09:00:00",
+                                "session_id": "s-inflight",
+                            }
+                        ]
+                    }
+                },
+            )
+            refund_remaining = state.kb_limiter.status("testclient")[0]
+        finally:
+            state.kb_limiter.limit = original_kb_limit
+        assert refund_remaining == 1, (
+            "零成本 503 拒绝必须归还已扣的知识库额度"
         )
         assert response.status_code == 503, response.text[:300]
         assert "该来源已有导入任务在处理" in response.json()["detail"]
+        assert response.headers.get("retry-after") == "5", (
+            "并发拒绝应给出可重试节奏"
+        )
         trips = client.post(
             "/api/trips/import",
             params={"user_id": user_id},

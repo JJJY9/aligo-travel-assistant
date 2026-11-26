@@ -5144,9 +5144,11 @@ const PREFERENCE_VALUE_MAX_CHARS = 10000;
 
 function preferenceValueTooLarge(value) {
   // 服务端按 JSON 序列化后的长度计（引号 / 转义 / 列表括号会略增），
-  // 前端在输入阶段就拦下，避免直接收到英文 422
+  // 前端在输入阶段就拦下，避免直接收到英文 422。服务端用 Python 的
+  // len() 按码点计数，这里必须用 Array.from 展开（String.length 是
+  // UTF-16 码元数）——否则星面字符等补充平面文本会被前端误拦。
   try {
-    return JSON.stringify(value).length > PREFERENCE_VALUE_MAX_CHARS;
+    return Array.from(JSON.stringify(value)).length > PREFERENCE_VALUE_MAX_CHARS;
   } catch {
     return false;
   }

@@ -808,9 +808,9 @@ def import_trips_from_text(
             if _bad_import_text(row.get(field)):
                 raise ValueError("行程内容包含 NUL 或非法 Unicode 字符，已拒绝导入")
 
-    # 新建行程才补默认目的；已存在（含本批前一行刚新建）的行程保留原目的。
-    # 只在写入前扫一次库；批内同身份行必须按顺序加入 pending，否则后一行
-    # 会被误判为「新行程」补默认值，覆盖前一行显式给出的目的。
+    # 新建行程的默认目的不在锁外按陈旧快照预填：存储层在写锁内重载后只对
+    # 「本批新增」行补默认值。锁外预填会把并发期间用户刚编辑的 purpose
+    # 当成显式更新覆盖掉（同身份行在快照之后才出现时）。
     history = store.get_trip_history(limit=None)
     existing_keys = {trip_identity(trip) for trip in history}
     # 与 Web 新增行程的上限同口径：超过总量后 user-export / GET /api/export
@@ -834,13 +834,6 @@ def import_trips_from_text(
             f"（现有 {len(history)} + 新增 {planned_created}），"
             "请先清理历史行程后重试"
         )
-    pending_keys = set(existing_keys)
-    for row in rows:
-        key = trip_identity(row)
-        if row.get("purpose") is None and (key is None or key not in pending_keys):
-            row["purpose"] = "出差"
-        if key is not None:
-            pending_keys.add(key)
 
     if dry_run:
         pending = set(existing_keys)
@@ -854,7 +847,9 @@ def import_trips_from_text(
                 pending.add(key)
         result["created"], result["updated"] = created, updated
         return result
-    created, updated = store.save_trip_histories(rows)
+    created, updated = store.save_trip_histories(
+        rows, default_new_purpose="出差"
+    )
     result["created"], result["updated"] = int(created), int(updated)
     return result
 

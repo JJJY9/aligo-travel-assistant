@@ -18,6 +18,7 @@ import os
 import re
 from collections import Counter
 from datetime import datetime
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -30,7 +31,7 @@ from utils.preference_values import (
     has_preference_value,
 )
 from utils.timestamps import localize_naive, parse_iso_datetime
-from utils.trip_export import normalized_uid_token
+from utils.trip_export import _MAX_ICS_X_ATTR_CHARS, normalized_uid_token
 from utils.trip_import import (
     _strict_date,
     normalize_identity_date,
@@ -214,8 +215,10 @@ def _bad_text_in_value(value: Any, depth: int = 0) -> str | None:
     这里的递归先于 json.loads 的护栏抛出 RecursionError（CLI user-import
     直接崩溃、--json 也没有结构化输出），按非法值拒绝。
     """
-    if depth > 64:
-        return "嵌套过深"
+    if depth > 16:
+        # 与 Web PUT / CLI 偏好编辑的深度上限同一口径：导入若接受更深的
+        # 嵌套，恢复出的偏好会在面板「未修改直接保存」时 422（僵尸值）
+        return "嵌套过深（超过 16 层）"
     if isinstance(value, float):
         # 非有限数写进 JSONB 会被 PostgreSQL 确定性拒绝（整份恢复 503），
         # JSON 后端则落盘成非标准写法；PUT /api/preferences 已拒绝同类值
@@ -762,8 +765,48 @@ def merged_backup_limit_problem(
         water = max([existing_last, *trip_numbers], default=existing_last)
         statistics["last_trip_number"] = water + created_trip_count
     payload["statistics"] = statistics
-    problem = backup_limit_problem(payload, crlf=crlf)
+    merged_size: dict[str, int] = {}
+    problem = backup_limit_problem(payload, crlf=crlf, size_out=merged_size)
     if problem is None:
+        # 原始形状通过不等于恢复后可导出：导出端在逼近上限时还会按
+        # 「恢复到新账号」的保守形状复核（naive 时间戳归一为 32 字符，
+        # 每条消息多算约 6 字节）。导入侧必须镜像同一条轴，否则恢复可以
+        # 通过本闸门，随后 /api/export 因保守估算永久 413——正是体积闸门
+        # 要避免的状态。只在 margin 内精确复核；导入前已处于同一状态的
+        # 账号仍放行（基线豁免语义与其它轴一致）。
+        merged_messages = payload.get("chat_history")
+        merged_trips_payload = payload.get("trip_history")
+        shape_margin = (
+            64
+            * (len(merged_messages) if isinstance(merged_messages, list) else 0)
+            + 512
+            * (len(merged_trips_payload) if isinstance(merged_trips_payload, list) else 0)
+            + 4096
+        )
+        if merged_size.get("size", 0) + shape_margin > MAX_BACKUP_BYTES:
+            user_shape_payload = dict(payload)
+            # 默认导出没有 knowledge 键（与导出端的保守轴同形状）
+            user_shape_payload.pop("knowledge", None)
+            user_shape_size = _backup_payload_size(
+                user_shape_payload, crlf=crlf
+            )
+            if user_shape_size + shape_margin > MAX_BACKUP_BYTES:
+                shape_problem = _post_restore_shape_problem(
+                    user_shape_payload, pg_shape=pg_shape
+                )
+                if shape_problem:
+                    baseline_shape_problem = _post_restore_shape_problem(
+                        _export_shape_baseline(
+                            existing,
+                            [],
+                            user_id=target_user_id,
+                            include_knowledge=False,
+                            include_session_id=False,
+                        ),
+                        pg_shape=pg_shape,
+                    )
+                    if not baseline_shape_problem:
+                        return f"恢复后{shape_problem}"
         return None
     # 导入前基线的按轴豁免：存量账号在某个轴上已超限时（体积 / 消息 /
     # 行程 / 偏好 / 知识片段）——任何恢复都无法让账号在该轴上更糟，
@@ -1094,13 +1137,16 @@ def export_backup_limit_problem(
     return None
 
 
-def _post_restore_shape_problem(backup: dict[str, Any]) -> str | None:
+def _post_restore_shape_problem(
+    backup: dict[str, Any], *, pg_shape: bool | None = None
+) -> str | None:
     """按导入端的落库形状复核 50MB（导出 200 / 导入 413 的非对称修复）。
 
     解析失败按原口径放行：能走到这里说明原始备份已通过全部结构预检，
-    解析异常属于内部问题，不应把合法导出误拒。``pg_shape`` 取当前部署
-    后端——恢复到同部署的新账号是最常见场景，也是导出承诺的可恢复性
-    口径。
+    解析异常属于内部问题，不应把合法导出误拒。``pg_shape`` 缺省取当前
+    部署后端（恢复到同部署的新账号是最常见场景，也是导出承诺的可恢复性
+    口径）；调用方持有明确后端形状（如导入侧的 store）时应显式传入，
+    避免测试替身 / 双后端与 STORAGE_CONFIG 不一致时多算行体积。
     """
     try:
         sections, _errors = parse_user_export_data(backup)
@@ -1108,12 +1154,13 @@ def _post_restore_shape_problem(backup: dict[str, Any]) -> str | None:
         return None
     if not isinstance(sections, dict):
         return None
-    try:
-        from config import STORAGE_CONFIG
+    if pg_shape is None:
+        try:
+            from config import STORAGE_CONFIG
 
-        pg_shape = bool(STORAGE_CONFIG.get("postgres_dsn"))
-    except Exception:  # noqa: BLE001 - 配置不可读时按 JSON 口径
-        pg_shape = False
+            pg_shape = bool(STORAGE_CONFIG.get("postgres_dsn"))
+        except Exception:  # noqa: BLE001 - 配置不可读时按 JSON 口径
+            pg_shape = False
     return sections_limit_problem(
         sections,
         pg_shape=pg_shape,
@@ -1537,19 +1584,21 @@ def sections_limit_problem(
             else 0
         )
     payload["statistics"] = statistics
-    problem = backup_limit_problem(payload, crlf=crlf)
-    if problem is None:
-        return None
-    problems = _limit_problems(payload, crlf=crlf)
     if existing is not None:
         # 体积轴交给随后的权威合并复核（merged_backup_limit_problem 用
         # 同一快照、含存量消息与现有知识库基线）：本函数的空行程表预演
         # 会给缺 trip_id 的历史行程逐行补 id（真实导入只按同身份批量
         # 更新、不补 id），独立判定比权威复核更严、临近上限的合法备份
-        # 被误拒 413。CLI / Web 主路径随后必定执行合并复核
-        problems = [
-            (axis, message) for axis, message in problems if axis != "size"
-        ]
+        # 被误拒 413。CLI / Web 主路径随后必定执行合并复核。
+        # 传 precomputed_size=0 跳过体积计算：该结果必被丢弃，此前预检会
+        # 为它再做一次 sanitize 深拷贝 + indent=2 序列化（50–64MB 备份
+        # 额外付出数百 MB 峰值）。条数轴仍完整判定。
+        problems = _limit_problems(payload, crlf=crlf, precomputed_size=0)
+    else:
+        problem = backup_limit_problem(payload, crlf=crlf)
+        if problem is None:
+            return None
+        problems = _limit_problems(payload, crlf=crlf)
     if not problems:
         return None
     if existing is None:
@@ -1627,10 +1676,14 @@ def parse_user_export_data(
         # 键名与 Web /api/preferences/{type} 的 ^[^/]{1,64}$ 同一口径，并
         # 排除控制字符 / 行分隔符（与 _PREF_TYPE_PATTERN 一致）：不做 strip
         # ——改名会让「 home」与「home」碰撞互相覆盖，含 ESC/NUL 的键导入
-        # 后面板与 API 都无法编辑或删除
+        # 后面板与 API 都无法编辑或删除。纯空白键会被 JSON 后端加载迁移
+        # 静默丢弃（导入报成功、重启后消失）；"." / ".." 在面板的路径式
+        # 编辑 / 删除里会被 URL 规范化为别的路径，同样无法寻址。
         name = str(key)
         if (
             not name
+            or not name.strip()
+            or name in (".", "..")
             or len(name) > 64
             or re.search(r"[\x00-\x1F\x7F-\x9F\u2028\u2029/]", name)
         ):
@@ -1713,6 +1766,19 @@ def parse_user_export_data(
             errors.append(f"跳过第 {index} 条行程：出发日期为空")
             continue
         end_date = _normalize_trip_date(end_raw)
+        if (
+            end_raw
+            and len(end_raw) > _MAX_ICS_X_ATTR_CHARS
+            and _strict_date(end_date) is None
+        ):
+            # ICS 只能把 ≤2000 字符的原始返程日期写进 X-ALIGO-TRIP-END；
+            # 更长且无法解析的值导出后身份会漂移（end 变成出发日），
+            # 回导时按新身份重复新增行程。恢复端收口为单日并显式报错。
+            errors.append(
+                f"第 {index} 条行程：返程日期过长且无法解析，已按单日恢复"
+            )
+            end_raw = ""
+            end_date = ""
         start_dt = _strict_date(start_date)
         end_dt = _strict_date(end_date) if end_date else None
         if start_dt is not None and end_dt is not None and end_dt < start_dt:
@@ -1888,7 +1954,7 @@ def parse_user_export_data(
                 continue
             cleaned_meta: dict[str, str] = {}
             meta_problem: str | None = ""
-            for key, value in list(metadata.items())[:_MAX_PREFERENCES]:
+            for key, value in islice(metadata.items(), _MAX_PREFERENCES):
                 key_text = str(key)[:32]
                 value_text = str(value)[:200]
                 meta_problem = (
