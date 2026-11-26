@@ -4,7 +4,10 @@
 响应，不再重复跑 Agent（也就不会重复写偏好 / 行程 / 聊天记录）。
 
 实现边界：
-- 进程内 TTL + 最大条目数（LRU），键为 ``(user_id, session_id, key)``；
+- 进程内 TTL + 最大条目数；键为 ``(user_id, session_id, key)``；
+- 超限淘汰按用户公平：只淘汰条目最多的用户自己最旧的一条，任一用户的
+  流量都不能把另一用户仍在 TTL 内的条目（尤其断连回合的
+  ``__incomplete__`` 标记）挤出缓存；
 - 只缓存成功完成的响应；失败不入缓存，允许客户端重试；
 - 读出时深拷贝，调用方修改返回对象不会污染缓存；
 - 多实例部署可把同一接口替换为 Redis 实现（键与 TTL 语义不变）。
@@ -72,13 +75,30 @@ class IdempotencyCache:
             self._entries.move_to_end(key)
             return copy.deepcopy(payload)
 
+    def _evict_fair_locked(self) -> None:
+        """超上限时按用户公平淘汰（调用方已持有 ``self._lock``）。
+
+        全局 FIFO 会让任一用户的流量把另一用户仍在 TTL 内的条目挤出：
+        断连回合的 ``__incomplete__`` 标记被挤出后，重试会重复执行、
+        重复落库。这里只淘汰条目最多的用户自己最旧的一条；同条目数时
+        按全局最旧条目的用户决胜，单用户场景仍是标准 LRU。
+        """
+        counts: dict[str, int] = {}
+        for key in self._entries:
+            counts[key[0]] = counts.get(key[0], 0) + 1
+        victim_user = max(counts, key=lambda user: counts[user])
+        for key in self._entries:
+            if key[0] == victim_user:
+                self._entries.pop(key)
+                return
+
     def put(self, key: IdempotencyKey, payload: dict[str, Any]) -> None:
-        """写入完成响应；超上限时淘汰最久未使用的条目。"""
+        """写入完成响应；超上限时按用户公平淘汰最久未使用的条目。"""
         with self._lock:
             self._entries[key] = (time.monotonic(), copy.deepcopy(payload))
             self._entries.move_to_end(key)
             while len(self._entries) > self.max_entries:
-                self._entries.popitem(last=False)
+                self._evict_fair_locked()
 
     def clear(self) -> None:
         with self._lock:

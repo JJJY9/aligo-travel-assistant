@@ -419,6 +419,40 @@ def test_user_switch_trip_preference_drafts():
     print("✓ 切换用户确认行程 / 偏好草稿")
 
 
+def test_user_switch_chat_composer_draft():
+    """聊天草稿与表单同口径：切换前确认，切换后清空；空输入不再静默回退。"""
+    data = _run_harness("userSwitchComposer")
+    rejected = data["rejected"]
+    assert rejected["confirmCalls"] == 1, rejected
+    assert rejected["userId"] == "u1", rejected
+    assert rejected["composer"] == "A-DRAFT-SECRET", rejected
+    accepted = data["accepted"]
+    assert accepted["userId"] == "u2", accepted
+    assert accepted["composer"] == "", accepted
+    empty = data["empty"]
+    assert empty["userId"] == "u3", empty
+    assert any("请输入用户 ID" in toast for toast in empty["toasts"]), empty
+    print("✓ 切换用户确认并清空聊天草稿")
+
+
+def test_stored_invalid_user_id_falls_back_with_flag():
+    """存储的非法用户 ID 回退 web_user 时记下被拒值（供启动提示）。"""
+    data = _run_harness("storedUserFallback")
+    assert data["userId"] == "web_user", data
+    assert data["rejected"] == "con", data
+    assert data["localLeft"] is None and data["sessionLeft"] is None, data
+    print("✓ 非法存储用户 ID 回退并记录被拒值")
+
+
+def test_delete_preference_late_response_keeps_new_user_baseline():
+    """A 的偏好删除响应迟到且已切到 B：不能清掉 B 的合并基线。"""
+    data = _run_harness("deletePreferenceLateResponse")
+    assert data["user_id"] == "user-b", data
+    assert data["latest"] == ["Rujia"], data
+    assert data["status"] == ["Rujia"], data
+    print("✓ 偏好删除迟到响应不污染新用户基线")
+
+
 def test_trip_dedupe_unknown_outcome_refreshes():
     """行程去重删除超时 / 503：提示可能已删除、刷新并退出编辑。"""
     data = _run_harness("tripDedupeUnknown")
@@ -1286,6 +1320,9 @@ if __name__ == "__main__":
     test_frontend_render_helpers()
     test_frontend_detail_fixes()
     test_user_switch_trip_preference_drafts()
+    test_user_switch_chat_composer_draft()
+    test_stored_invalid_user_id_falls_back_with_flag()
+    test_delete_preference_late_response_keeps_new_user_baseline()
     test_trip_dedupe_unknown_outcome_refreshes()
     test_kb_pending_result_cleared_on_cancel()
     test_knowledge_duplicates_panel_states()

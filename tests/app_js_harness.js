@@ -3724,6 +3724,97 @@ async function scenarioUserSwitchFormsDraft(source) {
   return { rejected, accepted };
 }
 
+async function scenarioUserSwitchComposer(source) {
+  // 切换用户必须把聊天草稿纳入未保存确认并在切换后清空：上一用户未发送
+  // 的文本不能留给新用户（输入框仍可回车，会按新 user_id 发出）
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    document.querySelector = () => null;
+    state.userId = "u1";
+    state.busy = false;
+    els.input.value = "A-DRAFT-SECRET";
+    els.userIdInput.value = "u2";
+    globalThis.__confirmCalls = 0;
+    globalThis.__confirmAnswer = false;
+    window.confirm = () => { __confirmCalls += 1; return __confirmAnswer; };
+    loadSessions = async () => {};
+    refreshStatus = () => {};
+    closeMemorySheet = () => {};
+    renderOverview = () => {};
+    resetTripForm = () => {};
+    resetPreferenceForm = () => {};
+  `);
+  await run("saveUser()");
+  const rejected = run(`({
+    confirmCalls: __confirmCalls,
+    userId: state.userId,
+    composer: els.input.value,
+  })`);
+  run("__confirmAnswer = true;");
+  await run("saveUser()");
+  const accepted = run(`({
+    confirmCalls: __confirmCalls,
+    userId: state.userId,
+    composer: els.input.value,
+  })`);
+  // 空输入不再隐式切到共享默认账号 web_user
+  run(`
+    state.userId = "u3";
+    els.userIdInput.value = "   ";
+    __toasts = [];
+  `);
+  await run("saveUser()");
+  const empty = run(`({ userId: state.userId, toasts: __toasts.slice() })`);
+  return { rejected, accepted, empty };
+}
+
+async function scenarioStoredUserFallback(source) {
+  // 存储的非法用户 ID：仍回退 web_user，但必须记下被拒值供 init 提示
+  const env = buildEnv(
+    'localStorage.setItem("aligo.userId", "con");\n' + source,
+  );
+  const run = (code) => runIn(env, code);
+  return run(`({
+    userId: state.userId,
+    rejected: state.rejectedUserId,
+    localLeft: localStorage.getItem("aligo.userId"),
+    sessionLeft: sessionStorage.getItem("aligo.userId"),
+  })`);
+}
+
+async function scenarioDeletePreferenceLateResponse(source) {
+  // A 的删除响应迟到且期间已切到 B：不能删掉 B 的偏好合并基线
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    document.querySelector = () => null;
+    globalThis.__req = [];
+    getJSON = (url, options) =>
+      new Promise((resolve, reject) => { __req.push({ url, options, resolve, reject }); });
+    state.userId = "user-a";
+    state.status = { preferences: { hotel_brands: ["Hanting"] } };
+    preferenceLatest.set("hotel_brands", ["Hanting"]);
+    refreshStatus = async () => {};
+  `);
+  const promise = run('deletePreference("hotel_brands", "汉庭", null)');
+  await tick();
+  run(`
+    state.userId = "user-b";
+    state.status = { preferences: { hotel_brands: ["Rujia"] } };
+    preferenceLatest.set("hotel_brands", ["Rujia"]);
+  `);
+  env.__req[0].resolve({});
+  await promise;
+  return {
+    user_id: run("state.userId"),
+    latest: run("preferenceLatest.get('hotel_brands') || null"),
+    status: run(
+      "(state.status.preferences && state.status.preferences.hotel_brands) || null"
+    ),
+  };
+}
+
 async function scenarioTripDedupeUnknown(source) {
   const results = {};
   for (const [key, status] of [["timeout", 0], ["partial503", 503]]) {
@@ -4342,6 +4433,12 @@ async function main() {
     payload = await scenarioFrontendDetailFixes(source);
   } else if (scenario === "userSwitchFormsDraft") {
     payload = await scenarioUserSwitchFormsDraft(source);
+  } else if (scenario === "userSwitchComposer") {
+    payload = await scenarioUserSwitchComposer(source);
+  } else if (scenario === "storedUserFallback") {
+    payload = await scenarioStoredUserFallback(source);
+  } else if (scenario === "deletePreferenceLateResponse") {
+    payload = await scenarioDeletePreferenceLateResponse(source);
   } else if (scenario === "tripDedupeUnknown") {
     payload = await scenarioTripDedupeUnknown(source);
   } else if (scenario === "kbPendingCancel") {
