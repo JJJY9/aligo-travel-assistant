@@ -52,6 +52,22 @@ def test_health_json_failure(monkeypatch):
     print("✓ health --json 失败退出码 1")
 
 
+def test_health_text_failure_strips_terminal_controls(monkeypatch):
+    """纯文本 health 的上游错误体可能含 ESC / OSC：不能原样打到终端。"""
+
+    async def fake_health(**kwargs):
+        return False, "gateway: \x1b]52;c;SGVsbG8=\x07\x1b[2J bad \x1b[31m"
+
+    monkeypatch.setattr(cli, "init_agentscope", lambda: None)
+    monkeypatch.setattr(cli, "check_llm_health", fake_health)
+    code, out = _capture(cli.run_health_check_standalone, False)
+    assert code == 1
+    assert "FAIL:" in out
+    assert "\x1b" not in out, repr(out)
+    assert "gateway: " in out and "bad " in out
+    print("✓ health 纯文本失败剥离终端控制序列")
+
+
 def test_kb_status_json(monkeypatch):
     from utils import knowledge_stats
 
@@ -214,6 +230,7 @@ if __name__ == "__main__":
     for case in (
         test_health_json_ok,
         test_health_json_failure,
+        test_health_text_failure_strips_terminal_controls,
         test_kb_status_json,
         test_health_missing_runtime_dependencies,
     ):

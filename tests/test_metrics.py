@@ -64,6 +64,21 @@ def test_average_duration_excludes_streaming_requests():
     print("✓ 平均耗时不把 SSE 请求计入分母")
 
 
+def test_count_only_skips_duration_samples():
+    """Host 拒绝 / 未匹配 404 探测只计请求数，不进延迟样本窗口。"""
+    metrics = RequestMetrics()
+    metrics.record("GET", "/api/health", 200, 10.0)
+    metrics.record("GET", "__host_rejected__", 400, 0.0, count_only=True)
+    metrics.record("GET", "__unmatched__", 404, 0.1, count_only=True)
+    snapshot = metrics.snapshot()
+    assert snapshot["requests_total"] == 3
+    assert snapshot["by_status"] == {"200": 1, "400": 1, "404": 1}
+    assert snapshot["duration_samples"] == 1
+    assert snapshot["p50_duration_ms"] == 10.0
+    assert snapshot["p95_duration_ms"] == 10.0
+    print("✓ 探测流量只计计数、不稀释延迟分位")
+
+
 def test_path_cardinality_is_bounded():
     metrics = RequestMetrics()
     for index in range(MAX_PATHS + 50):
@@ -179,6 +194,7 @@ if __name__ == "__main__":
     test_percentiles_use_bounded_recent_samples()
     test_path_cardinality_is_bounded()
     test_average_duration_excludes_streaming_requests()
+    test_count_only_skips_duration_samples()
     test_method_cardinality_is_bounded()
     test_control_characters_are_sanitized()
     test_prometheus_render()

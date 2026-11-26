@@ -19,8 +19,10 @@ from typing import Any
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
+from utils.access_log import MAX_LOG_TEXT, _safe_log_text
 from utils.json_parser import extract_json_from_async_response
 from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
+from utils.log_redact import redact_paths
 from utils.user_query import extract_user_query
 
 logger = logging.getLogger(__name__)
@@ -325,7 +327,14 @@ class SimplePromptSkill(AgentBase):
                 # 上游模型 / 网络故障不能吞成 status=error：编排层看不到
                 # 异常就不会退避重试，熔断器也永远不会记账
                 raise
-            logger.warning("%s 执行失败: %s", self.skill_name, exc)
+            # 网关 4xx 错误体常回显密钥 / 内部地址，且可能含换行：脱敏 +
+            # 单行化 + 截断后再写日志；返回给编排层的 message 仍保留原文
+            # （编排层统一 redact_paths）
+            logger.warning(
+                "%s 执行失败: %s",
+                self.skill_name,
+                _safe_log_text(redact_paths(exc))[:MAX_LOG_TEXT],
+            )
             result = {
                 "status": "error",
                 "skill": self.skill_name,

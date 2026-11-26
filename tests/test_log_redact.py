@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -173,6 +174,58 @@ def test_redaction_keeps_url_after_spacey_cjk_path():
     assert "<路径>" in cleaned and "Connection refused" in cleaned
     print("✓ 路径后的 URL 仍被整体遮蔽")
 
+
+def test_redact_secret_masks_libpq_quoted_tokens():
+    """psycopg 解析 DSN 失败时把参数值整段回显在引号里（含未编码密码）。"""
+    spaced = (
+        'unexpected spaces found in "pa ss", '
+        "use percent-encoded spaces (%20) instead"
+    )
+    cleaned = redact_secret(spaced)
+    assert "pa ss" not in cleaned, cleaned
+    assert "unexpected spaces found in" in cleaned, cleaned
+    assert "percent-encoded" in cleaned, cleaned
+
+    missing_eq = 'missing "=" after "aligo:pa ss" in connection info string'
+    cleaned = redact_secret(missing_eq)
+    assert "pa ss" not in cleaned, cleaned
+    assert 'missing "=" after' in cleaned, cleaned
+    print("✓ redact_secret 遮蔽 libpq 引号内 DSN 参数")
+
+
+def test_redact_paths_covers_macos_and_nix_roots():
+    """macOS 框架 / 外置卷与 NixOS 的常见安装根同样属于本机路径。"""
+    for raw in (
+        "/Library/Frameworks/Python.framework/Versions/3.12/lib/"
+        "python3.12/site-packages/x.py",
+        "/Volumes/Data/models/bge-small-zh-v1.5/config.json",
+        "/nix/store/abcd1234-source/utils/x.py",
+    ):
+        cleaned = redact_local_paths(raw)
+        assert cleaned == "<路径>", (raw, cleaned)
+        quoted = redact_local_paths(f"load '{raw}' failed")
+        assert quoted == "load '<路径>' failed", (raw, quoted)
+    print("✓ macOS /Library、/Volumes 与 /nix/store 路径被遮蔽")
+
+
+def test_redact_secret_url_scheme_is_bounded_for_linear_time():
+    """scheme 超过 RFC 事实上限时不按 URL 处理；长文本脱敏保持近线性。"""
+    long_scheme = "x" * 60 + "://u:SECRET123456@host/db"
+    cleaned = redact_secret(long_scheme)
+    assert "SECRET123456" not in cleaned, cleaned
+
+    overlong = "x" * 80 + "://u:SECRET123456@host/db"
+    cleaned = redact_secret(overlong)
+    assert cleaned.startswith("x" * 80), "超长 scheme 不应被当作 URL 前缀"
+    assert "SECRET123456" not in cleaned, cleaned
+
+    # 无界 scheme 下 64k 无分隔文本是 O(n²)（数十秒）；有界后应为毫秒级
+    started = time.perf_counter()
+    redact_secret("a" * 200_000)
+    assert time.perf_counter() - started < 5.0
+    print("✓ URL scheme 限长，长文本脱敏近线性")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
@@ -186,7 +239,10 @@ if __name__ == "__main__":
     test_redact_secret_keeps_url_punctuation_passwords_out()
     test_redact_secret_masks_bare_api_keys()
     test_redact_secret_masks_auth_headers_and_colon_forms()
+    test_redact_secret_masks_libpq_quoted_tokens()
+    test_redact_secret_url_scheme_is_bounded_for_linear_time()
     test_redact_paths_hides_internal_paths_and_urls()
+    test_redact_paths_covers_macos_and_nix_roots()
     test_redact_local_paths_keeps_urls_intact()
     test_redact_local_paths_covers_paths_with_spaces()
     test_redaction_keeps_url_after_spacey_cjk_path()

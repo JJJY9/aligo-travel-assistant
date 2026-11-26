@@ -7,6 +7,7 @@ import re
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
+from .access_log import MAX_LOG_TEXT, _safe_log_text
 from .circuit_breaker import CircuitOpenError
 from .errors import MemoryPersistenceError
 from .log_redact import redact_secret
@@ -213,8 +214,10 @@ async def retry_with_backoff(
                 attempt + 1,
                 max_retries + 1,
                 delay,
-                # 上游响应体常回显 API Key / 内部地址：日志与终端同口径脱敏
-                redact_secret(str(e)),
+                # 上游响应体常回显 API Key / 内部地址：日志与终端同口径脱敏；
+                # 非 JSON 错误体（反代 502 HTML）还可能是多行，单行化避免
+                # 伪造日志行，并截断防止超长刷屏
+                _safe_log_text(redact_secret(str(e)))[:MAX_LOG_TEXT],
             )
             await asyncio.sleep(delay)
     if last_exc is None:

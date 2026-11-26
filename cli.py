@@ -2080,7 +2080,9 @@ def run_health_check_standalone(as_json: bool = False) -> int:
         if ok:
             print("OK")
         else:
-            print(f"FAIL: {msg}")
+            # 上游非 JSON 错误体（反代 502 HTML）可能含 ESC / OSC 终端
+            # 控制序列：与 doctor 纯文本回退同口径剥离
+            print(f"FAIL: {_plain_safe(msg)}")
     return 0 if ok else 1
 
 
@@ -4397,6 +4399,7 @@ def run_trips_dedupe_standalone(
     Returns:
         0 清理完成（含无重复 / dry-run）；1 参数 / 读取 / 删除失败
     """
+    from utils.log_redact import redact_paths
 
     def _fail(message: str, **extra: Any) -> int:
         if as_json:
@@ -4535,8 +4538,11 @@ def run_trips_dedupe_standalone(
         )
         if as_json:
             if failure is not None:
+                # failure 是存储层原始异常文本（可能含锁文件 / 库文件绝对
+                # 路径）：与 Web 端点同一含义的输出同样先脱敏
                 return _fail(
-                    f"删除过程中失败：{failure}（已删除 {removed} 条）",
+                    f"删除过程中失败：{redact_paths(failure)}"
+                    f"（已删除 {removed} 条）",
                     removed=removed,
                     duplicates=plan["duplicates"],
                 )
@@ -4554,7 +4560,10 @@ def run_trips_dedupe_standalone(
             )
             return 1 if ambiguous else 0
         if failure is not None:
-            print(f"删除过程中失败：{failure}（已删除 {removed} 条）")
+            print(
+                f"删除过程中失败：{redact_paths(failure)}"
+                f"（已删除 {removed} 条）"
+            )
             return 1
         if duplicates:
             print(f"用户 {user_id}：删除 {removed} 条重复行程（保留最早记录）")

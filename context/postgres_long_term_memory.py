@@ -25,6 +25,7 @@ from utils.chat_import import (
     session_dedupe_key,
 )
 from utils.errors import MemoryPersistenceError, PartialImportError
+from utils.log_redact import redact_secret
 from utils.preference_values import merge_preference_value, preference_value_problem
 from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_export import normalized_uid_token
@@ -526,8 +527,10 @@ class PostgresLongTermMemory:
 
         def _wrap(exc: Exception) -> None:
             if isinstance(exc, psycopg.Error):
+                # 驱动异常常内嵌连接串 / 未编码密码片段：包装成本地错误前
+                # 先脱敏（该文本会进服务端日志与 doctor 诊断）
                 raise MemoryPersistenceError(
-                    f"PostgreSQL 操作失败：{exc}"
+                    f"PostgreSQL 操作失败：{redact_secret(exc)}"
                 ) from exc
             raise exc
 
@@ -536,19 +539,19 @@ class PostgresLongTermMemory:
         except getattr(self, "_non_retry_db_errors", ()) as busy_exc:
             # 等锁 / 语句超时：连接本身健康，不重连不重试
             raise MemoryPersistenceError(
-                f"PostgreSQL 操作失败：{busy_exc}"
+                f"PostgreSQL 操作失败：{redact_secret(busy_exc)}"
             ) from busy_exc
         except self._retry_errors as first_exc:
             if not replay_safe:
                 raise MemoryPersistenceError(
-                    f"PostgreSQL 操作失败：{first_exc}"
+                    f"PostgreSQL 操作失败：{redact_secret(first_exc)}"
                 ) from first_exc
             try:
                 self._reconnect()
                 return operation()
             except self._retry_errors as retry_exc:
                 raise MemoryPersistenceError(
-                    f"PostgreSQL 操作失败：{retry_exc}"
+                    f"PostgreSQL 操作失败：{redact_secret(retry_exc)}"
                 ) from retry_exc
             except Exception as exc:  # noqa: BLE001 - 数据错误按持久化失败上报
                 _wrap(exc)
@@ -2455,7 +2458,7 @@ class PostgresLongTermMemory:
                 logger.warning(
                     "导出一致性快照连接中断（第 %d 次），整体重试：%s",
                     attempt,
-                    exc,
+                    redact_secret(exc),
                 )
                 try:
                     self._reconnect()
@@ -2470,7 +2473,7 @@ class PostgresLongTermMemory:
                 logger.warning(
                     "导出一致性快照事务中断（第 %d 次），整体重试：%s",
                     attempt,
-                    exc,
+                    redact_secret(exc),
                 )
                 try:
                     self._reconnect()
@@ -2479,7 +2482,9 @@ class PostgresLongTermMemory:
                 start_conn = self._conn
                 continue
             except Exception as exc:  # noqa: BLE001 - 快照失败退回逐项读取
-                logger.warning("导出一致性快照失败（%s），退回逐项读取", exc)
+                logger.warning(
+                    "导出一致性快照失败（%s），退回逐项读取", redact_secret(exc)
+                )
                 break
         return self._export_snapshot_queries()
 

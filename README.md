@@ -623,7 +623,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 - 访问日志默认输出单行文本（方法 / 路径 / 状态 / 耗时 / 请求 ID）；设置 `LOG_FORMAT=json` 后，应用日志（含访问日志）每行输出为**合法 JSON**（`time` / `level` / `logger` + `event=http_request` 等字段），便于日志采集与检索；uvicorn 自身的启动 / access 日志保持原格式。
 - 静态资源与 JSON 响应启用 gzip（≥1KB）；`/api/chat/stream` 的 SSE 事件流保持不压缩，避免缓冲破坏实时进度。
 - 系统自检：记忆面板「运行自检」调用 `/api/doctor`，展示 Python 版本、核心 / RAG 依赖、大模型配置、版本一致性（`pyproject.toml` / wheel 元数据 / `index.html` 静态资源 `?v=` / `utils/version.py`）、技能目录（发现数量）、记忆存储后端（配置 Redis / PostgreSQL 时检查连通性）、嵌入模型文件、知识库状态；勾选「检查 LLM 连通性」时额外发起一次真实健康检查（默认不请求网络）。
-- 请求指标：`GET /api/metrics` 返回进程内 `/api` 请求计数（仅统计 `/api` 路由与 Host 白名单拒绝的探测；首页、`/static` 资源与 `/metrics` 抓取本身不计）、状态 / 方法分布、Top 路径（按路由模板聚合，如 `/api/sessions/{session_id}`；未匹配路径记为 `__unmatched__`，Host 白名单拒绝记为 `__host_rejected__`，路由前 413 与尾斜杠重定向按已知接口归一）、平均 / 最大 / P50 / P95 耗时（百分位基于最近 1000 个请求样本；流式与取消 / 客户端断开的 499 不计耗时；无计时样本时面板显示「—」）、熔断器状态、缓存会话数，以及当前限流后端（Redis 共享 / 进程内）、是否降级与用户 / IP / 知识库 / 天气额度配置（请求指标多进程各自统计）；同时提供 Prometheus 文本端点 `GET /metrics`，便于接入 Prometheus / Grafana，多实例需分别采集。
+- 请求指标：`GET /api/metrics` 返回进程内 `/api` 请求计数（仅统计 `/api` 路由与 Host 白名单拒绝的探测；首页、`/static` 资源与 `/metrics` 抓取本身不计）、状态 / 方法分布、Top 路径（按路由模板聚合，如 `/api/sessions/{session_id}`；未匹配路径记为 `__unmatched__`，Host 白名单拒绝记为 `__host_rejected__`，路由前 413 与尾斜杠重定向按已知接口归一）、平均 / 最大 / P50 / P95 耗时（百分位基于最近 1000 个请求样本；流式与取消 / 客户端断开的 499 不计耗时；Host 拒绝探测与未匹配路径的 404 不受限流、可被扫描无限次触发，只计请求数、不进延迟分位；无计时样本时面板显示「—」）、熔断器状态、缓存会话数，以及当前限流后端（Redis 共享 / 进程内）、是否降级与用户 / IP / 知识库 / 天气额度配置（请求指标多进程各自统计）；同时提供 Prometheus 文本端点 `GET /metrics`，便于接入 Prometheus / Grafana，多实例需分别采集。
 
   Prometheus 抓取示例：
 
@@ -903,7 +903,7 @@ python -m webapp.server --port 8002   # 另一个进程 / 机器
 - **请求幂等**：幂等缓存（进程内 TTL 10 分钟 + LRU 256）与按用户串行的 asyncio 锁都是进程内状态。响应丢失后重试若被负载均衡分到另一实例，仍会重新执行整轮并重复落库；请配合会话粘滞（session affinity），或把 `IdempotencyCache` 替换为 Redis 实现。
 - **PostgreSQL 连接**：生产连接默认 `lock_timeout=3000ms`（等表锁超过 3 秒按「存储暂时不可用」返回，而不是无限挂起）和 TCP keepalive（30s/10s/3，半开连接约一分钟内被发现）；`statement_timeout` 只在自检探测等显式场景设置，大备份导入等合法长事务不受默认语句上限影响。表结构在进程内每个 DSN 只初始化一次（首次持跨进程 advisory lock）。
 - **反向代理**：前面有 Nginx / 负载均衡时设置 `TRUST_PROXY_HEADERS=1`，并让最靠近应用的代理以追加模式写入 `X-Forwarded-For`（应用默认取最后一项）；多层代理（CDN→nginx→应用）把 `TRUST_PROXY_HOPS` 设为实际代理层数（如 `2`），否则所有客户端会共用上游出口地址的 IP 桶、一个客户端即可打满全站额度。默认不信任该头是为了防止客户端伪造。
-- **观测**：请求指标（`/api/metrics`）是进程内统计（只统计 `/api` 路由请求与 Host 白名单拒绝的探测，首页 / 静态资源 / 抓取自身不计），需要分别采集每个实例；SSE 长连接只统计请求数与状态码、不计入延迟分位（整段会话时长没有可比性），以 error 事件收尾的流单独计入 `sse_errors`（HTTP 已发出 200，按状态码看不到失败）；PostgreSQL 后端的偏好快照缓存命中 / 未命中 / 版本失效计数见 `preference_cache`（同样按实例统计，`version_invalidations` 是 misses 的子集：只统计快照仍在 TTL 内、因跨进程版本变化被迫回源），Prometheus 暴露对应计数；`/api/health` 在熔断打开或技能目录不可用（`skills.ok` 为 `false`）时返回 `status: degraded`，可用于实例级健康检查。
+- **观测**：请求指标（`/api/metrics`）是进程内统计（只统计 `/api` 路由请求与 Host 白名单拒绝的探测，首页 / 静态资源 / 抓取自身不计），需要分别采集每个实例；SSE 长连接只统计请求数与状态码、不计入延迟分位（整段会话时长没有可比性），以 error 事件收尾（且终态帧已送达）的流单独计入 `sse_errors`（HTTP 已发出 200，按状态码看不到失败）；Host 拒绝探测与未匹配路径的 404 不受限流、只计请求数、不计入延迟分位；PostgreSQL 后端的偏好快照缓存命中 / 未命中 / 版本失效计数见 `preference_cache`（同样按实例统计，`version_invalidations` 是 misses 的子集：只统计快照仍在 TTL 内、因跨进程版本变化被迫回源），Prometheus 暴露对应计数；`/api/health` 在熔断打开或技能目录不可用（`skills.ok` 为 `false`）时返回 `status: degraded`，可用于实例级健康检查。
 - **知识库**：Milvus Lite 是本地单进程文件锁，多个实例无法共享同一个向量库文件；这里的多实例共享适用于无 RAG 或各实例独立知识库的场景，需要共享向量库时请替换为 Milvus 服务端部署。
 
 ### 知识库初始化

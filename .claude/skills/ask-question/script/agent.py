@@ -76,6 +76,7 @@ from utils.hybrid_retrieval import (
     rrf_fuse,
     tokenize,
 )
+from utils.access_log import _safe_log_text
 from utils.log_redact import redact_paths
 from utils.user_query import extract_user_query
 
@@ -475,8 +476,9 @@ class RAGKnowledgeAgent(AgentBase):
             }
 
         except Exception as e:
-            logger.error(f"Error adding documents: {e}")
-            return {"status": "error", "message": str(e)}
+            safe_error = redact_paths(e)
+            logger.error("Error adding documents: %s", _safe_log_text(safe_error))
+            return {"status": "error", "message": safe_error}
 
     def update_document(
         self, document_id: int, content: str, metadata: dict | None = None
@@ -502,8 +504,11 @@ class RAGKnowledgeAgent(AgentBase):
             self._invalidate_bm25_cache()
             return {"status": "success", "id": int(document_id)}
         except Exception as e:
-            logger.error(f"Error updating document: {e}")
-            return {"status": "error", "message": str(e)}
+            safe_error = redact_paths(e)
+            logger.error(
+                "Error updating document: %s", _safe_log_text(safe_error)
+            )
+            return {"status": "error", "message": safe_error}
 
     def _next_document_id(self) -> int:
         """返回下一个可用的文档 id（现有最大 id + 1，空集合从 1 开始）。
@@ -682,7 +687,13 @@ class RAGKnowledgeAgent(AgentBase):
                     query, retrieved_docs, k, min_distance
                 )
 
-            logger.info(f"Retrieved {len(retrieved_docs)} documents for query: {query[:50]}")
+            # 查询原文（用户问题）不以 INFO 明文进日志，只记条数与长度
+            # （#587 隐私口径；长度足以定位「检索有多长」）
+            logger.info(
+                "Retrieved %d documents for query (len=%d)",
+                len(retrieved_docs),
+                len(query),
+            )
             return retrieved_docs
 
         except Exception as e:
@@ -1236,13 +1247,13 @@ class RAGKnowledgeAgent(AgentBase):
                 min_distance=min_score,
             )
         except Exception as exc:  # noqa: BLE001 - 知识库故障转为智能体错误
-            logger.warning("知识库检索失败: %s", exc)
-            # 顶层 error / message 供编排聚合与前端展示使用：聚合器按
-            # result["error"] / result["message"] 提取原因，只放在
-            # answer / data.error 里会被丢弃渲染成「智能体返回错误状态」。
             # 文本回流给终端用户：先遮蔽内部路径 / 上游 URL（保留
             # timeout / connection 等关键词供编排层判定瞬时错误）
             detail = redact_paths(exc)
+            logger.warning("知识库检索失败: %s", _safe_log_text(detail))
+            # 顶层 error / message 供编排聚合与前端展示使用：聚合器按
+            # result["error"] / result["message"] 提取原因，只放在
+            # answer / data.error 里会被丢弃渲染成「智能体返回错误状态」。
             result = {
                 "status": "error",
                 "error": f"知识库查询失败：{detail}",
@@ -1304,7 +1315,9 @@ class RAGKnowledgeAgent(AgentBase):
                     min_distance=min_score,
                 )
             except Exception as exc:  # noqa: BLE001 - 重检索失败按无结果
-                logger.warning("简化查询重检索失败: %s", exc)
+                logger.warning(
+                    "简化查询重检索失败: %s", _safe_log_text(redact_paths(exc))
+                )
             else:
                 retried = _above_threshold(retried)
                 if retried:
@@ -1420,10 +1433,14 @@ class RAGKnowledgeAgent(AgentBase):
                     # 上游 5xx / 超时 / 连接失败 / 空响应：交给编排层退避
                     # 重试与熔断记账（其它技能同一口径），不能吞成普通失败
                     raise
-                logger.error(f"Error generating answer with LLM: {e}")
                 # 用户可见的错误信息不能带本机路径 / 上游 URL（模型缓存
                 # 路径、HuggingFace 链接会随回答与备份导出）
                 safe_error = redact_paths(e)
+                # 日志同口径：网关错误体可能回显密钥 / 换行，先脱敏再单行化
+                logger.error(
+                    "Error generating answer with LLM: %s",
+                    _safe_log_text(safe_error),
+                )
                 answer = f"知识库中找到相关信息，但生成答案时出错：{safe_error}"
                 # 生成失败不能被当成正常回答：编排层要能标记失败并按
                 # 瞬时错误（timeout / connection）触发一次退避重试
@@ -1472,7 +1489,7 @@ class RAGKnowledgeAgent(AgentBase):
                 "knowledge_base_path": str(self.knowledge_base_path)
             }
         except Exception as e:
-            return {"status": "error", "message": str(e)}
+            return {"status": "error", "message": redact_paths(e)}
 
     def close(self):
         """Milvus Lite 客户端在进程内按数据库路径共享，这里不主动关闭。

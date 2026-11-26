@@ -16,7 +16,9 @@ from agentscope.message import Msg
 # Add project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
+from utils.access_log import _safe_log_text
 from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
+from utils.log_redact import redact_paths
 from utils.preference_values import (
     EXPLANATORY_PREF_KEYS,
     has_preference_value,
@@ -841,7 +843,10 @@ class PreferenceAgent(AgentBase):
                     self.memory_manager.long_term.get_preference
                 )
             except Exception as e:  # noqa: BLE001 - 存储抖动走降级
-                logger.warning(f"Failed to load current preferences: {e}")
+                logger.warning(
+                    "Failed to load current preferences: %s",
+                    _safe_log_text(redact_paths(e)),
+                )
                 baseline = None
         if not isinstance(baseline, dict):
             fallback = context.get("user_preferences")
@@ -929,7 +934,12 @@ class PreferenceAgent(AgentBase):
                 # 同样穿透，由外层上抛并计入熔断——吞成 error JSON 会让
                 # 密钥失效 / 余额耗尽时熔断器永远打不开
                 raise
-            logger.error(f"Preference collection failed: {e}")
-            result = {"has_preferences": False, "error": str(e)}
+            safe_error = redact_paths(e)
+            logger.error(
+                "Preference collection failed: %s", _safe_log_text(safe_error)
+            )
+            # SKILL.md 文档化支持直接调用：错误 JSON 同样不能带本机路径 /
+            # 上游 URL / 网关回显的密钥
+            result = {"has_preferences": False, "error": safe_error}
 
         return Msg(name=self.name, content=json.dumps(result, ensure_ascii=False), role="assistant")

@@ -5,6 +5,7 @@
 运行：python tests/test_memory_recent_summary.py
 """
 import asyncio
+import logging
 import os
 import shutil
 import sys
@@ -114,6 +115,59 @@ def test_summary_failure_cooldown():
         shutil.rmtree(storage, ignore_errors=True)
 
 
+class _ListHandler(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.messages: list[str] = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+
+def test_summary_failure_logs_are_redacted():
+    """摘要失败的日志（含 traceback）不能带上网关回显的 API Key。"""
+    key = "sk-SECRET1234567890abcdef"
+    error = RuntimeError(
+        "Error code: 401 - Incorrect API key provided: " + key
+    )
+    model = _CountingModel(response=error)
+    manager, storage = _manager(model)
+    handler = _ListHandler()
+    logger = logging.getLogger("context.memory_manager")
+    old_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    try:
+        _add_turn(manager, "一", "二")
+        _add_turn(manager, "三", "四")
+        assert asyncio.run(manager.get_recent_summary_async()) == ""
+
+        # 长期摘要：其它会话窗口非空才会走到模型调用
+        manager._summary_inputs = lambda: (  # noqa: SLF001 - 注入窗口
+            [
+                {
+                    "session_id": "other",
+                    "timestamp": "2026-01-01T00:00:00Z",
+                    "role": "user",
+                    "content": "hi",
+                }
+            ],
+            [],
+        )
+        assert asyncio.run(manager.get_long_term_summary_async()) == ""
+
+        joined = "\n".join(handler.messages)
+        assert "生成最近对话摘要失败" in joined
+        assert "Failed to generate long-term summary" in joined
+        assert key not in joined, joined
+        assert "***" in joined, joined
+        print("✓ 摘要失败日志已脱敏")
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+        shutil.rmtree(storage, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -122,4 +176,5 @@ if __name__ == "__main__":
     test_summary_cached_until_window_changes()
     test_summary_truncated_to_200_chars()
     test_summary_failure_cooldown()
+    test_summary_failure_logs_are_redacted()
     print("\n全部通过")

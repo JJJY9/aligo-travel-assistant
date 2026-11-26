@@ -19,6 +19,7 @@ from config import STORAGE_CONFIG
 from utils import tombstones
 from utils.json_parser import extract_json_from_async_response
 from utils.json_safe import sanitize_json
+from utils.log_redact import redact_secret
 from utils.metrics import REQUEST_METRICS
 from utils.preference_values import has_preference_value
 from utils.timestamps import to_aware
@@ -466,7 +467,10 @@ class MemoryManager:
                 role, content, metadata, timestamp=timestamp
             )
         except Exception as exc:  # noqa: BLE001 - 缓存失败降级为缺少本轮上下文
-            logger.warning("短期记忆写入失败（%s），本轮上下文可能缺少该消息", exc)
+            logger.warning(
+                "短期记忆写入失败（%s），本轮上下文可能缺少该消息",
+                redact_secret(exc),
+            )
             return None
         if role == "user" and isinstance(ts, str) and ts:
             self._staged_user_timestamps.append((content, ts))
@@ -522,7 +526,10 @@ class MemoryManager:
                         break
             return removed
         except Exception as exc:  # noqa: BLE001 - 回滚失败不能掩盖原始错误
-            logger.warning("回滚暂存提问失败（%s），短期上下文可能残留本轮提问", exc)
+            logger.warning(
+                "回滚暂存提问失败（%s），短期上下文可能残留本轮提问",
+                redact_secret(exc),
+            )
             return False
 
     def add_message(self, role: str, content: str, metadata: dict | None = None):
@@ -723,9 +730,20 @@ class MemoryManager:
         # 聊天窗口 / 行程查询是阻塞 IO（JSON 文件、PostgreSQL 网络往返），
         # 放到线程池执行：留在事件循环线程会冻结同进程所有 SSE 流，
         # 即使随后命中总结缓存或走空历史提前返回
-        history_from_other_sessions, trip_history = await asyncio.to_thread(
-            self._summary_inputs
-        )
+        try:
+            history_from_other_sessions, trip_history = await asyncio.to_thread(
+                self._summary_inputs
+            )
+        except Exception as exc:  # noqa: BLE001 - 摘要失败不阻断对话
+            # 存储异常原文可能内嵌 DSN / 本机路径：先脱敏再落日志，
+            # 与存储层「记录 / 抛出前统一 redact」的口径一致
+            self._summary_failure_until = (
+                time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SEC
+            )
+            logger.warning(
+                "读取总结输入失败，跳过摘要: %s", redact_secret(exc)
+            )
+            return ""
 
         # 如果既没有聊天记录也没有行程记录，直接返回
         if not history_from_other_sessions and not trip_history:
@@ -902,9 +920,13 @@ class MemoryManager:
             self._summary_failure_until = (
                 time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SEC
             )
-            logger.error(f"Failed to generate long-term summary: {e}")
+            logger.error(
+                "Failed to generate long-term summary: %s", redact_secret(e)
+            )
             import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(
+                "Traceback: %s", redact_secret(traceback.format_exc())
+            )
             return ""
 
     async def get_recent_summary_async(
@@ -925,7 +947,9 @@ class MemoryManager:
                 self.short_term.get_recent_context, int(max_turns)
             )
         except Exception as exc:  # noqa: BLE001 - 摘要失败不阻断对话
-            logger.warning("读取最近对话失败，跳过摘要: %s", exc)
+            logger.warning(
+                "读取最近对话失败，跳过摘要: %s", redact_secret(exc)
+            )
             return ""
         items = [
             message
@@ -997,7 +1021,9 @@ class MemoryManager:
             self._recent_summary_failure_until = (
                 time.monotonic() + _RECENT_SUMMARY_FAILURE_COOLDOWN_SEC
             )
-            logger.warning("生成最近对话摘要失败: %s", exc)
+            logger.warning(
+                "生成最近对话摘要失败: %s", redact_secret(exc)
+            )
             return ""
 
     def get_long_term_summary(self, max_messages: int = 50) -> str:
