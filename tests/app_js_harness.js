@@ -186,6 +186,7 @@ function buildEnv(source) {
     TextEncoder,
     TextDecoder,
     HTMLElement: Object,
+    CSS: { escape: (value) => String(value).replace(/["\\]/g, "\\$&") },
     document: doc,
     localStorage: makeStorage(),
     sessionStorage: makeStorage(),
@@ -241,6 +242,9 @@ function buildEnv(source) {
   // 所有出站请求都排队，由场景代码逐个 resolve / reject
   vm.runInContext(
     `
+    // 覆盖前保留原函数引用：个别场景需要验证真实的渲染 / 编辑入口逻辑
+    globalThis.__origRenderUserNode = renderUserNode;
+    globalThis.__origRefreshEditButtons = refreshEditButtons;
     getJSON = (...args) =>
       new Promise((resolve, reject) => {
         __requests.push({ args, resolve, reject });
@@ -3624,19 +3628,344 @@ async function scenarioOpenSessionGuards(source) {
     getJSON = (url) => new Promise((resolve) => { __requests.push({ args: [url], resolve }); });
   `);
   run("state.deletingSessions.add('D');");
-  await run("openSession('D')");
+  const deletingReturn = await run("openSession('D')");
   const deletingRequests = run("__requests.length");
   run("state.deletingSessions.delete('D');");
   const promise = run("openSession('deletedY')");
   await tick();
   run("__requests[0].resolve({ messages: [] });");
   await promise;
+  // 已知会话在服务端已无消息（其它标签页 / CLI 删除）：移除幽灵行并
+  // 明确返回 false，供 sendMessage 中止发送
+  run('state.sessions = [{ session_id: "G", title: "g" }];');
+  const ghostPromise = run("openSession('G')");
+  await tick();
+  run("__requests[__requests.length - 1].resolve({ messages: [] });");
+  const ghostReturn = await ghostPromise;
   return {
     deleting_requests: deletingRequests,
+    // 未加载到目标会话时必须显式返回 false：sendMessage 的发送前守卫
+    // 按 loaded !== true 中止，裸 return 会让提问写进已删除会话
+    deleting_return: deletingReturn,
+    ghost_return: ghostReturn,
     session_id: run("state.sessionId"),
     new_session_calls: run("__newSessionCalls"),
     toasts: run("__toasts.slice()"),
   };
+}
+
+async function scenarioWebappRound(source) {
+  // Web 前端 app.js 复审一轮的回归：发送前守卫、焦点兜底、IME、超长拦截、
+  // 重新生成反馈、偏好合并基线、语义暂存恢复、截断消息编辑入口
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const results = {};
+  const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // 1) 删除 / 归档 / 分页取尽后键盘焦点不能留给 body
+  results.focus = run(`
+    (() => {
+      globalThis.__focusLog = [];
+      const mk = (name) => ({
+        focus() { __focusLog.push(name); },
+        querySelector() { return null; },
+      });
+      els.history = {
+        querySelector() { return null; },
+        querySelectorAll(sel) {
+          return sel === ".history-item" ? (globalThis.__items || []) : [];
+        },
+      };
+      els.historySearch = mk("search");
+      const out = {};
+      globalThis.__items = [mk("s1"), mk("s2"), mk("s3")];
+      restoreHistoryFocus({ id: "gone", action: "", key: "", index: 5 });
+      out.clamped = __focusLog.slice();
+      __focusLog.length = 0;
+      restoreHistoryFocus({ id: "gone", action: "", key: "", index: 1 });
+      out.indexed = __focusLog.slice();
+      __focusLog.length = 0;
+      globalThis.__items = [];
+      restoreHistoryFocus({ id: "gone", action: "", key: "", index: 0 });
+      out.empty = __focusLog.slice();
+      return out;
+    })()
+  `);
+
+  // 2) 超长提问（程序化合并草稿可绕过 maxlength）在清空输入 / 请求前拦截
+  run(`
+    globalThis.__fetchCalls = 0;
+    fetch = async () => { __fetchCalls += 1; return { ok: true, body: null }; };
+    state.ready = true;
+    state.busy = false;
+    state.sessionId = null;
+    state.sessionLoading = false;
+    state.partialHistory = false;
+    els.input.value = "";
+    __toasts.length = 0;
+  `);
+  await run(`sendMessage("x".repeat(CHAT_MESSAGE_MAX + 1))`);
+  results.oversize = run(`({
+    fetchCalls: __fetchCalls,
+    toasts: __toasts.slice(),
+    inputKept: els.input.value,
+  })`);
+
+  // 3) 无会话 ID 的停止 / 中断：草稿保留且提示结果未知
+  results.unconfirmed = run(`
+    (() => {
+      globalThis.__toasts = [];
+      els.input.value = "";
+      restoreUnconfirmedDraft("合并后的提问", "已停止");
+      const empty = { value: els.input.value, toasts: __toasts.slice() };
+      els.input.value = "已有草稿";
+      __toasts.length = 0;
+      restoreUnconfirmedDraft("合并后的提问", "连接中断");
+      return {
+        empty,
+        withDraft: { value: els.input.value, toasts: __toasts.slice() },
+      };
+    })()
+  `);
+
+  // 4) 重新生成：删除阶段按钮显示「准备中…」，失败 / mismatch 恢复可点
+  const chipSetup = `
+    globalThis.__chip = {
+      dataset: { turnId: "t1" },
+      disabled: false,
+      attributes: {},
+      label: { textContent: "重新生成" },
+      querySelector(sel) { return sel === "span" ? __chip.label : null; },
+      setAttribute(name, value) { __chip.attributes[name] = String(value); },
+      removeAttribute(name) { delete __chip.attributes[name]; },
+      remove() { globalThis.__chipRemoved += 1; },
+    };
+    globalThis.__chipRemoved = 0;
+    globalThis.__sent = 0;
+    sendMessage = async () => { __sent += 1; };
+    deleteLastTurn = () => new Promise((resolve, reject) => {
+      globalThis.__pendingDelete = { resolve, reject };
+    });
+    state.sessionId = "s1";
+    state.ready = true;
+    state.busy = false;
+    state.sessionLoading = false;
+    __toasts.length = 0;
+  `;
+  run(chipSetup);
+  let promise = run('regenerate(__chip, "问题")');
+  await tick();
+  results.regeneratePending = run(`({
+    disabled: __chip.disabled,
+    label: __chip.label.textContent,
+    ariaBusy: __chip.attributes["aria-busy"] || "",
+  })`);
+  run("__pendingDelete.resolve(false);");
+  await promise;
+  results.regenerateSuccess = run(`({
+    removed: __chipRemoved,
+    sent: __sent,
+  })`);
+
+  run(chipSetup);
+  promise = run('regenerate(__chip, "问题")');
+  await tick();
+  run("__pendingDelete.resolve(true);");
+  await promise;
+  results.regenerateMismatch = run(`({
+    disabled: __chip.disabled,
+    label: __chip.label.textContent,
+    ariaBusy: __chip.attributes["aria-busy"] || "",
+    removed: __chipRemoved,
+    sent: __sent,
+    toasts: __toasts.slice(),
+  })`);
+
+  run(chipSetup);
+  promise = run('regenerate(__chip, "问题")');
+  await tick();
+  run('__pendingDelete.reject(new Error("timeout"));');
+  await promise;
+  results.regenerateTimeout = run(`({
+    disabled: __chip.disabled,
+    label: __chip.label.textContent,
+    toasts: __toasts.slice(),
+  })`);
+
+  // 5) 列表型偏好保存成功后写回合并基线与状态缓存（刷新失败也不覆盖）
+  results.preference = await run(`
+    (async () => {
+      preferenceLatest.clear();
+      preferenceLatest.set("hotel_brands", ["汉庭"]);
+      state.userId = "u1";
+      state.status = { preferences: { hotel_brands: ["汉庭"] } };
+      els.prefType.value = "hotel_brands";
+      els.prefValue.value = "如家";
+      getJSON = async () => ({ type: "hotel_brands", value: ["汉庭", "如家"] });
+      refreshStatus = async () => {};
+      await addPreference({ preventDefault() {} });
+      return {
+        latest: preferenceLatest.get("hotel_brands"),
+        status: state.status.preferences.hotel_brands,
+      };
+    })()
+  `);
+
+  // 6) 语义检索进行中关键词刷新失败：暂存列表必须还原，不能停在占位文案
+  results.semanticStash = await run(`
+    (async () => {
+      const mkRow = (text) => ({ textContent: text });
+      globalThis.__mkRow = mkRow;
+      document.createDocumentFragment = () => ({
+        __fragment: true,
+        __children: [],
+        appendChild(node) {
+          // 模拟真实 DOM：节点从原父节点移入 fragment
+          node.__stashed = true;
+          this.__children.push(node);
+          return node;
+        },
+      });
+      els.kbList = {
+        children: [mkRow("row1"), mkRow("row2")],
+        get firstChild() {
+          return this.children.find((node) => !node.__stashed) || null;
+        },
+        set textContent(value) {
+          this.children = value ? [mkRow(value)] : [];
+        },
+        get textContent() {
+          return this.children.length === 1 ? this.children[0].textContent : "";
+        },
+        appendChild(node) {
+          if (node && node.__fragment) {
+            for (const child of node.__children) {
+              child.__stashed = false;
+              this.children.push(child);
+            }
+          } else {
+            // 与真实 DOM 一致：appendChild 是把节点从原位置移走
+            const index = this.children.indexOf(node);
+            if (index >= 0) this.children.splice(index, 1);
+            this.children.push(node);
+          }
+          return node;
+        },
+        focus() {},
+      };
+      els.kbSearch.value = "语义词";
+      els.kbSemantic = { disabled: false, textContent: "", addEventListener() {} };
+      els.kbMore = { hidden: false, disabled: false };
+      refreshKnowledgeCategories = () => {};
+      updateKnowledgeMore = () => {};
+      // 恢复排队式请求桩（上一节把 getJSON 换成了立即 resolve）
+      getJSON = (...args) =>
+        new Promise((resolve, reject) => {
+          __requests.push({ args, resolve, reject });
+        });
+      state.kbSemanticMode = false;
+      state.kbSemanticQuery = "";
+      state.kbQuery = "";
+      __requests.length = 0;
+      const promise = runSemanticSearch();
+      await new Promise((resolve) => setImmediate(resolve));
+      const stashing = {
+        first: els.kbList.children.length === 1,
+        text: els.kbList.firstChild && els.kbList.firstChild.textContent,
+      };
+      // 并发的关键词刷新接管（seq 作废），随后关键词刷新失败保留了占位
+      kbListSeq += 1;
+      __requests[0].reject(new Error("429"));
+      await promise;
+      return {
+        stashing,
+        restored: els.kbList.children.map((node) => node.textContent),
+      };
+    })()
+  `);
+
+  // 7) 截断显示的超长用户消息不提供必然失败的编辑入口
+  results.truncated = run(`
+    (() => {
+      const long = __origRenderUserNode("x".repeat(200001));
+      const short = __origRenderUserNode("短消息");
+      globalThis.__appended = 0;
+      const mkLast = (truncated) => ({
+        dataset: truncated ? { truncated: "1" } : {},
+        querySelector(sel) {
+          return sel === ".bubble" ? { querySelector: () => null } : null;
+        },
+        appendChild() { __appended += 1; },
+      });
+      const selectFor = (last) => (sel) => {
+        if (sel === ".user-edit") return [];
+        if (sel === ".msg.user") return [last];
+        return [];
+      };
+      state.busy = false;
+      state.sessionLoading = false;
+      state.sessionId = "s1";
+      state.partialHistory = false;
+      els.messages = { querySelectorAll: selectFor(mkLast(true)) };
+      __origRefreshEditButtons();
+      const truncatedAppends = __appended;
+      __appended = 0;
+      els.messages = { querySelectorAll: selectFor(mkLast(false)) };
+      __origRefreshEditButtons();
+      return {
+        longMarked: long.dataset.truncated === "1",
+        shortMarked: short.dataset.truncated === "1",
+        truncatedAppends,
+        normalAppends: __appended,
+      };
+    })()
+  `);
+
+  // 8) 行程筛选：输入法合成期间不调度服务端过滤，合成结束补一次
+  run(`
+    const mkInput = () => {
+      const listeners = {};
+      return {
+        value: "",
+        listeners,
+        addEventListener(type, handler) { (listeners[type] ||= []).push(handler); },
+        dispatch(type, event) {
+          (listeners[type] || []).forEach((handler) =>
+            handler(Object.assign({ target: this, preventDefault() {} }, event)),
+          );
+        },
+        focus() {},
+      };
+    };
+    els.tripFilter = mkInput();
+    els.tripFilterRow = { hidden: true };
+    // 还原前几节替换过的节点，bindEvents 需要在它们上面注册监听
+    els.history = document.createElement("div");
+    els.historySearch = document.createElement("input");
+    els.kbList = document.createElement("div");
+    els.kbMore = document.createElement("button");
+    els.kbSemantic = document.createElement("button");
+    els.kbSearch = document.createElement("input");
+    state.tripsExpanded = true;
+    state.tripsComposing = false;
+    state.tripsFilter = "";
+    __requests.length = 0;
+    bindEvents();
+  `);
+  run('els.tripFilter.dispatch("compositionstart", {});');
+  run('els.tripFilter.value = "hang";');
+  run('els.tripFilter.dispatch("input", { isComposing: true });');
+  await sleep(320);
+  results.tripComposing = run(
+    '({ composing: state.tripsComposing, requests: __requests.length })'
+  );
+  run('els.tripFilter.dispatch("compositionend", {});');
+  await sleep(320);
+  results.tripComposed = run(
+    '({ composing: state.tripsComposing, requests: __requests.length, filter: state.tripsFilter })'
+  );
+
+  return results;
 }
 
 async function main() {
@@ -3761,6 +4090,8 @@ async function main() {
     payload = await scenarioOpenSessionGuards(source);
   } else if (scenario === "metricsPanel") {
     payload = await scenarioMetricsPanel(source);
+  } else if (scenario === "webappRound") {
+    payload = await scenarioWebappRound(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
