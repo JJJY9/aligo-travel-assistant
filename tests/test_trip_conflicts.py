@@ -385,6 +385,20 @@ def test_unparsable_start_warns_once(caplog):
     print("✓ 非法出发日期按无日期处理且同值只告警一次")
 
 
+def test_iso_date_parse_cache_reuses_normalized_text():
+    """归一后同一日期串只 strptime 一次（/api/status 三遍解析的公共热点）。"""
+    from utils import trip_conflicts
+
+    trip_conflicts._parse_iso_date.cache_clear()
+    first = trip_conflicts._parse_trip_date("2026-03-12")
+    second = trip_conflicts._parse_trip_date("2026/3/12")
+    assert first == second
+    info = trip_conflicts._parse_iso_date.cache_info()
+    assert info.misses == 1, info
+    assert info.hits >= 1, info
+    print("✓ 行程日期解析按归一文本缓存")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -409,6 +423,7 @@ if __name__ == "__main__":
     test_trip_interval_parses_identity_dates()
     test_slash_dates_overlap_detected()
     test_conflict_order_uses_parsed_slash_dates()
+    test_iso_date_parse_cache_reuses_normalized_text()
     # 日志断言用例：直跑用 caplog 替身真正执行
     import _caplog_shim
 

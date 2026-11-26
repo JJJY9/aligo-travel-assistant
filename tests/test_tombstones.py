@@ -354,6 +354,51 @@ def test_reassert_overwrites_shared_tombstone(monkeypatch):
     print("✓ 重写墓碑后旧 token 的回滚不再命中")
 
 
+def test_batch_check_uses_pipeline(monkeypatch):
+    """批量查询按批走流水线：数千会话不再逐键串行往返。"""
+
+    class _Pipeline:
+        def __init__(self, parent):
+            self.parent = parent
+            self.keys = []
+
+        def exists(self, key):
+            self.keys.append(key)
+
+        def execute(self):
+            return [1 if key in self.parent.deleted else 0 for key in self.keys]
+
+    class _Redis:
+        def __init__(self, deleted):
+            self.deleted = set(deleted)
+            self.pipelines = 0
+
+        def pipeline(self, transaction=True):
+            self.pipelines += 1
+            return _Pipeline(self)
+
+    client = _Redis({"aligo:deleted:u1:s1"})
+    monkeypatch.setattr(tombstones, "_shared_client", lambda force=False: client)
+    result = tombstones.is_sessions_deleted("u1", ["s1", "s2", "s1", ""])
+    assert result == {"s1"}
+    assert client.pipelines == 1
+    print("✓ 批量墓碑查询走流水线并去重")
+
+
+def test_batch_check_honours_single_key_override(monkeypatch):
+    """单键实现被测试替身替换时批量入口退回逐键语义。"""
+    calls = []
+    monkeypatch.setattr(
+        tombstones,
+        "is_session_deleted",
+        lambda uid, sid, force=False: calls.append(sid) or sid == "s2",
+    )
+    result = tombstones.is_sessions_deleted("u1", ["s1", "s2"])
+    assert result == {"s2"}
+    assert calls == ["s1", "s2"]
+    print("✓ 单键替身覆盖时批量入口退回逐键")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -378,6 +423,8 @@ if __name__ == "__main__":
         test_unmark_accepts_bytes_value,
         test_epoch_bump_is_atomic_script,
         test_reassert_overwrites_shared_tombstone,
+        test_batch_check_uses_pipeline,
+        test_batch_check_honours_single_key_override,
     ):
         mp = pytest.MonkeyPatch()
         try:

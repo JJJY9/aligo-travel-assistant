@@ -88,6 +88,67 @@ def test_render_escapes_lone_surrogates():
     print("✓ 渲染出口转义孤立代理项（JSON / 用户原文）")
 
 
+def test_render_cache_reuses_result(monkeypatch):
+    """同一 (role, content) 的渲染结果命中缓存；会话详情只解析一次 JSON。"""
+    import utils.stored_message as stored_module
+
+    content = json.dumps(
+        {
+            "status": "completed",
+            "results": [
+                {"agent_name": "A", "status": "success", "data": {"answer": "缓存"}}
+            ],
+            "_meta": {"intents": ["查询"]},
+        },
+        ensure_ascii=False,
+    )
+    message = {"role": "assistant", "content": content}
+    rendered, meta = stored_module.render_stored_message_with_meta(message)
+    assert "缓存" in rendered
+    assert meta == {"intents": ["查询"]}
+
+    calls = []
+
+    def boom(_data):
+        calls.append(1)
+        raise AssertionError("缓存命中时不应重新渲染")
+
+    monkeypatch.setattr(stored_module, "result_to_markdown", boom)
+    assert stored_module.render_stored_message(message) == rendered
+    assert stored_module.render_stored_message_with_meta(message) == (
+        rendered,
+        {"intents": ["查询"]},
+    )
+    assert calls == []
+    print("✓ 渲染结果按内容缓存，会话详情复用缓存与元数据")
+
+
+def test_render_falls_back_without_caching_failure(monkeypatch):
+    """渲染器临时异常时的原文回退不入缓存：恢复后同一内容仍能正常渲染。"""
+    import utils.stored_message as stored_module
+
+    content = json.dumps(
+        {
+            "status": "completed",
+            "results": [
+                {"agent_name": "A", "status": "success", "data": {"answer": "恢复"}}
+            ],
+        },
+        ensure_ascii=False,
+    )
+    message = {"role": "assistant", "content": content}
+    real_render = stored_module.result_to_markdown
+    monkeypatch.setattr(
+        stored_module,
+        "result_to_markdown",
+        lambda _data: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    assert stored_module.render_stored_message(message) == content
+    monkeypatch.setattr(stored_module, "result_to_markdown", real_render)
+    assert "恢复" in stored_module.render_stored_message(message)
+    print("✓ 渲染异常回退不缓存，恢复后正常渲染")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -102,7 +163,17 @@ if __name__ == "__main__":
     test_render_escapes_lone_surrogates()
     _mp = pytest.MonkeyPatch()
     try:
-        test_render_failure_falls_back_to_raw_content(_mp)
+        test_render_cache_reuses_result(_mp)
     finally:
         _mp.undo()
+    _mp_fallback = pytest.MonkeyPatch()
+    try:
+        test_render_falls_back_without_caching_failure(_mp_fallback)
+    finally:
+        _mp_fallback.undo()
+    _mp_render = pytest.MonkeyPatch()
+    try:
+        test_render_failure_falls_back_to_raw_content(_mp_render)
+    finally:
+        _mp_render.undo()
     print("\n全部通过")

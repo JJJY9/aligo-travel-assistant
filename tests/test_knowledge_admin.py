@@ -134,7 +134,7 @@ def test_list_documents_pages_full_scan(monkeypatch):
     ]
     fake = _FakeMilvusClient(rows)
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
-    monkeypatch.setattr(knowledge_admin, "_IMPORT_CHUNK", 7)  # 迭代器多批次
+    monkeypatch.setattr(knowledge_admin, "_SCAN_BATCH", 7)  # 迭代器多批次
     page = knowledge_admin.list_documents(limit=5, offset=20)
     assert page["total"] == 25
     assert [item["id"] for item in page["items"]] == [5, 4, 3, 2, 1]
@@ -1103,7 +1103,7 @@ def test_existing_contents_scans_all_rows(monkeypatch):
     ]
     fake = _FakeMilvusClient(rows)
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
-    monkeypatch.setattr(knowledge_admin, "_IMPORT_CHUNK", 4)
+    monkeypatch.setattr(knowledge_admin, "_SCAN_BATCH", 4)
     assert sorted(knowledge_admin._existing_contents()) == sorted(
         row["content"] for row in rows
     )
@@ -1535,7 +1535,7 @@ def test_group_member_ids_scans_all_batches(monkeypatch):
         for index in range(1, 31)
     ]
     fake = _FakeMilvusClient(rows)
-    monkeypatch.setattr(knowledge_admin, "_IMPORT_CHUNK", 10)
+    monkeypatch.setattr(knowledge_admin, "_SCAN_BATCH", 10)
     assert sorted(knowledge_admin._group_member_ids(fake, "g")) == [3, 15, 25]
     assert knowledge_admin._group_member_ids(fake, "missing") == []
     print("✓ 组内分片跨多个迭代批次扫描")
@@ -2607,15 +2607,21 @@ def test_update_group_to_single_part_replaces_old_members(monkeypatch):
     monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
     monkeypatch.setattr(knowledge_admin, "_document_info", lambda client, doc_id: (2, "g-upd"))
-    monkeypatch.setattr(
-        knowledge_admin, "_group_member_ids", lambda client, group: [1, 2]
-    )
+    member_scans = []
+
+    def _members(client, group):
+        member_scans.append(group)
+        return [1, 2]
+
+    monkeypatch.setattr(knowledge_admin, "_group_member_ids", _members)
 
     result = knowledge_admin.update_document(1, "新的短内容")
     assert result.get("status") == "success"
     assert agent.updated and agent.updated[0][1] == "新的短内容"
     assert agent.batches == [], "单片内容不应追加新分片"
     assert fake.deleted == [2], "旧组其余分片应被删除"
+    # 读锁预检 1 次 + 写锁内 1 次：组成员只扫描两次，不再每次编辑扫 3~4 遍全库
+    assert member_scans == ["g-upd", "g-upd"], member_scans
     print("✓ 整组→单片编辑删除旧成员")
 
 

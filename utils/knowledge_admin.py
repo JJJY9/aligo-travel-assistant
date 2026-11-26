@@ -26,8 +26,11 @@ from utils.text_chunker import split_text
 logger = logging.getLogger(__name__)
 
 # 导入时每次嵌入 / 插入的条数，控制大文件的峰值内存
-# （全量扫描 query_iterator 也用它作为每批行数）
 _IMPORT_CHUNK = 500
+# 全量扫描的迭代批（与嵌入 / 插入批解耦）：调用方本就物化整个集合，批越
+# 小往返越多——50k 片段按 500/批扫描 12.6s，4096/批仅 4.7s。峰值单批约
+# 8-32MB，仍远低于嵌入 / 插入批的内存预算。
+_SCAN_BATCH = 4096
 # 单条内容超过该长度时按语义边界拆片：嵌入模型只编码前 512 token
 # （约 400 个汉字），更长的尾部内容对检索完全不可见
 _MAX_CONTENT_CHARS = 400
@@ -676,7 +679,7 @@ def _iter_all_rows(client: Any):
     iterator = client.query_iterator(
         collection_name=COLLECTION_NAME,
         filter="id >= 0",
-        batch_size=_IMPORT_CHUNK,
+        batch_size=_SCAN_BATCH,
         output_fields=["id", "content", "metadata"],
     )
     try:
@@ -715,9 +718,13 @@ def _locked_user_snapshot(
 
 
 def _locked_user_snapshot_details(
-    client: Any, doc_id: int, group: str
+    client: Any, doc_id: int, group: str, members: list[int] | None = None
 ) -> tuple[str, dict[str, str], list[dict[str, str]]] | None:
-    """快照 + 组内逐片用户元数据（按 part 升序，供整组重建保留逐片元数据）。"""
+    """快照 + 组内逐片用户元数据（按 part 升序，供整组重建保留逐片元数据）。
+
+    ``members`` 供整组编辑在写锁内只扫描一次组成员：快照与随后计算旧分片
+    删除集复用同一列表，避免对全库重复全表扫描。
+    """
 
     def _user_meta(raw: Any) -> dict[str, str]:
         meta = _parse_metadata(raw)
@@ -740,7 +747,8 @@ def _locked_user_snapshot_details(
         return str(rows[0].get("content", "")), meta, [meta]
     pieces: list[tuple[int, str, dict[str, str]]] = []
     user_meta: dict[str, str] | None = None
-    members = _group_member_ids(client, group)
+    if members is None:
+        members = _group_member_ids(client, group)
     rows_by_id = _rows_by_ids(client, members)
     for member in members:
         row = rows_by_id.get(int(member))
@@ -951,8 +959,12 @@ def update_document(
         # 原样保存（内容与回填完全一致、元数据未变）直接返回：重新切片会把
         # 空行 / 换行合并（排版逐渐劣化、分片边界变化），还白白重建分片与
         # 向量；面板「不做修改直接保存」应是 no-op
+        # 组内成员在写锁内只扫描一次：快照读取与旧分片删除集复用同一列表
+        # （此前每次多分片编辑要对全库做 3 次 _group_member_ids 全表扫描，
+        # 其中 2 次在写锁内，数千片段时写锁持有数秒）
+        members = _group_member_ids(client, group) if group else []
         snapshot_details = _locked_user_snapshot_details(
-            client, int(doc_id), group
+            client, int(doc_id), group, members=members
         )
         snapshot = (
             (snapshot_details[0], snapshot_details[1])
@@ -997,11 +1009,7 @@ def update_document(
         # 无法补偿的孤儿新 group（此前覆盖目标后才扫描，失败即残留）
         old_ids: list[int] = []
         if group:
-            old_ids = [
-                member
-                for member in _group_member_ids(client, group)
-                if member != int(doc_id)
-            ]
+            old_ids = [member for member in members if member != int(doc_id)]
         # 全局导出上限：整组替换先增后删，按「现有 − 被替换的旧分片 +
         # 本次新分片」在写入前预检——越限状态下不能经编辑长文继续推高
         # 行数（add_document / 导入已在同类预检处拒绝）
@@ -2465,12 +2473,14 @@ def import_documents(
                 # 库里的同组旧分片内容被改过时其 part 号仍占着，直接补写
                 # 同号分片会产生重复 part 的畸形组（之后整份备份再也导不进去）
                 if layout is not None and doc_group:
-                    occupied_parts = {
-                        old_part
-                        for candidates in layout.values()
-                        for old_group, old_part, _ in candidates
-                        if old_group == doc_group and old_part
-                    }
+                    # 整次导入只扫一次布局；此前每个缺失分片组都把全库布局
+                    # 再遍历一遍（O(组数×库片段数)，5000 片段 × 2000 组可到
+                    # 秒级，且发生在全局写锁内）。此分支 layout 非 None，
+                    # 由同一缓存构建的 part_contents 必然可用。
+                    part_contents = _group_part_contents()
+                    occupied_parts = set(
+                        (part_contents or {}).get(doc_group) or {}
+                    )
                     missing_parts: set[int] = set()
                     for chunk in missing:
                         chunk_meta = chunk.get("metadata") or {}

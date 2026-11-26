@@ -944,6 +944,41 @@ def test_exporter_json_is_importable():
     print("✓ user-export 实际输出可直接被 user-import 解析")
 
 
+def test_import_batches_preference_writes(monkeypatch):
+    """偏好恢复在同一次 write_batch 内完成（JSON 后端只重载 + 写盘一次）。"""
+    from utils.user_import import import_user_data
+
+    sections, errors = parse_user_export(
+        json.dumps(
+            {
+                "preferences": {
+                    "home_location": "北京",
+                    "hotel_brands": ["汉庭", "如家"],
+                    "airlines": ["东航"],
+                }
+            },
+            ensure_ascii=False,
+        )
+    )
+    assert errors == [], errors
+    store = _real_store("u-pref-batch")
+    batches = []
+    original = store.write_batch
+
+    @contextlib.contextmanager
+    def tracked_batch():
+        batches.append(True)
+        with original() as batched:
+            yield batched
+
+    monkeypatch.setattr(store, "write_batch", tracked_batch)
+    counts = import_user_data(store, sections)
+    assert counts["preferences"] == 3
+    assert batches == [True], batches
+    assert store.get_preference("home_location") == "北京"
+    print("✓ 偏好恢复合并为一次批量写入")
+
+
 def test_import_duplicate_message_counts():
     """同一会话里重复的相同提问：按出现次数补齐，不多也不少。"""
     payload = {
