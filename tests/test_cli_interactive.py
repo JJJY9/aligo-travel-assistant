@@ -434,6 +434,67 @@ def test_summary_tolerates_legacy_nested_preference_and_trip_fields():
     print("✓ 嵌套偏好 / 非字符串行程字段不崩溃")
 
 
+def test_summary_budgets_preferences():
+    """合法上限规模的偏好不能撑爆每轮意图 prompt（与 Web 500 / 4000 同预算）。"""
+    import asyncio
+
+    from utils.preference_values import PROMPT_PREFERENCE_TEXT_MAX_CHARS
+
+    agent = cli.AligoCLI()
+
+    class _LongTerm:
+        def get_preference(self):
+            return {f"pref_{i:03d}": "汉" * 9990 for i in range(20)}
+
+        def get_trip_history(self, limit=None):
+            return []
+
+    class _Manager:
+        long_term = _LongTerm()
+
+        async def get_long_term_summary_async(self, max_messages=50):
+            return ""
+
+    agent.memory_manager = _Manager()
+    text = asyncio.run(agent._get_long_term_summary(""))
+    # 偏好合法上限 20 类型 × 9990 字符：不设预算时摘要约 20 万字符
+    assert len(text) <= PROMPT_PREFERENCE_TEXT_MAX_CHARS + 1000, len(text)
+    assert "pref_000" in text
+    assert "（值已省略）" in text
+    print("✓ 偏好摘要按单值 / 总量预算截断")
+
+
+def test_summary_reads_long_term_off_loop_thread():
+    """存储读取放线程池：PostgreSQL 同步网络往返不能卡住事件循环与 Ctrl-C。"""
+    import asyncio
+    import threading
+
+    agent = cli.AligoCLI()
+    main_thread = threading.current_thread()
+    seen = []
+
+    class _LongTerm:
+        def get_preference(self):
+            seen.append(threading.current_thread())
+            return {"hotel_brands": ["汉庭"]}
+
+        def get_trip_history(self, limit=None):
+            seen.append(threading.current_thread())
+            return []
+
+    class _Manager:
+        long_term = _LongTerm()
+
+        async def get_long_term_summary_async(self, max_messages=50):
+            return ""
+
+    agent.memory_manager = _Manager()
+    text = asyncio.run(agent._get_long_term_summary(""))
+    assert "汉庭" in text
+    assert len(seen) == 2 and all(t is not main_thread for t in seen)
+    print("✓ 长期记忆读取不阻塞事件循环线程")
+
+
 def test_process_query_releases_probe_on_early_failure(monkeypatch):
     """LLM 调用前失败（如记忆写盘错误）：半开试探名额必须归还。"""
     from utils import circuit_breaker as cb_module
@@ -1549,6 +1610,8 @@ if __name__ == "__main__":
     test_display_tolerates_non_list_results()
     test_read_commands_reload_snapshot()
     test_summary_tolerates_legacy_nested_preference_and_trip_fields()
+    test_summary_budgets_preferences()
+    test_summary_reads_long_term_off_loop_thread()
     test_process_query_reloads_long_term_each_turn()
     test_process_query_stages_user_message_before_orchestration()
     _mp = pytest.MonkeyPatch()

@@ -625,6 +625,67 @@ def test_pref_set_rejects_reserved_type_and_nul(monkeypatch):
     print("✓ pref-set 拒绝保留类型与 NUL 值")
 
 
+def test_pref_set_rejects_dot_types(monkeypatch):
+    """「.」「..」类型面板路径无法寻址、加载端会丢弃：写入会假成功。"""
+    store = _WriteStore({})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    for bad_type in (".", "..", " . "):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.run_preference_set_standalone(
+                "u1", bad_type, "上海", as_json=True
+            )
+        data = json.loads(out.getvalue())
+        assert code == 1 and data["ok"] is False, (bad_type, data)
+        assert "无法寻址" in data["error"], (bad_type, data)
+    assert store.saved == [], store.saved
+
+    # 含点号的正常类型不受影响（精确匹配才算点号键）
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", "a.b", "x", as_json=True)
+    assert code == 0, out.getvalue()
+    # 删除路径保持放行（PG 历史脏行的唯一清理入口）
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_delete_standalone("u1", ".", as_json=True)
+    data = json.loads(out.getvalue())
+    assert code == 1 and "未设置或已删除" in data["error"], data
+    print("✓ pref-set 拒绝 . / .. 类型，删除路径放行")
+
+
+def test_pref_set_rejects_nul_in_dict_keys(monkeypatch):
+    """--json-value 递归检查对象键：含 NUL 的键 Web PUT / 导入都会拒绝。"""
+    store = _WriteStore({})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    for raw in (
+        '{"a\\u0000b": "x"}',
+        '[{"a\\u0000b": "x"}]',
+        '{"outer": {"a\\u0000b": 1}}',
+    ):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.run_preference_set_standalone(
+                "u1", "memo", raw, json_value=True, as_json=True
+            )
+        data = json.loads(out.getvalue())
+        assert code == 1 and "NUL" in data["error"], (raw, data)
+    assert store.saved == [], store.saved
+
+    # 合法嵌套形状照常放行
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1", "room", '{"room": "window"}', json_value=True, as_json=True
+        )
+    assert code == 0 and store.saved, out.getvalue()
+    print("✓ --json-value 拒绝嵌套对象键里的 NUL")
+
+
 def test_pref_set_json_value_allows_blank_items_in_list(monkeypatch):
     """列表内部的 null / 空白项按忽略处理（与存储合并口径一致），不整体拒绝。"""
     store = _WriteStore({})
@@ -802,6 +863,8 @@ if __name__ == "__main__":
         test_pref_set_json_value_types,
         test_pref_set_json_value_rejects_empty_shapes,
         test_pref_set_rejects_reserved_type_and_nul,
+        test_pref_set_rejects_dot_types,
+        test_pref_set_rejects_nul_in_dict_keys,
         test_pref_set_json_value_allows_blank_items_in_list,
         test_pref_set_json_value_rejects_non_finite,
         test_pref_set_json_value_depth_guard,
