@@ -32,12 +32,10 @@ import re
 import threading
 import time
 import traceback
-import weakref
 import uuid
 from urllib.parse import urlsplit
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures.thread import _worker
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -76,6 +74,7 @@ from utils.access_log import (
     format_access_log,
 )
 from utils.agent_names import canonical_agent_name
+from utils.daemon_executor import DaemonThreadPoolExecutor
 from utils.errors import (
     ImportVolumeError,
     MemoryPersistenceError,
@@ -188,6 +187,10 @@ _CHAT_LOCK_POLL_SEC = 0.5
 # 备份在大文件上必然 408；300 秒与前端 10 分钟等待、单导入槽的背压口径
 # 相洽（408 发生在解析前，零写入，可安全重试）
 IMPORT_BODY_READ_TIMEOUT_SEC = 300.0
+# 其它接口读请求体的总时限：uvicorn 在首个响应完成前对连接没有任何定时器，
+# 慢速 / 滴灌上传会让一个连接无限期占用内存与任务（Slowloris）。2MB 上限下
+# 60 秒足够 34KB/s 的慢上行；/api/import 走上面的 300 秒（大备份慢上行）。
+BODY_READ_TIMEOUT_SEC = 60.0
 # /api/import 要一次性接收整份备份（面板文件上限 50 MB，JSON 包装 / 转义
 # 还有额外开销）；其它路径维持 2 MB
 IMPORT_REQUEST_BODY_BYTES = 64 * 1024 * 1024
@@ -670,6 +673,9 @@ class RequestContextMiddleware:
                         "headers": [
                             (b"content-type", b"application/json; charset=utf-8"),
                             (b"cache-control", b"no-store"),
+                            # 请求体未读即拒绝：与 413 / 415 同口径关闭连接，
+                            # 避免 keep-alive 上剩余 body 被无限读取丢弃
+                            (b"connection", b"close"),
                         ],
                     }
                 )
@@ -813,6 +819,10 @@ class _BodyTooLarge(Exception):
     """请求体超过上限的内部信号（由 BodySizeLimitMiddleware 转换为 413）。"""
 
 
+class _BodyReadTimeout(Exception):
+    """读请求体超时的内部信号（由 BodySizeLimitMiddleware 转换为 408）。"""
+
+
 class BodySizeLimitMiddleware:
     """按实际读取字节数限制请求体大小。
 
@@ -832,22 +842,38 @@ class BodySizeLimitMiddleware:
 
         received = 0
         exceeded = False
-        sent_413 = False
-        limit = body_limit_for(_route_path(scope), self.max_bytes)
-        payload = json.dumps(
-            {"detail": f"请求体过大（上限 {limit // (1024 * 1024)} MB）"},
-            ensure_ascii=False,
-        ).encode("utf-8")
+        timed_out = False
+        sent_rejection = False
+        route_path = _route_path(scope)
+        limit = body_limit_for(route_path, self.max_bytes)
+        # 请求是否声明了 body：没有 body 的请求（GET / HEAD / Content-Length: 0）
+        # 不存在读体问题——尤其不能给读体套超时，事件循环在流式响应期间也会
+        # 反复调用 receive() 等待 http.disconnect。
+        headers = {k.lower(): v for k, v in scope.get("headers") or []}
+        content_length = headers.get(b"content-length") or b""
+        declared_body = bool(headers.get(b"transfer-encoding")) or (
+            content_length.strip() not in (b"", b"0")
+        )
+        body_complete = not declared_body
+        # /api/import 有端点级的 300 秒读体预算（大备份慢上行）；其余接口用
+        # 较短的统一时限，避免慢速上传无限期占用连接与任务
+        read_timeout = (
+            None if route_path == "/api/import" else BODY_READ_TIMEOUT_SEC
+        )
+        read_deadline = time.monotonic() + (read_timeout or 0.0)
 
-        async def send_413() -> None:
-            nonlocal sent_413
-            if sent_413:
+        async def send_rejection(status: int, detail: str) -> None:
+            nonlocal sent_rejection
+            if sent_rejection:
                 return
-            sent_413 = True
+            sent_rejection = True
+            body = json.dumps({"detail": detail}, ensure_ascii=False).encode(
+                "utf-8"
+            )
             await send(
                 {
                     "type": "http.response.start",
-                    "status": 413,
+                    "status": status,
                     "headers": [
                         (b"content-type", b"application/json; charset=utf-8"),
                         # 分块流在中止处停止读取：keep-alive 复用会让剩余的
@@ -857,39 +883,83 @@ class BodySizeLimitMiddleware:
                     ],
                 }
             )
-            await send({"type": "http.response.body", "body": payload})
+            await send({"type": "http.response.body", "body": body})
 
         async def limited_receive() -> dict[str, Any]:
-            nonlocal received, exceeded
-            message = await receive()
+            nonlocal received, exceeded, timed_out, body_complete
+            if body_complete or read_timeout is None:
+                return await receive()
+            remaining = read_deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                raise _BodyReadTimeout()
+            try:
+                message = await asyncio.wait_for(receive(), remaining)
+            except asyncio.TimeoutError:
+                timed_out = True
+                raise _BodyReadTimeout() from None
             if message.get("type") == "http.request":
                 received += len(message.get("body") or b"")
                 if received > limit:
                     exceeded = True
                     raise _BodyTooLarge()
+                if not message.get("more_body"):
+                    body_complete = True
+            elif message.get("type") == "http.disconnect":
+                body_complete = True
             return message
 
         async def limited_send(message: dict[str, Any]) -> None:
-            if not exceeded:
-                await send(message)
+            if exceeded:
+                # 应用可能在捕获异常后照常发送 500 / 200，甚至忽略异常继续
+                # 输出；统一改写为 413，并丢弃其响应体
+                if message.get("type") == "http.response.start":
+                    await send_rejection(
+                        413,
+                        f"请求体过大（上限 {limit // (1024 * 1024)} MB）",
+                    )
+                elif message.get("type") not in (
+                    "http.response.body",
+                    "http.response.trailers",
+                ):
+                    await send(message)
                 return
-            # 应用可能在捕获异常后照常发送 500 / 200，甚至忽略异常继续输出；
-            # 统一改写为 413，并丢弃其响应体
-            if message.get("type") == "http.response.start":
-                await send_413()
-            elif message.get("type") not in (
-                "http.response.body",
-                "http.response.trailers",
+            if timed_out:
+                if message.get("type") == "http.response.start":
+                    await send_rejection(408, "请求体读取超时，请重试")
+                elif message.get("type") not in (
+                    "http.response.body",
+                    "http.response.trailers",
+                ):
+                    await send(message)
+                return
+            if (
+                message.get("type") == "http.response.start"
+                and not body_complete
             ):
-                await send(message)
+                # 未读尽请求体就响应（Host 拒绝、405/404、尾斜杠 307 等路由前
+                # 响应）：keep-alive 连接上剩余 body 会被服务器无限读取丢弃；
+                # 与 413 / 415 同口径，明确关闭连接（已带 close 的不重复追加）
+                headers = list(message.get("headers") or [])
+                if not any(
+                    key.lower() == b"connection" for key, _ in headers
+                ):
+                    headers.append((b"connection", b"close"))
+                message = dict(message)
+                message["headers"] = headers
+            await send(message)
 
         try:
             await self.app(scope, limited_receive, limited_send)
-        except _BodyTooLarge:
+        except (_BodyTooLarge, _BodyReadTimeout):
             pass
-        # 应用吞掉异常且没有发出任何响应时，在这里补发 413
+        # 应用吞掉异常且没有发出任何响应时，在这里补发拒绝响应
         if exceeded:
-            await send_413()
+            await send_rejection(
+                413, f"请求体过大（上限 {limit // (1024 * 1024)} MB）"
+            )
+        elif timed_out:
+            await send_rejection(408, "请求体读取超时，请重试")
 
 
 def _accepts_gzip(accept_encoding: str) -> bool:
@@ -1421,6 +1491,17 @@ class _SessionTurnLease:
         """登记本回合的协程任务：释放租约前先由 :meth:`stop_turn` 收尾。"""
         self._turn_task = task
 
+    def request_cancel(self) -> None:
+        """幂等请求取消回合任务（与 :meth:`stop_turn` 共用单次取消守卫）。
+
+        生成器的 finally 与 stop_turn 都会请求取消；回合任务只显式取消一次
+        ——再次 cancel() 会打断回合协程里的收尾等待。两处统一走这里。
+        """
+        task = self._turn_task
+        if task is not None and not task.done() and not self._turn_cancelled:
+            self._turn_cancelled = True
+            task.cancel()
+
     async def stop_turn(self) -> None:
         """取消在途回合并等待落库线程结束（幂等）。
 
@@ -1443,9 +1524,7 @@ class _SessionTurnLease:
             if callable(begin):
                 begin(self._drain_deadline)
         task = self._turn_task
-        if task is not None and not task.done() and not self._turn_cancelled:
-            self._turn_cancelled = True
-            task.cancel()
+        self.request_cancel()
         if task is not None and not task.done():
             with contextlib.suppress(asyncio.CancelledError):
                 await task
@@ -1493,6 +1572,10 @@ class _LockReplayLease:
         return None
 
     def after_stop(self) -> None:
+        return None
+
+    def request_cancel(self) -> None:
+        """回放没有在途回合，无需取消。"""
         return None
 
     def release(self) -> None:
@@ -1564,41 +1647,10 @@ return 0
 """
 
 
-class _DaemonImportExecutor(ThreadPoolExecutor):
-    """导入专用执行器：工作线程为守护线程。
-
-    ThreadPoolExecutor 默认创建非守护线程：lifespan 里 wait=False 之后，
-    进程退出仍要 join 正在跑的分钟级导入，服务停不下来。这里沿用 CPython
-    的内部线程创建逻辑（3.10-3.12 稳定），只把线程标记为 daemon。
-    """
-
-    def _adjust_thread_count(self) -> None:  # type: ignore[override]
-        if self._idle_semaphore.acquire(timeout=0):  # type: ignore[attr-defined]
-            return
-
-        def weakref_cb(_: Any, q: Any = self._work_queue) -> None:  # type: ignore[attr-defined]
-            q.put(None)
-
-        num_threads = len(self._threads)  # type: ignore[attr-defined]
-        if num_threads < self._max_workers:  # type: ignore[attr-defined]
-            thread_name = f"{self._thread_name_prefix or self}_{num_threads}"
-            thread = threading.Thread(
-                name=thread_name,
-                target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,  # type: ignore[attr-defined]
-                    self._initializer,  # type: ignore[attr-defined]
-                    self._initargs,  # type: ignore[attr-defined]
-                ),
-                daemon=True,
-            )
-            thread.start()
-            self._threads.add(thread)  # type: ignore[attr-defined]
-            # 刻意不登记到 concurrent.futures.thread._threads_queues：atexit
-            # 的 _python_exit 会对登记过的线程逐个 join（daemon=True 不豁免），
-            # 导入进行中停服仍会卡住整个导入时长；不登记则在解释器退出时
-            # 直接随 daemon 线程结束
+# 导入 / 天气专用执行器：worker 为 daemon 且不登记 atexit join，停服时
+# 不被在途的分钟级导入或上游天气请求拖住（实现见 utils.daemon_executor）。
+# 保留类名 _DaemonImportExecutor 以兼容既有引用。
+_DaemonImportExecutor = DaemonThreadPoolExecutor
 
 
 class AligoWebApp:
@@ -2425,11 +2477,19 @@ class AligoWebApp:
         return deleted
 
     def close_all(self) -> None:
-        """关闭所有会话（进程退出时调用）。"""
+        """关闭所有会话（进程退出时调用）。
+
+        仍在收尾的会话（在途回合 / drain）不在这里关闭：停机时 uvicorn
+        只取消请求任务、不等待其结束就调用本方法，关闭正在使用的 runtime
+        会让随后的落库线程失去存储连接，而 PG 侧 close 还可能卡在等
+        advisory 锁（最长 30 秒）。这些连接随进程退出由操作系统回收。
+        """
         with self._sessions_lock:
             sessions = list(self.sessions.values())
             self.sessions.clear()
         for session in sessions:
+            if session.in_use():
+                continue
             session.close()
 
     def lock_for(self, user_id: str) -> asyncio.Lock:
@@ -3222,7 +3282,8 @@ def _get_weather_executor() -> ThreadPoolExecutor:
     global _weather_executor
     with _weather_executor_lock:
         if _weather_executor is None:
-            _weather_executor = ThreadPoolExecutor(
+            # 守护线程：停服时不被在途上游天气请求（最坏约一分钟）拖住
+            _weather_executor = _DaemonImportExecutor(
                 max_workers=_WEATHER_EXECUTOR_MAX_WORKERS,
                 thread_name_prefix="aligo-weather",
             )
@@ -4621,10 +4682,18 @@ def create_app(model: Any = None) -> FastAPI:
         响应体未开始迭代就被取消时同样在 finally 释放。
         """
 
-        def __init__(self, content: Any, release: Any, **kwargs: Any) -> None:
+        def __init__(
+            self,
+            content: Any,
+            release: Any,
+            *,
+            stream_state: dict[str, Any] | None = None,
+            **kwargs: Any,
+        ) -> None:
             super().__init__(content, **kwargs)
             self._release_slot = release
             self._slot_released = False
+            self._stream_state = stream_state
 
         def _release_once(self) -> None:
             if self._slot_released:
@@ -4636,6 +4705,12 @@ def create_app(model: Any = None) -> FastAPI:
             try:
                 await super().__call__(scope, receive, send)
             finally:
+                # 与聊天流同口径：响应体未送达即客户端中断——打标让中间件按
+                # 499 记账，而不是 200 成功、长耗时混入延迟分位
+                if self._stream_state is not None and not self._stream_state.get(
+                    "terminal_delivered"
+                ):
+                    scope.setdefault("state", {})["aligo_stream_aborted"] = True
                 self._release_once()
 
     def _raise_restore_conflict(
@@ -4732,8 +4807,12 @@ def create_app(model: Any = None) -> FastAPI:
                     state.export_slots.release()
                     return response
 
+                stream_state = {"terminal_delivered": False}
+
                 async def _content():
                     yield body
+                    # 消费方取下一条才执行：走到这里说明 body 已发送成功
+                    stream_state["terminal_delivered"] = True
 
                 headers = {
                     key: value
@@ -4743,6 +4822,7 @@ def create_app(model: Any = None) -> FastAPI:
                 return _ExportLeaseResponse(
                     _content(),
                     state.export_slots.release,
+                    stream_state=stream_state,
                     status_code=response.status_code,
                     headers=headers,
                     media_type=response.media_type,
@@ -6925,12 +7005,11 @@ def create_app(model: Any = None) -> FastAPI:
                     heartbeat.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await heartbeat
-                # 取消在途回合并等待落库线程结束。生成器可能处在 Starlette
-                # 的 anyio 取消作用域内，作用域取消后这里的 await 会立刻
-                # 再次抛 CancelledError：同步的 task.cancel() 必须在这里
-                # 做，等待落库线程由作用域外的 _LeasedStreamingResponse 兜底
-                if task is not None and not task.done():
-                    task.cancel()
+                # 取消在途回合。生成器可能处在 Starlette 的 anyio 取消作用域
+                # 内，作用域取消后这里的 await 会立刻再次抛 CancelledError：
+                # 同步的取消必须在这里做，与 stop_turn 共用「只取消一次」守卫；
+                # 等待落库线程由作用域外的 _LeasedStreamingResponse 兜底
+                lease.request_cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await lease.stop_turn()
                 # 断连未完成标记不在这里写：取消时上面的等待会立即抛错，
@@ -8294,17 +8373,18 @@ def create_app(model: Any = None) -> FastAPI:
             state.import_queue_slots.release()
             state.end_import(import_client)
 
-    # RFC 9110 §9.3.2：支持 GET 的资源必须支持 HEAD（与 GET 同头、无 body）。
-    # FastAPI 的 APIRoute 只登记显式方法，HEAD 探测（HAProxy / uptime 监控 /
-    # curl -I）此前全部 405；这里给所有 GET 路由补上 HEAD。SSE 端点除外：
-    # HEAD 会触发一次完整生成再丢弃 body，没有探测价值。
+    # RFC 9110 §9.3.2：支持 GET 的资源应支持 HEAD（与 GET 同头、无 body）。
+    # FastAPI 的 APIRoute 只登记显式方法，HEAD 探测此前全部 405。这里只给
+    # 轻量探活路由补 HEAD：导出 / 全库扫描 / 上游查询类 GET 的 HEAD 会完整
+    # 执行端点（读库、序列化、gzip）再丢弃 body，没有探测价值——与 SSE
+    # 端点同口径。
+    head_probe_paths = {"/", "/api/health", "/api/metrics", "/metrics"}
     for _route in app.routes:
+        if getattr(_route, "path", "") not in head_probe_paths:
+            continue
         _methods = getattr(_route, "methods", None)
-        if not _methods or "GET" not in _methods or "HEAD" in _methods:
-            continue
-        if getattr(_route, "path", "") == "/api/chat/stream":
-            continue
-        _methods.add("HEAD")
+        if _methods and "GET" in _methods and "HEAD" not in _methods:
+            _methods.add("HEAD")
 
     return app
 

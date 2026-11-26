@@ -11,7 +11,6 @@ import logging
 import os
 import re
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from agentscope.agent import AgentBase
@@ -21,6 +20,7 @@ from agentscope.message import Msg
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 from utils.access_log import _safe_log_text
+from utils.daemon_executor import DaemonThreadPoolExecutor
 from utils.json_parser import extract_json_from_async_response
 from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
 from utils.log_redact import redact_paths
@@ -41,11 +41,12 @@ except ImportError:
 
 # 网络搜索与技能内天气查询的专用线程池：ddgs 同步调用在上游限流 / 挂起时
 # 会长时间占用线程，此前走 asyncio 默认执行器会连带堵住所有会话的记忆读写
-# 与落库（同池只有 min(32, CPU+4) 个线程）；独立小池把故障限制在信息查询内
-_SEARCH_EXECUTOR = ThreadPoolExecutor(
+# 与落库（同池只有 min(32, CPU+4) 个线程）；独立小池把故障限制在信息查询内。
+# 守护线程且不登记 atexit join：停服 / CLI 退出不被在途查询拖住。
+_SEARCH_EXECUTOR = DaemonThreadPoolExecutor(
     max_workers=4, thread_name_prefix="aligo-ddgs"
 )
-_WEATHER_EXECUTOR = ThreadPoolExecutor(
+_WEATHER_EXECUTOR = DaemonThreadPoolExecutor(
     max_workers=4, thread_name_prefix="aligo-skill-weather"
 )
 # 单次网络搜索后端的总耗时上限：ddgs 内部约 5s/轮，多重试 / 多引擎叠加时

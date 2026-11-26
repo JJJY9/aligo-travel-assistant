@@ -243,12 +243,33 @@ async def test_information_query_agent():
     print()
 
 
+def test_skill_executors_are_daemon_and_not_registered():
+    """搜索 / 天气池为守护线程且不登记 atexit join：停服不被在途查询拖住。"""
+    from concurrent.futures.thread import _threads_queues
+
+    import agent as query_info_agent
+
+    for executor in (
+        query_info_agent._SEARCH_EXECUTOR,
+        query_info_agent._WEATHER_EXECUTOR,
+    ):
+        assert executor.submit(lambda: 1).result(timeout=5) == 1
+        threads = list(executor._threads)
+        assert threads and all(thread.daemon for thread in threads)
+        assert all(thread not in _threads_queues for thread in threads), (
+            "登记到 _threads_queues 会让 atexit 逐个 join，停服仍被查询拖住"
+        )
+    print("✓ query-info 技能执行器线程不参与 atexit join")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
 
     _stdio.ensure_utf8()
     _tmp_registry.install()
+    # 执行器生命周期用例不依赖模型 / 网络：直跑也执行
+    test_skill_executors_are_daemon_and_not_registered()
     # @requires_llm_key 只对 pytest 收集生效：直跑必须自己守卫
     if not LLM_CONFIG["api_key"]:
         print("未配置模型密钥（LLM_API_KEY / config_local），跳过实时模型用例")

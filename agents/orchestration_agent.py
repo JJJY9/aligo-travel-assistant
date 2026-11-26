@@ -21,17 +21,16 @@ import logging
 import re
 import threading
 import time
-import weakref
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures.thread import _worker
 from typing import Any
 
 from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
 from utils.agent_names import canonical_agent_name
+from utils.daemon_executor import DaemonThreadPoolExecutor
 from utils.json_safe import sanitize_json, strip_nul
 from utils.log_redact import redact_paths
 from utils.llm_resilience import (
@@ -63,37 +62,9 @@ _AGENT_RETRY_MAX_DELAY = 5.0
 # 下载）嵌入模型；放进默认线程池会在冷启动时占满 min(32, CPU+4) 个 token，
 # 把对话限流 / 记忆读写 / 会话构造等所有 asyncio.to_thread 一起阻塞。
 # 超时只中断等待、线程本身仍占着——隔离到小池后阻塞范围限定在加载自身。
-class _DaemonLoadExecutor(ThreadPoolExecutor):
-    """加载专用执行器：守护线程且不登记 atexit join。
-
-    ThreadPoolExecutor 默认把 worker 登记进 concurrent.futures.thread.
-    _threads_queues，进程退出时 atexit 会对登记线程逐个 join（daemon 标记
-    不豁免）：RAG 冷加载进行中停服，会被拖到加载结束。这里沿用 CPython
-    内部线程创建逻辑（3.10-3.12 稳定），只把线程标记为 daemon 且跳过登记。
-    """
-
-    def _adjust_thread_count(self) -> None:  # type: ignore[override]
-        if self._idle_semaphore.acquire(timeout=0):  # type: ignore[attr-defined]
-            return
-
-        def weakref_cb(_: Any, q: Any = self._work_queue) -> None:  # type: ignore[attr-defined]
-            q.put(None)
-
-        num_threads = len(self._threads)  # type: ignore[attr-defined]
-        if num_threads < self._max_workers:  # type: ignore[attr-defined]
-            thread = threading.Thread(
-                name=f"{self._thread_name_prefix or self}_{num_threads}",
-                target=_worker,
-                args=(
-                    weakref.ref(self, weakref_cb),
-                    self._work_queue,  # type: ignore[attr-defined]
-                    self._initializer,  # type: ignore[attr-defined]
-                    self._initargs,  # type: ignore[attr-defined]
-                ),
-                daemon=True,
-            )
-            thread.start()
-            self._threads.add(thread)  # type: ignore[attr-defined]
+# 守护线程且不登记 atexit join：加载进行中停服不被拖住（见
+# utils.daemon_executor）。
+_DaemonLoadExecutor = DaemonThreadPoolExecutor
 
 
 _AGENT_LOAD_EXECUTOR = _DaemonLoadExecutor(
