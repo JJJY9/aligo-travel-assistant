@@ -99,6 +99,22 @@ def resolve_skills_root() -> Path:
     return roots[0]
 
 
+def knowledge_init_command() -> str:
+    """知识库初始化命令提示（源码 checkout 与 wheel 安装给出各自可执行的形式）。
+
+    源码运行沿用仓库相对脚本路径；wheel 安装后技能脚本位于安装前缀、
+    内置文档目录不随包分发，改用 ``aligo kb-init --documents <目录>``。
+    """
+    try:
+        from utils.paths import is_source_checkout
+
+        if is_source_checkout():
+            return "python .claude/skills/ask-question/script/init_knowledge_base.py"
+    except Exception:  # noqa: BLE001 - 旧版本无 utils.paths
+        pass
+    return "aligo kb-init --documents <文档目录>"
+
+
 def skill_scripts(root: Path | None = None) -> dict[str, Path]:
     """返回技能名 → ``script/agent.py`` 路径（目录不存在或没有技能时为空）。"""
     base = root if root is not None else resolve_skills_root()

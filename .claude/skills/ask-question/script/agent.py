@@ -328,6 +328,12 @@ class RAGKnowledgeAgent(AgentBase):
             from utils.paths import default_data_root
 
             candidates.append(default_data_root() / path_obj)
+            # 默认配置是 data/models/...，而数据根目录自身即 .../data：
+            # 去掉前缀再拼一次，覆盖 ALIGO_DATA_DIR / wheel 用户目录下
+            # 模型放在 <数据根>/models 的布局
+            parts = path_obj.parts
+            if len(parts) > 1 and parts[0] == "data":
+                candidates.append(default_data_root() / Path(*parts[1:]))
         except Exception:  # noqa: BLE001 - 旧版本无 utils.paths
             pass
         try:

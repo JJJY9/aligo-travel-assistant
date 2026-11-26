@@ -509,6 +509,7 @@ def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
 def check_knowledge_base(db_path: Path | str | None = None) -> CheckResult:
     """检查 RAG 知识库是否已初始化（复用 knowledge_status，避免重复实现）。"""
     from utils.knowledge_stats import knowledge_status
+    from utils.skill_paths import knowledge_init_command
 
     # 写锁有界等待：导入进行中时快速返回「正在写入」而不是让探针线程
     # 无限期挂在写锁上（Web /api/doctor 会并发触发本检查）
@@ -519,7 +520,7 @@ def check_knowledge_base(db_path: Path | str | None = None) -> CheckResult:
             return CheckResult(
                 "RAG 知识库",
                 STATUS_WARN,
-                "未初始化：python .claude/skills/ask-question/script/init_knowledge_base.py",
+                f"未初始化：{knowledge_init_command()}",
             )
         if reason == "集合不存在":
             return CheckResult("RAG 知识库", STATUS_WARN, "数据库存在，但缺少知识集合（请重新初始化）")

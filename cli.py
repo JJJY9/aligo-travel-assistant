@@ -9,6 +9,7 @@ import inspect
 import os
 import re
 import signal
+import subprocess
 import sys
 import unicodedata
 from pathlib import Path
@@ -2404,6 +2405,7 @@ def run_knowledge_status_standalone(as_json: bool = False) -> int:
         configured_dimension_mismatch,
         knowledge_status,
     )
+    from utils.skill_paths import knowledge_init_command
 
     status = knowledge_status()
     configured_dim = configured_dimension_mismatch(status.get("dimension"))
@@ -2426,13 +2428,39 @@ def run_knowledge_status_standalone(as_json: bool = False) -> int:
                 "知识库不可用：集合维度"
                 f"（{status.get('dimension')}）与当前嵌入模型配置"
                 f"（{configured_dim}）不一致，请重新运行初始化脚本重建："
-                "python .claude/skills/ask-question/script/init_knowledge_base.py"
+                f"{knowledge_init_command()}"
             )
             return 1
         return 0
     print(f"知识库不可用：{status.get('reason', '未知原因')}")
     print(f"数据库：{status.get('path', '')}")
     return 1
+
+
+def run_knowledge_init_standalone(documents: str | None = None) -> int:
+    """运行知识库初始化脚本（用于 `python cli.py kb-init [--documents DIR]`）。
+
+    通过 ``resolve_skills_root()`` 定位随 wheel 安装的技能脚本：源码
+    checkout 与安装布局都能用，不需要用户自己拼仓库相对路径。
+    ``--documents`` 透传给脚本——wheel 安装后内置文档目录不会随包分发，
+    需要用 ``--documents`` / ``ALIGO_KB_DOCS_DIR`` 指向自己的文档目录。
+    """
+    from utils.skill_paths import resolve_skills_root
+
+    script = resolve_skills_root() / "ask-question" / "script" / "init_knowledge_base.py"
+    if not script.is_file():
+        print(f"❌ 技能目录中找不到初始化脚本：{script}")
+        print("   可用 aligo skills / python cli.py skills 查看当前技能目录")
+        return 1
+    command = [sys.executable, str(script)]
+    if documents:
+        command.extend(["--documents", documents])
+    try:
+        completed = subprocess.run(command, check=False)
+    except OSError as exc:
+        print(f"❌ 启动初始化脚本失败：{exc}")
+        return 1
+    return 0 if completed.returncode == 0 else 1
 
 
 def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int:
@@ -7643,6 +7671,7 @@ def _parse_export_args(
 _COMMANDS_HINT = (
     "可用命令：health / doctor / skills / weather / stats / kb / eval / eval-cases / "
     "eval-agent / "
+    "kb-init / "
     "kb-export / "
     "kb-import / kb-list / kb-search / kb-show / kb-add / kb-update / "
     "kb-categories / kb-delete / kb-duplicates / kb-dedupe / "
@@ -7837,6 +7866,35 @@ def _main_impl():
                     as_json=agent_json,
                 )
             )
+        if arg == "kb-init":
+            documents = None
+            valid = True
+            items = sys.argv[2:]
+            index = 0
+            while index < len(items):
+                item = items[index]
+                lowered = item.lower()
+                if lowered == "--documents":
+                    # 目录值不能以 - 开头（避免吞掉下一个选项）
+                    if index + 1 >= len(items) or items[index + 1].startswith("-"):
+                        valid = False
+                        break
+                    documents = items[index + 1]
+                    index += 2
+                    continue
+                if lowered.startswith("--documents="):
+                    documents = item.split("=", 1)[1]
+                    if not documents:
+                        valid = False
+                        break
+                else:
+                    valid = False
+                    break
+                index += 1
+            if not valid:
+                _cli_fail("用法：python cli.py kb-init [--documents DIR]", False)
+                sys.exit(2)
+            sys.exit(run_knowledge_init_standalone(documents=documents))
         if arg == "kb-export":
             parsed_kb_export = _parse_kb_export_args(sys.argv[2:])
             if parsed_kb_export is None:

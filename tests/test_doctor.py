@@ -138,6 +138,37 @@ def test_model_dir_follows_runtime_data_root(monkeypatch, tmp_path):
     print("✓ 嵌入模型目录跟随运行期数据目录")
 
 
+def test_model_dir_accepts_models_without_data_prefix(monkeypatch, tmp_path):
+    """ALIGO_DATA_DIR / wheel 数据根本身即 .../data：<数据根>/models 也应命中。"""
+    from config import RAG_CONFIG
+    from utils import paths as paths_module
+    from utils.doctor import _default_model_dir
+
+    monkeypatch.setitem(
+        RAG_CONFIG, "embedding_model", "data/models/custom-test-embed"
+    )
+    monkeypatch.setattr(paths_module, "default_data_root", lambda: tmp_path)
+    runtime = tmp_path / "models" / "custom-test-embed"
+    runtime.mkdir(parents=True)
+    assert _default_model_dir() == runtime
+    print("✓ 嵌入模型目录不再重复拼接 data 前缀")
+
+
+def test_model_dir_fallback_outside_checkout_uses_runtime_root(monkeypatch, tmp_path):
+    """模型不存在时提示路径也应是用户该放置的位置（数据根，无 data/）。"""
+    from config import RAG_CONFIG
+    from utils import paths as paths_module
+    from utils.doctor import _default_model_dir
+
+    monkeypatch.setitem(
+        RAG_CONFIG, "embedding_model", "data/models/custom-test-embed"
+    )
+    monkeypatch.setattr(paths_module, "default_data_root", lambda: tmp_path)
+    monkeypatch.setattr(paths_module, "is_source_checkout", lambda *a, **k: False)
+    assert _default_model_dir() == tmp_path / "models" / "custom-test-embed"
+    print("✓ wheel / ALIGO_DATA_DIR 下回退路径为数据根口径")
+
+
 def test_version_consistency(monkeypatch):
     from utils import version as version_module
 
@@ -1010,6 +1041,8 @@ _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_version_check_handles_non_utf8_files": "需要 tmp_path 夹具",
     "test_version_check_detects_static_version_mismatch": "需要 tmp_path 夹具",
     "test_model_dir_follows_runtime_data_root": "需要 tmp_path 夹具",
+    "test_model_dir_accepts_models_without_data_prefix": "需要 tmp_path 夹具",
+    "test_model_dir_fallback_outside_checkout_uses_runtime_root": "需要 tmp_path 夹具",
     "test_doctor_rejects_unknown_flag": "需要 capsys 夹具",
 }
 

@@ -33,13 +33,17 @@ dependencies = [
     "greenlet==3.5.6",
     "tqdm==4.70.1",
     "mcp==1.30.0",
+    # utils/skill_loader.py 顶层 import yaml（技能 frontmatter 解析）；
+    # 此前仅靠 agentscope 的间接依赖带入，CI 的 --no-deps 安装会漏装
+    "PyYAML==6.0.3",
     "redis==8.1.0",
     "psycopg[binary]==3.3.9",
     "fastapi==0.162.0",
     "uvicorn==0.54.0",
-    # Windows / 无系统时区库的容器：ZoneInfo 需要 tzdata，否则 ICS 的
-    # TZID 被静默当作浮动时间（跨时区日期可能差一天）
-    "tzdata>=2024.1; sys_platform == 'win32'",
+    # Windows / 无系统时区库的容器（python:slim 等）都需要：ZoneInfo 缺少
+    # 系统 tzdata 时 ICS 的 TZID 会被静默当作浮动时间（跨时区日期可能差
+    # 一天）。marker 不能只限 win32，否则 Linux 容器从 wheel 安装会丢时区
+    "tzdata>=2024.1",
 ]
 
 [project.scripts]

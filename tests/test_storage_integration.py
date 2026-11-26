@@ -2,7 +2,7 @@
 Redis / PostgreSQL 后端集成测试（需要真实服务）
 
 本地运行（先启动服务）：
-    docker compose up -d
+    docker compose up -d --wait
     TEST_REDIS_URL=redis://localhost:6379/0 \\
     TEST_POSTGRES_DSN=postgresql://aligo:aligo@localhost:5432/aligo \\
     pytest tests/test_storage_integration.py -q

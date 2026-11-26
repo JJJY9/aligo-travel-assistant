@@ -7373,6 +7373,59 @@ def test_pg_trip_update_replay_is_not_safe():
     assert updates and all(flag is False for _sql, flag in updates), updates
 
 
+def test_pg_transient_startup_error_retries_then_succeeds(monkeypatch):
+    """initdb / 重启期间的 57P03 不应一次就进入 60 秒 JSON 回退。"""
+    calls: list[str] = []
+
+    class _Starting(Exception):
+        sqlstate = "57P03"
+
+    class FakeMemory:
+        def __init__(self, user_id, dsn):
+            calls.append(user_id)
+            if len(calls) == 1:
+                raise _Starting("the database system is starting up")
+
+    monkeypatch.setattr(storage, "PostgresLongTermMemory", FakeMemory)
+    monkeypatch.setattr(storage.time, "sleep", lambda *_args, **_kwargs: None)
+    memory = storage._create_postgres_memory("u-retry", "postgresql://x/y")
+    assert isinstance(memory, FakeMemory)
+    assert calls == ["u-retry", "u-retry"], calls
+    print("✓ PG 瞬时启动错误按有界退避重试")
+
+
+def test_pg_transient_error_retry_is_bounded(monkeypatch):
+    calls: list[int] = []
+
+    class FakeMemory:
+        def __init__(self, user_id, dsn):
+            calls.append(1)
+            raise ConnectionRefusedError("connection refused")
+
+    monkeypatch.setattr(storage, "PostgresLongTermMemory", FakeMemory)
+    monkeypatch.setattr(storage.time, "sleep", lambda *_args, **_kwargs: None)
+    with pytest.raises(ConnectionRefusedError):
+        storage._create_postgres_memory("u-bounded", "postgresql://x/y")
+    assert len(calls) == storage._PG_CONNECT_ATTEMPTS, calls
+    print("✓ PG 瞬时错误重试次数有上限")
+
+
+def test_pg_non_transient_error_is_not_retried(monkeypatch):
+    calls: list[int] = []
+
+    class FakeMemory:
+        def __init__(self, user_id, dsn):
+            calls.append(1)
+            raise ValueError("password authentication failed for user")
+
+    monkeypatch.setattr(storage, "PostgresLongTermMemory", FakeMemory)
+    monkeypatch.setattr(storage.time, "sleep", lambda *_args, **_kwargs: None)
+    with pytest.raises(ValueError):
+        storage._create_postgres_memory("u-no-retry", "postgresql://x/y")
+    assert len(calls) == 1, calls
+    print("✓ PG 认证失败等永久错误不重试")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理

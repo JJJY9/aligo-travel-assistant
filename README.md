@@ -363,26 +363,30 @@ pip install agentscope==1.0.16        # 多智能体框架
 # agentscope 1.0.16 的元数据未声明以下隐含依赖（缺失会导致 import 失败）：
 # mcp 必须保持 <2（2.x 移除了 streamablehttp_client），greenlet 供 SQLAlchemy asyncio 使用
 pip install mcp==1.30.0 tqdm==4.70.1 greenlet==3.5.6
+pip install PyYAML==6.0.3             # 技能 frontmatter 解析（utils/skill_loader.py 顶层 import）
 # 向量数据库（macOS / Linux）：milvus-lite 2.x 没有 Windows wheel
 pip install "pymilvus[milvus_lite]==2.6.9"
 # 向量数据库（Windows）：改用 pymilvus 3.x + milvus-lite 3.x（与 requirements.txt 一致）
-pip install "pymilvus==3.0.2" "milvus-lite==3.2.2"
-pip install sentence-transformers==5.2.3    # Embedding模型
-pip install rich==13.9.4                    # CLI界面
-pip install ddgs==9.10.0                    # 网络搜索
+pip install "pymilvus==3.0.3" "milvus-lite==3.2.2"
+pip install sentence-transformers==6.3.0    # Embedding模型
+pip install rich==15.0.0                    # CLI界面
+pip install fastapi==0.162.0 uvicorn==0.54.0  # Web 界面
+pip install tzdata==2026.6                  # Windows / 无系统时区库的容器：ICS 的 TZID 需要
+pip install ddgs==9.16.1                    # 网络搜索
 ```
 
-也可以直接安装 [Releases](https://github.com/JJJY9/aligo-travel-assistant/releases) 中的 wheel（已包含 Web 静态资源与 `.claude/skills` 技能代码，普通安装时技能位于虚拟环境根目录，`pip install --user` 时位于用户目录）：
+也可以直接安装 [Releases](https://github.com/JJJY9/aligo-travel-assistant/releases) 中的 wheel（已包含 Web 静态资源与 `.claude/skills` 技能代码，普通安装时技能位于虚拟环境根目录，`pip install --user` 时位于用户目录）。**注意**：Releases 上最新正式发布仍是 v1.6.0（6 个技能）；下文 v2.0 能力（12 技能、固定 DAG、行程约束校验等）已合入 main、尚未发布新 wheel，需要这些能力时请按上面的方式从源码安装，或从 main 自行构建 wheel：
 
 ```bash
-pip install aligo_travel_assistant-1.6.0-py3-none-any.whl
+# 从 Releases 页面下载 wheel 后安装（文件名以页面实际文件为准）
+pip install ./aligo_travel_assistant-<版本>-py3-none-any.whl
 aligo-web        # 启动 Web 界面（也可用 python -m webapp.server）
 aligo            # 启动交互式 CLI
 ```
 
 wheel 安装后**数据目录不再写入安装前缀**（site-packages 会随 venv 重建 / `pipx reinstall` 整体消失）：默认使用用户数据目录（Windows `%LOCALAPPDATA%/aligo/data`，其它 `$XDG_DATA_HOME/aligo/data` 或 `~/.local/share/aligo/data`），可用 `ALIGO_DATA_DIR` 指定；源码目录运行时仍为 `<仓库>/data`。`config_local.py` 按**当前运行目录**显式加载，console script（`aligo-web`）启动也能生效。
 
-安装后可访问 `/api/health` 确认 `skills.count` 与 `aligo skills` 列出的技能数一致（当前源码目录 / 随包安装为 12 个；v1.6.0 旧发布包为 6 个）（或运行 `aligo skills` / `aligo doctor` 查看「技能目录」检查；源码目录下等价命令为 `python cli.py skills` / `python cli.py doctor`）；若为 0，用环境变量 `ALIGO_SKILLS_DIR` 指向技能目录。
+安装后可访问 `/api/health` 确认 `skills.count` 与 `aligo skills` 列出的技能数一致（当前源码目录 / 由本仓库源码构建的 wheel 为 12 个；Releases 上的 v1.6.0 wheel 为 6 个）（或运行 `aligo skills` / `aligo doctor` 查看「技能目录」检查；源码目录下等价命令为 `python cli.py skills` / `python cli.py doctor`）；若为 0，用环境变量 `ALIGO_SKILLS_DIR` 指向技能目录。
 
 RAG 知识库文档、嵌入模型与记忆数据属于运行时数据，不随安装包分发，需要按「知识库初始化」自行准备；技能目录可用环境变量 `ALIGO_SKILLS_DIR` 覆盖。
 
@@ -635,7 +639,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
         - targets: ["127.0.0.1:8000"]
   ```
 - 对话接口默认按「客户端 + 用户」限流 **30 次 / 分钟**，同时按客户端 IP 限流 **120 次 / 分钟**（用户 ID 由请求方提供、可轮换，IP 桶防止换 ID 绕过），超限返回 `429` 与整数秒 `Retry-After`；响应同时附带 `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`，便于客户端感知额度。可用环境变量 `CHAT_RATE_LIMIT`（单用户次数）、`CHAT_RATE_LIMIT_IP`（单 IP 次数）与 `CHAT_RATE_WINDOW_SEC`（窗口秒数）调整。默认使用进程内滑动窗口（`utils/rate_limit.py`）；配置 `REDIS_URL` 后计数写入 Redis（`aligo:ratelimit:*`，使用 Redis 服务器时间），多实例共享同一份额度，Redis 运行中故障时自动回退进程内实现并在 60 秒后重试；启动时不可达的实例会在 Redis 恢复后通过客户端工厂自动重新接入共享计数（限流降级标志只有在下一次调用成功后才清除，冷却到期不视为恢复）。知识库写入 / 导出 / 列表 / 分类统计 / 语义检索 / 整篇回填都会触发嵌入模型推理或整库读取，按客户端 IP 单独限流（默认 **60 次 / 分钟**，`KB_RATE_LIMIT` 调整），与对话额度互不影响，429 同样附带额度头（`/api/doctor` 自检与 `/api/import` 备份恢复同样占用该桶，429 文案按实际被限操作区分）；知识库导入、导入预览与行程导入使用独立桶（默认 **1200 次 / 分钟**，`KB_IMPORT_RATE_LIMIT` 调整——面板分批导入需要远高于普通操作的额度，调整它会同时改变行程导入额度）；单 IP 单桶直接原子记录，不会在并发下超发。天气接口每次未命中缓存会向上游发两次请求，也按客户端 IP 单独限流（默认 **30 次 / 分钟**，`WEATHER_RATE_LIMIT` 调整），保护 Open-Meteo 免费额度与共用线程池，不占用对话 / 知识库额度。面板数据读接口（会话列表 / 状态 / 导出 / 台账）每次请求都全量读取用户历史并走共享线程池，按客户端 IP 单独限流（默认 **600 次 / 分钟**，`READ_RATE_LIMIT` 调整），额度远高于正常面板刷新频率，只用于挡住并发拉满线程池的脚本行为。用户数据写接口（偏好 / 会话标题 / 置顶 / 归档 / 行程增删改 / 删除会话 / 删除最后一轮）每次都会全量重载并重写该用户记忆，按客户端 IP 单独限流（默认 **240 次 / 分钟**，`WRITE_RATE_LIMIT` 调整，超限 429）；偏好与行程的实时写入同样受导入上限约束（200 / 5000 条，超限 409），避免写入路径把用户数据撑到备份无法导出高开销伪 GET（`/api/doctor`、知识库搜索 / 评测、`/api/weather`）与全量读取 / 导出类只读接口要求同源客户端标记：面板自动携带 `X-Aligo-Client: web`，脚本调用同样需要携带该头（或提供 `Sec-Fetch-Site: same-origin`；Referer 不作为同源证据——应用对所有响应下发 `Referrer-Policy: no-referrer`，反代部署下后端也无法可靠得知外部 scheme），否则返回 403——HTTP 内网部署与旧版 Safari 不发送 `Sec-Fetch-Site`，该头不能作为唯一防线。部署在反向代理后面时设置 `TRUST_PROXY_HEADERS=1`，限流按 `X-Forwarded-For` **最后一个地址**计算客户端 IP（默认关闭以防客户端伪造；最靠近应用的代理用 `$proxy_add_x_forwarded_for` 追加，应用取它写入的那一项），且只信任来自 `TRUSTED_PROXY_CIDRS`（默认仅回环 `127.0.0.1/32,::1/128`；容器 / 跨主机代理必须显式配置其来源网段，否则 XFF 被忽略、所有用户合入代理 IP 桶并打印告警）；末跳接受裸 IP、`[IPv6]`、`[IPv6]:port` 与 `IP:port`（端口剥离后按地址归桶），无法解析时回退 TCP 对端并告警。429 的 `X-RateLimit-Reset` 与 `Retry-After` 都是**剩余秒数**（非 epoch）。IPv6 客户端默认按 `RATE_IPV6_PREFIX_LEN=64` 聚合（可按接入网络委派粒度改为 56 / 48，多实例须同值）。进程内限流器每个桶有键表上限 `RATE_LIMIT_MAX_KEYS`（默认 10000，钳制在 100..1000000）：满时对新客户端 429「限流容量暂满」并按最早到期键给出 Retry-After（不再固定整窗口）；小时 / 日窗口或单进程键基数可能超过上限的部署应改用 Redis 后端（无键表上限）。`with_knowledge=1` 的用户备份导出会整库扫描知识片段，因此在读桶之外**同时占用知识库桶**（先查 KB 桶：被 KB 额度拒绝的请求不消耗读额度）。
-- 安全响应头：CSP（仅同源脚本）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy`；主题初始化脚本拆分为 `/static/theme.js` 以满足 CSP。`/docs`、`/redoc`、`/openapi.json` **默认关闭**（页面从 CDN 加载资源、schema 暴露完整端点结构，内网部署时是常见的信息泄露面），需要时设置环境变量 `ALIGO_ENABLE_DOCS=1` 开启，文档页使用仅对其放宽的 CSP（允许 CDN 资源；`frame-ancestors` 与全站一致保持 `'none'`，文档关闭时 `/docs*` 的 404 使用严格策略）；未处理异常返回的 500 同样带安全响应头与 `X-Request-ID`；`/api/` 响应一律带 `Cache-Control: no-store`（用户数据不进入浏览器 / 代理缓存；SSE 对话流为 `no-store, no-cache`，导出同样 no-store，无例外）。轻量探活路由（`/`、`/api/health`、`/api/metrics`、`/metrics`）支持 `HEAD`（RFC 9110），健康检查 / 监控可用 `curl -I`；SSE 与高开销只读 / 导出 / 上游查询路由不补 `HEAD`——它会完整执行端点（读库、序列化、gzip、请求上游）再丢弃 body，没有探测价值；`Accept-Encoding` 按标准解析（`gzip;q=0`、大小写写法都按语义处理）。HSTS 默认不下发：应用自身不终止 TLS，**由 TLS 反向代理对 HTTPS 响应下发 `Strict-Transport-Security`**；确有需要时设置 `ALIGO_HSTS_MAX_AGE`（秒，默认 0 = 关闭）让应用在全部响应（含错误页）附加该头。
+- 安全响应头：CSP（仅同源脚本）、`X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`、`Permissions-Policy`；主题初始化脚本拆分为 `/static/theme.js` 以满足 CSP。`/docs`、`/redoc`、`/openapi.json` **默认关闭**（页面从 CDN 加载资源、schema 暴露完整端点结构，内网部署时是常见的信息泄露面），需要时设置环境变量 `ALIGO_ENABLE_DOCS=1` 开启，文档页使用仅对其放宽的 CSP（允许 CDN 资源；`frame-ancestors` 与全站一致保持 `'none'`，文档关闭时 `/docs*` 的 404 使用严格策略）；未处理异常返回的 500 同样带安全响应头与 `X-Request-ID`；`/api/` 响应一律带 `Cache-Control: no-store`（用户数据不进入浏览器 / 代理缓存；SSE 对话流为 `no-store, no-cache`，导出同样 no-store，无例外）。轻量探活路由（`/`、`/api/health`、`/api/metrics`、`/metrics`）支持 `HEAD`（RFC 9110），存活探测可用 `curl -I`；注意 `/api/health` 的 HTTP 状态恒为 200，降级信息在 body 的 `status` 字段（`ok` / `degraded`），就绪 / 降级探测必须读取 body，例如 `curl -fsS http://127.0.0.1:8000/api/health | grep -q '"status": *"ok"'`；SSE 与高开销只读 / 导出 / 上游查询路由不补 `HEAD`——它会完整执行端点（读库、序列化、gzip、请求上游）再丢弃 body，没有探测价值；`Accept-Encoding` 按标准解析（`gzip;q=0`、大小写写法都按语义处理）。HSTS 默认不下发：应用自身不终止 TLS，**由 TLS 反向代理对 HTTPS 响应下发 `Strict-Transport-Security`**；确有需要时设置 `ALIGO_HSTS_MAX_AGE`（秒，默认 0 = 关闭）让应用在全部响应（含错误页）附加该头。
 
 **接口**
 
@@ -728,7 +732,7 @@ python tests/test_memory_system.py # 记忆系统（含 LLM 总结）
 ### 存储后端集成测试（需要 Redis / PostgreSQL）
 
 ```bash
-docker compose up -d
+docker compose up -d --wait
 TEST_REDIS_URL=redis://localhost:6379/0 \
 TEST_POSTGRES_DSN=postgresql://aligo:aligo@localhost:5432/aligo \
 pytest tests/test_storage_integration.py -q
@@ -840,11 +844,11 @@ aligo-travel-assistant/
 
 ### 向量化与检索
 - 🧠 **BGE-small-zh-v1.5** - 中文Embedding模型（本地部署）
-- 📚 **Sentence-Transformers 5.2.3** - 向量化工具库
+- 📚 **Sentence-Transformers 6.3.0** - 向量化工具库
 - 🎯 **余弦相似度检索** - Top-K检索算法
 
 ### 联网与搜索
-- 🌐 **DuckDuckGo (DDGS 9.10.0)** - 免费网络搜索引擎
+- 🌐 **DuckDuckGo (DDGS 9.16.1)** - 免费网络搜索引擎
 - 📝 **LLM自动摘要** - 搜索结果智能提取
 
 ### 架构设计
@@ -860,7 +864,7 @@ aligo-travel-assistant/
 - 💊 **健康检查** - 实时监控LLM服务可用性
 
 ### 用户界面
-- 🖥️ **Rich 13.9.4** - 精美的CLI终端界面
+- 🖥️ **Rich 15.0.0** - 精美的CLI终端界面
 
 ---
 
@@ -878,13 +882,15 @@ aligo-travel-assistant/
 ### 数据存储
 - **默认（开箱即用）**：短期记忆为进程内滑动窗口，长期记忆为 JSON 文件（`data/memory/{user_id}.json`）
 - **生产模式（可选）**：设置 `REDIS_URL` 启用 Redis 短期记忆（List + 滑动窗口 + TTL）；设置 `DATABASE_URL` 启用 PostgreSQL 长期记忆（表结构首次连接自动创建）；未配置或连接失败时自动回退默认实现（失败后 60 秒冷却，不阻塞启动）
-- **本地一键启动依赖**：`docker compose up -d`（见 `docker-compose.yml`），然后：
+- **本地一键启动依赖**：`docker compose up -d --wait`（见 `docker-compose.yml`；`--wait` 要等 Redis / PostgreSQL 健康检查通过才返回，首次 initdb 未就绪时应用连接会触发 60 秒 JSON 回退、造成数据分叉），然后：
 
   ```bash
   export REDIS_URL=redis://localhost:6379/0
   export DATABASE_URL=postgresql://aligo:aligo@localhost:5432/aligo
   python cli.py        # 或 python -m webapp.server
   ```
+
+  `docker-compose.yml` 中 Redis 已开启 AOF 并挂载 `aligo_redisdata` 卷：删除墓碑（TTL 1h）、会话纪元（TTL 24h）等跨实例保护在容器重启后仍然有效（`docker compose down -v` 会连同数据一起清空）；Redis **运行中**故障期间的删除仍只记录在进程内，恢复前进程退出则不再执行（见「已知限制」）。
 
 ### 多实例部署（可选）
 
@@ -904,13 +910,14 @@ python -m webapp.server --port 8002   # 另一个进程 / 机器
 - **请求幂等**：幂等缓存（进程内 TTL 10 分钟 + 上限 256 条，超限时按用户公平淘汰——只淘汰条目最多的用户自己最旧的一条，任一用户的流量不会把另一用户仍在 TTL 内的缓存条目 / 断连未完成标记挤出）与按用户串行的 asyncio 锁都是进程内状态。响应丢失后重试若被负载均衡分到另一实例，仍会重新执行整轮并重复落库；请配合会话粘滞（session affinity），或把 `IdempotencyCache` 替换为 Redis 实现。
 - **PostgreSQL 连接**：生产连接默认 `lock_timeout=3000ms`（等表锁超过 3 秒按「存储暂时不可用」返回，而不是无限挂起）和 TCP keepalive（30s/10s/3，半开连接约一分钟内被发现）；`statement_timeout` 只在自检探测等显式场景设置，大备份导入等合法长事务不受默认语句上限影响。表结构在进程内每个 DSN 只初始化一次（首次持跨进程 advisory lock）。
 - **反向代理**：前面有 Nginx / 负载均衡时设置 `TRUST_PROXY_HEADERS=1`，并让最靠近应用的代理以追加模式写入 `X-Forwarded-For`（应用默认取最后一项）；多层代理（CDN→nginx→应用）把 `TRUST_PROXY_HOPS` 设为实际代理层数（如 `2`），否则所有客户端会共用上游出口地址的 IP 桶、一个客户端即可打满全站额度。默认不信任该头是为了防止客户端伪造。
-- **观测**：请求指标（`/api/metrics`）是进程内统计（只统计 `/api` 路由请求与 Host 白名单拒绝的探测，首页 / 静态资源 / 抓取自身不计），需要分别采集每个实例；SSE 长连接只统计请求数与状态码、不计入延迟分位（整段会话时长没有可比性），以 error 事件收尾（且终态帧已送达）的流单独计入 `sse_errors`（HTTP 已发出 200，按状态码看不到失败）；Host 拒绝探测与未匹配路径的 404 不受限流、只计请求数、不计入延迟分位；PostgreSQL 后端的偏好快照缓存命中 / 未命中 / 版本失效计数见 `preference_cache`（同样按实例统计，`version_invalidations` 是 misses 的子集：只统计快照仍在 TTL 内、因跨进程版本变化被迫回源），Prometheus 暴露对应计数；`/api/health` 在熔断打开或技能目录不可用（`skills.ok` 为 `false`）时返回 `status: degraded`，可用于实例级健康检查。
+- **观测**：请求指标（`/api/metrics`）是进程内统计（只统计 `/api` 路由请求与 Host 白名单拒绝的探测，首页 / 静态资源 / 抓取自身不计），需要分别采集每个实例；SSE 长连接只统计请求数与状态码、不计入延迟分位（整段会话时长没有可比性），以 error 事件收尾（且终态帧已送达）的流单独计入 `sse_errors`（HTTP 已发出 200，按状态码看不到失败）；Host 拒绝探测与未匹配路径的 404 不受限流、只计请求数、不计入延迟分位；PostgreSQL 后端的偏好快照缓存命中 / 未命中 / 版本失效计数见 `preference_cache`（同样按实例统计，`version_invalidations` 是 misses 的子集：只统计快照仍在 TTL 内、因跨进程版本变化被迫回源），Prometheus 暴露对应计数；`/api/health` 在熔断打开或技能目录不可用（`skills.ok` 为 `false`）时 body 的 `status` 为 `degraded`（HTTP 仍返回 200，K8s / 负载均衡的就绪探针需要解析 body 或改用 `storage.*_degraded` 等指标），可用于实例级就绪检查。
 - **知识库**：Milvus Lite 是本地单进程文件锁，多个实例无法共享同一个向量库文件；这里的多实例共享适用于无 RAG 或各实例独立知识库的场景，需要共享向量库时请替换为 Milvus 服务端部署。
 
 ### 知识库初始化
 - 首次运行前必须初始化RAG知识库
 - 知识库文档位于 `.claude/skills/ask-question/data/documents/`
-- Milvus数据库文件生成在 `.claude/skills/ask-question/data/rag_knowledge/milvus_lite.db`
+- **初始化命令**：源码运行用 `python .claude/skills/ask-question/script/init_knowledge_base.py`；wheel 安装后内置文档目录不随包分发，用 `aligo kb-init --documents <存放 .txt 文档的目录>`（或设置 `ALIGO_KB_DOCS_DIR`）指向自己的文档目录，脚本与数据库位置由安装目录 / 用户数据目录自动解析
+- Milvus数据库文件生成在 `.claude/skills/ask-question/data/rag_knowledge/milvus_lite.db`（wheel 安装为 `<用户数据目录>/rag_knowledge/milvus_lite.db`）
 - **Windows 说明**：`requirements.txt` 会按平台自动选择依赖（非 Windows 用 `pymilvus 2.6.9 + milvus-lite 2.x`，Windows 用 `pymilvus 3.x + milvus-lite 3.x`）。如果目录中已有旧版（2.x 时代）生成的 `milvus_lite.db` 文件，需先删除再运行初始化脚本（两个版本的数据文件互不兼容；该文件为可再生文件）
 
 ### 性能优化
