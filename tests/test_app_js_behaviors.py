@@ -1124,7 +1124,72 @@ def test_open_session_guards_deleting_and_unknown_empty():
     assert results["session_id"] == "A", "未知空会话不能把当前对话切走"
     assert results["new_session_calls"] == 0, results
     assert any("已不存在或还没有消息" in item for item in results["toasts"]), results
+    # 未加载到目标会话必须显式返回 false：sendMessage 的发送前守卫按
+    # loaded !== true 中止，裸 return 会让提问写进已删除的会话
+    assert results["deleting_return"] is False, results
+    assert results["ghost_return"] is False, results
     print("✓ openSession 删除在途 / 未知空会话守卫")
+
+
+def test_webapp_round_interaction_fixes():
+    """发送前守卫、焦点兜底、IME、超长拦截、重新生成反馈、偏好基线。"""
+    results = _run_harness("webappRound")
+    focus = results["focus"]
+    assert focus["clamped"] == ["s3"], "删除 / 归档后应按旧索引就近聚焦"
+    assert focus["indexed"] == ["s2"], focus
+    assert focus["empty"] == ["search"], "列表清空时焦点回到搜索框"
+
+    oversize = results["oversize"]
+    assert oversize["fetchCalls"] == 0, "超长提问不能发出请求"
+    assert any("超过 4000 字" in item for item in oversize["toasts"]), oversize
+
+    unconfirmed = results["unconfirmed"]
+    assert unconfirmed["empty"]["value"] == "合并后的提问", "空输入框仍要回填原文"
+    assert "暂未确认保存结果" in unconfirmed["empty"]["toasts"][0], unconfirmed
+    assert unconfirmed["withDraft"]["value"] == "已有草稿", "不能覆盖已有草稿"
+
+    pending = results["regeneratePending"]
+    assert pending == {"disabled": True, "label": "准备中…", "ariaBusy": "true"}, pending
+    success = results["regenerateSuccess"]
+    assert success == {"removed": 1, "sent": 1}, success
+    mismatch = results["regenerateMismatch"]
+    assert mismatch["disabled"] is False
+    assert mismatch["label"] == "重新生成"
+    assert mismatch["ariaBusy"] == ""
+    assert mismatch["removed"] == 0 and mismatch["sent"] == 0, mismatch
+    assert any("上一轮对话已变化" in item for item in mismatch["toasts"]), mismatch
+    timeout = results["regenerateTimeout"]
+    assert timeout["disabled"] is False
+    assert any("结果未知" in item for item in timeout["toasts"]), timeout
+
+    pref = results["preference"]
+    assert pref["latest"] == ["汉庭", "如家"], "保存成功后必须写回合并基线"
+    assert pref["status"] == ["汉庭", "如家"], "状态缓存同样要同步"
+    print("✓ 发送前守卫 / 焦点兜底 / IME / 超长拦截 / 重新生成反馈 / 偏好基线")
+
+
+def test_webapp_round_semantic_stash_and_truncation():
+    """语义检索暂存恢复、超长消息编辑入口、行程筛选合成守护。"""
+    results = _run_harness("webappRound")
+    semantic = results["semanticStash"]
+    assert semantic["stashing"]["first"] is True, semantic
+    assert "语义检索中" in semantic["stashing"]["text"], semantic
+    assert semantic["restored"] == ["row1", "row2"], "并发作废后必须还原暂存列表"
+
+    truncated = results["truncated"]
+    assert truncated["longMarked"] is True, "超长消息要打截断标记"
+    assert truncated["shortMarked"] is False, truncated
+    assert truncated["truncatedAppends"] == 0, "截断消息不提供必然失败的编辑入口"
+    assert truncated["normalAppends"] == 1, truncated
+
+    composing = results["tripComposing"]
+    assert composing["composing"] is True
+    assert composing["requests"] == 0, "输入法合成期间不能请求服务端过滤"
+    composed = results["tripComposed"]
+    assert composed["composing"] is False
+    assert composed["requests"] == 1, "合成结束后补一次过滤请求"
+    assert composed["filter"] == "hang"
+    print("✓ 语义暂存恢复 / 截断消息编辑入口 / 行程筛选 IME 守护")
 
 
 def test_metrics_panel_uses_duration_samples():
@@ -1221,5 +1286,7 @@ if __name__ == "__main__":
     test_user_switch_clears_preference_cache()
     test_stop_reconcile_deferred_until_next_turn_ends()
     test_open_session_guards_deleting_and_unknown_empty()
+    test_webapp_round_interaction_fixes()
+    test_webapp_round_semantic_stash_and_truncation()
     test_metrics_panel_uses_duration_samples()
     print("\n全部通过")
