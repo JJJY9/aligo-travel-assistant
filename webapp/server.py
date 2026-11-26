@@ -42,6 +42,7 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Any, Callable, Literal, NoReturn
+from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Path as ApiPath, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -4135,8 +4136,26 @@ def _display_usage(usage: dict[str, Any]) -> dict[str, Any]:
     return normalized
 
 
-def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
-    """从历史消息的执行元数据汇总模型用量（旧消息没有 _meta，自动忽略）。"""
+def _usage_zone(tz: str | None) -> ZoneInfo | None:
+    """面板传入的浏览器时区；非法 / 未知时区退回服务器本地（不 500）。"""
+    if not tz:
+        return None
+    try:
+        return ZoneInfo(tz)
+    except (ValueError, KeyError, OSError):
+        return None
+
+
+def _usage_summary(
+    history: list[dict[str, Any]], tz: str | None = None
+) -> dict[str, Any]:
+    """从历史消息的执行元数据汇总模型用量（旧消息没有 _meta，自动忽略）。
+
+    ``tz`` 由 /api/status 传浏览器时区：容器常以 UTC 部署，按服务器本地
+    日期分桶会让东八区用户 0–8 点的调用计入前一天，「今天」高亮与近 7 天
+    窗口整体偏移。缺省（CLI / 导出 / 旧客户端）仍是服务器本地日期。
+    """
+    zone = _usage_zone(tz)
     calls = input_tokens = output_tokens = total_tokens = 0
     elapsed_total = 0.0
     elapsed_count = 0
@@ -4162,8 +4181,13 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
             try:
                 parsed_timestamp = datetime.fromisoformat(timestamp)
                 if parsed_timestamp.tzinfo is not None:
-                    # PostgreSQL timestamptz 序列化为 UTC；统一转到本地时区再取日期
-                    parsed_timestamp = parsed_timestamp.astimezone()
+                    # PostgreSQL timestamptz 序列化为 UTC；统一转到浏览器
+                    # （缺省本地）时区再取日期
+                    parsed_timestamp = (
+                        parsed_timestamp.astimezone(zone)
+                        if zone is not None
+                        else parsed_timestamp.astimezone()
+                    )
                 message_day = parsed_timestamp.date().isoformat()
             except (ValueError, OSError, OverflowError):
                 # Windows 上 astimezone() 对越界年份还会抛 OSError/OverflowError
@@ -4198,7 +4222,7 @@ def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
                         canonical_agent_name(str(agent["name"]).strip())
                     ] += 1
 
-    today = datetime.now().date()
+    today = datetime.now(zone).date() if zone is not None else datetime.now().date()
     recent_days = []
     for offset in range(6, -1, -1):
         day = (today - timedelta(days=offset)).isoformat()
@@ -4232,16 +4256,25 @@ _USAGE_SUMMARY_CACHE_MAX = 64
 _usage_summary_cache_lock = threading.Lock()
 
 
-def _usage_history_fingerprint(history: list[dict[str, Any]]) -> tuple[Any, ...]:
+def _usage_history_fingerprint(
+    history: list[dict[str, Any]], tz: str | None = None
+) -> tuple[Any, ...]:
     # 指纹包含当天日期：进程跨过午夜后「近 7 天」窗口要向前滚动，
     # 历史没变也必须重新汇总（否则会把第 8 天的 bucket 继续算进 7 天合计）
-    today = datetime.now().date().isoformat()
+    # 日期按请求时区取：同一用户换时区（面板时区参数变化）不能命中旧窗口
+    zone = _usage_zone(tz)
+    today = (
+        datetime.now(zone).date().isoformat()
+        if zone is not None
+        else datetime.now().date().isoformat()
+    )
     if not history:
-        return (today, 0)
+        return (today, tz or "", 0)
     first = history[0]
     last = history[-1]
     return (
         today,
+        tz or "",
         len(history),
         str(first.get("timestamp") or ""),
         len(str(first.get("content") or "")),
@@ -4251,15 +4284,15 @@ def _usage_history_fingerprint(history: list[dict[str, Any]]) -> tuple[Any, ...]
 
 
 def _usage_summary_for_user(
-    user_id: str, history: list[dict[str, Any]]
+    user_id: str, history: list[dict[str, Any]], tz: str | None = None
 ) -> dict[str, Any]:
     """带缓存的用量汇总（/api/status 专用；导出路径仍走实时计算）。"""
-    fingerprint = _usage_history_fingerprint(history)
+    fingerprint = _usage_history_fingerprint(history, tz)
     with _usage_summary_cache_lock:
         cached = _USAGE_SUMMARY_CACHE.get(user_id)
         if cached is not None and cached[0] == fingerprint:
             return cached[1]
-    summary = _usage_summary(history)
+    summary = _usage_summary(history, tz)
     with _usage_summary_cache_lock:
         if (
             user_id not in _USAGE_SUMMARY_CACHE
@@ -5468,6 +5501,7 @@ def create_app(model: Any = None) -> FastAPI:
         response: Response,
         user_id: str = Query(default="web_user", pattern=_ID_PATTERN),
         today: date | None = Query(default=None),
+        tz: str | None = Query(default=None, max_length=64),
     ) -> dict[str, Any]:
         response.headers.update(_enforce_read_rate_limit(state, request))
         # strict：配置 PostgreSQL 但当前不可用时返回可重试 503，不能把
@@ -5520,7 +5554,7 @@ def create_app(model: Any = None) -> FastAPI:
                 "archived_count": _archived_count(data),
                 "statistics": data["statistics"],
                 "storage": describe_backends(),
-                "usage": _usage_summary_for_user(user_id, data["chat_history"]),
+                "usage": _usage_summary_for_user(user_id, data["chat_history"], tz),
             }
         )
 
@@ -5535,6 +5569,7 @@ def create_app(model: Any = None) -> FastAPI:
         # 规范化类型：` home_location` / `home_location ` 会落库成与规范键
         # 并存的「影子偏好」——精确键查找（如推断出发地）读不到它，面板却
         # 单独成行并占用类型上限。与对话侧 strip 后落库的口径一致
+        raw_type = pref_type
         pref_type = pref_type.strip()
         if not pref_type:
             raise HTTPException(status_code=422, detail="偏好类型不能为空白")
@@ -5556,6 +5591,10 @@ def create_app(model: Any = None) -> FastAPI:
         store = _open_long_term(payload.user_id, strict=True)
         try:
             existing = store.get_preference()
+            # 编辑影子行时原键会在写入后释放：本次等于替换而非新增，不占新名额
+            shadow_type = (
+                raw_type if raw_type != pref_type and raw_type in existing else None
+            )
             # 面板永远看不到的空值条目（旧备份导入 / 旧版本写入）不渲染、
             # 也无法从面板删除，却占用类型上限名额：写入偏好时顺带释放，
             # 409 只在真实可见条目达到上限时出现
@@ -5572,7 +5611,11 @@ def create_app(model: Any = None) -> FastAPI:
                     logger.warning("清理空值偏好失败: %s", hidden)
             # 只拦「恰好在上限、本次新增类型」：已越限的历史账号（上限
             # 上线前的存量）继续可用，与存储写层 / 导入基线豁免同口径
-            if pref_type not in existing and len(existing) == MAX_PREFERENCE_ENTRIES:
+            if (
+                pref_type not in existing
+                and len(existing) == MAX_PREFERENCE_ENTRIES
+                and shadow_type is None
+            ):
                 raise HTTPException(
                     status_code=409,
                     detail=(
@@ -5582,6 +5625,15 @@ def create_app(model: Any = None) -> FastAPI:
                 )
             store.save_preference(pref_type, payload.value)
             value = store.get_preference(pref_type)
+            # 编辑影子行（" home_location" 等首尾空格存量键）时把原键一并
+            # 清掉：否则规范键拿到新值、被编辑行仍回显旧值，同一偏好并存
+            # 两份并继续占用名额。best-effort，失败不阻断本次写入
+            if shadow_type:
+                try:
+                    if store.delete_preference(shadow_type):
+                        logger.info("清理影子偏好条目: %s", shadow_type)
+                except Exception:  # noqa: BLE001 - 清理失败不阻断本次写入
+                    logger.warning("清理影子偏好失败: %s", shadow_type)
         except HTTPException:
             raise
         except ValueError as exc:

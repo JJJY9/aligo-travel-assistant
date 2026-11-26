@@ -15,6 +15,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from utils.trip_export import (
+    _MAX_ICS_X_ATTR_CHARS,
     _needs_quote_guard,
     normalize_identity_date,
     normalize_identity_text,
@@ -484,7 +485,9 @@ def _restored_end_from_props(props: dict[str, str]) -> str | None:
     if raw is None:
         return None
     value = unescape_ics_machine_field(_ics_unescape(raw)).strip()
-    if not value or len(value) > _MAX_TRIP_FIELD_CHARS:
+    # 与导出端 _MAX_ICS_X_ATTR_CHARS 同口径（宽于 100 字字段上限）：超限的
+    # 原始返程日期仍需带回身份键，否则回导按新身份重复新增行程
+    if not value or len(value) > _MAX_ICS_X_ATTR_CHARS:
         return None
     if _bad_import_text(value):
         return None

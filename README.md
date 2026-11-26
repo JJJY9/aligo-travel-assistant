@@ -660,7 +660,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/knowledge/export` | 导出全部知识片段为 JSON 文件（备份 / 迁移） |
 | POST | `/api/knowledge/import` | 批量导入知识片段（`documents` 数组，单次最多 20000 条；`dry_run=1` 只返回 `would_import` 不写库） |
 | POST | `/api/knowledge/import/preview` | 预览整个备份（一次最多 20000 条）：校验 / 去重后返回将导入 / 跳过的数量（`skipped_invalid` 无效内容 / `skipped_duplicate` 已存在分别统计），不写库 |
-| GET | `/api/status` | 用户数据概览（偏好 / 最近行程 / 行程统计（总数 / 出行天数 / 到访城市 / 进行中 / 即将出行）/ 对话数 / 统计 / 存储后端 / 模型用量与近 7 天趋势） |
+| GET | `/api/status` | 用户数据概览（偏好 / 最近行程 / 行程统计（总数 / 出行天数 / 到访城市 / 进行中 / 即将出行）/ 对话数 / 统计 / 存储后端 / 模型用量与近 7 天趋势（可按浏览器时区 `tz` 参数分桶）） |
 | GET | `/api/weather` | 目的地天气（Open-Meteo，无 API Key；实时 + 未来 3 天，成功结果 10 分钟进程内缓存（配置 `REDIS_URL` 时同时写入共享缓存 `aligo:weather:<城市>`，其它实例直接复用）、失败结果 60 秒；上游故障时沿用最近一次成功数据并标记 `stale`，窗口按最近一次成功计时、1 小时封顶，不会被反复降级刷新；按客户端 IP 限流，默认 30 次 / 分钟，10 分钟缓存命中不消耗额度（缓存命中的成功响应同样附带 `X-RateLimit-*` 额度头，与未命中的 200 形状一致） |
 | PUT | `/api/preferences/{type}` | 新增或覆盖一条偏好（JSON 值，记忆面板编辑入口） |
 | DELETE | `/api/preferences/{type}` | 删除一条偏好 |

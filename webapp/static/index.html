@@ -111,7 +111,7 @@
           <span class="brand-mark"><svg class="icon"><use href="#i-route"></use></svg></span>
           <span class="brand-text"><strong>Aligo</strong><small>智能旅行助手</small></span>
         </a>
-        <button class="icon-btn side-collapse" id="collapseSidebar" type="button" title="收起侧栏" aria-label="收起侧栏">
+        <button class="icon-btn side-collapse" id="collapseSidebar" type="button" title="收起侧栏" aria-label="收起侧栏" aria-expanded="true">
           <svg class="icon"><use href="#i-panel"></use></svg>
         </button>
       </div>
@@ -154,7 +154,7 @@
 
     <main class="main">
       <header class="topbar">
-        <button class="icon-btn menu-btn" id="menuBtn" type="button" title="展开 / 收起侧栏" aria-label="展开或收起侧栏">
+        <button class="icon-btn menu-btn" id="menuBtn" type="button" title="展开 / 收起侧栏" aria-label="展开或收起侧栏" aria-expanded="true">
           <svg class="icon"><use href="#i-menu"></use></svg>
         </button>
         <div class="conv-title">
@@ -175,7 +175,7 @@
             <svg class="icon"><use href="#i-doc"></use></svg>
           </button>
           <span class="health" id="health" title="服务状态"><i></i><span id="healthText">连接中</span></span>
-          <button class="icon-btn" id="themeToggle" type="button" title="切换主题" aria-label="切换主题">
+          <button class="icon-btn" id="themeToggle" type="button" title="切换主题" aria-label="切换主题" aria-pressed="false">
             <svg class="icon"><use href="#i-moon"></use></svg>
           </button>
           <button class="icon-btn" id="shortcutsBtn" type="button" title="键盘快捷键" aria-label="键盘快捷键" aria-haspopup="dialog" aria-expanded="false">
@@ -312,13 +312,13 @@
         <div
           class="kb-list"
           id="kbList"
-          role="status"
-          aria-live="polite"
+          role="group"
           tabindex="-1"
           aria-label="知识片段列表"
         >
           加载中…
         </div>
+        <div class="empty kb-eval" id="kbListStatus" role="status" aria-live="polite" hidden></div>
         <button class="ghost kb-more" id="kbMore" type="button" hidden>加载更多</button>
         <form class="kb-form" id="kbForm">
           <textarea

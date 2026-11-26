@@ -362,6 +362,17 @@ def test_must_see_suffix_triggers_and_connectors():
     assert "must_see" not in extract_requirements("周末都要去爬山")
     assert "must_see" not in extract_requirements("西湖、灵隐寺不一定要去")
     assert "must_see" not in extract_requirements("北京必去景点有哪些")
+    # 「不一定都要去」命中的是「都要去」、捕获段以「不一定」结尾：整句是
+    # 否定语境，不能产出「西湖灵隐寺不一定」这类假必去项
+    assert "must_see" not in extract_requirements("去杭州，西湖灵隐寺不一定都要去")
+    assert "must_see" not in extract_requirements("这些景点不一定都要去")
+    assert "must_see" not in extract_requirements("去杭州，西湖、灵隐寺不一定都要去")
+    # 「到X后」前缀按已知目的地剥离，不把城市与介词收进景点名
+    assert extract_requirements("到杭州后西湖、灵隐寺都要去", {"destination": "杭州"})[
+        "must_see"
+    ] == ["西湖", "灵隐寺"]
+    # 守卫只锚定结尾：「大唐不夜城」这类真实地名不能被当成否定
+    assert extract_requirements("大唐不夜城都要去")["must_see"] == ["大唐不夜城"]
     print("✓ 后置触发词 /「或」连接词提取")
 
 

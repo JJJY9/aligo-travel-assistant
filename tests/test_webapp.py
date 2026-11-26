@@ -4450,6 +4450,38 @@ def test_preference_put_strips_type_and_rejects_blank():
         _cleanup(user_id)
 
 
+def test_preference_put_edits_shadow_key_clears_original():
+    """编辑影子键（历史备份 / 旧 API 写入的 " home_location"）时清掉原键。
+
+    否则规范键拿到新值、被编辑行仍回显旧值，同一偏好并存两份并继续
+    占用类型上限名额。
+    """
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user_id = _unique_user("web_test_pref_shadow")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_preference(" home_location", "旧影子值")
+            store.save_preference("home_location", "北京")
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        response = client.put(
+            "/api/preferences/%20home_location",
+            json={"user_id": user_id, "value": "上海"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["type"] == "home_location", response.json()
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["preferences"] == {"home_location": "上海"}, status["preferences"]
+        print("✓ 编辑影子偏好时清掉原键（不并存两份）")
+    finally:
+        _cleanup(user_id)
+
+
 def test_preference_put_cleans_hidden_blank_entries():
     """写入偏好时顺带清理面板不可见的空值条目（释放类型上限名额）。"""
     from context.storage import create_long_term_memory
@@ -9848,6 +9880,25 @@ def test_knowledge_write_rejects_nul_and_surrogates():
     print("✓ 知识写入拒绝 NUL / 孤立代理项，分类上限一致")
 
 
+def test_kb_list_is_not_live_region():
+    """知识列表承载可交互按钮，不能当实时区（整列表会被反复朗读）。
+
+    摘要交给独立的隐藏节点 #kbListStatus 播报。
+    """
+    index_html = (
+        Path(__file__).resolve().parents[1] / "webapp" / "static" / "index.html"
+    ).read_text(encoding="utf-8")
+    kb_list = re.search(r'<div[^>]*id="kbList"[\s\S]*?>', index_html)
+    assert kb_list, "缺少 #kbList"
+    tag = kb_list.group(0)
+    assert 'role="group"' in tag, tag
+    assert "aria-live" not in tag, "列表本身不能再是实时区"
+    assert re.search(r'id="kbListStatus"[^>]*role="status"', index_html), (
+        "摘要播报节点必须带 role=status"
+    )
+    print("✓ 知识列表不是实时区，摘要独立播报")
+
+
 def test_knowledge_collection_missing_gets_actionable_error(monkeypatch):
     """半初始化（集缺失）的 503 与 /api/knowledge、doctor 同口径，其它异常仍脱敏。"""
     from webapp import server as server_module
@@ -13739,6 +13790,47 @@ def test_usage_by_day_local_date():
     print("✓ by_day 使用本地日期（固定时区跨日时间戳）")
 
 
+def test_usage_summary_tz_parameter_buckets_browser_day():
+    """tz 参数按浏览器时区分桶与取 7 天窗口（容器 UTC + 东八区浏览器）。
+
+    浏览器本地 0–8 点的调用时间戳落在 UTC 前一天：不传 tz 时进 UTC 桶、
+    最新柱不是浏览器「今天」，前端按浏览器日期加的今天高亮整张图无命中。
+    """
+    from datetime import datetime, timedelta, timezone
+    from zoneinfo import ZoneInfo
+
+    from webapp.server import _usage_summary
+
+    zone = ZoneInfo("Asia/Shanghai")
+    browser_today = datetime.now(zone).date()
+    # 浏览器本地「今天」04:00 = UTC 前一天 20:00
+    stamp = datetime.combine(
+        browser_today, datetime.min.time(), tzinfo=zone
+    ) + timedelta(hours=4)
+    meta = {
+        "usage": {"calls": 1, "input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+        "elapsed": 1.0,
+        "agents": [],
+    }
+    history = [
+        {
+            "role": "assistant",
+            "content": json.dumps({"results": [], "_meta": meta}, ensure_ascii=False),
+            "timestamp": stamp.astimezone(timezone.utc).isoformat(),
+            "session_id": "s",
+        }
+    ]
+    usage = _usage_summary(history, "Asia/Shanghai")
+    buckets = {day["date"]: day["tokens"] for day in usage["by_day"]}
+    today_text = browser_today.isoformat()
+    assert buckets.get(today_text) == 5, f"应记到浏览器日期 {today_text}: {buckets}"
+    assert usage["by_day"][-1]["date"] == today_text, usage["by_day"]
+    # 非法 / 未知时区退回服务器本地，不能 500
+    fallback = _usage_summary(history, "Not/AZone")
+    assert len(fallback["by_day"]) == 7
+    print("✓ 用量 by_day 支持浏览器时区参数")
+
+
 def test_cached_chronological_key_invalidates_on_tz_change():
     """chronological_key 缓存必须带时区世代：进程内切 TZ 后不得命中旧结果。"""
     import time as time_module
@@ -14002,9 +14094,9 @@ def test_usage_summary_cached_per_user(monkeypatch):
     calls = {"n": 0}
     real = server_module._usage_summary
 
-    def counting(history):
+    def counting(history, tz=None):
         calls["n"] += 1
-        return real(history)
+        return real(history, tz)
 
     monkeypatch.setattr(server_module, "_usage_summary", counting)
     history = [
@@ -14037,6 +14129,9 @@ def test_usage_summary_cached_per_user(monkeypatch):
         ]
         server_module._usage_summary_for_user("u-cache", grown)
         assert calls["n"] == 2, "历史变化后必须重新汇总"
+        # 时区进入指纹：同一历史按不同时区取窗口不能命中旧缓存
+        server_module._usage_summary_for_user("u-cache", grown, "Asia/Shanghai")
+        assert calls["n"] == 3, "换时区（窗口口径变化）必须重新汇总"
         # 缓存封顶：不同用户不会无限写入
         for index in range(server_module._USAGE_SUMMARY_CACHE_MAX + 5):
             server_module._usage_summary_for_user(f"u-{index}", [])

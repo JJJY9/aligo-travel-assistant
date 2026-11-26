@@ -34,6 +34,7 @@ from utils.preference_values import (
     merge_preference_value,
     preference_value_problem,
     has_preference_value,
+    is_manageable_pref_type,
 )
 from utils.timestamps import chronological_key
 
@@ -1349,6 +1350,14 @@ class LongTermMemory:
                     logger.warning("丢弃 type 非字符串的偏好记录：%r", pref.get("type"))
                     destructive = True
                     continue
+                # 面板 / CLI 无法寻址的键（空串、纯空白、控制字符、含 "/"、
+                # 原始长度超过 64 的键）会渲染出改不掉也删不掉的行，并永久
+                # 占用类型上限名额：读入时丢弃，与 Web / CLI 的类型校验同口径
+                pref_key = pref["type"]
+                if not is_manageable_pref_type(pref_key) or not 0 < len(pref_key) <= 64:
+                    logger.warning("丢弃面板 / CLI 无法管理的偏好记录：%r", pref_key)
+                    destructive = True
+                    continue
                 if "value" not in pref:
                     logger.warning("丢弃缺少 value 的偏好记录：%s", pref.get("type"))
                     destructive = True
@@ -1369,6 +1378,10 @@ class LongTermMemory:
                             isinstance(nested_pref, dict)
                             and isinstance(nested_pref.get("type"), str)
                             and "value" in nested_pref
+                            # 嵌套展开同样不能把不可寻址的键提升为顶层：
+                            # 面板改不掉也删不掉，只能占上限名额
+                            and is_manageable_pref_type(nested_pref["type"])
+                            and 0 < len(nested_pref["type"]) <= 64
                         ):
                             fixed_prefs.append(
                                 {

@@ -96,6 +96,9 @@ def test_frontend_render_helpers():
     assert results["date_unpadded"] == "2026-01-05", results["date_unpadded"]
     assert results["date_slash"] == "2026-03-12", results["date_slash"]
     assert results["date_bad"] is None, results["date_bad"]
+    # 形状合法但非真实日历日：与后端 strptime 失败（按无日期处理）同口径
+    assert results["date_invalid_calendar"] is None, results["date_invalid_calendar"]
+    assert results["date_leap_valid"] == "2024-02-29", results["date_leap_valid"]
     assert results["highlight_plain"] == "no match here", "无命中时返回转义原文"
     assert results["highlight_meta"] == "<mark>a+b</mark> (x)", (
         "正则元字符按字面匹配，不能被当成模式"
@@ -348,6 +351,7 @@ def test_editor_round2_preferences_and_guards():
     deleted = data["deleteSuccess"]
     assert deleted["rowRemoved"] is True, "删除成功后必须本地移除该行"
     assert deleted["latestHas"] is False, "删除后必须清掉 preferenceLatest"
+    assert deleted["statusHas"] is False, "删除后必须同步移除 state.status 里的键"
     assert deleted["refreshes"] == [{"silentFailure": True}], deleted
 
     kb = data["kbReclick"]
@@ -376,6 +380,29 @@ def test_frontend_detail_fixes():
     )
     assert data["tripReclickClean"] == 0, "未改动的重复点击不应弹确认"
     assert data["tripLatestView"] == "杭州", "刷新在途时回填最近一次保存值"
+    display = data["prefDisplay"]
+    assert display["known"] == "常住地", display
+    assert display["constructorKey"] == "constructor", "原型链成员名必须按原键回退"
+    assert display["toStringKey"] == "toString", display
+    assert display["unknown"] == "custom_type", display
+    pruned = data["pruned"]
+    assert pruned["hotelHas"] is False, "权威快照里已缺席的类型必须回收合并基线"
+    assert pruned["homeLatest"] == "北京", pruned
+    assert data["prunedPut"] == ["锦江"], "已删除类型不能经合并基线复活"
+    chips = data["degradedChips"]
+    assert "短期记忆 · Redis（降级中）" in chips, chips
+    assert any("已回退本地" in item for item in chips), chips
+    assert data["themeDarkAttrs"] == {
+        "label": "切换到浅色主题",
+        "pressed": "true",
+    }, data["themeDarkAttrs"]
+    assert data["themeLightAttrs"] == {
+        "label": "切换到深色主题",
+        "pressed": "false",
+    }, data["themeLightAttrs"]
+    assert data["sidebarExpanded"] == "true", data["sidebarExpanded"]
+    assert data["sidebarCollapsed"] == "false", data["sidebarCollapsed"]
+    assert data["kbAnnounce"] == ["共 12 条，已显示 5 条"], data["kbAnnounce"]
     print("✓ 前端细节修复（草稿合并 / 待刷新 / 归档 / 行程重编辑）")
 
 

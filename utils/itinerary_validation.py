@@ -491,10 +491,11 @@ def extract_requirements(
             if name not in must_see:
                 must_see.append(name)
     # 后置触发词：「西湖、灵隐寺都要去 / 故宫必须去」；「不一定要去」里
-    # 触发词前紧邻「不」时是否定，不能算必去项
+    # 触发词前紧邻「不」时是否定，不能算必去项；「不一定都要去」命中的
+    # 是「都要去」、捕获段以「不一定 / 未必 / 不都」结尾，同一守卫要认
     for match in _MUST_SEE_SUFFIX_RE.finditer(text):
         raw = match.group(1).rstrip()
-        if re.search(r"[不别没未]$", raw):
+        if re.search(r"(?:不一定|未必|并非|不都|不全都?)$|[不别没未]$", raw):
             continue
         for name in _clean_must_see(raw):
             if name not in must_see:
@@ -502,8 +503,15 @@ def extract_requirements(
     destination = str(event.get("destination") or "").strip()
     if must_see and destination:
         dest_core = _strip_admin_suffix(destination)
+        # 只对已知目的地生效：「到杭州后西湖」剥成「西湖」；destination
+        # 为空时不动，避免误剥「到后海」这类真实地名
         forms = sorted(
-            {form for form in (destination, dest_core) if form},
+            {
+                form
+                for base in (destination, dest_core)
+                if base
+                for form in (base, f"到{base}后", f"到{base}", f"去{base}后")
+            },
             key=len,
             reverse=True,
         )
