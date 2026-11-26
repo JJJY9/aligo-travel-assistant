@@ -54,7 +54,13 @@ from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import ClientDisconnect
 
 from agents.conversation import ConversationRuntime
-from config import LLM_CONFIG, RATE_LIMIT_CONFIG, RESILIENCE_CONFIG, STORAGE_CONFIG
+from config import (
+    LLM_CONFIG,
+    RATE_LIMIT_CONFIG,
+    RESILIENCE_CONFIG,
+    STORAGE_CONFIG,
+    _env_int,
+)
 from config_agentscope import create_chat_model, init_agentscope, wrap_usage_tracking
 from context.storage import (
     clear_short_term_session,
@@ -247,10 +253,10 @@ _BASE_SECURITY_HEADERS = [
 # 浏览器。README / SECURITY.md 要求 TLS 反向代理自行下发 HSTS；应用侧
 # 兜底由部署者显式设置 ALIGO_HSTS_MAX_AGE（秒，0 = 关闭）。
 # 浏览器只在 HTTPS 响应上采纳该头，回环明文部署不受影响。
-try:
-    _HSTS_MAX_AGE = max(0, int(os.environ.get("ALIGO_HSTS_MAX_AGE", "0") or 0))
-except ValueError:
-    _HSTS_MAX_AGE = 0
+# 与 config.py 的数值型环境变量同口径：清洗 K8s / .env 注入的 BOM 与
+# 成对引号（``"31536000"`` / ``BOM31536000``），非法值回退 0 并告警——
+# 静默归零会让运维误以为 HSTS 已开启
+_HSTS_MAX_AGE = max(0, _env_int("ALIGO_HSTS_MAX_AGE", 0))
 _SECURITY_HEADERS = _BASE_SECURITY_HEADERS + [
     (
         b"content-security-policy",
@@ -504,12 +510,16 @@ def _is_allowed_host(host: str) -> bool:
         return True
     if host == "testserver" and _test_client_host_allowed():
         return True
+    # 与 config.py 同口径：K8s ConfigMap / docker --env-file 会把成对引号
+    # 连引号一起注入（整段或逐项）。此前整条白名单因引号永远不命中，
+    # 全站 400 且无告警；Host 本身不可能以引号开头 / 结尾，逐项剥离安全
     configured = (
         os.environ.get(_ALLOWED_HOSTS_ENV, "")
         .replace("\ufeff", "")
         .strip()
     )
     for item in configured.split(","):
+        item = item.strip().strip("\"'").strip()
         # 配置项与请求 Host 同一归一化：操作员按地址栏写 ``域名:端口``
         # 时必须能匹配（此前只对请求侧剥端口，配置侧永不命中、全站 400）
         pattern = _normalized_allowed_host(item)
@@ -8299,6 +8309,26 @@ def create_app(model: Any = None) -> FastAPI:
     return app
 
 
+def _configure_app_logging() -> None:
+    """配置应用根日志，并压低第三方请求行日志。
+
+    httpx 在 INFO 会逐请求记录完整 URL（``HTTP Request: POST https://…``），
+    ``str(httpx.URL)`` 保留 userinfo 与查询串；``LLM_BASE_URL`` 允许内嵌
+    网关凭据（doctor 也把 base_url 当凭据脱敏），INFO 根日志会让凭据原样
+    进入应用日志与采集管道。httpcore / openai SDK 只在 DEBUG 输出，无需处理。
+    """
+    if access_log_format() == "json":
+        handler = logging.StreamHandler()
+        handler.setFormatter(JsonLogFormatter())
+        logging.basicConfig(level=logging.INFO, handlers=[handler])
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
 def main() -> None:
     """启动 Web 服务（默认仅监听本机 8000 端口）。
 
@@ -8321,18 +8351,9 @@ def main() -> None:
     args = parser.parse_args()
 
     configure_stdio()
-    # uvicorn 只配置自己的日志：为应用日志（访问日志 / 智能体等）补一个根 handler。
-    # LOG_FORMAT=json 时整行输出 JSON（time / level / logger + 访问日志字段），
-    # 而不是在 JSON 前拼文本前缀。
-    if access_log_format() == "json":
-        handler = logging.StreamHandler()
-        handler.setFormatter(JsonLogFormatter())
-        logging.basicConfig(level=logging.INFO, handlers=[handler])
-    else:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s %(levelname)s %(name)s %(message)s",
-        )
+    # uvicorn 只配置自己的日志：为应用日志（访问日志 / 智能体等）补一个根
+    # handler，同时关闭 httpx 的请求行日志（见 _configure_app_logging）
+    _configure_app_logging()
     if not _is_loopback_host(args.host):
         logger.warning(
             "服务监听在 %s，可能对外可访问；请通过反向代理提供认证与 HTTPS，"

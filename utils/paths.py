@@ -9,6 +9,20 @@ import os
 from pathlib import Path
 
 
+def clean_env_path(name: str) -> str:
+    """读取路径类环境变量并清洗文件注入残留（BOM / 成对引号 / 空白）。
+
+    K8s ConfigMap ``--from-file`` 会带 BOM 与尾随换行，docker ``--env-file``
+    / Windows ``set VAR="D:\\data"`` 会把引号连值一起注入：Windows 路径
+    含引号 / BOM 时 ``Path`` 操作直接 WinError 123，且没有任何提示。
+    与 config.py 的字符串型环境变量同一清洗口径。
+    """
+    value = os.environ.get(name, "").replace("\ufeff", "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
 def package_root() -> Path:
     """仓库根（源码运行）或 site-packages（wheel 安装）。"""
     return Path(__file__).resolve().parent.parent
@@ -29,7 +43,7 @@ def default_data_root() -> Path:
       （Windows: ``%LOCALAPPDATA%\\aligo\\data``；其它:
       ``$XDG_DATA_HOME/aligo/data`` 或 ``~/.local/share/aligo/data``）。
     """
-    override = os.environ.get("ALIGO_DATA_DIR", "").strip()
+    override = clean_env_path("ALIGO_DATA_DIR")
     if override:
         return Path(override).expanduser()
     root = package_root()

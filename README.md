@@ -414,6 +414,7 @@ $env:LLM_API_KEY="你的API密钥"
 - `LLM_API_KEY`: 大模型API密钥（必填，从 [DeepSeek 开放平台](https://platform.deepseek.com) 获取）
 - `LLM_MODEL_NAME`: 模型名称（可选，默认 `deepseek-chat`；也可用 `deepseek-reasoner`）
 - `LLM_BASE_URL`: 接口地址（可选，默认 `https://api.deepseek.com`）
+- 网络代理：LLM / 天气 / 嵌入模型等 HTTP 客户端沿用标准 `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY`；网络搜索（ddgs）额外支持 `DDGS_PROXY`（优先于 `HTTPS_PROXY` / `ALL_PROXY`），只设 `ALL_PROXY` 时搜索也会走代理
 - 切换其他服务商（豆包 / OpenAI 等）：覆盖上面两个变量，或修改 `config.py` 中的默认值（文件内有示例）
 - `temperature` / `max_tokens`: 生成参数（0.7 / 8192）
 - 完整环境变量清单见根目录 [`.env.example`](.env.example)（含 Redis / PostgreSQL 与限流配置；项目不会自动加载 `.env`，请自行 export 或使用 `config_local.py`）

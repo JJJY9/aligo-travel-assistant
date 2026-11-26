@@ -52,6 +52,40 @@ _WEATHER_EXECUTOR = ThreadPoolExecutor(
 # 一次查询可占用半分钟以上；超时按该后端失败继续下一个，不拖死整个回合
 _SEARCH_BACKEND_TIMEOUT_SEC = 20.0
 
+# 各搜索后端实际访问的主机：NO_PROXY 排除判定按后端分别进行
+_DDGS_BACKEND_HOSTS = {
+    "duckduckgo": "html.duckduckgo.com",
+    "google": "www.google.com",
+}
+
+
+def _ddgs_proxy_for_backend(backend: str) -> str | None:
+    """ddgs 搜索的代理（与 LLM / 天气链路统一口径）。
+
+    ddgs 只认 ``DDGS_PROXY`` 与 ``HTTPS_PROXY``，不读 ``ALL_PROXY``：
+    全局代理只设 ALL_PROXY 时搜索会直连超时。这里显式解析——DDGS_PROXY
+    优先，其次 HTTPS_PROXY / ALL_PROXY，并尊重 NO_PROXY 的后端主机排除。
+    """
+    explicit = os.environ.get("DDGS_PROXY", "").replace("\ufeff", "").strip()
+    if explicit:
+        return explicit
+    try:
+        from urllib.request import (
+            getproxies_environment,
+            proxy_bypass_environment,
+        )
+
+        proxies = getproxies_environment()
+        proxy = proxies.get("https") or proxies.get("all")
+        if not proxy:
+            return None
+        host = _DDGS_BACKEND_HOSTS.get(backend)
+        if host and proxy_bypass_environment(host, proxies=proxies):
+            return None
+        return proxy
+    except Exception:  # noqa: BLE001 - 代理解析失败按无代理（ddgs 自身兜底）
+        return None
+
 # 疑似垃圾/低质域名：多为 SEO 或不良站，不展示给用户
 _SUSPICIOUS_DOMAIN_PATTERN = re.compile(
     r"\.(cc|tk|ml|ga|cf|gq|xyz|top|work|click|link|pw|buzz)(/|$)",
@@ -583,7 +617,9 @@ class InformationQueryAgent(AgentBase):
                         # 每个后端用全新 DDGS 实例：共享实例在前两个后端失败后
                         # 会让 auto 兜底直接报网络错误（实测），逐一新建可恢复
                         return list(
-                            DDGS().text(
+                            DDGS(
+                                proxy=_ddgs_proxy_for_backend(backend_name)
+                            ).text(
                                 query,
                                 max_results=10,
                                 safesearch="on",

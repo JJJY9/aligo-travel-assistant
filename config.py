@@ -322,6 +322,19 @@ STORAGE_CONFIG: StorageConfig = {
     "redis_ttl_sec": _env_int("REDIS_TTL_SEC", 3600),
 }
 
+# EXPIRE 的秒值超过 Redis 的 int64 上限会直接报错（invalid expire time）：
+# 每次写入的消息 / 去重集合都拿不到过期时间，短期记忆静默降级且键永久
+# 驻留。按 10 年上限钳制并告警（下限 <1 由 context/storage.py 钳制）
+_MAX_REDIS_TTL_SEC = 10 * 365 * 86400
+_redis_ttl_sec = int(STORAGE_CONFIG["redis_ttl_sec"])
+if _redis_ttl_sec > _MAX_REDIS_TTL_SEC:
+    logger.warning(
+        "REDIS_TTL_SEC=%s 过大（上限 %s 秒，约 10 年），按上限处理",
+        _redis_ttl_sec,
+        _MAX_REDIS_TTL_SEC,
+    )
+    STORAGE_CONFIG["redis_ttl_sec"] = _MAX_REDIS_TTL_SEC
+
 # 连接与可用性：重试、熔断、健康检查
 RESILIENCE_CONFIG: ResilienceConfig = {
     "max_retries": 3,              # 单次请求最大重试次数（与 SYSTEM_CONFIG 对齐）
@@ -402,8 +415,20 @@ if int(RATE_LIMIT_CONFIG["window_sec"]) > 86400:
     )
 
 # 窗口同时作用于全部桶：非默认值时列出每个桶的等效每分钟额度，避免
-# 「只调对话窗口」却按比例放大知识库 / 读 / 写额度的静默耦合
+# 「只调对话窗口」却按比例放大知识库 / 读 / 写额度的静默耦合。
+# 窗口秒数最终会被 float() 进限流器（utils/rate_limit.py），Redis PEXPIRE
+# 也按毫秒计：数百位的超大整数（>1.8e308）在 create_app 里直接
+# OverflowError、Web 启动失败。上限取 1 年（仍覆盖小时 / 日配额），
+# 越界钳制并告警（与 LLM_REQUEST_TIMEOUT_SEC 同口径）
+_MAX_WINDOW_SEC = 366 * 86400
 _window_sec = int(RATE_LIMIT_CONFIG["window_sec"])
+if _window_sec > _MAX_WINDOW_SEC:
+    logger.warning(
+        "CHAT_RATE_WINDOW_SEC=%s 超出合理上限，按 %s 秒（约 1 年）处理",
+        _window_sec,
+        _MAX_WINDOW_SEC,
+    )
+    RATE_LIMIT_CONFIG["window_sec"] = _window_sec = _MAX_WINDOW_SEC
 if _window_sec != 60:
     logger.warning(
         "CHAT_RATE_WINDOW_SEC=%s 同时作用于全部限流桶（对话 / IP / 知识库 / "

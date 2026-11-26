@@ -37,6 +37,22 @@ def test_env_override(monkeypatch):
     print("✓ ALIGO_SKILLS_DIR 覆盖技能目录")
 
 
+def test_env_override_strips_bom_and_quotes(monkeypatch):
+    """ALIGO_SKILLS_DIR 带 BOM / 成对引号（文件注入形态）仍指向自定义目录。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        custom = Path(tmp) / "skills"
+        (custom / "demo").mkdir(parents=True)
+        noisy_values = (
+            '"' + str(custom) + '"',
+            "'" + str(custom) + "'",
+            chr(0xFEFF) + str(custom),
+        )
+        for noisy in noisy_values:
+            monkeypatch.setenv(skill_paths.ENV_SKILLS_DIR, noisy)
+            assert skill_paths.resolve_skills_root() == custom, noisy
+    print("✓ ALIGO_SKILLS_DIR 去 BOM / 成对引号")
+
+
 def test_prefix_fallback_for_installed_wheel(monkeypatch):
     """源码目录不存在时回退到 sys.prefix/.claude/skills（wheel data-files 位置）。"""
     monkeypatch.delenv(skill_paths.ENV_SKILLS_DIR, raising=False)
@@ -227,6 +243,11 @@ if __name__ == "__main__":
     try:
         test_source_tree_resolves_repo_skills()
         test_env_override(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_env_override_strips_bom_and_quotes(mp)
     finally:
         mp.undo()
     mp = pytest.MonkeyPatch()
