@@ -247,6 +247,9 @@ def test_file_lock_close_error_does_not_mask_timeout(monkeypatch, tmp_path):
     def fail_write(handle):
         raise OSError(28, "No space left on device")
 
+    # 加锁本身用替身成功（假句柄没有 seek/fileno），直接走到补字节失败；
+    # 锁由 finally 关闭句柄释放
+    monkeypatch.setattr(lock_module, "_acquire", lambda handle, timeout: None)
     monkeypatch.setattr(lock_module, "_ensure_lockable", fail_write)
     with pytest.raises(TimeoutError):
         with lock_module.file_lock(str(tmp_path / "demo.json")):
@@ -427,6 +430,92 @@ def test_pg_fallback_case_conflict_is_retryable_message(tmp_path):
     print("✓ PG 回退期大小写冲突给出可重试文案")
 
 
+def test_in_process_lock_wait_is_bounded(monkeypatch, tmp_path):
+    """进程内写锁同样有 6 秒上限：导入长持锁时其它请求有界失败而非排队。"""
+    import threading
+    import time
+
+    import context.long_term_memory as ltm
+
+    monkeypatch.setattr(ltm, "_IN_PROCESS_LOCK_TIMEOUT_SEC", 0.2)
+    memory = LongTermMemory("bounded-user", str(tmp_path))
+    memory.save_preference("home_location", "北京")
+
+    holding = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with memory._write_lock:
+            holding.set()
+            release.wait(10)
+
+    thread = threading.Thread(target=hold, daemon=True)
+    thread.start()
+    try:
+        assert holding.wait(5)
+        started = time.monotonic()
+        with pytest.raises(MemoryPersistenceError):
+            memory.save_preference("home_location", "上海")
+        elapsed = time.monotonic() - started
+        assert elapsed < 2.0, f"有界等待应在阈值附近失败（实际 {elapsed:.2f}s）"
+        # 读路径（每次请求构造实例都会走 _load）同样有界
+        with pytest.raises(MemoryPersistenceError):
+            LongTermMemory("bounded-user", str(tmp_path))
+    finally:
+        release.set()
+        thread.join(5)
+    memory.save_preference("home_location", "上海")
+    assert memory.get_preference()["home_location"] == "上海"
+
+
+def test_orphan_atomic_temp_files_cleaned_on_write(tmp_path):
+    """崩溃遗留的旧记忆快照临时文件在下次写入时清理，新鲜 / 他人前缀保留。"""
+    user = "orphan-user"
+    stale = tmp_path / f".{user}.deadbeef.tmp"
+    stale.write_text("old snapshot", encoding="utf-8")
+    os.utime(stale, (1_000_000.0, 1_000_000.0))
+    fresh = tmp_path / f".{user}.cafebabe.tmp"
+    fresh.write_text("active writer", encoding="utf-8")
+    foreign = tmp_path / ".other-user.deadbeef.tmp"
+    foreign.write_text("other account", encoding="utf-8")
+    os.utime(foreign, (1_000_000.0, 1_000_000.0))
+
+    memory = LongTermMemory(user, str(tmp_path))
+    memory.save_preference("home_location", "北京")
+
+    assert not stale.exists(), "超过阈值的本账号临时文件应被清理"
+    assert fresh.exists(), "新鲜临时文件可能是活跃写者，不能删"
+    assert foreign.exists(), "其它账号前缀的临时文件不能删"
+
+
+def test_file_lock_empty_lock_file_concurrent_first_open(tmp_path):
+    """空锁文件可直接加锁；并发首次打开不会把预置字节写进别人的锁区。"""
+    import threading
+    import time as _time
+
+    from utils.file_lock import file_lock
+
+    target = str(tmp_path / "user.json")
+    errors: list[BaseException] = []
+    acquired: list[int] = []
+
+    def worker(index: int) -> None:
+        try:
+            with file_lock(target, timeout=5.0):
+                acquired.append(index)
+                _time.sleep(0.05)
+        except BaseException as exc:  # noqa: BLE001 - 断言统一收集
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(4)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+    assert not errors, errors
+    assert sorted(acquired) == [0, 1, 2, 3], acquired
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_case_collision_user_id_is_refused": "需要 tmp_path 夹具",
     "test_canonically_equivalent_user_ids_are_refused": "需要 tmp_path 夹具",
@@ -442,6 +531,9 @@ _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_lock_timeout_maps_to_persistence_error": "需要 tmp_path 夹具",
     "test_save_fsyncs_before_atomic_replace": "需要 tmp_path 夹具",
     "test_save_retries_transient_replace_errors": "需要 tmp_path 夹具",
+    "test_in_process_lock_wait_is_bounded": "需要 tmp_path / monkeypatch 夹具",
+    "test_orphan_atomic_temp_files_cleaned_on_write": "需要 tmp_path 夹具",
+    "test_file_lock_empty_lock_file_concurrent_first_open": "需要 tmp_path 夹具",
 }
 
 if __name__ == "__main__":

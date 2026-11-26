@@ -27,6 +27,7 @@ from utils.chat_import import (
     prepare_import_messages,
     session_dedupe_key,
 )
+from utils.atomic_write import fsync_parent_dir
 from utils.errors import MemoryPersistenceError
 from utils.file_lock import file_lock
 from utils.preference_values import (
@@ -37,6 +38,14 @@ from utils.preference_values import (
 from utils.timestamps import chronological_key
 
 logger = logging.getLogger(__name__)
+
+# 进程内按路径 RLock 的有界等待上限：与 utils.file_lock.DEFAULT_TIMEOUT_SEC
+# 同口径。导入等大写入会整段持锁（可达数十秒），其它请求无上限排队会把
+# Web 的共享线程池钉住；超时按持久化失败处理（端点映射为可重试 503）
+_IN_PROCESS_LOCK_TIMEOUT_SEC = 6.0
+# 崩溃遗留的原子写临时文件最小年龄：活跃写者的临时文件刚创建，靠 mtime
+# 阈值避免误删；600 秒覆盖 dump + fsync + 迁移拷贝的最坏耗时
+_ORPHAN_TEMP_MIN_AGE_SEC = 600.0
 
 
 def _trip_date_is_valid(value: object) -> bool:
@@ -220,9 +229,10 @@ def _locked_mutation(func):
             except BaseException:
                 self._dirty = True
                 raise
-        with self._write_lock:
+        with self._hold_write_lock():
             try:
                 with file_lock(self.db_path):
+                    self._cleanup_orphan_temp_files()
                     # 加载时没能确认的损坏文件在这里补复核：否则空快照会把
                     # 磁盘上的损坏文件直接覆盖且不产生 .corrupt-* 备份
                     self._ensure_corrupt_backed_up()
@@ -355,8 +365,57 @@ class LongTermMemory:
         self._batch_owner: int | None = None
         self._batch_depth = 0
         self._batch_dirty = False
+        self._orphan_temps_checked = False
         self.data = self._load()
         logger.info(f"Long-term memory initialized for user: {user_id}")
+
+    @contextlib.contextmanager
+    def _hold_write_lock(self) -> Iterator[None]:
+        """有界获取进程内按路径 RLock（与跨进程文件锁同口径的 6 秒上限）。
+
+        导入等大写入会整段持有该锁（可达数十秒）：无上限等待时，偏好 /
+        标题 / 状态等同步端点会直接在 anyio 工作线程里排队，跨进程文件锁
+        的 6 秒超时发生在拿到本锁之后，覆盖不到这里。超时按持久化失败
+        处理（``MemoryPersistenceError``，端点映射为可重试 503），而不是
+        无界占用共享线程池。RLock 可重入：同一线程的嵌套获取立即成功。
+        """
+        if not self._write_lock.acquire(
+            timeout=_IN_PROCESS_LOCK_TIMEOUT_SEC
+        ):
+            raise MemoryPersistenceError("长期记忆写锁等待超时：进程内写锁")
+        try:
+            yield
+        finally:
+            self._write_lock.release()
+
+    def _cleanup_orphan_temp_files(self) -> None:
+        """清理崩溃 / 断电遗留的原子写临时文件（调用方已持有进程内写锁）。
+
+        ``_save`` 在 mkstemp 与 replace 之间被强杀时，``.<user_id>.*.tmp``
+        会留下完整的记忆快照；此前只有 delete_all 顺带清理，账号存续期间
+        会永久累积。只删超过年龄阈值的条目（活跃写者的临时文件刚创建），
+        每个实例至多扫一次；失败静默，不影响正常写入。
+        """
+        if self._orphan_temps_checked:
+            return
+        self._orphan_temps_checked = True
+        cutoff = time.time() - _ORPHAN_TEMP_MIN_AGE_SEC
+        prefix = f".{self.user_id}."
+        try:
+            with os.scandir(os.path.dirname(self.db_path) or ".") as entries:
+                for entry in entries:
+                    if not (
+                        entry.name.startswith(prefix)
+                        and entry.name.endswith(".tmp")
+                    ):
+                        continue
+                    try:
+                        if entry.stat().st_mtime < cutoff:
+                            os.remove(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            return
 
     def _load(self) -> dict[str, Any]:
         """从文件加载数据。
@@ -365,7 +424,7 @@ class LongTermMemory:
         实例的 ``os.replace``（WinError 5），并发写盘会被误报为失败。锁是
         可重入的，下方复核分支可安全再次进入。
         """
-        with self._write_lock:
+        with self._hold_write_lock():
             if os.path.exists(self.db_path):
                 try:
                     # 读句柄尽早关闭：Windows 上任何打开中的句柄都会让其它
@@ -632,6 +691,7 @@ class LongTermMemory:
                 while True:
                     try:
                         os.replace(temp_path, marker)
+                        fsync_parent_dir(marker)
                         return True
                     except OSError:
                         if time.monotonic() >= deadline:
@@ -871,7 +931,7 @@ class LongTermMemory:
 
     def reload(self) -> None:
         """重新从磁盘加载最新数据（供 CLI 并发复核等只读场景调用）。"""
-        with self._write_lock:
+        with self._hold_write_lock():
             self._reload_latest()
 
     def _reload_latest(self) -> None:
@@ -995,7 +1055,7 @@ class LongTermMemory:
             finally:
                 self._batch_depth -= 1
             return
-        with self._write_lock:
+        with self._hold_write_lock():
             try:
                 with file_lock(self.db_path):
                     self._ensure_corrupt_backed_up()
@@ -1040,7 +1100,7 @@ class LongTermMemory:
         待复核或文件已变（其它进程经原子替换写入）时返回 False，调用方
         走原有重建路径。只取按路径进程 RLock，不等待跨进程文件锁。
         """
-        with self._write_lock:
+        with self._hold_write_lock():
             if self._dirty or self._loaded_stat is None:
                 return False
             if (
@@ -1100,6 +1160,7 @@ class LongTermMemory:
                 out.flush()
                 os.fsync(out.fileno())
             os.replace(tmp_path, backup)
+            fsync_parent_dir(backup)
             tmp_path = None
         except OSError:
             logger.warning("无法备份迁移前的记忆文件：%s", self.db_path)
@@ -1406,6 +1467,9 @@ class LongTermMemory:
                 while True:
                     try:
                         os.replace(temp_path, self.db_path)
+                        # 目录项同步：临时文件 fsync 只保证内容落盘，POSIX
+                        # 上 rename 元数据掉电后仍可能丢失（Windows 为 no-op）
+                        fsync_parent_dir(self.db_path)
                         break
                     except OSError:
                         if time.monotonic() >= deadline:
@@ -1462,7 +1526,7 @@ class LongTermMemory:
         实例不是恢复入口（allow_quarantined）时不做任何事。"""
         if not self._allow_quarantined:
             return
-        with self._write_lock:
+        with self._hold_write_lock():
             try:
                 with file_lock(self.db_path):
                     # 与 _locked_mutation 同口径的写前损坏复核：_corrupt_pending
@@ -2781,7 +2845,7 @@ class LongTermMemory:
         接口每请求新建实例，构造时已全量解析过一次，无条件重载等于整份
         解析两遍），变了仍走 _reload_latest 的完整复核路径。
         """
-        with self._write_lock:
+        with self._hold_write_lock():
             if not self._disk_unchanged():
                 self._reload_latest()
             return {
@@ -2819,7 +2883,7 @@ class LongTermMemory:
         无需更新，不清空快照的话，同一实例的下一次写入会把已删除的数据
         整份写回。
         """
-        with self._write_lock:
+        with self._hold_write_lock():
             try:
                 with file_lock(self.db_path):
                     # 归属复核：陈旧实例（大小写变体）不能删掉另一账号的

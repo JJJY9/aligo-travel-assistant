@@ -1524,6 +1524,85 @@ def test_chat_incomplete_idempotency_marker_returns_409():
     print("✓ 未完成幂等标记返回 409")
 
 
+def test_chat_incomplete_marker_prefers_deleted_session_404():
+    """未完成标记与「会话已删除」同时成立：与流式端点一致返回 404。"""
+    from utils.idempotency import make_key
+
+    client = _client()
+    user_id = _unique_user("web_test_idem_incomplete_del")
+    session_id = "sess-idem-incomplete-del"
+    state = client.app.state.aligo
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "session_id": session_id,
+            "idempotency_key": "req-incomplete-del",
+        }
+        key = make_key(
+            user_id,
+            session_id,
+            "req-incomplete-del",
+            endpoint="chat",
+            message="你好",
+        )
+        state.idempotency.put(
+            key,
+            {
+                "session_id": session_id,
+                "__incomplete__": True,
+                "message": "上一请求已处理但响应未送达，请刷新会话历史",
+            },
+        )
+        state.mark_deleted(user_id, session_id)
+        response = client.post("/api/chat", json=payload)
+        assert response.status_code == 404, response.text
+        assert "已删除" in response.json()["detail"]
+        assert "X-Idempotent-Replay" not in response.headers
+    finally:
+        state.unmark_deleted(user_id, session_id)
+        _cleanup(user_id)
+    print("✓ 未完成标记 + 会话删除优先返回 404")
+
+
+def test_persist_guard_skips_pending_tombstone_replay(monkeypatch):
+    """存储落库守卫不触发待补写墓碑的补写（避免在写锁内做数十次 Redis 往返）。"""
+    client = _client()
+    state = client.app.state.aligo
+    calls = {"n": 0}
+
+    monkeypatch.setattr(
+        state, "_maybe_replay_pending", lambda: calls.__setitem__("n", calls["n"] + 1)
+    )
+    assert state.is_recently_deleted("u-guard", "s-guard", replay_pending=False) is False
+    assert calls["n"] == 0, "落库守卫路径不能补写墓碑"
+    state.is_recently_deleted("u-guard", "s-guard")
+    assert calls["n"] == 1, "入口检查仍负责补写"
+    print("✓ 落库守卫跳过待补写墓碑")
+
+
+def test_chat_lock_released_when_disconnect_probe_raises():
+    """拿到用户锁后断连探测抛异常：锁必须归还，不能永久 locked。"""
+    import asyncio
+
+    from webapp.server import _acquire_chat_lock
+
+    class _BoomRequest:
+        async def is_disconnected(self):
+            raise RuntimeError("receive boom")
+
+    async def scenario():
+        lock = asyncio.Lock()
+        with pytest.raises(RuntimeError):
+            await _acquire_chat_lock(_BoomRequest(), lock, "rid-boom")
+        assert lock.locked() is False, "异常路径也必须释放用户锁"
+        await lock.acquire()
+        lock.release()
+
+    asyncio.run(scenario())
+    print("✓ 断连探测异常时归还用户锁")
+
+
 def test_leased_streaming_response_settles_after_drain():
     """流式响应在 stop_turn（drain）之后才执行断连标记回调。"""
     from webapp.server import _LeasedStreamingResponse

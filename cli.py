@@ -11,6 +11,7 @@ import re
 import signal
 import sys
 import unicodedata
+from pathlib import Path
 from typing import Any
 
 # 添加项目根目录到路径
@@ -2862,15 +2863,16 @@ def run_knowledge_export_standalone(
     path = Path(target) if target else Path("exports") / "knowledge-export.json"
     # 与 trips-export / session-export 一致：默认不覆盖已有文件，
     # 避免把用户数据（如误把 data/memory/*.json 当作导出路径）静默替换
-    if path.exists() and not force:
-        print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
-        return 1
     try:
+        if not _claim_export_target(path, force):
+            print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
+            return 1
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(
             path, json.dumps(payload, ensure_ascii=False, indent=2)
         )
     except (OSError, UnicodeEncodeError) as exc:
+        _remove_export_placeholder(path, force)
         print(f"写入失败：{exc}")
         return 1
     print(f"已导出 {len(documents)} 条知识片段到 {path}")
@@ -5678,14 +5680,15 @@ def run_session_export_standalone(
         )
     )
     try:
-        # 超长 / 非法默认名在 exists() 阶段也可能抛 OSError（ENAMETOOLONG），
+        # 超长 / 非法默认名在占名阶段也可能抛 OSError（ENAMETOOLONG），
         # 与写入失败同一提示，而不是未捕获 traceback
-        if path.exists() and not force:
+        if not _claim_export_target(path, force):
             print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
             return 1
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, text)
     except (OSError, UnicodeEncodeError) as exc:
+        _remove_export_placeholder(path, force)
         print(f"写入失败：{exc}")
         return 1
     print(f"已导出会话 {session_id} 到 {path}（{len(messages)} 条消息）")
@@ -5772,13 +5775,14 @@ def run_sessions_export_standalone(
         if target
         else Path("exports") / f"aligo_sessions_{safe_user}{suffix}"
     )
-    if path.exists() and not force:
-        print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
-        return 1
     try:
+        if not _claim_export_target(path, force):
+            print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
+            return 1
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, text)
     except (OSError, UnicodeEncodeError) as exc:
+        _remove_export_placeholder(path, force)
         print(f"写入失败：{exc}")
         return 1
     print(f"已导出 {count} 个会话到 {path}（{exported_messages} 条消息）")
@@ -5936,16 +5940,17 @@ def run_trips_export_standalone(
         return 0
 
     path = Path(target) if target else Path("exports") / default_name
-    if path.exists() and not force:
-        print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
-        return 1
     try:
+        if not _claim_export_target(path, force):
+            print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
+            return 1
         path.parent.mkdir(parents=True, exist_ok=True)
         if ics:
             write_bytes_atomic(path, text.encode("utf-8"))
         else:
             write_text_atomic(path, text)
     except (OSError, UnicodeEncodeError) as exc:
+        _remove_export_placeholder(path, force)
         print(f"写入失败：{exc}")
         return 1
     suffix = "（iCalendar）" if ics else ("（HTML）" if html else "")
@@ -6106,12 +6111,13 @@ def run_trip_calendar_standalone(
         )
     )
     try:
-        if path.exists() and not force:
+        if not _claim_export_target(path, force):
             print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
             return 1
         path.parent.mkdir(parents=True, exist_ok=True)
         write_bytes_atomic(path, text.encode("utf-8"))
     except (OSError, UnicodeEncodeError) as exc:
+        _remove_export_placeholder(path, force)
         print(f"写入失败：{exc}")
         return 1
     print(f"已导出行程 {trip_id} 的日历到 {path}（iCalendar）")
@@ -7554,6 +7560,34 @@ def _safe_export_component(value: str, fallback: str = "user") -> str:
     from utils.exporter import safe_export_component
 
     return safe_export_component(value, fallback)
+
+
+def _claim_export_target(path: Path, force: bool) -> bool:
+    """非 ``--force`` 导出的原子占名；已存在返回 False。
+
+    「先 ``exists()`` 检查、再原子替换」在并发下是 TOCTOU：两个实例都
+    可能通过检查，后者静默覆盖先写者的完整快照。改与 user-export 同一
+    实现（``O_CREAT|O_EXCL`` 占名），已存在就按原有文案拒绝。
+    """
+    from utils.exporter import claim_export_path
+
+    if force:
+        return True
+    return claim_export_path(path)
+
+
+def _remove_export_placeholder(path: Path, force: bool) -> None:
+    """写入失败时清掉非 ``--force`` 导出占下的空占位文件。
+
+    否则正式导出名上会留下 0 字节文件，后续导出永远报「文件已存在」，
+    并发读取者（备份脚本 / rsync）还可能把它当成有效备份。
+    """
+    if force:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
 
 
 def _print_stdout(text: str, end: str = "\n") -> None:

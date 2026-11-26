@@ -26,6 +26,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from utils.atomic_write import fsync_parent_dir, replace_with_retry
 from utils.paths import default_data_root, package_root
 
 logger = logging.getLogger(__name__)
@@ -157,7 +158,10 @@ class CheckpointStore:
                 json.dump(payload, handle, ensure_ascii=False)
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_name, path)
+            # Windows 上检查点文件被其它进程短暂打开时 replace 会
+            # PermissionError（与长期记忆 _save 同口径的有界重试）
+            replace_with_retry(temp_name, path)
+            fsync_parent_dir(path)
         except Exception:
             try:
                 Path(temp_name).unlink()

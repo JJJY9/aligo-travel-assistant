@@ -73,11 +73,15 @@ def file_lock(path: str, timeout: float = DEFAULT_TIMEOUT_SEC) -> Iterator[None]
         # 裸 OSError 会被重试层当成可重试的网络错误
         raise TimeoutError(f"无法获取文件锁：{lock_path}（{exc}）") from exc
     try:
+        _acquire(handle, timeout)
         try:
+            # 补预置字节必须在拿到锁之后：Windows 字节锁会把 [0,1) 区段
+            # 锁住，另一个进程此时对同区段 write/flush 会 PermissionError。
+            # 加锁本身允许区段越过 EOF（空文件可直接锁），所以先锁后补。
             _ensure_lockable(handle)
         except OSError as exc:
+            # 补字节失败按「拿不到锁」处理；锁由 finally 关闭句柄释放
             raise TimeoutError(f"无法获取文件锁：{lock_path}（{exc}）") from exc
-        _acquire(handle, timeout)
         try:
             yield
         finally:

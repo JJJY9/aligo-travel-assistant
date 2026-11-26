@@ -76,6 +76,29 @@ class _ApplyThenTimeout:
         return 0
 
 
+class _ApplyThenRenewRedis:
+    """SET 已在服务端生效但响应超时；续期脚本按 token 校验后返回成功。"""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+        self.renew_ok = 0
+
+    def set(self, key, value, nx=False, ex=None):
+        self.store[key] = value
+        raise TimeoutError("set response timeout")
+
+    def eval(self, script, numkeys, key, *args):
+        if self.store.get(key) != args[0]:
+            return 0
+        if "DEL" in script:
+            del self.store[key]
+            return 1
+        if "EXPIRE" in script:
+            self.renew_ok += 1
+            return 1
+        return 0
+
+
 def test_factory_failure_falls_back_to_local():
     """客户端工厂自身失败：本次回退进程内锁，degraded 标记为 True。"""
     from utils.redis_lock import _LOCAL_TOKEN
@@ -391,6 +414,65 @@ def test_transient_renew_failure_keeps_lock():
 
 
 
+def test_heartbeat_start_failure_rolls_back(monkeypatch):
+    """心跳线程起不来时回滚：不留「本地锁已持有但调用方拿不到 token」的半状态。"""
+    client = _FlakyRedis()
+    lock = DistributedLock(client, "aligo:test:hb-start-fail", ttl_sec=30)
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", boom)
+    with pytest.raises(RuntimeError):
+        lock.acquire()
+    assert lock._local.locked() is False, "acquire 失败必须归还进程内锁"
+    assert "aligo:test:hb-start-fail" not in client.store, "已生效的键要尽力清理"
+    assert lock._heartbeat_thread is None, "半状态的心跳登记也要清掉"
+
+    monkeypatch.undo()
+    token = lock.acquire()
+    assert token, "回滚后必须能再次加锁（不能永久占住本地互斥）"
+    lock.release(token)
+    print("✓ 心跳线程启动失败时回滚本地锁与键")
+
+
+def test_heartbeat_start_failure_on_degraded_path_rolls_back(monkeypatch):
+    """SET 超时但可能已生效的降级路径：启动心跳失败同样回滚并清理键。"""
+    client = _ApplyThenTimeout()
+    lock = DistributedLock(client, "aligo:test:hb-start-fail-degraded", ttl_sec=30)
+
+    def boom(self):
+        raise RuntimeError("can't start new thread")
+
+    monkeypatch.setattr(threading.Thread, "start", boom)
+    with pytest.raises(RuntimeError):
+        lock.acquire()
+    assert lock._local.locked() is False
+    assert "aligo:test:hb-start-fail-degraded" not in client.store
+    print("✓ 降级路径心跳启动失败回滚")
+
+
+def test_set_timeout_degraded_clears_after_successful_renew():
+    """续期成功证明本实例确实持有共享键：SET 超时置位的 degraded 应解除。"""
+    client = _ApplyThenRenewRedis()
+    lock = DistributedLock(client, "aligo:test:ambiguous-renew", ttl_sec=1)
+    token = lock.acquire()
+    assert token and token != "__local__"
+    assert lock.degraded is True, "SET 超时先按降级处理"
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and client.renew_ok == 0:
+        time.sleep(0.05)
+    assert client.renew_ok >= 1, "持有期间应续期成功"
+    time.sleep(0.05)
+    assert lock.lost is False
+    assert lock.degraded is False, "续期成功应解除降级判定（评测结果不被误标并发）"
+
+    lock.release(token)
+    assert "aligo:test:ambiguous-renew" not in client.store
+    print("✓ SET 超时后成功续期解除降级标记")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_cross_instance_lock": "需要真实 Redis（TEST_REDIS_URL）",
 }
@@ -413,6 +495,17 @@ if __name__ == "__main__":
     test_heartbeat_marks_lost_after_renew_outage()
     test_transient_renew_failure_keeps_lock()
     test_stale_renewal_does_not_mark_new_hold_lost()
+    test_set_timeout_degraded_clears_after_successful_renew()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_heartbeat_start_failure_rolls_back(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_heartbeat_start_failure_on_degraded_path_rolls_back(_mp)
+    finally:
+        _mp.undo()
     print("\n全部通过（Redis 集成用例需 TEST_REDIS_URL）")
     if _DIRECT_RUN_SKIP:
         print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

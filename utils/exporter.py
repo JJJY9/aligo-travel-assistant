@@ -210,6 +210,37 @@ def _export_stem(data: dict[str, Any]) -> str:
     return f"{user}_{timestamp or 'export'}"
 
 
+def _unlink_quiet(path: Path) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def claim_export_path(path: str | Path) -> bool:
+    """原子占名单个导出路径（``O_CREAT|O_EXCL`` 建空占位文件）。
+
+    已存在返回 False，调用方按「文件已存在」拒绝；成功返回 True，随后用
+    原子写覆盖占位文件。CLI 的 ``exists()`` 检查 + ``os.replace`` 是
+    TOCTOU：并发导出都可能在文件尚不存在时通过检查，后者静默覆盖先写者
+    的完整快照。占名与 :func:`_claim_export_paths` 同一口径。
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    try:
+        os.close(fd)
+    except BaseException:
+        # 占位文件已建立但 close 失败（EIO/ENOSPC 等）：自清后再上抛，
+        # 避免在正式导出名上留下 0 字节文件
+        _unlink_quiet(target)
+        raise
+    return True
+
+
 def _claim_export_paths(out: Path, stem: str) -> tuple[Path, Path]:
     """原子占用一对尚未存在的 ``(json, md)`` 路径。
 
@@ -228,14 +259,29 @@ def _claim_export_paths(out: Path, stem: str) -> tuple[Path, Path]:
         except FileExistsError:
             index += 1
             continue
-        os.close(fd)
+        try:
+            os.close(fd)
+        except BaseException:
+            _unlink_quiet(json_path)
+            raise
         try:
             fd = os.open(md_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
-            os.unlink(json_path)
+            _unlink_quiet(json_path)
             index += 1
             continue
-        os.close(fd)
+        except BaseException:
+            # 非撞名失败（ENOSPC/EDQUOT、同名目录的 PermissionError 等）：
+            # 调用方的 try 在占名之后，这里必须自清已占的 json，避免在
+            # 正式备份名下留下 0 字节文件
+            _unlink_quiet(json_path)
+            raise
+        try:
+            os.close(fd)
+        except BaseException:
+            _unlink_quiet(json_path)
+            _unlink_quiet(md_path)
+            raise
         return json_path, md_path
 
 

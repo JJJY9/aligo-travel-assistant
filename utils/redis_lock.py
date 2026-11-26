@@ -92,14 +92,27 @@ class DistributedLock:
             # SET 可能已在服务端生效：启动心跳（续期脚本按 token 校验归属，
             # 未真正持有键时不会续期别人的锁），否则长任务超过 TTL 后共享
             # 锁静默过期且 lost 永远为 False
-            self._start_heartbeat(token)
+            try:
+                self._start_heartbeat(token)
+            except BaseException:
+                # 心跳线程起不来（线程耗尽 / 解释器收尾）时不能让进程内锁
+                # 处于「已持有但调用方拿不到 token」的半状态：复用 release
+                # 归还本地锁并按 token 尽力清理可能已生效的键
+                self.release(token)
+                raise
             return token
         if not acquired:
             self._local.release()
             self.degraded = False
             return None
         self.degraded = False
-        self._start_heartbeat(token)
+        try:
+            self._start_heartbeat(token)
+        except BaseException:
+            # 同上：start() 抛异常时回滚，否则本地锁永久被占，后续 acquire
+            # 全部返回 None（评测端点恒定「已有评测在运行」直到重启）
+            self.release(token)
+            raise
         return token
 
     def release(self, token: str | None) -> None:
@@ -175,6 +188,16 @@ class DistributedLock:
                     stop.set()
                     return
                 last_ok = time.monotonic()
+                if (
+                    self.degraded
+                    and not stop.is_set()
+                    and self._heartbeat_stop is stop
+                ):
+                    # 续期脚本按 token 比对返回 1：本实例确实持有共享键。
+                    # 「SET 响应超时但已生效」的降级判定在此解除，避免评测
+                    # 结果整轮被误标为可能并发；旧续期（已被新持有取代）
+                    # 不得清掉新持有期 acquire 置位的 degraded
+                    self.degraded = False
 
         thread = threading.Thread(
             target=_renew, name=f"aligo-lock-{self._key}", daemon=True
@@ -191,5 +214,11 @@ class DistributedLock:
             self._heartbeat_thread = None
         if stop is not None:
             stop.set()
-        if thread is not None and thread is not threading.current_thread():
+        if (
+            thread is not None
+            and thread.ident is not None
+            and thread is not threading.current_thread()
+        ):
+            # ident 为 None 表示 start() 抛异常后的半状态：join 未启动的
+            # 线程会再抛 RuntimeError，掩盖 acquire 的回滚异常
             thread.join(timeout=2.0)
