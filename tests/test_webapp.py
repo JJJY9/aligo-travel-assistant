@@ -17005,6 +17005,252 @@ def test_lru_eviction_carries_pending_usage():
     print("✓ LRU 淘汰结转未结算用量")
 
 
+def test_weather_executor_threads_are_daemon_and_not_registered():
+    """天气池复用守护执行器：停服不被在途上游请求拖住。"""
+    from concurrent.futures.thread import _threads_queues
+    from webapp import server as server_module
+
+    executor = server_module._get_weather_executor()
+    try:
+        assert executor.submit(lambda: 1).result(timeout=5) == 1
+        threads = list(executor._threads)
+        assert threads and all(thread.daemon for thread in threads)
+        assert all(thread not in _threads_queues for thread in threads), (
+            "登记到 _threads_queues 会让 atexit 逐个 join，停服仍被天气请求拖住"
+        )
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+        server_module._weather_executor = None
+    print("✓ 天气执行器线程不参与 atexit join")
+
+
+def test_slow_body_on_api_times_out_with_408(monkeypatch):
+    """非导入接口的慢速上传在统一时限后 408 并关闭连接（Slowloris）。"""
+    from webapp import server as server_module
+
+    monkeypatch.setattr(server_module, "BODY_READ_TIMEOUT_SEC", 0.05)
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    events: list[tuple] = []
+
+    async def receive():
+        if not events:
+            events.append(("chunk",))
+            return {"type": "http.request", "body": b"{", "more_body": True}
+        await asyncio.sleep(10)
+        return {"type": "http.request", "body": b"}", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            headers = {k.lower(): v for k, v in message.get("headers") or []}
+            events.append((message["status"], headers.get(b"connection")))
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/api/chat",
+        "raw_path": b"/api/chat",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"testserver"),
+            (b"content-type", b"application/json"),
+            (b"content-length", b"2"),
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+    asyncio.run(app(scope, receive, send))
+    starts = [event for event in events if len(event) == 2]
+    assert starts and starts[-1][0] == 408, events
+    assert starts[-1][1] == b"close", events
+    print("✓ 慢速请求体 408 并关闭连接")
+
+
+def test_rejections_without_reading_body_close_connection():
+    """未读请求体的拒绝（405/404/307/Host 400）必须关闭连接。"""
+    client = _client()
+    for path, expected in (("/api/health", 405), ("/nope", 404)):
+        response = client.post(path, content=b'{"x": 1}')
+        assert response.status_code == expected, (path, response.text)
+        assert response.headers.get("connection") == "close", (
+            path,
+            response.headers,
+        )
+    redirect = client.post("/api/import/", content=b"{}", follow_redirects=False)
+    assert redirect.status_code in (307, 308), redirect.text
+    assert redirect.headers.get("connection") == "close", redirect.headers
+    rejected = client.post(
+        "/api/health", content=b"{}", headers={"Host": "evil.example"}
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert rejected.headers.get("connection") == "close", rejected.headers
+    # 正常请求（无 body / body 已读尽）不得关闭连接
+    assert client.get("/api/health").headers.get("connection") != "close"
+    user = _unique_user("web_test_unread_body")
+    try:
+        ok = client.put(
+            "/api/preferences/hotel_brand",
+            json={"user_id": user, "value": "汉庭"},
+        )
+        assert ok.status_code in (200, 201), ok.text
+        assert ok.headers.get("connection") != "close", ok.headers
+    finally:
+        _cleanup(user)
+    print("✓ 未读请求体的拒绝关闭连接、正常请求保持 keep-alive")
+
+
+def test_head_probe_only_on_lightweight_routes(monkeypatch):
+    """HEAD 只补在轻量探活路由上：导出 / 上游类 GET 不得被探测完整执行。"""
+    from webapp import server as server_module
+
+    loads: list = []
+    monkeypatch.setattr(
+        server_module,
+        "_load_user_data",
+        lambda *args, **kwargs: loads.append(args) or {},
+    )
+    fetched: list = []
+    monkeypatch.setattr(
+        server_module,
+        "fetch_weather",
+        lambda *args, **kwargs: fetched.append(args) or {},
+    )
+    client = _client()
+    user = _unique_user("web_test_head_probe")
+    export = client.head("/api/export", params={"user_id": user})
+    assert export.status_code == 405, export.text
+    assert not loads, "HEAD 不应执行完整导出读取"
+    weather = client.head("/api/weather", params={"city": "北京"})
+    assert weather.status_code == 405, weather.text
+    assert not fetched, "HEAD 不应触发真实上游天气请求"
+    for path in ("/", "/api/health", "/api/metrics", "/metrics"):
+        assert client.head(path).status_code == 200, path
+    print("✓ HEAD 仅用于轻量探活路由")
+
+
+def test_export_abort_recorded_as_499_and_slot_released():
+    """导出流被客户端中断：按 499 记账、导出槽释放。"""
+    from utils.metrics import REQUEST_METRICS
+
+    REQUEST_METRICS.reset()
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    user = _unique_user("web_test_export_abort")
+    events: list = []
+
+    async def receive():
+        await asyncio.sleep(0)
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            events.append(message["status"])
+        if message["type"] == "http.response.body" and message.get("body"):
+            raise OSError("broken pipe")
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/api/export",
+        "raw_path": b"/api/export",
+        "query_string": f"user_id={user}".encode(),
+        "headers": [
+            (b"host", b"127.0.0.1"),
+            (b"x-aligo-client", b"web"),
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("127.0.0.1", 80),
+    }
+    try:
+        asyncio.run(app(scope, receive, send))
+    except OSError:
+        pass
+    snapshot = REQUEST_METRICS.snapshot()
+    assert 200 in events, events
+    assert snapshot["by_status"].get("499") == 1, snapshot
+    assert "200" not in snapshot["by_status"], snapshot
+    acquired = state.export_slots.acquire(blocking=False)
+    assert acquired, "中断的导出必须释放并发槽位"
+    if acquired:
+        state.export_slots.release()
+    REQUEST_METRICS.reset()
+    _cleanup(user)
+    print("✓ 导出断连记 499 并释放导出槽")
+
+
+def test_lease_request_cancel_is_idempotent():
+    """生成器 finally 与 stop_turn 共用「回合只取消一次」守卫。"""
+    from webapp.server import _SessionTurnLease
+
+    class _Task:
+        def __init__(self):
+            self.cancels = 0
+
+        def done(self):
+            return False
+
+        def cancel(self):
+            self.cancels += 1
+
+        def __await__(self):
+            if False:  # pragma: no cover - 只用于成为生成器
+                yield
+            return None
+
+    class _Sess:
+        runtime = None
+
+        def end_turn(self):
+            pass
+
+    async def scenario():
+        lock = asyncio.Lock()
+        await lock.acquire()
+        lease = _SessionTurnLease(lock, _Sess())
+        task = _Task()
+        lease.bind_turn(task)
+        lease.request_cancel()
+        await lease.stop_turn()
+        assert task.cancels == 1, task.cancels
+        lease.release()
+        assert not lock.locked()
+
+    asyncio.run(scenario())
+    print("✓ 租约 request_cancel 幂等（stop_turn 不重复取消）")
+
+
+def test_close_all_skips_in_use_sessions():
+    """停机收尾不关闭仍有在途回合的会话（落库线程仍需存储连接）。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+
+    class _Sess:
+        def __init__(self, busy):
+            self.busy = busy
+            self.closed = False
+
+        def in_use(self):
+            return self.busy
+
+        def close(self):
+            self.closed = True
+
+    busy = _Sess(True)
+    idle = _Sess(False)
+    state.sessions["a"] = busy
+    state.sessions["b"] = idle
+    state.close_all()
+    assert busy.closed is False, "在途会话关闭会打断落库并可能卡在等锁"
+    assert idle.closed is True
+    assert not state.sessions
+    print("✓ close_all 跳过在途会话")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理
