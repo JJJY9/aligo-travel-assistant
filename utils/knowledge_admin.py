@@ -71,6 +71,40 @@ _DERIVED_CHUNK_KEYS = {
     "retrieved_parts",
     "parts_abnormal",
 }
+# 服务端自己维护、不由用户编辑的内部键：分片派生标记 + 内置文档编辑标记。
+# 它们不占用户的 10 键额度，面板回传时要先丢弃、快照比较时也要剔除——
+# 否则 10 个用户键的片段首次保存被追加 user_edited 后变 11 键，面板此后
+# 每次保存都在校验阶段 422，正文与分类都无法再修改
+_INTERNAL_META_KEYS = _DERIVED_CHUNK_KEYS | {"user_edited"}
+# 导入清洗时原样保留的内部键：分片标记 + 编辑标记。检索侧诊断键
+# （missing_parts 等）即使出现在备份里也不能入库——回答 prompt 会把它
+# 当成真实的缺片标记
+_PERSISTED_INTERNAL_KEYS = {"part", "parts", "group", "user_edited"}
+
+
+def _bounded_metadata(metadata: dict[str, Any]) -> dict[str, str]:
+    """导入清洗：保留最多 10 个用户键 + 持久化内部键。
+
+    此前按 ``list(items)[:10]`` 截断：内部键（user_edited 等）排在后面时
+    与用户键一起被丢弃，导出→导入会静默丢编辑标记（init 重建还原用户
+    编辑）或 category/title。
+    """
+    bounded: dict[str, str] = {}
+    user_keys = 0
+    for meta_key, meta_value in metadata.items():
+        key_text = str(meta_key)[:METADATA_KEY_MAX_CHARS]
+        value_text = str(meta_value)[:METADATA_VALUE_MAX_CHARS]
+        if key_text in _PERSISTED_INTERNAL_KEYS:
+            bounded[key_text] = value_text
+            continue
+        if key_text in _INTERNAL_META_KEYS:
+            continue
+        if user_keys < _METADATA_MAX_KEYS:
+            bounded[key_text] = value_text
+            user_keys += 1
+    return bounded
+
+
 class _ReadWriteLock:
     """读写锁：读并发、写独占，读写都有界等待（防止钉死共享线程池）。
 
@@ -518,7 +552,13 @@ def _restore_pieces(parts: Any, fallback: str) -> list[str]:
 
 
 def _validate_metadata_lengths(metadata: dict[str, Any]) -> None:
-    """元数据键 / 值长度与 Web 接口共享同一上限，超长直接拒绝（不静默截断）。"""
+    """元数据键 / 值长度与键数上限，超限直接拒绝（不静默截断）。
+
+    键数上限此前只在 Web schema 与导入截断上执行：CLI kb-update 合并库内
+    元数据后可写出 11+ 键，该片段在面板随后每次保存都 422。内部键
+    （分片标记 / user_edited）不占用户的 10 键额度。
+    """
+    user_keys = 0
     for meta_key, meta_value in metadata.items():
         key_text = str(meta_key)
         if len(key_text) > METADATA_KEY_MAX_CHARS:
@@ -529,6 +569,13 @@ def _validate_metadata_lengths(metadata: dict[str, Any]) -> None:
             raise ValueError(
                 f"元数据值不能超过 {METADATA_VALUE_MAX_CHARS} 字（键 {key_text}）"
             )
+        if key_text not in _INTERNAL_META_KEYS:
+            user_keys += 1
+    if user_keys > _METADATA_MAX_KEYS:
+        raise ValueError(
+            f"元数据最多 {_METADATA_MAX_KEYS} 个键（当前 {user_keys} 个），"
+            "请合并或删除多余字段"
+        )
 
 
 def _chunk_documents(
@@ -731,7 +778,7 @@ def _locked_user_snapshot_details(
         return {
             str(key): str(value)
             for key, value in meta.items()
-            if key not in _DERIVED_CHUNK_KEYS
+            if key not in _INTERNAL_META_KEYS
         }
 
     if not group:
@@ -789,35 +836,46 @@ def _apply_per_part_metadata(
     documents: list[dict[str, Any]],
     submitted: dict[str, str] | None,
     per_part_metas: list[dict[str, str]],
+    reference: dict[str, str] | None = None,
 ) -> None:
     """整组重建时保留逐片用户元数据，只把真正改动的字段应用到全组。
 
     面板「编辑整份文档」回填的是被点击分片的元数据；若把这份元数据原样
     复制给每个新分片，内置文档的「… (Part N)」标题与导入备份里逐片不同
     的 category/title 会被整体压平成被点击片的值。这里以旧第 i 片元数据
-    为底，仅把调用方相对「被点击片」（与提交值重合键最多的一片）改动过
-    的字段应用到所有分片；分片数变化时按同一约定重建标题的 Part 后缀。
+    为底，仅把调用方相对「被点击片」改动过的字段应用到所有分片；分片数
+    变化时按同一约定重建标题的 Part 后缀。
+
+    ``reference`` 是被点击片的权威旧元数据（调用方在写锁内已读到）：
+    不传时才退回「与提交值重合键最多的一片」。按重合键猜测在逐片元数据
+    不同时会选错片——用户把后一片的分类改成前一片已有的值时，改动相对
+    错误参考片为空、被静默丢弃，接口仍返回成功。
     """
     if not per_part_metas:
         return
     wanted = {
         str(key): str(value)
         for key, value in (submitted or {}).items()
-        if key not in _DERIVED_CHUNK_KEYS
+        if key not in _INTERNAL_META_KEYS
     }
 
     def _overlap(meta: dict[str, str]) -> int:
         return sum(1 for key, value in wanted.items() if meta.get(key) == value)
 
-    reference = max(per_part_metas, key=_overlap)
+    if reference is not None:
+        base_reference = {str(key): str(value) for key, value in reference.items()}
+    else:
+        base_reference = max(per_part_metas, key=_overlap)
     changed = {
-        key: value for key, value in wanted.items() if reference.get(key) != value
+        key: value
+        for key, value in wanted.items()
+        if base_reference.get(key) != value
     }
-    removed = [key for key in reference if key not in wanted]
+    removed = [key for key in base_reference if key not in wanted]
     total = len(documents)
     for index, document in enumerate(documents):
         base = dict(
-            per_part_metas[index] if index < len(per_part_metas) else reference
+            per_part_metas[index] if index < len(per_part_metas) else base_reference
         )
         for key in removed:
             base.pop(key, None)
@@ -884,10 +942,11 @@ def update_document(
         wanted_meta = {
             str(key): str(value)
             for key, value in (metadata or {}).items()
-            if key not in _DERIVED_CHUNK_KEYS
+            if key not in _INTERNAL_META_KEYS
         }
         return (
-            _normalize_newlines(text) == _normalize_newlines(current_text)
+            _normalize_newlines(text).strip()
+            == _normalize_newlines(current_text).strip()
             and wanted_meta == current_meta
         )
 
@@ -985,8 +1044,8 @@ def update_document(
         if (
             expect_content is not None
             and snapshot is not None
-            and _normalize_newlines(expect_content.strip())
-            != _normalize_newlines(snapshot[0])
+            and _normalize_newlines(expect_content).strip()
+            != _normalize_newlines(snapshot[0]).strip()
         ):
             raise DocumentConflictError(
                 "知识片段已在其他会话被修改，请刷新后重新编辑"
@@ -997,14 +1056,19 @@ def update_document(
             expected_meta = {
                 str(key): str(value)
                 for key, value in expect_metadata.items()
-                if key not in _DERIVED_CHUNK_KEYS
+                if key not in _INTERNAL_META_KEYS
             }
             if expected_meta != snapshot[1]:
                 raise DocumentConflictError(
                     "知识片段已在其他会话被修改（元数据已变化），"
                     "请刷新后重新编辑"
                 )
-        _apply_per_part_metadata(documents, metadata, per_part_metas)
+        _apply_per_part_metadata(
+            documents,
+            metadata,
+            per_part_metas,
+            snapshot_details[1] if snapshot_details is not None else None,
+        )
         # 旧组成员在写入前扫描：扫描失败时还没有插入任何新分片，不会留下
         # 无法补偿的孤儿新 group（此前覆盖目标后才扫描，失败即残留）
         old_ids: list[int] = []
@@ -2084,6 +2148,22 @@ def import_documents(
         # 先写入的一篇，不能把第二套 part 1..N 塞进同一组
         planned_groups: set[str] = set()
         problems: list[dict[str, Any]] = []
+        # 逐组明细与日志同样受 _PROBLEMS_MAX 约束：恶意 / 大量冲突备份不能
+        # 让响应与日志随组数线性放大（片数仍完整累计在汇总行）
+        overflow_groups = 0
+        overflow_parts = 0
+
+        def _append_problem(entry: dict[str, Any]) -> None:
+            nonlocal overflow_groups, overflow_parts
+            if len(problems) < _PROBLEMS_MAX:
+                problems.append(entry)
+            else:
+                overflow_groups += 1
+                try:
+                    overflow_parts += int(entry.get("parts") or 0)
+                except (TypeError, ValueError):
+                    pass
+
         layout_cache: dict[str, Any] = {}
         if ignore_existing:
             # 空库规划：库内布局恒为空，不能触发对真实库的扫描
@@ -2203,10 +2283,7 @@ def import_documents(
                 continue
             metadata = item.get("metadata")
             metadata = metadata if isinstance(metadata, dict) else {}
-            sanitized_meta = {
-                str(key)[:METADATA_KEY_MAX_CHARS]: str(value)[:METADATA_VALUE_MAX_CHARS]
-                for key, value in list(metadata.items())[:_METADATA_MAX_KEYS]
-            }
+            sanitized_meta = _bounded_metadata(metadata)
             # 长内容拆成 ≤400 字的片段：每段都会被嵌入，尾部内容不再不可检索；
             # 备份还原的拼接长度等于 strip 后总长，交给下面的 DOC_MAX_CHARS 校验
             limit = _IMPORT_CONTENT_MAX_CHARS
@@ -2265,12 +2342,7 @@ def import_documents(
                         candidate = restored_metas[source_index]
                         extra_meta = candidate if isinstance(candidate, dict) else None
                     if extra_meta is not None:
-                        meta = {
-                            str(meta_key)[:32]: str(meta_value)[:200]
-                            for meta_key, meta_value in list(extra_meta.items())[
-                                :_METADATA_MAX_KEYS
-                            ]
-                        }
+                        meta = _bounded_metadata(extra_meta)
                     else:
                         meta = dict(sanitized_meta)
                     if total_parts > 1:
@@ -2315,7 +2387,7 @@ def import_documents(
             if doc_group and doc_group in planned_groups:
                 existing_counts.update(consumed)
                 conflict += len(missing)
-                problems.append(
+                _append_problem(
                     {
                         "group": doc_group,
                         "reason": (
@@ -2342,7 +2414,7 @@ def import_documents(
                     )
                     existing_counts.update(consumed)
                     conflict += len(missing)
-                    problems.append(
+                    _append_problem(
                         {
                             "group": doc_group,
                             "reason": (
@@ -2374,7 +2446,7 @@ def import_documents(
                     )
                     existing_counts.update(consumed)
                     conflict += len(missing)
-                    problems.append(
+                    _append_problem(
                         {
                             "group": doc_group,
                             "reason": (
@@ -2456,7 +2528,7 @@ def import_documents(
                     )
                     existing_counts.update(consumed)
                     conflict += len(missing)
-                    problems.append(
+                    _append_problem(
                         {
                             "group": doc_group,
                             "reason": (
@@ -2498,7 +2570,7 @@ def import_documents(
                         )
                         existing_counts.update(consumed)
                         conflict += len(missing)
-                        problems.append(
+                        _append_problem(
                             {
                                 "group": doc_group,
                                 "reason": (
@@ -2524,6 +2596,17 @@ def import_documents(
             for missing_piece in missing:
                 existing_counts[missing_piece["content"].strip()] += 1
             unique.extend(missing)
+        if overflow_groups:
+            problems.append(
+                {
+                    "group": "",
+                    "reason": (
+                        f"另有 {overflow_groups} 个分组因冲突被跳过"
+                        "（明细过多未逐条展开）"
+                    ),
+                    "parts": overflow_parts,
+                }
+            )
         if not unique:
             result: dict[str, Any] = {
                 "imported": 0,

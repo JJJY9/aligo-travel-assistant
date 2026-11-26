@@ -553,10 +553,13 @@ class RAGKnowledgeAgent(AgentBase):
         chosen = question_parts[-1] if question_parts else parts[-1]
         if len(chosen) > 200:
             chosen = chosen[-200:]
+        # 与检索日志的 #587 隐私口径一致：查询原文（用户问题）不进日志，
+        # 只记长度与 token 数（WARNING 在默认日志级别下同样会落盘）
         logger.warning(
-            "查询超过嵌入模型上下文（%d tokens），改用末句检索: %s",
+            "查询超过嵌入模型上下文（%d tokens > %d），改用末句检索（len=%d）",
             len(tokens),
-            chosen[:50],
+            max_len - 2,
+            len(chosen),
         )
         return chosen
 

@@ -4,6 +4,7 @@
 RAG Skill、Web 状态接口、CLI 与 doctor 共用同一套解析逻辑，避免各自维护
 路径导致“状态显示可用但检索为空”的分歧。
 """
+import os
 from pathlib import Path
 
 from utils.paths import default_data_root, is_source_checkout
@@ -76,3 +77,46 @@ def knowledge_db_path(directory: str | Path | None = None) -> Path:
     """返回 milvus_lite.db 的完整路径。"""
     base = Path(directory) if directory is not None else default_knowledge_dir()
     return base / "milvus_lite.db"
+
+
+def _windows_acp() -> int | None:
+    """Windows ANSI 代码页；非 Windows / 探测失败返回 None。"""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+
+        return int(ctypes.windll.kernel32.GetACP())
+    except Exception:  # noqa: BLE001 - 探测失败按非 UTF-8 处理
+        return 936
+
+
+def knowledge_path_encoding_hint(
+    path: str | Path,
+    *,
+    windows: bool | None = None,
+    acp: int | None = None,
+) -> str | None:
+    """知识库路径在 Windows 下含非 ASCII 字符时的修正提示（其余情况 None）。
+
+    仓库钉死的 pymilvus / milvus-lite 在 Windows 上把索引路径按 ANSI 代码页
+    传给 faiss：路径含中文时索引写盘失败，但同进程内 insert / 检索仍走内存
+    索引、初始化脚本自检全部通过；进程重启后集合加载必然失败。写入端没有
+    办法提前感知，只能在这里统一给出可操作的规避指引（init 提前失败、
+    状态接口把「重新运行初始化脚本」换成真实原因）。
+    """
+    is_windows = os.name == "nt" if windows is None else bool(windows)
+    if not is_windows:
+        return None
+    if str(path).isascii():
+        return None
+    code_page = _windows_acp() if acp is None else acp
+    if code_page == 65001:
+        # 已启用「Beta: 使用 Unicode UTF-8 提供全球语言支持」：ANSI 代码页
+        # 就是 UTF-8，faiss 按 ANSI 解释也能得到正确路径
+        return None
+    return (
+        "知识库路径含非 ASCII 字符，Windows 下 Milvus Lite 无法把索引写入磁盘"
+        "（重启后集合加载失败）；请把 ALIGO_DATA_DIR（或 ALIGO_SKILLS_DIR）"
+        "指向纯英文路径后重建知识库"
+    )

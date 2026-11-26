@@ -91,6 +91,7 @@ from utils.knowledge_admin import (
     JOINED_MAX_CHARS,
     METADATA_KEY_MAX_CHARS,
     METADATA_VALUE_MAX_CHARS,
+    _INTERNAL_META_KEYS,
     DocumentConflictError,
     add_document,
     cleanup_duplicate_contents,
@@ -1176,16 +1177,17 @@ class KnowledgeUpdatePayload(KnowledgeDocumentPayload):
     @field_validator("metadata", "expect_metadata", mode="before")
     @classmethod
     def _drop_derived_chunk_keys(cls, value: object) -> object:
-        """丢弃回传的派生分片元数据（part/parts/group）。
+        """丢弃回传的内部元数据键（part/parts/group、user_edited 等）。
 
-        面板整份编辑会把读到的完整 metadata 原样提交；这些派生键由服务端
-        按新分片重写，先丢弃再校验，避免 8+ 用户键的记录因 11 个键被 422。
+        面板整份编辑会把读到的完整 metadata 原样提交；这些键由服务端维护，
+        不占用户的 10 键额度，先丢弃再校验，避免 10 用户键的记录被服务端
+        追加 user_edited 后（11 键）面板每次保存都 422。
         """
         if isinstance(value, dict):
             return {
                 key: item
                 for key, item in value.items()
-                if key not in {"part", "parts", "group"}
+                if key not in _INTERNAL_META_KEYS
             }
         return value
 
@@ -5100,9 +5102,23 @@ def create_app(model: Any = None) -> FastAPI:
         的只读接口打满线程池）。
         """
         response.headers.update(_enforce_kb_rate_limit(state, request))
-        return knowledge_status(
+        status = knowledge_status(
             include_path=False, detail_errors=False, lock_timeout=0.5
         )
+        if status.get("dimension_mismatch"):
+            # 集合能读但维度与当前嵌入模型不一致：所有检索 / 问答入口都会
+            # 503「向量维度不一致」。芯片只按 available 渲染，不能显示健康
+            # 徽标——降级并把原因换成可直接执行的修复指引
+            status = {
+                **status,
+                "available": False,
+                "reason": (
+                    "知识库向量维度与当前嵌入模型不一致，请重新运行初始化"
+                    "脚本重建：python .claude/skills/ask-question/script/"
+                    "init_knowledge_base.py"
+                ),
+            }
+        return status
 
     @app.get("/api/knowledge/documents", dependencies=[Depends(_cross_site_side_effect)])
     @_kb_read_guard
@@ -5112,7 +5128,10 @@ def create_app(model: Any = None) -> FastAPI:
         limit: int = Query(default=20, ge=1, le=100),
         offset: int = Query(default=0, ge=0),
         q: str = Query(default="", max_length=100),
-        category: str = Query(default="", max_length=METADATA_VALUE_MAX_CHARS),
+        # 200 字只约束新写入；读侧必须能承载库内历史超长分类（旧版本写入），
+        # 否则选中该分类必得 422、分类筛选不可用。仅用于精确串比较，给传输
+        # 层量级上限即可
+        category: str = Query(default="", max_length=8192),
     ) -> dict[str, Any]:
         """列出知识片段（记忆面板的知识库维护）。
 
@@ -5489,9 +5508,14 @@ def create_app(model: Any = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 导出失败统一提示
             logger.warning("导出知识片段失败: %s", redact_paths(exc))
             raise _knowledge_unavailable("导出失败", exc) from exc
+        from utils.json_safe import strip_nul
+
         # 元数据里的 NaN / Infinity 会让产物不是合法 JSON（标准解析器
-        # 无法回读，kb-import 也拒绝）：与用户备份同口径清洗后再写出
-        documents = _json_safe_value(documents)
+        # 无法回读，kb-import 也拒绝）：与用户备份同口径清洗后再写出。
+        # sanitize_json 不处理 NUL，而导入端把含 NUL 的条目标为无效：
+        # 专用导出是「备份 / 换机」用途，必须与用户备份的 knowledge 段
+        # 一样剥离 NUL，否则导出→导入会静默丢片段
+        documents = strip_nul(_json_safe_value(documents))
         payload = {
             "version": 1,
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),

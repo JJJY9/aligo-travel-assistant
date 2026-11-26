@@ -2860,10 +2860,12 @@ def run_knowledge_export_standalone(
         return _fail(f"导出失败：{exc}")
 
     # 元数据里的 NaN / Infinity 会让产物不是合法 JSON（标准解析器无法
-    # 回读，kb-import 也拒绝）：与 Web 知识导出同口径清洗后再写出
-    from utils.json_safe import sanitize_json
+    # 回读，kb-import 也拒绝）：与 Web 知识导出同口径清洗后再写出。
+    # 导入端把含 NUL 的条目标为无效项，导出必须同样剥离 NUL，
+    # 否则导出→导入会静默丢片段
+    from utils.json_safe import sanitize_json, strip_nul
 
-    documents = sanitize_json(documents)
+    documents = strip_nul(sanitize_json(documents))
 
     from datetime import datetime, timezone
 

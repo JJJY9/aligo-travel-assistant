@@ -10,7 +10,11 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from utils.knowledge_paths import COLLECTION_NAME, default_knowledge_dir
+from utils.knowledge_paths import (
+    COLLECTION_NAME,
+    default_knowledge_dir,
+    knowledge_path_encoding_hint,
+)
 from utils.milvus_client import get_milvus_client
 
 logger = logging.getLogger(__name__)
@@ -101,13 +105,19 @@ def knowledge_status(
                 loader(collection)
             except Exception as exc:  # noqa: BLE001 - 加载失败即不可用
                 logger.warning("知识库集合加载失败：%s", type(exc).__name__)
+                reason = (
+                    "集合无法加载（索引损坏或版本不兼容），"
+                    "请重新运行初始化脚本"
+                )
+                # Windows 非 ASCII 路径下索引必然写盘失败，重跑初始化脚本
+                # 只会再次「成功」并再次损坏——直接给出真实原因与规避方式
+                hint = knowledge_path_encoding_hint(db)
+                if hint:
+                    reason = f"{reason}；{hint}"
                 return {
                     **base,
                     "available": False,
-                    "reason": (
-                        "集合无法加载（索引损坏或版本不兼容），"
-                        "请重新运行初始化脚本"
-                    ),
+                    "reason": reason,
                 }
         stats = client.get_collection_stats(collection)
         dimension = _collection_dimension(client, collection)

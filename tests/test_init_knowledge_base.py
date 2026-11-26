@@ -56,6 +56,9 @@ def _prepare_dirs(module, tmp):
     module._resolve_knowledge_source_dir = lambda knowledge_base_path: (
         knowledge_base_path
     )
+    # 临时目录可能位于中文用户名下（Windows）：路径编码守卫会提前退出，
+    # 与用例主题无关。每个用例重新加载模块，直接覆盖模块级引用即可
+    module.knowledge_path_encoding_hint = lambda path: None
 
 
 def test_main_returns_1_when_agent_not_initialized(monkeypatch):
@@ -164,6 +167,7 @@ def test_empty_documents_fail_before_agent(monkeypatch):
         (root / "data" / "documents").mkdir(parents=True)
         (root / "script").mkdir()
         module.current_dir = root / "script"
+        module.knowledge_path_encoding_hint = lambda path: None
         monkeypatch.setattr(module, "create_chat_model", lambda: None)
         monkeypatch.setattr(module, "RAGKnowledgeAgent", FakeAgent)
         out = io.StringIO()
@@ -192,6 +196,7 @@ def test_load_failure_aborts_before_agent(monkeypatch):
         (documents / "01_good.txt").write_text("正常内容", encoding="utf-8")
         (documents / "02_bad.txt").write_bytes("住宿标准".encode("gbk"))
         module.current_dir = root / "script"
+        module.knowledge_path_encoding_hint = lambda path: None
         monkeypatch.setattr(module, "create_chat_model", lambda: None)
         monkeypatch.setattr(module, "RAGKnowledgeAgent", FakeAgent)
         out = io.StringIO()
@@ -273,6 +278,7 @@ def test_multi_chunk_documents_carry_group_metadata():
         documents = root / "data" / "documents"
         documents.mkdir(parents=True)
         module.current_dir = root / "script"
+        module.knowledge_path_encoding_hint = lambda path: None
         long_text = "\n\n".join("第一段内容。" * 30 for _ in range(5))
         (documents / "01_long.txt").write_text(long_text, encoding="utf-8")
         (documents / "02_short.txt").write_text("短内容", encoding="utf-8")
@@ -329,9 +335,11 @@ def test_preserved_semantics_by_source(monkeypatch):
     edited_entry = next(
         piece for piece in preserved if piece["content"] == "我改过的内置内容"
     )
-    assert "source" not in edited_entry["metadata"]
-    assert "file_path" not in edited_entry["metadata"]
-    assert "user_edited" not in edited_entry["metadata"]
+    assert edited_entry["metadata"]["source"] == "商旅知识库文档"
+    assert edited_entry["metadata"]["file_path"] == "02_edited.txt"
+    # 受管标记必须保留：下一次重建才能继续识别为「被编辑的内置文档」
+    # 并跳过源文件；剥掉标记会把内置原文重新导回、与编辑版并存
+    assert edited_entry["metadata"]["user_edited"] == "1"
     assert edited_files == {"02_edited.txt"}
     assert any("手动编辑" in warning for warning in warnings), warnings
     assert any("残缺" in warning for warning in warnings), warnings
@@ -467,6 +475,132 @@ def test_export_failure_aborts_before_drop(monkeypatch):
             "旧部署 rag_knowledge/ 的知识永远不再迁移"
         )
     print("✓ 导出失败先于删库中止")
+
+
+def test_main_aborts_on_non_ascii_knowledge_path(monkeypatch):
+    """Windows 非 ASCII 路径：构造 Agent 之前退出 1（退出码 0 必须可用）。"""
+    module = _load_init_module()
+    built = {"n": 0}
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            built["n"] += 1
+            self.initialized = True
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dirs(module, tmp)
+        module.knowledge_path_encoding_hint = (
+            lambda path: "请把 ALIGO_DATA_DIR 指向纯英文路径后重建知识库"
+        )
+        monkeypatch.setattr(module, "create_chat_model", lambda: None)
+        monkeypatch.setattr(module, "RAGKnowledgeAgent", FakeAgent)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.main()
+        assert code == 1
+        assert "ALIGO_DATA_DIR" in out.getvalue()
+        assert built["n"] == 0, "路径编码守卫必须早于 Agent 构造"
+    print("✓ 非 ASCII 知识库路径提前失败")
+
+
+def test_unreadable_collection_error_classification():
+    """只有确定性不可加载的错误才走「移走旧库重建」恢复路径。"""
+    module = _load_init_module()
+    assert module._unreadable_collection_error(
+        RuntimeError("读取现有知识失败：Collection is in state 'released'")
+    )
+    assert module._unreadable_collection_error(
+        RuntimeError("This file contains pickled (object) data ... allow_pickle")
+    )
+    assert module._unreadable_collection_error(
+        RuntimeError("faiss FileIOWriter could not open index")
+    )
+    assert not module._unreadable_collection_error(RuntimeError("db locked"))
+    assert not module._unreadable_collection_error(
+        RuntimeError("Open local milvus failed")
+    )
+    print("✓ 不可加载错误分类（锁 / 连接错误保持中止语义）")
+
+
+def test_unreadable_collection_is_renamed_and_rebuilt(monkeypatch):
+    """旧集合无法加载时移走并重建，而不是让「重新运行初始化脚本」永远失败。"""
+    module = _load_init_module()
+    builds = {"n": 0}
+    dropped = []
+
+    class FakeAgent(_RebuildAgent):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            builds["n"] += 1
+            if builds["n"] == 1:
+
+                class _Existing(_FakeMilvus):
+                    def has_collection(self, name):
+                        return True
+
+                    def drop_collection(self, name):
+                        dropped.append(name)
+
+                self.milvus_client = _Existing()
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dirs(module, tmp)
+        kb = Path(tmp) / "skill" / "data" / "rag_knowledge"
+        (kb / "milvus_lite.db").mkdir(parents=True)
+        monkeypatch.setattr(module, "create_chat_model", lambda: None)
+        monkeypatch.setattr(module, "RAGKnowledgeAgent", FakeAgent)
+        import utils.knowledge_admin as admin_module
+
+        def unreadable(directory=None):
+            raise RuntimeError(
+                "读取现有知识失败：Collection 'business_travel_knowledge' "
+                "is in state 'released'; call load() before search/get/query"
+            )
+
+        monkeypatch.setattr(admin_module, "export_documents", unreadable)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.main()
+        assert code == 0, out.getvalue()
+        backups = list(kb.glob("milvus_lite.db.unreadable-*"))
+        assert len(backups) == 1, list(kb.iterdir())
+        assert "旧库已重命名为" in out.getvalue()
+        assert dropped == [], "恢复路径不应再对旧集合执行 drop_collection"
+    print("✓ 无法加载的旧库改名后重建成功")
+
+
+def test_preserved_edited_marker_survives_next_rebuild(monkeypatch):
+    """编辑标记跨重建保留：第二次重建仍跳过源文件，原文不会重新导入。"""
+    module = _load_init_module()
+    import utils.knowledge_admin as admin_module
+
+    first_rows = [
+        {
+            "content": "我改过的内置内容",
+            "metadata": {
+                "source": "商旅知识库文档",
+                "file_path": "02_edited.txt",
+                "user_edited": "1",
+            },
+        }
+    ]
+    monkeypatch.setattr(
+        admin_module, "export_documents", lambda directory=None: first_rows
+    )
+    preserved, _warnings, edited_files = module._collect_preserved_documents(
+        Path("/tmp/source-kb")
+    )
+    assert edited_files == {"02_edited.txt"}
+    # 第一轮保留下来的片段（原样写回库）作为第二轮重建的导出结果
+    monkeypatch.setattr(
+        admin_module, "export_documents", lambda directory=None: preserved
+    )
+    preserved2, _warnings2, edited_files2 = module._collect_preserved_documents(
+        Path("/tmp/source-kb")
+    )
+    assert edited_files2 == {"02_edited.txt"}, edited_files2
+    assert [piece["content"] for piece in preserved2] == ["我改过的内置内容"]
+    print("✓ 编辑标记跨重建保留（第二次重建仍跳过源文件）")
 
 
 def test_add_in_batches_retries_and_reports(monkeypatch):
@@ -792,6 +926,22 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_embedding_dim_unreadable_does_not_drop_collection(_mp)
+    finally:
+        _mp.undo()
+    test_unreadable_collection_error_classification()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_main_aborts_on_non_ascii_knowledge_path(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_unreadable_collection_is_renamed_and_rebuilt(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_preserved_edited_marker_survives_next_rebuild(_mp)
     finally:
         _mp.undo()
     if _DIRECT_RUN_SKIP:
