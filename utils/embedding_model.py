@@ -84,6 +84,59 @@ def configured_model_dimension(model_path: str | Path) -> int | None:
     return None
 
 
+def _model_dir_candidates(candidate: Path, anchor: Path) -> list[Path]:
+    """相对嵌入模型路径的候选锚点（顺序与 RAG 技能一致）。"""
+    candidates: list[Path] = []
+    try:
+        import config as _config
+
+        candidates.append(Path(_config.__file__).resolve().parent / candidate)
+    except Exception:  # noqa: BLE001 - 独立运行时没有 config
+        pass
+    try:
+        from utils.paths import default_data_root
+
+        candidates.append(default_data_root() / candidate)
+    except Exception:  # noqa: BLE001 - 旧版本无 utils.paths
+        pass
+    candidates.append(anchor / candidate)
+    candidates.append(Path.cwd() / candidate)
+    return candidates
+
+
+def default_embedding_model_dir() -> Path:
+    """按 RAG 技能的同一口径解析嵌入模型目录（不加载模型 / 不 import torch）。
+
+    与 ``RAGKnowledgeAgent._model_path_candidates`` 保持同序：config 模块
+    目录（源码仓库根）→ 运行期数据目录（wheel 用户目录 / ALIGO_DATA_DIR）
+    → 技能安装根 → 当前目录。doctor 与知识库状态接口共用本函数，避免
+    两边锚点漂移导致「doctor 告警、面板显示健康」的口径分裂。
+    """
+    from utils.skill_paths import resolve_skills_root
+
+    anchor = Path(resolve_skills_root()).parent.parent
+    configured = ""
+    try:
+        from config import RAG_CONFIG
+
+        configured = str(RAG_CONFIG.get("embedding_model") or "")
+    except Exception:  # noqa: BLE001 - 配置缺失时退回默认目录名
+        configured = ""
+    candidate = (
+        Path(configured).expanduser()
+        if configured
+        else Path("data") / "models" / "bge-small-zh-v1.5"
+    )
+    if candidate.is_absolute():
+        return candidate
+    for resolved in _model_dir_candidates(candidate, anchor):
+        if resolved.exists():
+            return resolved
+    # 都不存在：返回技能安装根口径（最接近历史行为，错误信息里的路径
+    # 仍是用户最可能放置模型的位置）
+    return anchor / candidate
+
+
 def get_embedding_model(model_path: str) -> Any:
     """返回共享的 SentenceTransformer（首次调用时加载并缓存）。
 

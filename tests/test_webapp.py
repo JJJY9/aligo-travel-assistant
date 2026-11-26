@@ -13665,21 +13665,51 @@ def test_knowledge_status_degrades_on_dimension_mismatch(monkeypatch):
     """维度与嵌入模型不一致时状态芯片不得显示健康（检索全部 503）。"""
     from webapp import server as server_module
 
-    monkeypatch.setattr(
-        server_module,
-        "knowledge_status",
-        lambda **kwargs: {
+    captured = {}
+
+    def fake_status(**kwargs):
+        captured.update(kwargs)
+        return {
             "available": True,
             "documents": 3,
             "dimension_mismatch": True,
-        },
-    )
+        }
+
+    monkeypatch.setattr(server_module, "knowledge_status", fake_status)
     response = _client().get("/api/knowledge")
     assert response.status_code == 200
     body = response.json()
     assert body["available"] is False
     assert "维度" in body["reason"] and "重建" in body["reason"], body
+    assert captured.get("check_configured_dim") is True, (
+        "冷进程也要按模型目录配置发现维度不一致"
+    )
     print("✓ 维度不一致时 /api/knowledge 降级为不可用并给出重建指引")
+
+
+def test_knowledge_eval_rejects_dimension_mismatch(monkeypatch):
+    """冷进程维度不一致：评测入口直接 503，不构造 Agent 抛底层异常。"""
+    from webapp import server as server_module
+
+    captured = {}
+
+    def fake_status(**kwargs):
+        captured.update(kwargs)
+        return {
+            "available": True,
+            "collection": "kb",
+            "documents": 3,
+            "path": "p",
+            "dimension": 512,
+            "dimension_mismatch": True,
+        }
+
+    monkeypatch.setattr(server_module, "knowledge_status", fake_status)
+    response = _client().get("/api/knowledge/eval")
+    assert response.status_code == 503
+    assert "维度" in response.json()["detail"]
+    assert captured.get("check_configured_dim") is True
+    print("✓ 冷进程维度不一致时评测入口 503 并给出重建指引")
 
 
 def test_knowledge_export_strips_nul(monkeypatch):
@@ -14371,6 +14401,8 @@ def test_knowledge_eval_bounded_lock_and_masked_status(monkeypatch):
         "include_path": False,
         "detail_errors": False,
         "lock_timeout": 0.5,
+        # 冷进程也要按模型目录配置发现维度不一致（重启后首次评测即 503）
+        "check_configured_dim": True,
     }, seen
     detail = response.json()["detail"]
     assert "正在写入" in detail

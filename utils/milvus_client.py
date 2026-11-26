@@ -226,13 +226,34 @@ def record_used_entity_id(
         per_client[state_key] = max(per_client.get(state_key, 0), int(last_used))
 
 
+def _release_local_server(db_path: str) -> None:
+    """停止该路径的进程内 milvus-lite server，释放数据目录锁与文件句柄。
+
+    milvus-lite 3.x 的 local server 由 ``server_manager`` 按绝对路径缓存；
+    ``MilvusClient.close()`` 只关闭 dedicated gRPC 通道，server 与数据库
+    句柄会一直保留到进程退出（数据目录的 LOCK 不释放）。Windows 上这会
+    让初始化脚本「把不可读的库目录改名后重建」的自愈永远失败——占用者
+    正是初始化进程自己。2.x 单文件库暴露同名 API；未安装 milvus-lite
+    （CI / 精简环境）或路径未缓存时静默跳过。
+    """
+    try:
+        from milvus_lite.server_manager import server_manager_instance
+    except Exception:  # noqa: BLE001 - 未安装 milvus-lite / 旧版本无该模块
+        return
+    try:
+        server_manager_instance.release_server(db_path)
+    except Exception:  # noqa: BLE001 - 未缓存 / 已释放：重连不依赖它
+        logger.debug("release milvus-lite server failed: %s", db_path, exc_info=True)
+
+
 def reset_milvus_client(db_path: str) -> None:
     """关闭并移除某个数据库路径的共享客户端（重连时使用）。
 
     关闭放在锁内：并发 reset / get 时，不会有线程在 pop 之后、close 之前
     拿到新建客户端，也不会把正在被关闭的对象再发给调用方。已经持有旧
     客户端的在途请求无法阻止（Milvus Lite 不支持事务性替换）——调用方
-    失败后由 ``_ensure_connection`` 重试。
+    失败后由 ``_ensure_connection`` 重试。关闭后同时停止该路径的进程内
+    server，确保下一次连接拿到新的 server / channel。
     """
     with _LOCK:
         client = _CLIENTS.pop(db_path, None)
@@ -241,20 +262,24 @@ def reset_milvus_client(db_path: str) -> None:
                 client.close()
             except Exception:  # noqa: BLE001 - 关闭失败不影响重连
                 pass
+            _release_local_server(db_path)
 
 
 def shutdown_milvus_clients() -> None:
     """关闭并清空所有共享客户端（测试或进程退出前使用）。
 
-    关闭同样放在锁内，避免与并发的 ``get_milvus_client`` 交错。注意
-    milvus-lite 的本地 server / 数据库句柄不一定随 ``close()`` 释放，
-    数据库文件锁可能保持到进程退出（README 已知限制）。
+    关闭同样放在锁内，避免与并发的 ``get_milvus_client`` 交错，并逐个
+    停止对应的进程内 milvus-lite server：只 ``close()`` 时 server 与数据
+    目录锁会保持到进程退出，初始化脚本的「改名不可读库后重建」在
+    Windows 上必然失败、也删不掉本次新建的库目录。
     """
     with _LOCK:
-        clients = list(_CLIENTS.values())
+        clients = list(_CLIENTS.items())
         _CLIENTS.clear()
-        for client in clients:
+        for _db_path, client in clients:
             try:
                 client.close()
             except Exception:  # noqa: BLE001 - 关闭失败不影响退出
                 pass
+        for db_path, _client in clients:
+            _release_local_server(db_path)

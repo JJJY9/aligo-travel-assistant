@@ -2400,15 +2400,35 @@ def run_knowledge_status_standalone(as_json: bool = False) -> int:
     Returns:
         0 知识库可用；1 未初始化或不可用
     """
-    from utils.knowledge_stats import knowledge_status
+    from utils.knowledge_stats import (
+        configured_dimension_mismatch,
+        knowledge_status,
+    )
 
     status = knowledge_status()
+    configured_dim = configured_dimension_mismatch(status.get("dimension"))
     if as_json:
+        if configured_dim is not None:
+            status = {
+                **status,
+                "dimension_mismatch": True,
+                "configured_dimension": configured_dim,
+            }
         print(json.dumps(status, ensure_ascii=False, indent=2))
-        return 0 if status.get("available") else 1
+        return 0 if status.get("available") and configured_dim is None else 1
     if status.get("available"):
         print(f"知识库：{status['collection']} · {status['documents']} 片段")
         print(f"数据库：{status['path']}")
+        if configured_dim is not None:
+            # 独立 CLI 进程从不加载模型：只能按模型目录配置推断维度。
+            # 换模型未重建时检索必然 503，健康门禁必须以失败退出
+            print(
+                "知识库不可用：集合维度"
+                f"（{status.get('dimension')}）与当前嵌入模型配置"
+                f"（{configured_dim}）不一致，请重新运行初始化脚本重建："
+                "python .claude/skills/ask-question/script/init_knowledge_base.py"
+            )
+            return 1
         return 0
     print(f"知识库不可用：{status.get('reason', '未知原因')}")
     print(f"数据库：{status.get('path', '')}")

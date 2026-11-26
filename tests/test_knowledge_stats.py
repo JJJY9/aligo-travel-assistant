@@ -120,6 +120,47 @@ def test_dimension_mismatch_best_effort(monkeypatch):
         assert "dimension_mismatch" not in status, "模型未加载时不做判断"
     print("✓ 状态维度与嵌入模型 mismatch（best-effort）")
 
+
+def test_configured_dimension_check_opt_in(monkeypatch):
+    """冷进程（模型未加载）按模型目录配置推断维度；默认不判定。"""
+    import utils.knowledge_stats as stats_module
+
+    class _Client:
+        def has_collection(self, name):
+            return True
+
+        def get_collection_stats(self, name):
+            return {"row_count": 3}
+
+        def describe_collection(self, name):
+            return {"fields": [{"name": "vector", "params": {"dim": 512}}]}
+
+    monkeypatch.setattr(stats_module, "get_milvus_client", lambda path: _Client())
+    monkeypatch.setattr(stats_module, "_loaded_embedding_dim", lambda: None)
+    monkeypatch.setattr(stats_module, "_configured_embedding_dim", lambda: 1024)
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "milvus_lite.db"
+        db.write_bytes(b"x")
+
+        # 默认（doctor 之外的旧调用方）：模型未加载时保持不判定
+        status = knowledge_status(db)
+        assert "dimension_mismatch" not in status
+
+        status = knowledge_status(db, check_configured_dim=True)
+        assert status["available"] and status["dimension"] == 512
+        assert status["dimension_mismatch"] is True, (
+            "冷进程按配置维度发现不一致，避免 /api/knowledge 与 cli kb 假绿"
+        )
+
+        # 独立 CLI 用的 helper：返回配置维度 / 一致时 None
+        assert stats_module.configured_dimension_mismatch(512) == 1024
+        monkeypatch.setattr(
+            stats_module, "_configured_embedding_dim", lambda: 512
+        )
+        assert stats_module.configured_dimension_mismatch(512) is None
+        assert stats_module.configured_dimension_mismatch(None) is None
+    print("✓ 冷进程按配置维度判定 mismatch（opt-in）")
+
 def test_dimension_probe_and_collection_errors(monkeypatch):
     """维度探测失败 / 集合不存在 / 统计失败都按可用性语义返回，不抛异常。"""
     import utils.knowledge_stats as stats_module
@@ -287,6 +328,7 @@ if __name__ == "__main__":
     test_missing_database()
     for case in (
         test_dimension_mismatch_best_effort,
+        test_configured_dimension_check_opt_in,
         test_dimension_probe_and_collection_errors,
         test_write_lock_import_failure_falls_back,
         test_loaded_dimension_probe_failure,

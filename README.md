@@ -14,7 +14,7 @@
 
 在原有「多智能体 + 两层记忆 + RAG」之上，v2.0 增加了以下可验证能力（均有回归测试）：
 
-- **混合检索**：向量 + BM25（中文按字符二元组，无需分词器）双路召回，RRF 融合；可选 `RAG_RERANK_MODEL` 做 cross-encoder 精排（默认关闭）。BM25 按 IDF 加权覆盖度 × 绝对证据量归一（覆盖全部查询词才接近满分；只命中一部分查询词、或重复单个查询词都不会满分绕过 `min_score`；未在库的查询词按 df=0 计入分母；单字中文查询无法组成二元组，关键词路退化为纯向量），索引进程内缓存、写入 / 删除即时失效，构建 / 重排失败自动回退纯向量；首轮结果全部低于阈值时用去掉疑问词 / 标点的简化查询重检索一次，仍无命中才拒答；精排只对通过 `min_score` 的候选排序（证据门槛先于精排 / 截断，不会把有证据的片段挤出 top-K）；管理 / 评测接口保持纯向量口径。
+- **混合检索**：向量 + BM25（中文按字符二元组，无需分词器）双路召回，RRF 融合；可选 `RAG_RERANK_MODEL` 做 cross-encoder 精排（默认关闭）。BM25 按 IDF 加权覆盖度 × 绝对证据量归一（覆盖全部查询词才接近满分；只命中一部分查询词、或重复单个查询词都不会满分绕过 `min_score`；未在库的查询词按 df=0 计入分母；单字中文查询无法组成二元组，关键词路退化为纯向量），索引进程内缓存、写入 / 删除即时失效，构建 / 重排失败自动回退纯向量；重排模型进程级共享、冷加载单飞且有界等待（加载中本次检索按 RRF 顺序降级，不会把多个请求线程钉在分钟级下载上，也不会因其它会话的瞬时失败永久关闭本会话精排）；首轮结果全部低于阈值时用去掉疑问词 / 标点的简化查询重检索一次，仍无命中才拒答；精排只对通过 `min_score` 的候选排序（证据门槛先于精排 / 截断，不会把有证据的片段挤出 top-K）；管理 / 评测接口保持纯向量口径。
 - **行程约束求解与校验**：需求提取（预算 / 必去项 / 天数）→ 必去项按天分配（OR-Tools CP-SAT 可选，未安装时确定性贪心）→ 五项校验（天数、时间冲突、预算、必去项、费用复核）；未通过时带原因重生成一次，仍失败保留原行程并返回 `validation`。
 - **固定 DAG 调度**：行程规划依赖事项收集 / 偏好抽取；`trip-budget` / `local-transport` 依赖行程规划，`packing-list` / `travel-checklist` / `safety-tips` / `trip-notes` 依赖事项收集，优先级只上调不下调（迭代处理传递依赖）；事项缺失信息随结果返回 `missing_info` / `clarification`，不阻断规划。
 - **持久化执行与防重**：`/api/chat` / `/api/chat/stream` 支持 `idempotency_key`（重复提交直接回放成功响应）；编排按 `user:session:turn_id` 落执行检查点到 `data/runtime/checkpoints`，失败重试 / 重启复用已成功的子智能体结果、只重跑失败者（复用要求两轮执行的计划字段——`agent_name` / `priority` / `reason` / `expected_output`——逐字段一致，且该步骤实际可见的前序结果 / 用户偏好 / 抽取实体未变化；意图重新生成后措辞变化或上游重跑都会让对应步骤按未命中重跑，日志会记录「摘要不匹配」）；检查点超过上限时按用户公平淘汰（只淘汰条目最多的用户自己的最旧文件，任一用户的流量不会把另一用户仍在 TTL 内的检查点挤出）；键绑定本轮提问内容，成功落库后清理，删除会话时按 `user:session` 作用域清理（落盘只存哈希，不等 TTL）。
@@ -61,7 +61,7 @@
 - 按小节切分（Chunking，保留章节边界）+ 余弦相似度检索（Top-K=5）
 - 知识溯源：返回文档来源（`metadata` 中保留原始文档路径），并在回答中附 Top 3 参考片段
 - 进程内按数据库路径共享 Milvus Lite 客户端：多个 Web 会话 / 智能体不会重复打开同一本地库，避免文件锁冲突
-- 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与 Web 记忆面板显示集合名 / 片段数，便于确认知识库是否就绪；接口同时返回集合向量维度，进程内已加载嵌入模型时附带 `dimension_mismatch`（换模型后不必等到问答报错才发现）
+- 知识库状态：`GET /api/knowledge`、`python cli.py kb` 与 Web 记忆面板显示集合名 / 片段数，便于确认知识库是否就绪；接口同时返回集合向量维度，进程内已加载嵌入模型时按实际维度、冷进程（重启后尚未检索 / 独立 CLI）按模型目录 `1_Pooling/config.json` 的配置维度附带 `dimension_mismatch`（换模型后不必等到问答报错才发现，`cli kb` 此时退出码 1，可直接当健康门禁）
 - 知识库维护：记忆面板可搜索 / 分页查看、新增、编辑、删除知识片段（`GET/POST/PUT/DELETE /api/knowledge/documents`；长内容自动按语义边界拆分并带 `group` 标识，任一分片可**编辑整份文档**或**整组删除**），支持按分类筛选（`category` 参数与 `/api/knowledge/categories` 统计）与**语义检索**（`/api/knowledge/search`，与聊天共用向量模型），并可运行**检索评测**（`/api/knowledge/eval`，30 个问题（覆盖全部 8 份随仓库知识文档）计算 hit@1/3/5 与 MRR，不调用大模型，同一时间只允许一个评测：配置 `REDIS_URL` 时通过 Redis 锁跨实例共享，未配置或 Redis 故障时回退进程内），面板「查重复」按钮与 `GET /api/knowledge/duplicates` 可列出内容完全相同的独立片段组（与 CLI `kb-duplicates` 同一实现，确认后到列表删除多余片段），「清理重复」按钮走 `POST /api/knowledge/duplicates/cleanup`（默认 dry-run 预览，确认后每组保留最早一条删除其余，与 CLI `kb-dedupe` 同一语义），导出 / 导入 JSON 备份（`/api/knowledge/export` / `import`；接口单次最多 20000 条（面板按 200 条分批、多分片组整组同批），CLI 不限条数；重复导入同一备份会按内容跳过已有片段）；新增 / 编辑后立即可被检索，删除后再新增按最大 id 递增，不会与已有主键冲突
 - 检索评测：`python cli.py eval` 用 30 个差旅问题（覆盖全部 8 份随仓库知识文档）离线计算 hit@1/3/5 与 MRR（只检索、不调用大模型），便于调整切分策略或补充知识后回归；Web 知识库维护面板也可直接「检索评测」
 
@@ -646,7 +646,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/health` | 服务版本 / 模型 / 技能数 / 存储与限流后端状态；熔断器打开或技能目录不可用（`skills.ok` 为 `false`）时 `status` 为 `degraded` 并附 `circuit_breaker` / `skills` |
 | GET | `/api/metrics` | 进程内 `/api` 请求指标（计数 / 状态分布 / Top 路径 / 平均、最大、P50、P95 耗时 / 熔断器状态 / SSE error 收尾计数 `sse_errors` / 偏好快照缓存 hits、misses、version_invalidations）与限流后端信息；Prometheus 文本端点（`/metrics`）另暴露 `aligo_preference_cache_hits_total` / `aligo_preference_cache_misses_total` / `aligo_preference_cache_version_invalidations_total`；SSE 长连接只计请求数、不计入延迟分位；首页、静态资源与抓取自身不计入 |
 | GET | `/metrics` | Prometheus 文本指标（请求计数 / 状态 / 方法 / 路径 / 耗时 / 熔断器 / 缓存会话 / 限流与存储后端降级 / 共享墓碑状态；多实例分别采集） |
-| GET | `/api/knowledge` | 知识库状态（集合名 / 片段数 / 是否可用 / 向量维度；进程已加载嵌入模型时附带 `dimension_mismatch` 标记换模型后的维度不一致） |
+| GET | `/api/knowledge` | 知识库状态（集合名 / 片段数 / 是否可用 / 向量维度；已加载嵌入模型时按实际维度、冷进程按模型目录配置维度附带 `dimension_mismatch` 标记换模型后的维度不一致） |
 | GET | `/api/doctor` | 环境自检（`network=true` 时包含 LLM 连通性检查）；熔断器打开 / 半开时附加「熔断器」检查项并让自检不再全绿 |
 | GET | `/api/knowledge/documents` | 知识片段列表（`limit` / `offset` / `q` / `category`，按 id 倒序） |
 | POST | `/api/knowledge/documents` | 新增知识片段（`content` / `metadata`；首次调用加载嵌入模型） |
@@ -923,7 +923,7 @@ python -m webapp.server --port 8002   # 另一个进程 / 机器
 - **隔离数据的升级遗留与大小写变体（冻结项）**：记忆文件损坏时会被改名为 `<用户>.json.corrupt-*` 并写 `<用户>.json.quarantine` 标记。本版本之前的旧版会用「最先发现损坏的请求」的用户 ID 拼备份名：在大小写不敏感文件系统（Windows / macOS）上，若该写法与真实账号仅大小写不同，升级后真实账号可能被归属校验拒绝（普通请求与 `user-import` / `/api/import` 恢复入口都会提示「用户 ID 与已有记忆文件仅大小写或 Unicode 规范化形式不同」）——把受影响的 `.corrupt-*` 备份重命名为与账号大小写一致即可恢复正常；同族残留还包括 `delete_all` 对标记名 / 迁移副本的变体归属误判、`ensure_persisted` 在空导入时缺少隔离证据归属校验、PostgreSQL 接管时清理 JSON 标记不校验归属、仅标记无备份状态的写路径文案、会话中途被隔离后交互面板展示空数据。该子系统经连续四轮对抗复审持续产出同族边界（多次由前一轮修复引入），已按冻结策略只修崩溃 / 数据丢失级问题，上述项记录不修。**知识体积轴**（合并预检的全局知识库计入 / 增量拦截）同理冻结：保证不复引入「阻断用户数据恢复」类回归，其余同族边界记录不修。
 - **CLI 管道输入编码**：交互模式从管道 / 重定向读取时逐行自动解码（UTF-8 优先，失败回退系统编码；支持 UTF-8 BOM 与 UTF-16，含无 BOM 的 UTF-16LE）；GBK 与 UTF-8 同时可解但结果不同的首行（如「唯一」「一一」「十」）会被拒绝并提示设置 `ALIGO_STDIN_ENCODING=gbk`（或 `utf-8`）后重试，后续歧义行按 UTF-8 解析并向 stderr 告警一次。管道模式下任一命令失败（模型调用错误、落库失败等）以退出码 1 结束；交互终端行为不变。从管道 / 重定向读取时提示符（`用户ID:`、`>`）输出到 stderr，stdout 只保留命令输出（不再出现 `用户ID: ✓ …`、`>: 表格` 的粘连）；`python cli.py > session.log` 等 stdout 重定向场景下提示符仍显示在终端。一次性命令的 stdout 与 stderr 都做了管道保护：下游（`| head`、`2>&1 | head`、提前退出的分页器）关闭管道后写入静默丢弃，成功命令不会以退出码 120 / traceback 结束；输出落到文件或终端时内容不变。
 - **行程导入编码**：面板读取 CSV / ICS 文件时识别 UTF-16（BOM 或无 BOM 的 NUL 规律）、严格 UTF-8，失败后回退 GB18030（Excel 中文 CSV）；Big5 等与 GB18030 字节重叠的编码无法可靠区分（可能解码为乱码），请先另存为 UTF-8。服务端 `content` 上限 50 万字符、单次最多 5000 行（JSON 中文序列化后仍在 2 MB 请求体内），面板同时限制文件 ≤ 2 MB；缺省目的不会覆盖已有行程的目的。
-- **Milvus Lite 是单进程文件锁**：Web 服务运行且已打开知识库后，外部再运行 `init_knowledge_base.py` / `cli.py kb*` / `doctor` 会提示锁占用；请先停止 Web 服务再执行这些命令。`reset_milvus_client` 会关闭并重建共享客户端（关闭在锁内，避免并发拿到正在关闭的对象），但 milvus-lite 的本地 server / 数据库句柄不一定随 `close()` 释放，文件锁可能保持到进程退出；连接损坏后重建也可能复用旧 server——重连仍失败时请重启进程（Web 服务）。
+- **Milvus Lite 是单进程文件锁**：Web 服务运行且已打开知识库后，外部再运行 `init_knowledge_base.py` / `cli.py kb*` / `doctor` 会提示锁占用；请先停止 Web 服务再执行这些命令。`reset_milvus_client` / `shutdown_milvus_clients` 会关闭客户端并停止对应的进程内 milvus-lite server（释放数据目录锁与文件句柄，初始化脚本「不可读库改名重建」与清理新建库目录因此可以在 Windows 上完成），但已持有旧客户端的在途请求无法阻止（Milvus Lite 不支持事务性替换）——重连仍失败时请重启进程（Web 服务）。
 - **知识库目录在进程内固定**：`default_knowledge_dir()` 首次解析成功后固定在进程内（Skill 数据目录与项目根兼容目录二选一）——面板管理接口与 RAG 智能体始终使用同一个库，服务运行期间新建 / 迁移出另一个库目录不会出现「面板看似被清空、新增写进旧库」的分裂；切换库（重建 / 迁移）后请重启 Web 进程（或调用 `reset_default_knowledge_dir()`）。半初始化状态（库文件存在但集合缺失）下，管理接口与 `GET /api/knowledge`、`python cli.py doctor` 一致提示「集合不存在，请重新运行初始化脚本」。
 - **技能模块在进程内缓存**：`LazyAgentRegistry` 按技能脚本路径缓存已加载模块（同一技能的多个会话注册器共享模块与模块级状态）；运行中修改技能脚本 / SKILL.md 不会热更新，需重启进程生效（`ALIGO_SKILLS_DIR` 指向不同目录的技能互不串用）。
 - **非 ASCII 路径**：Milvus Lite 3.x 在含中文等非 ASCII 字符的目录下无法写入 Faiss 索引（同进程自检走内存索引仍会「通过」，重启后集合不可加载）；建议把项目放在纯英文路径（如 `D:\Code\chailv`）。wheel 安装的知识库固定在 `%LOCALAPPDATA%\aligo\data\rag_knowledge`，中文用户名下同样命中——请把 `ALIGO_DATA_DIR`（或 `ALIGO_SKILLS_DIR`）指向纯英文目录后重建。初始化脚本会提前失败并给出提示；状态接口在加载失败时也会直接给出该原因。

@@ -424,57 +424,15 @@ def check_version_consistency() -> CheckResult:
 
 
 def _default_model_dir() -> Path:
-    """按 RAG 技能的同一口径解析嵌入模型目录。
+    """嵌入模型目录（与 RAG 技能、知识库状态接口同一解析口径）。
 
-    与 ``RAGKnowledgeAgent._model_path_candidates`` 保持同序：config 模块
-    目录（源码仓库根）→ 运行期数据目录（wheel 用户目录 / ALIGO_DATA_DIR）
-    → 技能安装根 → 当前目录。只在两个锚点上解析时，wheel 安装或设置了
-    ``ALIGO_DATA_DIR`` 的部署里技能能按数据目录加载模型，doctor 却在
-    site-packages 下找不到，误报「未下载 / RAG 功能不可用」。
+    解析逻辑已抽到 ``utils.embedding_model.default_embedding_model_dir``：
+    知识库状态接口在冷进程里也要按同一目录推断配置维度，两处各自维护
+    锚点会让 doctor 告警与面板健康状态分裂。
     """
-    from utils.skill_paths import resolve_skills_root
+    from utils.embedding_model import default_embedding_model_dir
 
-    anchor = Path(resolve_skills_root()).parent.parent
-    configured = ""
-    try:
-        from config import RAG_CONFIG
-
-        configured = str(RAG_CONFIG.get("embedding_model") or "")
-    except Exception:  # noqa: BLE001 - 配置缺失时退回默认目录名
-        configured = ""
-    candidate = (
-        Path(configured).expanduser()
-        if configured
-        else Path("data") / "models" / "bge-small-zh-v1.5"
-    )
-    if candidate.is_absolute():
-        return candidate
-    for resolved in _model_dir_candidates(candidate, anchor):
-        if resolved.exists():
-            return resolved
-    # 都不存在：返回技能安装根口径（最接近历史行为，错误信息里的路径
-    # 仍是用户最可能放置模型的位置）
-    return anchor / candidate
-
-
-def _model_dir_candidates(candidate: Path, anchor: Path) -> list[Path]:
-    """相对嵌入模型路径的候选锚点（顺序与 RAG 技能一致）。"""
-    candidates: list[Path] = []
-    try:
-        import config as _config
-
-        candidates.append(Path(_config.__file__).resolve().parent / candidate)
-    except Exception:  # noqa: BLE001 - 独立运行时没有 config
-        pass
-    try:
-        from utils.paths import default_data_root
-
-        candidates.append(default_data_root() / candidate)
-    except Exception:  # noqa: BLE001 - 旧版本无 utils.paths
-        pass
-    candidates.append(anchor / candidate)
-    candidates.append(Path.cwd() / candidate)
-    return candidates
+    return default_embedding_model_dir()
 
 
 _HF_MODEL_ID_RE = re.compile(r"^[\w.-]+/[\w.-]+$")

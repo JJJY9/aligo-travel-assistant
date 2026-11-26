@@ -7,6 +7,8 @@ import sys
 import threading
 import types
 
+import pytest
+
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
@@ -67,7 +69,11 @@ def test_concurrent_first_load_constructs_once(monkeypatch):
 
 
 def test_load_failure_enters_cooldown(monkeypatch):
-    """加载失败抛 RuntimeError 并进入冷却，冷却期内不再尝试构造。"""
+    """加载失败抛 RuntimeError 并进入冷却，冷却期内不再尝试构造。
+
+    冷却命中抛 ``RerankerCooldownError``：调用方不能把他人失败的冷却
+    当成自己的永久失败。
+    """
     reranker_model._MODELS.clear()
     reranker_model._FAILURES.clear()
     calls = []
@@ -78,15 +84,46 @@ def test_load_failure_enters_cooldown(monkeypatch):
             raise OSError("model not found")
 
     _install_fake_backend(monkeypatch, _BoomCrossEncoder)
-    for _ in range(2):
-        try:
-            reranker_model.get_shared_cross_encoder("missing")
-        except (OSError, RuntimeError):
-            pass
-        else:  # pragma: no cover
-            raise AssertionError("加载失败应抛出")
+    with pytest.raises((OSError, RuntimeError)):
+        reranker_model.get_shared_cross_encoder("missing")
+    with pytest.raises(reranker_model.RerankerCooldownError):
+        reranker_model.get_shared_cross_encoder("missing")
     assert calls == ["missing"], "冷却期内不得重复构造"
-    print("✓ 重排模型加载失败进入冷却")
+    print("✓ 重排模型加载失败进入冷却（独立异常类型）")
+
+
+def test_loading_wait_is_bounded(monkeypatch):
+    """加载进行中：其它调用有限等待后按「加载中」降级，不计入失败冷却。"""
+    import threading
+    import time
+
+    reranker_model._MODELS.clear()
+    reranker_model._FAILURES.clear()
+    monkeypatch.setattr(reranker_model, "_LOAD_WAIT_SEC", 0.05)
+    started = threading.Event()
+
+    class _SlowCrossEncoder:
+        def __init__(self, name):
+            started.set()
+            time.sleep(0.4)
+
+    _install_fake_backend(monkeypatch, _SlowCrossEncoder)
+    loaded = []
+    loader = threading.Thread(
+        target=lambda: loaded.append(
+            reranker_model.get_shared_cross_encoder("slow")
+        )
+    )
+    loader.start()
+    assert started.wait(timeout=2)
+    began = time.monotonic()
+    with pytest.raises(reranker_model.RerankerLoadingError):
+        reranker_model.get_shared_cross_encoder("slow")
+    assert time.monotonic() - began < 0.3, "等待必须有界，不能钉住默认线程池"
+    assert "slow" not in reranker_model._FAILURES, "加载中不是失败"
+    loader.join(timeout=5)
+    assert loaded and reranker_model._MODELS.get("slow") is loaded[0]
+    print("✓ 并发加载有界等待，超时按 RRF 顺序降级且不冷却")
 
 
 if __name__ == "__main__":
@@ -95,12 +132,15 @@ if __name__ == "__main__":
     _stdio.ensure_utf8()
     import pytest
 
-    mp = pytest.MonkeyPatch()
-    try:
-        test_concurrent_first_load_constructs_once(mp)
-        mp.undo()
+    cases = (
+        test_concurrent_first_load_constructs_once,
+        test_load_failure_enters_cooldown,
+        test_loading_wait_is_bounded,
+    )
+    for case in cases:
         mp = pytest.MonkeyPatch()
-        test_load_failure_enters_cooldown(mp)
-    finally:
-        mp.undo()
+        try:
+            case(mp)
+        finally:
+            mp.undo()
     print("\n全部通过")
