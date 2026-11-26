@@ -12,10 +12,15 @@
 import os
 import re
 import sys
-import tomllib
 from pathlib import Path
 
+import pytest
 import yaml
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python 3.10 没有 tomllib
+    tomllib = None  # type: ignore[assignment]
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -67,6 +72,8 @@ def test_compose_redis_keeps_tombstones_across_restarts():
 
 
 def test_pyproject_declares_runtime_dependencies():
+    if tomllib is None:
+        pytest.skip("Python 3.10 无 tomllib；依赖清单在 Python 3.12 CI 校验")
     data = tomllib.loads(_read("pyproject.toml"))
     deps = data["project"]["dependencies"]
     names = {re.split(r"[<>=!;\[]", dep, maxsplit=1)[0].strip().lower() for dep in deps}
