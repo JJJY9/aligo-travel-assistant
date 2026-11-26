@@ -86,7 +86,11 @@ def _windows_acp() -> int | None:
     try:
         import ctypes
 
-        return int(ctypes.windll.kernel32.GetACP())
+        # 非 Windows 的类型存根没有 windll；运行时该分支只在 nt 走到
+        windll = getattr(ctypes, "windll", None)
+        if windll is None:
+            return 936
+        return int(windll.kernel32.GetACP())
     except Exception:  # noqa: BLE001 - 探测失败按非 UTF-8 处理
         return 936
 
