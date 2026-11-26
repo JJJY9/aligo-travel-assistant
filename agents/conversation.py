@@ -40,7 +40,7 @@ from utils.log_redact import redact_secret
 from utils.paths import default_data_root
 from utils.preference_values import has_preference_value, preference_prompt_lines
 from utils.result_formatter import normalize_results, result_to_markdown
-from utils.turn_meta import attach_turn_meta, build_turn_meta
+from utils.turn_meta import attach_turn_meta, build_turn_meta, strip_turn_meta
 from utils.usage import add_usage
 
 logger = logging.getLogger(__name__)
@@ -205,6 +205,16 @@ class ConversationRuntime:
     ) -> dict[str, Any]:
         """一轮对话的主体（``ask`` 负责熔断名额的占用与归还）。"""
         settlement = settlement if settlement is not None else {"done": False}
+        rc_config = rc if isinstance(rc, dict) else {}
+        # 整轮重试预算：意图 / 编排两段外层重试共享同一个绝对截止时刻。
+        # 内层逐智能体重试（2 次）× 外层整轮重试（4 次）叠加时，同一失败
+        # 智能体最多被完整执行 8 次（默认 120 秒读超时下十几分钟），用户锁
+        # 与半开试探名额会被长时间占住；预算只限制「再发起新的尝试」，
+        # 不打断在途调用
+        retry_budget = float(rc_config.get("turn_retry_budget_sec", 300.0) or 0.0)
+        retry_deadline = (
+            time.monotonic() + retry_budget if retry_budget > 0 else None
+        )
         # cancel 收尾的共享截止时刻：由断连取消方在 cancel 之前建立，
         # 暂存等待 / 回滚等待 / drain 都从同一预算扣减
         self._drain_deadline = None
@@ -253,6 +263,7 @@ class ConversationRuntime:
             # 意图调用成功不重置熔断计数：只发生在编排腿上的子智能体
             # 429/5xx 否则每轮都被这里清零，永远累计不到阈值
             record_success=False,
+            deadline=retry_deadline,
         )
 
         try:
@@ -411,6 +422,7 @@ class ConversationRuntime:
                 max_retries=int(rc.get("max_retries", 3)),
                 base_delay=float(rc.get("retry_base_delay_sec", 1.0)),
                 max_delay=float(rc.get("retry_max_delay_sec", 30.0)),
+                deadline=retry_deadline,
             )
 
             try:
@@ -972,6 +984,16 @@ class ConversationRuntime:
 
     def close(self) -> None:
         """释放会话占用的资源（PostgreSQL 连接等）。"""
+        pending = getattr(self, "_unsettled_usage", None)
+        if pending:
+            # 只会出现在调用方未结转就关闭（删除 / 进程退出）时：保留告警
+            # 便于解释用量面板少记，不阻断关闭
+            logger.warning(
+                "会话 %s/%s 关闭，丢弃未结算用量 %s",
+                self.user_id,
+                self.session_id,
+                pending,
+            )
         close = getattr(self.memory.long_term, "close", None)
         if callable(close):
             try:
@@ -1086,6 +1108,12 @@ class ConversationRuntime:
                 continue
             if not isinstance(content, str):
                 continue
+            if role == "assistant":
+                # 助手消息存的是编排结果 JSON，_meta 里的用量 / 耗时 /
+                # client_turn_id 只服务于历史回看：送进意图模型 prompt
+                # 既浪费 token 也把内部账目暴露给模型。短期 / 长期记忆
+                # 原样保留（回合 id 回填与删除逻辑仍要读 _meta）
+                content = strip_turn_meta(content)
             messages.append(Msg(name=role, content=content, role=role))
         messages.append(Msg(name="user", content=user_input, role="user"))
         return messages
@@ -1183,6 +1211,7 @@ class ConversationRuntime:
         base_delay: float,
         max_delay: float,
         record_success: bool = True,
+        deadline: float | None = None,
     ):
         """带重试与熔断记录的单次 LLM 调用。
 
@@ -1198,11 +1227,15 @@ class ConversationRuntime:
                 max_retries=max_retries,
                 base_delay_sec=base_delay,
                 max_delay_sec=max_delay,
+                deadline_monotonic=deadline,
             )
             if self.circuit_breaker:
                 if record_success:
                     self.circuit_breaker.record_success()
-                self._probe_recorded = True
+                    # 只有真正记账才把名额视为已消费：意图腿
+                    # （record_success=False）成功后若在本轮后续被取消 /
+                    # 存储异常打断，ask() 的 finally 需要归还半开名额
+                    self._probe_recorded = True
             return result
         except CircuitOpenError:
             raise
@@ -1228,6 +1261,21 @@ class ConversationRuntime:
         self._unsettled_usage = add_usage(
             getattr(self, "_unsettled_usage", None), usage
         )
+
+    def take_pending_usage(self) -> dict[str, Any] | None:
+        """取出并清空未结算用量（Web 层在会话被 LRU 淘汰前结转用）。
+
+        账目只存在于运行体内存：淘汰 / 关闭后新实例从零开始快照，未结算
+        部分会永久少记；调用方负责把它结转给下次新建的同名会话。
+        """
+        pending = getattr(self, "_unsettled_usage", None)
+        if pending:
+            self._unsettled_usage = None
+        return pending
+
+    def seed_unsettled_usage(self, usage: dict[str, Any] | None) -> None:
+        """并入从旧实例结转的未结算用量（下一个成功回合统一 drain）。"""
+        self._accumulate_unsettled_usage(usage)
 
     def _settle_usage_after_persist(
         self,

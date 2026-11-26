@@ -16709,6 +16709,115 @@ def test_hsts_header_opt_in(monkeypatch):
     print("✓ HSTS 显式开启后覆盖全部响应（含 404）")
 
 
+def test_chat_circuit_open_in_ask_refunds_rate_limit(monkeypatch):
+    """锁内预检之后 ask 首行才被熔断拒绝：零 LLM 拒绝必须归还限流额度。"""
+    from utils.circuit_breaker import CircuitOpenError
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.rate_limiter = RateLimiter(limit=5, window_sec=60)
+    state.ip_limiter = RateLimiter(limit=5, window_sec=60)
+    client = TestClient(app)
+    user_id = _unique_user("web_test_refund_in_ask")
+    refunded: list[str] = []
+
+    async def open_ask(self, message, on_event=None, turn_id=""):
+        raise CircuitOpenError()
+
+    monkeypatch.setattr(server_module.ConversationRuntime, "ask", open_ask)
+    monkeypatch.setattr(
+        server_module,
+        "_refund_rate_limit",
+        lambda st, uid, request: refunded.append(uid),
+    )
+    try:
+        response = client.post(
+            "/api/chat", json={"message": "你好", "user_id": user_id}
+        )
+        assert response.status_code == 503, response.text[:300]
+        assert refunded == [user_id], "ask 层的熔断拒绝必须归还额度"
+
+        refunded.clear()
+        stream = client.post(
+            "/api/chat/stream", json={"message": "你好", "user_id": user_id}
+        )
+        assert "服务暂时不可用" in stream.text, stream.text[:300]
+        assert refunded == [user_id], "流式路径同样归还额度"
+    finally:
+        _cleanup(user_id)
+    print("✓ ask 层熔断拒绝归还限流额度（非流式 / 流式）")
+
+
+def test_doctor_reports_open_breaker():
+    """/api/doctor 不再在熔断打开时全绿：显式给出熔断检查项与 fail 状态。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    for _ in range(state.breaker.failure_threshold):
+        state.breaker.record_failure()
+    data = TestClient(app).get("/api/doctor").json()
+    item = next(check for check in data["checks"] if check["name"] == "熔断器")
+    assert item["status"] == "fail", item
+    assert data["status"] == "fail"
+    print("✓ /api/doctor 反映熔断状态")
+
+
+def test_session_detail_normalizes_usage():
+    """会话详情的 _meta.usage 与面板汇总同口径（负数归零、total 按 input+output）。"""
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user = _unique_user("web_meta_usage")
+    try:
+        store = create_long_term_memory(user, str(MEMORY_DIR))
+        try:
+            store.add_chat_message("user", "hi", "s-usage")
+            store.add_chat_message(
+                "assistant",
+                '{"results": [], "_meta": {"usage": '
+                '{"calls": -2, "input_tokens": 10, "output_tokens": 5, '
+                '"total_tokens": 99}}}',
+                "s-usage",
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        response = client.get("/api/sessions/s-usage", params={"user_id": user})
+        assert response.status_code == 200, response.text
+        usage = response.json()["messages"][-1]["meta"]["usage"]
+        assert usage["calls"] == 0, "负数调用数必须归零"
+        assert usage["input_tokens"] == 10
+        assert usage["output_tokens"] == 5
+        assert usage["total_tokens"] == 15, "total 按 input+output 重算"
+    finally:
+        _cleanup(user)
+    print("✓ 会话详情 usage 与汇总同口径")
+
+
+def test_lru_eviction_carries_pending_usage():
+    """LRU 淘汰时未结算用量结转给重建的同名会话（否则用量永久少记）。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.max_sessions = 1
+    user = _unique_user("web_test_pending_usage")
+    try:
+        first = state.get_session(user, "s-a")
+        first.runtime.seed_unsettled_usage({"calls": 1, "total_tokens": 7})
+        state.get_session(user, "s-b")  # 淘汰 s-a，账目结转
+        assert f"{user}\ns-a" not in state.sessions
+        rebuilt = state.get_session(user, "s-a")  # 重建 s-a，并入结转账目
+        assert rebuilt.runtime.take_pending_usage() == {
+            "calls": 1,
+            "total_tokens": 7,
+        }
+    finally:
+        state.close_all()
+        _cleanup(user)
+    print("✓ LRU 淘汰结转未结算用量")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理

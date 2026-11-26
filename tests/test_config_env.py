@@ -509,6 +509,19 @@ def test_rate_limit_max_keys_and_ipv6_prefix_env():
     print("✓ RATE_LIMIT_MAX_KEYS / RATE_IPV6_PREFIX_LEN（含越界钳制）")
 
 
+def test_resolved_timeout_rejects_non_finite():
+    """模型超时参数 NaN / ±inf 回退 120 秒（NaN 会绕过 <= 0 检查）。"""
+    from config_agentscope import _resolved_timeout_seconds
+
+    assert _resolved_timeout_seconds(float("nan")) == 120.0
+    assert _resolved_timeout_seconds(float("inf")) == 120.0
+    assert _resolved_timeout_seconds(float("-inf")) == 120.0
+    # 合法有限值原样返回（含整数与字符串形态）
+    assert _resolved_timeout_seconds(30) == 30.0
+    assert _resolved_timeout_seconds("45") == 45.0
+    print("✓ 模型超时非有限值回退 120 秒")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -533,5 +546,6 @@ if __name__ == "__main__":
         _mp.undo()
     test_numeric_and_bool_envs_strip_bom_and_strip_quotes()
     test_oversized_timeout_clamped_and_factory_survives()
+    test_resolved_timeout_rejects_non_finite()
     test_rag_config_env_overrides()
     print("\n全部通过")

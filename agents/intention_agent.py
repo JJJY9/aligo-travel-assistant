@@ -145,6 +145,36 @@ _TRANSIENT_ERROR_CODES = {
 }
 
 
+# 错误文本（而非结构化 code）里的永久故障标记
+_PERMANENT_ERROR_MARKERS = (
+    ("invalid api key", 401),
+    ("incorrect api key", 401),
+    ("invalid_api_key", 401),
+    ("incorrect_api_key", 401),
+    ("authentication", 401),
+    ("unauthorized", 401),
+    ("permission_error", 403),
+    ("insufficient_quota", 402),
+    ("insufficient quota", 402),
+    ("billing_hard_limit_reached", 402),
+    ("model_not_found", 404),
+)
+
+
+def _status_from_error_text(text: str) -> int | None:
+    """错误体只有 message（无 code / status）时按关键词映射状态码。
+
+    网关常见的 200 + ``{"error": "Incorrect API key provided..."}`` / 纯文本
+    错误体没有结构化字段：映射为 401/402/403/404 后熔断器才能按永久故障
+    记账；否则会被判成确定性失败、静默降级为默认意图。
+    """
+    lowered = text.lower()
+    for marker, code in _PERMANENT_ERROR_MARKERS:
+        if marker in lowered:
+            return code
+    return None
+
+
 def _error_status_code(raw_code: Any, provider_error: dict) -> int | None:
     """从错误体的 code / status / type 提取状态码（int 或字符串形态）。"""
     for candidate in (
@@ -618,6 +648,10 @@ class IntentionAgent(AgentBase):
                             "status"
                         )
                         code = _error_status_code(raw_code, provider_error)
+                    if code is None:
+                        # 没有结构化 code / status（纯字符串错误体或只有
+                        # message 的 dict）：按错误文本识别永久故障
+                        code = _status_from_error_text(str(provider_error))
                     raise _ProviderError(
                         f"模型服务返回错误：{str(provider_error)[:200]}", code
                     )

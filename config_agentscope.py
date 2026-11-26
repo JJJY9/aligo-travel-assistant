@@ -3,6 +3,7 @@ AgentScope Configuration for Aligo Multi-Agent Travel Planning System
 适配 AgentScope 1.0.16+
 """
 import logging
+import math
 
 import agentscope
 
@@ -48,13 +49,48 @@ class UsageTracker:
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
+    @staticmethod
+    def _as_int(value, field: str) -> int:
+        """usage 数字字段的防御性转换。
+
+        部分网关把 token 数写成字符串 / 浮点 / null：``int("12.5")`` 抛
+        ValueError 会让已经成功（且已计费）的模型调用整个失败，调用方
+        拿不到响应、账目也丢。坏字段按 0 计并告警，模型调用本身不受影响。
+        """
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("模型 usage 字段 %s 非法（%r），按 0 计", field, value)
+            return 0
+
+    @staticmethod
+    def _as_float(value, field: str) -> float:
+        try:
+            number = float(value or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("模型 usage 字段 %s 非法（%r），按 0 计", field, value)
+            return 0.0
+        if not math.isfinite(number):
+            # NaN / inf 会随 _meta.usage 落库并让面板 JSON 序列化失败
+            logger.warning("模型 usage 字段 %s 非有限（%r），按 0 计", field, value)
+            return 0.0
+        return number
+
     def record_usage(self, usage) -> None:
         """累计一次调用的 usage（agentscope ChatUsage，dict 子类，可能为 None）。"""
         if not usage:
             return
-        self.input_tokens += int(usage.get("input_tokens", 0) or 0)
-        self.output_tokens += int(usage.get("output_tokens", 0) or 0)
-        self.time += float(usage.get("time", 0.0) or 0.0)
+        try:
+            input_tokens = usage.get("input_tokens", 0)
+            output_tokens = usage.get("output_tokens", 0)
+            elapsed = usage.get("time", 0.0)
+        except AttributeError:
+            # 形状非法（如 list / 数字）：记一次告警后按无 usage 处理
+            logger.warning("模型 usage 形状非法（%r），本次不记账", type(usage))
+            return
+        self.input_tokens += self._as_int(input_tokens, "input_tokens")
+        self.output_tokens += self._as_int(output_tokens, "output_tokens")
+        self.time += self._as_float(elapsed, "time")
 
     def snapshot(self) -> dict:
         """当前用量快照（用于计算单次查询的增量）。"""
@@ -129,6 +165,13 @@ def _resolved_timeout_seconds(timeout: Any | None) -> float:
         logger.warning(
             "模型超时参数 %r 非正数（会导致每次请求立即超时），回退 120 秒",
             raw,
+        )
+        return 120.0
+    if not math.isfinite(value):
+        # NaN 与 +inf：NaN 能绕过 <= 0 检查，传给 httpx 后行为未定义
+        # （既非「无超时」也非「立即截止」）；与非法值同口径回退
+        logger.warning(
+            "模型超时参数 %r 不是有限数值，回退 120 秒", raw
         )
         return 120.0
     return value

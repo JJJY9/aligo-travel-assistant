@@ -586,6 +586,12 @@ class AligoCLI:
         try:
             rc = RESILIENCE_CONFIG
             max_retries = int(rc.get("max_retries", 3))
+            # 整轮重试预算：意图 / 编排两段外层重试共享同一截止时刻，避免
+            # 内层 2 次 × 外层 4 次叠加把单回合拖到十几分钟（与 Web 同口径）
+            retry_budget = float(rc.get("turn_retry_budget_sec", 300.0) or 0.0)
+            retry_deadline = (
+                time.monotonic() + retry_budget if retry_budget > 0 else None
+            )
 
             # 每轮对话前重载长期记忆（与 Web 端一致）：记忆面板 / 其它进程刚写入的
             # 标题、偏好、行程必须进入本轮上下文，本进程的旧快照也不能在写回时
@@ -624,6 +630,7 @@ class AligoCLI:
                         max_retries=max_retries,
                         base_delay_sec=rc.get("retry_base_delay_sec", 1.0),
                         max_delay_sec=rc.get("retry_max_delay_sec", 30.0),
+                        deadline_monotonic=retry_deadline,
                     )
                     # 意图调用成功不记 record_success：每轮都清零连续失败计数
                     # 会让子智能体的 429/5xx 永远凑不满熔断阈值（与 Web 的
@@ -704,6 +711,7 @@ class AligoCLI:
                         max_retries=max_retries,
                         base_delay_sec=rc.get("retry_base_delay_sec", 1.0),
                         max_delay_sec=rc.get("retry_max_delay_sec", 30.0),
+                        deadline_monotonic=retry_deadline,
                     )
                 if self.circuit_breaker:
                     self.circuit_breaker.record_success()
@@ -1602,6 +1610,9 @@ class AligoCLI:
         if ok:
             self.console.print("LLM 服务: [green]正常[/green]", style="bold")
         else:
+            # 管道 / 脚本模式下与 `cli.py health` 同口径：探测失败要反映
+            # 到退出码，而不是只打印一行红字
+            self._command_failed = True
             self.console.print(
                 f"LLM 服务: [red]不可用[/red] - {_markup_safe(str(msg))}",
                 style="bold",
@@ -1610,9 +1621,17 @@ class AligoCLI:
 
     async def run_doctor(self):
         """在会话内执行环境自检（依赖 / 密钥 / 模型 / 知识库 / 连通性）"""
-        from utils.doctor import build_report_table, run_doctor, summarize
+        from utils.doctor import (
+            build_report_table,
+            has_failures,
+            run_doctor,
+            summarize,
+        )
 
         results = await run_doctor(include_network=bool(LLM_CONFIG["api_key"]))
+        if has_failures(results):
+            # 与 `cli.py doctor` 独立命令同口径（失败项 → 退出码 1）
+            self._command_failed = True
         self.console.print(build_report_table(results))
         text, style = summarize(results)
         self.console.print(text, style=style)

@@ -78,7 +78,7 @@ from utils.errors import (
 from utils.execution_checkpoint import clear_session_checkpoints
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio, strip_terminal_controls
-from utils.doctor import run_doctor
+from utils.doctor import STATUS_FAIL, STATUS_OK, STATUS_WARN, CheckResult, run_doctor
 from utils.identifiers import is_valid_web_id
 from utils.idempotency import IdempotencyCache, make_key
 from utils.knowledge_admin import (
@@ -1622,6 +1622,10 @@ class AligoWebApp:
             half_open_successes=int(config.get("circuit_half_open_successes", 2)),
         )
         self.sessions: OrderedDict[str, _WebSession] = OrderedDict()
+        # 被 LRU 淘汰会话的未结算 token 账目（失败回合没有消息承载
+        # _meta.usage）：按会话键结转给下次新建的同名会话，上限与会话缓存
+        # 相同（进程内、有界；进程重启后仍会丢失，见 README 用量口径）
+        self._pending_usage: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.locks: dict[str, asyncio.Lock] = {}
         self._deleted_sessions: OrderedDict[str, tuple[float, str]] = OrderedDict()
         # mark/unmark/is_recently_deleted 会被 asyncio.to_thread 在线程池里执行，
@@ -1820,6 +1824,28 @@ class AligoWebApp:
                 break
             evicted.append(self.sessions.pop(victim))
 
+    def _carry_pending_usage(self, session: "_WebSession") -> None:
+        """会话被淘汰前结转未结算用量（调用方不得持有 _sessions_lock）。
+
+        失败 / 取消回合的 token 账目只存在于运行体内存，新实例的增量
+        快照会把它减掉；按键有界结转，同名会话下次建立时并入。
+        """
+        runtime = getattr(session, "runtime", None)
+        if runtime is None:
+            return
+        take = getattr(runtime, "take_pending_usage", None)
+        if not callable(take):
+            return
+        pending = take()
+        if not pending:
+            return
+        key = self._session_key(session.user_id, session.session_id)
+        with self._sessions_lock:
+            self._pending_usage[key] = pending
+            self._pending_usage.move_to_end(key)
+            while len(self._pending_usage) > self.max_sessions:
+                self._pending_usage.popitem(last=False)
+
     def get_session(
         self, user_id: str, session_id: str | None, mark_in_use: bool = False
     ) -> _WebSession:
@@ -1950,6 +1976,16 @@ class AligoWebApp:
                         else:
                             session = candidate
                             self.sessions[key] = candidate
+                            # 淘汰结转的未结算用量并入新实例（仍在 _sessions_lock 内）
+                            carried = self._pending_usage.pop(key, None)
+                            if carried:
+                                seed = getattr(
+                                    getattr(candidate, "runtime", None),
+                                    "seed_unsettled_usage",
+                                    None,
+                                )
+                                if callable(seed):
+                                    seed(carried)
                             # 只淘汰未在用、且不是本次要返回的会话：正在对话的会话被
                             # close 会让 runtime 中途失去存储连接；本次刚取到的会话被
                             # 淘汰则会把 close 掉的实例交给调用方。全部在用则暂时超限，
@@ -1969,18 +2005,21 @@ class AligoWebApp:
                 raise SessionCapacityError(
                     f"并发会话过多（上限 {self.max_sessions}），请稍后再试"
                 )
-        # 关闭被淘汰的会话（可能做收尾 IO）放在锁外，避免拖慢其它请求
+        # 关闭被淘汰的会话（可能做收尾 IO）放在锁外，避免拖慢其它请求。
+        # 未结算用量在 close 丢弃之前结转给下次新建的同名会话
         for stale in evicted:
+            self._carry_pending_usage(stale)
             stale.close()
         assert session is not None  # 容量拒绝已在上面抛出
         return session
 
     def drop_session(self, user_id: str, session_id: str) -> None:
         """移除并关闭某用户的一个会话（其它用户的同名会话不受影响）。"""
+        key = self._session_key(user_id, session_id)
         with self._sessions_lock:
-            session = self.sessions.pop(
-                self._session_key(user_id, session_id), None
-            )
+            session = self.sessions.pop(key, None)
+            # 删除语义下用量随会话消失：淘汰结转的账目不能再种回同名新会话
+            self._pending_usage.pop(key, None)
         if session is not None:
             session.close()
 
@@ -4080,6 +4119,22 @@ def _usage_message_total(usage: dict[str, Any]) -> int:
     return _safe_usage_int(usage.get("total_tokens"))
 
 
+def _display_usage(usage: dict[str, Any]) -> dict[str, Any]:
+    """会话详情 / 消息页脚的 usage 口径归一（与 /api/status 汇总一致）。
+
+    备份恢复可能带入负数、NaN 或 total_tokens 与 input+output 冲突的
+    _meta.usage：面板汇总按 _safe_usage_int + _usage_message_total 归零 /
+    重算，而会话详情此前原样返回，同一份历史在两处显示两个数字。
+    """
+    normalized = dict(usage)
+    for key in ("calls", "input_tokens", "output_tokens", "total_tokens"):
+        if key in normalized:
+            normalized[key] = _safe_usage_int(normalized[key])
+    if "input_tokens" in normalized or "output_tokens" in normalized:
+        normalized["total_tokens"] = _usage_message_total(normalized)
+    return normalized
+
+
 def _usage_summary(history: list[dict[str, Any]]) -> dict[str, Any]:
     """从历史消息的执行元数据汇总模型用量（旧消息没有 _meta，自动忽略）。"""
     calls = input_tokens = output_tokens = total_tokens = 0
@@ -4877,6 +4932,29 @@ def create_app(model: Any = None) -> FastAPI:
             )
         )
         results = await run_doctor(include_network=network)
+        # 熔断器状态是本进程的对话可用性：全绿的自检而所有对话 503
+        # 会让面板与监控误判。只读快照，不改动既有检查项
+        breaker_state = str(state.breaker.get_status().get("state") or "")
+        if breaker_state == "open":
+            results = [
+                *results,
+                CheckResult(
+                    "熔断器",
+                    STATUS_FAIL,
+                    "熔断中：对话将返回 503，恢复期后自动半开试探",
+                ),
+            ]
+        elif breaker_state == "half_open":
+            results = [
+                *results,
+                CheckResult(
+                    "熔断器",
+                    STATUS_WARN,
+                    "半开单飞试探中：试探名额被占用时其余对话返回 503",
+                ),
+            ]
+        else:
+            results = [*results, CheckResult("熔断器", STATUS_OK, breaker_state or "closed")]
         return {
             "status": "fail" if any(item.status == "fail" for item in results) else "ok",
             "checks": [
@@ -5684,6 +5762,10 @@ def create_app(model: Any = None) -> FastAPI:
         rendered_messages = []
         for message in messages:
             rendered, meta = render_stored_message_with_meta(message)
+            if isinstance(meta, dict) and isinstance(meta.get("usage"), dict):
+                # 与 /api/status 汇总同口径：负数 / NaN 归零、缺 total 或
+                # total 与 input+output 冲突时按 input+output
+                meta = {**meta, "usage": _display_usage(meta["usage"])}
             rendered_messages.append(
                 {
                     "role": message.get("role", "assistant"),
@@ -6299,6 +6381,11 @@ def create_app(model: Any = None) -> FastAPI:
                         },
                     )
             except CircuitOpenError as exc:
+                # ask() 首行的熔断复检在锁内预检之后才拒绝：本请求没有
+                # 发生任何 LLM 调用，与锁内预检分支同口径归还限流额度
+                await asyncio.to_thread(
+                    _refund_rate_limit, state, payload.user_id, request
+                )
                 raise HTTPException(
                     status_code=503,
                     detail=f"服务暂时不可用，请稍后再试（请求 ID：{_request_id(request)}）",
@@ -6673,6 +6760,11 @@ def create_app(model: Any = None) -> FastAPI:
                         raise
                     except CircuitOpenError:
                         logger.warning("流式对话触发熔断（%s）", rid)
+                        # 零 LLM 拒绝（ask 首行熔断复检）：归还本次限流
+                        # 额度，避免重试耗尽额度、服务恢复后仍被 429
+                        await asyncio.to_thread(
+                            _refund_rate_limit, state, payload.user_id, request
+                        )
                         await queue.put(
                             {
                                 "type": "error",

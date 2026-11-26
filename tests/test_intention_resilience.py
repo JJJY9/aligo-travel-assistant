@@ -111,6 +111,11 @@ def test_http_200_error_body_is_llm_error():
         ),
         # 永久方向保持不变
         ({"error": {"code": "invalid_api_key", "message": "bad key"}}, False, True),
+        # 无结构化 code / status：按错误文本识别永久故障（不能吞成默认
+        # 意图让熔断器与健康检查看不到密钥失效）
+        ({"error": "Incorrect API key provided: sk-***"}, False, True),
+        ({"error": {"message": "Authentication failed"}}, False, True),
+        ({"error": "insufficient_quota: quota exceeded"}, False, True),
     ]
     for body, retriable, permanent in cases:
         agent = IntentionAgent(

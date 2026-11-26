@@ -170,7 +170,12 @@ def test_failed_orchestration_leaves_no_long_term_user_turn():
     runtime, memory = _make_runtime()
 
     async def _direct(
-        factory, max_retries=0, base_delay=0.0, max_delay=0.0, record_success=True
+        factory,
+        max_retries=0,
+        base_delay=0.0,
+        max_delay=0.0,
+        record_success=True,
+        deadline=None,
     ):
         return await factory()
 
@@ -1976,6 +1981,45 @@ _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_runtime_uses_default_data_root_for_long_term": "需要 tmp_path 夹具",
 }
 
+def test_assistant_meta_not_sent_to_intention_prompt():
+    """助手消息的 _meta（用量 / 耗时 / 回合 id）只供历史回看，不进意图 prompt。"""
+    runtime, memory = _make_runtime()
+    memory.get_recent_context = lambda n_turns=5: [  # type: ignore[method-assign]
+        {"role": "user", "content": "上次的行程"},
+        {
+            "role": "assistant",
+            "content": json.dumps(
+                {
+                    "results": [
+                        {
+                            "agent_name": "itinerary_planning",
+                            "status": "success",
+                        }
+                    ],
+                    "_meta": {
+                        "usage": {"calls": 2, "total_tokens": 99},
+                        "elapsed": 1.2,
+                        "client_turn_id": "t-1",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    result = asyncio.run(runtime.ask("再改一下"))
+    assert result["reply"]
+    assistant_msgs = [
+        msg.content
+        for msg in runtime.intention_agent.context
+        if msg.role == "assistant"
+    ]
+    assert assistant_msgs, "助手最近消息应进入意图上下文"
+    assert "_meta" not in assistant_msgs[0]
+    assert "total_tokens" not in assistant_msgs[0]
+    assert "itinerary_planning" in assistant_msgs[0], "结果正文仍需保留"
+    print("✓ 助手 _meta 不进入意图 prompt")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -2050,6 +2094,7 @@ if __name__ == "__main__":
     finally:
         _mp.undo()
     test_runtime_wires_epoch_guard_into_persist()
+    test_assistant_meta_not_sent_to_intention_prompt()
     if _DIRECT_RUN_SKIP:
         print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
     print("\n全部通过")

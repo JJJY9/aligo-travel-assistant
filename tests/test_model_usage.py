@@ -114,6 +114,31 @@ def test_per_session_tracking_is_independent():
     print("✓ 每个会话的用量计数相互独立")
 
 
+def test_bad_usage_types_do_not_break_call():
+    """usage 字段类型异常（字符串 / None / NaN）只按 0 记账，调用本身不失败。"""
+    model = UsageTrackingModel(
+        _FakeModel(
+            {
+                "input_tokens": "12",
+                "output_tokens": None,
+                "time": float("nan"),
+            }
+        )
+    )
+    asyncio.run(model([{"role": "user", "content": "hi"}]))
+    assert model.usage.calls == 1
+    assert model.usage.input_tokens == 12
+    assert model.usage.output_tokens == 0
+    assert model.usage.time == 0.0, "NaN 耗时不能写进账目"
+
+    # 完全非映射的 usage：按无 usage 处理，不抛错
+    broken = UsageTrackingModel(_FakeModel(["not", "a", "dict"]))
+    asyncio.run(broken([{"role": "user", "content": "hi"}]))
+    assert broken.usage.calls == 1
+    assert broken.usage.total_tokens == 0
+    print("✓ 异常 usage 字段不打断调用")
+
+
 def test_add_usage_merges_numeric_fields():
     """未结算用量的合并：任一侧缺失字段按 0 起算，None 两侧原样返回。"""
     from utils.usage import add_usage
@@ -153,4 +178,5 @@ if __name__ == "__main__":
     test_per_session_tracking_is_independent()
     test_add_usage_merges_numeric_fields()
     test_failed_attempts_count_as_calls()
+    test_bad_usage_types_do_not_break_call()
     print("\n全部通过")

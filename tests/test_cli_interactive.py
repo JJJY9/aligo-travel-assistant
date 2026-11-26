@@ -1483,6 +1483,33 @@ def test_pipeline_marks_export_failure(monkeypatch):
     print("✓ 交互 export 中止计入管道退出码")
 
 
+def test_health_and_doctor_failures_set_pipeline_exit(monkeypatch):
+    """REPL health / doctor 失败进入管道退出码（与独立命令同口径）。"""
+    from utils.doctor import STATUS_FAIL, CheckResult
+
+    agent = cli.AligoCLI()
+    agent.console = Console(file=io.StringIO(), force_terminal=False, width=100)
+    agent.circuit_breaker = None
+    agent._command_failed = False
+
+    async def failing_health(*args, **kwargs):
+        return False, "boom"
+
+    monkeypatch.setattr(cli, "check_llm_health", failing_health)
+    asyncio.run(agent.run_health_check())
+    assert agent._command_failed is True, "health 失败必须反映到管道退出码"
+
+    agent._command_failed = False
+
+    async def failing_doctor(include_network=False):
+        return [CheckResult("依赖", STATUS_FAIL, "boom")]
+
+    monkeypatch.setattr("utils.doctor.run_doctor", failing_doctor)
+    asyncio.run(agent.run_doctor())
+    assert agent._command_failed is True, "doctor 失败必须反映到管道退出码"
+    print("✓ REPL health / doctor 失败进入管道退出码")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -1617,6 +1644,7 @@ if __name__ == "__main__":
         test_prompt_console_routes_to_stderr_when_captured,
         test_read_commands_refuse_pg_fallback,
         test_pipeline_marks_export_failure,
+        test_health_and_doctor_failures_set_pipeline_exit,
     ):
         _mp = pytest.MonkeyPatch()
         try:

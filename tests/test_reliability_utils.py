@@ -836,6 +836,133 @@ def test_probe_hard_cap_reclaims_stuck_task(monkeypatch):
     print("✓ 半开试探硬上限回收卡死任务")
 
 
+def test_local_io_errors_not_retriable():
+    """本地存储类 errno（磁盘满 / 只读 / I/O）重试不自愈，必须判不可重试。"""
+    import errno
+
+    for code in (
+        errno.ENOSPC,
+        errno.EIO,
+        errno.EEXIST,
+        errno.ENOTEMPTY,
+    ):
+        assert is_retriable_error(OSError(code, "local io")) is False, code
+    # 不带 errno 的连接级 OSError 仍按网络错误重试（既有语义）
+    assert is_retriable_error(OSError("network unreachable")) is True
+    print("✓ 本地存储 errno 不按网络错误重试")
+
+
+def test_quota_exhausted_429_is_permanent():
+    """429 + 配额耗尽：不可重试且按永久故障记账（重试只会反复失败）。"""
+    from utils.llm_resilience import is_permanent_llm_error
+
+    class _QuotaError(Exception):
+        status_code = 429
+
+    exc = _QuotaError(
+        "Error code: 429 - {'code': 'insufficient_quota', "
+        "'message': 'You exceeded your current quota'}"
+    )
+    assert is_retriable_error(exc) is False
+    assert is_permanent_llm_error(exc) is True
+    print("✓ 配额耗尽 429 判为永久故障")
+
+
+def test_retry_budget_deadline_stops_attempts(monkeypatch):
+    """整轮重试预算：超过截止时刻不再发起新尝试，抛最后一次真实异常。"""
+    import utils.llm_resilience as lr
+
+    times = {"now": 100.0}
+    monkeypatch.setattr(
+        lr,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: times["now"]),
+    )
+    calls = {"n": 0}
+
+    async def factory():
+        calls["n"] += 1
+        times["now"] += 10.0
+        raise ConnectionError("upstream down")
+
+    async def scenario():
+        with pytest.raises(ConnectionError):
+            await retry_with_backoff(
+                factory,
+                max_retries=5,
+                base_delay_sec=0.0,
+                max_delay_sec=0.0,
+                jitter=False,
+                deadline_monotonic=125.0,
+            )
+
+    asyncio.run(scenario())
+    assert calls["n"] == 3, f"预算内只应尝试 3 次，实际 {calls['n']}"
+    print("✓ 整轮重试预算限制新的尝试")
+
+
+def test_probe_not_recorded_without_record_success(monkeypatch):
+    """意图腿（record_success=False）成功不算记账：半开名额仍可归还。"""
+    from agents.conversation import ConversationRuntime
+
+    times = {"now": 100.0}
+    monkeypatch.setattr(cb_module.time, "monotonic", lambda: times["now"])
+    breaker = CircuitBreaker(
+        failure_threshold=1, recovery_timeout_sec=10, half_open_successes=1
+    )
+    breaker.record_failure()
+    times["now"] = 111.0
+
+    runtime = object.__new__(ConversationRuntime)
+    runtime.circuit_breaker = breaker
+    runtime._probe_recorded = False
+
+    async def ok():
+        return "done"
+
+    async def scenario():
+        assert breaker.allow_call() is True, "本请求占用唯一试探名额"
+        result = await runtime._call_with_resilience(
+            ok,
+            max_retries=0,
+            base_delay=0.0,
+            max_delay=0.0,
+            record_success=False,
+        )
+        assert result == "done"
+        assert runtime._probe_recorded is False, (
+            "未记账的意图腿成功不能把名额标记为已消费"
+        )
+        breaker.release_probe()
+        # 归还后其它请求可以立即试探（同一线程归属，直接断言放行）
+        assert breaker.allow_call() is True
+
+    asyncio.run(scenario())
+    print("✓ record_success=False 不占用半开名额")
+
+
+def test_get_status_wall_clock(monkeypatch):
+    """/api/metrics 的熔断快照：字段同锁读取，时间换算为墙钟秒。"""
+    times = {"now": 100.0}
+    monkeypatch.setattr(
+        cb_module,
+        "time",
+        types.SimpleNamespace(
+            monotonic=lambda: times["now"],
+            time=lambda: 1_700_000_000.0,
+        ),
+    )
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout_sec=10)
+    breaker.record_failure()
+    status = breaker.get_status()
+    assert status["state"] == "open"
+    assert status["failure_count"] == 1
+    # now=100 对应 1.7e9 → 打开时刻（同为 now=100）就是 1.7e9，而不是单调钟 100
+    assert status["opened_at"] == 1_700_000_000.0
+    assert status["last_failure_time"] == 1_700_000_000.0
+    print("✓ 熔断快照同锁读取且时间为墙钟")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -974,4 +1101,21 @@ if __name__ == "__main__":
         _mp.undo()
     test_json_formatter_includes_exc_info()
     test_json_formatter_sanitizes_any_message()
+    test_local_io_errors_not_retriable()
+    test_quota_exhausted_429_is_permanent()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_retry_budget_deadline_stops_attempts(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_probe_not_recorded_without_record_success(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_get_status_wall_clock(_mp)
+    finally:
+        _mp.undo()
     print("\n全部通过")
