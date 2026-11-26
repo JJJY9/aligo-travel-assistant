@@ -5655,17 +5655,25 @@ def run_session_export_standalone(
         return 0
 
     suffix = ".html" if html else ".md"
-    # 默认名带上用户：两个用户使用相同会话 ID 时不会互相覆盖（--force）
+    # 默认名带上用户：两个用户使用相同会话 ID 时不会互相覆盖（--force）；
+    # 会话 ID 同样经清洗 + 短哈希：合法 ID 可达 64 个多字节字符（POSIX
+    # NAME_MAX 溢出），大小写不同的会话（S1 / s1）在大小写不敏感文件
+    # 系统上会解析到同一文件
     path = (
         Path(target)
         if target
         else Path("exports")
-        / f"aligo_{_safe_export_user(user_id)}_{session_id}{suffix}"
+        / (
+            f"aligo_{_safe_export_user(user_id)}_"
+            f"{_safe_export_component(session_id)}{suffix}"
+        )
     )
-    if path.exists() and not force:
-        print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
-        return 1
     try:
+        # 超长 / 非法默认名在 exists() 阶段也可能抛 OSError（ENAMETOOLONG），
+        # 与写入失败同一提示，而不是未捕获 traceback
+        if path.exists() and not force:
+            print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
+            return 1
         path.parent.mkdir(parents=True, exist_ok=True)
         write_text_atomic(path, text)
     except (OSError, UnicodeEncodeError) as exc:
@@ -6082,12 +6090,16 @@ def run_trip_calendar_standalone(
     path = (
         Path(target)
         if target
-        else Path("exports") / f"aligo_{_safe_export_user(user_id)}_{trip_id}.ics"
+        else Path("exports")
+        / (
+            f"aligo_{_safe_export_user(user_id)}_"
+            f"{_safe_export_component(trip_id, 'trip')}.ics"
+        )
     )
-    if path.exists() and not force:
-        print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
-        return 1
     try:
+        if path.exists() and not force:
+            print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
+            return 1
         path.parent.mkdir(parents=True, exist_ok=True)
         write_bytes_atomic(path, text.encode("utf-8"))
     except (OSError, UnicodeEncodeError) as exc:
@@ -7526,6 +7538,13 @@ def _safe_export_user(user_id: str) -> str:
     from utils.exporter import safe_export_user
 
     return safe_export_user(user_id)
+
+
+def _safe_export_component(value: str, fallback: str = "user") -> str:
+    """导出文件名里的会话 / 行程 ID（同一清洗 + 短哈希实现）。"""
+    from utils.exporter import safe_export_component
+
+    return safe_export_component(value, fallback)
 
 
 def _print_stdout(text: str, end: str = "\n") -> None:

@@ -397,6 +397,35 @@ def test_list_scoped_fence_restores_escaping_after_container():
     print("✓ 列表容器内的围栏结束后恢复转义")
 
 
+def test_fence_ambiguity_degrades_to_escaping():
+    """围栏状态无法判定时余下内容全部转义（渲染器可能已关闭围栏）。
+
+    三类实测载荷：① 顶层 1-3 空格缩进围栏后出现去缩进普通行（渲染器
+    仍把该行当代码内容，围栏未关；旧实现误判容器结束并重新开围栏，
+    紧随其后的缩进 HTML 原样落盘）；② 列表项内 2 空格开围栏、4 空格
+    关围栏（渲染器按相对缩进合法关闭，旧实现当作代码内容）；③ 顶层
+    围栏 + 制表符缩进的关围栏（渲染器按 tab stop 展开后合法关闭）。
+    """
+    from utils.session_markdown import sanitize_body
+
+    payloads = [
+        "a\n  ```\nx\n  ```\n  <img src=x onerror=alert(1)>",
+        "- item\n  ```\n  code\n    ```\n  <img src=x onerror=alert(1)>",
+        "```\n\t```\n<img src=x onerror=alert(1)>",
+        "x\n   ```\ncode\n```\n<img src=x onerror=alert(1)>",
+    ]
+    for payload in payloads:
+        text = sanitize_body(payload)
+        assert "<img" not in text, (payload, text)
+        assert "&lt;img" in text, (payload, text)
+    # 歧义之后不再把围栏形行当新开围栏：真实关围栏也按转义文本落盘，
+    # 渲染器即使仍开着围栏，后续内容也只是代码文本，不会外泄 HTML
+    text = sanitize_body("```\n\t```\n````\n<script>alert(1)</script>")
+    assert "<script>" not in text
+    assert "&lt;script&gt;" in text
+    print("✓ 围栏歧义降级为全部转义")
+
+
 def test_table_row_escapes_html_without_cross_cell_code_span():
     """GFM 表格行不参与跨单元格反引号配对，单元格里的 HTML 必须转义。"""
     from utils.session_markdown import sanitize_body
@@ -574,6 +603,7 @@ if __name__ == "__main__":
     test_block_start_line_cannot_close_code_span()
     test_heading_line_cannot_open_cross_line_code_span()
     test_list_scoped_fence_restores_escaping_after_container()
+    test_fence_ambiguity_degrades_to_escaping()
     test_table_row_escapes_html_without_cross_cell_code_span()
     test_latest_timestamp_keeps_first_on_ties_and_invalid()
     test_render_all_sessions_matches_with_precomputed_grouping()

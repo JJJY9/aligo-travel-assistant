@@ -11,7 +11,7 @@ from pathlib import Path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from utils.exporter import export_files, render_markdown
+from utils.exporter import export_files, render_markdown, write_export_files
 
 
 def _base_data():
@@ -229,6 +229,37 @@ def test_export_user_names_are_casefold_unique():
     print("✓ 导出文件名按大小写折叠唯一（含哈希重叠空间）")
 
 
+def test_export_files_same_clock_tick_does_not_overwrite():
+    """同一 exported_at（并发备份 / cron 重入撞同一时钟刻度）不静默覆盖。
+
+    系统时钟只有约 1ms 分辨率，同名导出的旧实现直接 ``os.replace``，
+    后写者会丢掉先写者的快照（实测并发 CLI 导出约三成撞名）。
+    """
+    data = _base_data()
+    data["exported_at"] = "2026-11-26T10:00:00.123456"
+    with tempfile.TemporaryDirectory() as tmp:
+        first = export_files(data, Path(tmp))
+        second = export_files(data, Path(tmp))
+        third = export_files(data, Path(tmp))
+        assert first[0] != second[0] and second[0] != third[0], (
+            first,
+            second,
+            third,
+        )
+        assert first[1] != second[1] and second[1] != third[1]
+        assert len({path.name for path in first + second + third}) == 6
+        assert all(path.stat().st_size > 0 for path in first + second + third)
+        # 显式 stem 的调用保持原语义（覆盖写），供内部 / 测试使用
+        explicit_a = write_export_files(
+            data, json.dumps(data, ensure_ascii=False).encode("utf-8"), tmp, "fixed"
+        )
+        explicit_b = write_export_files(
+            data, json.dumps(data, ensure_ascii=False).encode("utf-8"), tmp, "fixed"
+        )
+        assert [p.name for p in explicit_a] == [p.name for p in explicit_b]
+    print("✓ 同一时钟刻度导出自动顺延编号，不互相覆盖")
+
+
 def test_export_files_cleans_backup_before_write():
     """export_files 接线必须使用 sanitize_backup_data：脏备份写出即可恢复。"""
     from utils.user_import import parse_user_export
@@ -317,6 +348,7 @@ if __name__ == "__main__":
     test_backup_sanitize_nested_nonfinite_and_nul()
     test_backup_sanitize_strips_escaped_nul_and_dict_keys()
     test_export_files_cleans_backup_before_write()
+    test_export_files_same_clock_tick_does_not_overwrite()
     test_write_export_files_matches_export_files_bytes()
     test_export_user_names_are_casefold_unique()
     test_export_files_json_is_nan_safe_and_md_written()
