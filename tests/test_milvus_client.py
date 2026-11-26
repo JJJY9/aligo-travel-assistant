@@ -193,6 +193,42 @@ def test_reset_and_shutdown_clients():
     assert closed == ["a"], "close 抛异常不能阻止清空注册表"
 
 
+def test_reset_and_shutdown_release_local_server(monkeypatch):
+    """reset / shutdown 必须停止进程内 milvus-lite server（否则目录锁不释放）。"""
+    import sys
+    import types
+
+    from utils import milvus_client as module
+
+    released = []
+
+    class _Manager:
+        def release_server(self, path):
+            released.append(path)
+
+    fake_package = types.ModuleType("milvus_lite")
+    fake_module = types.ModuleType("milvus_lite.server_manager")
+    fake_module.server_manager_instance = _Manager()
+    fake_package.server_manager = fake_module
+    monkeypatch.setitem(sys.modules, "milvus_lite", fake_package)
+    monkeypatch.setitem(sys.modules, "milvus_lite.server_manager", fake_module)
+
+    class _Client:
+        def close(self):
+            pass
+
+    module._CLIENTS.clear()
+    module._CLIENTS["a.db"] = _Client()
+    module._CLIENTS["b.db"] = _Client()
+
+    module.reset_milvus_client("a.db")
+    assert released == ["a.db"], "reset 后应停止该路径的本地 server"
+
+    module.shutdown_milvus_clients()
+    assert released == ["a.db", "b.db"], released
+    print("✓ reset / shutdown 释放进程内 milvus-lite server")
+
+
 def test_client_uses_dedicated_connection_on_pymilvus3(monkeypatch):
     """pymilvus 3 共享连接 close 后仍被复用：用 dedicated 让 reset 真正重连。"""
     import sys
@@ -308,6 +344,7 @@ if __name__ == "__main__":
         test_client_uses_dedicated_connection_on_pymilvus3,
         test_milvus_locked_error_has_actionable_message,
         test_lock_probe_detects_and_releases,
+        test_reset_and_shutdown_release_local_server,
     ):
         mp = pytest.MonkeyPatch()
         try:

@@ -50,18 +50,51 @@ def _loaded_embedding_dim() -> int | None:
         return None
 
 
+def _configured_embedding_dim() -> int | None:
+    """按模型目录配置推断的嵌入维度（冷进程可用，不加载 torch）。"""
+    try:
+        from utils.embedding_model import (
+            configured_model_dimension,
+            default_embedding_model_dir,
+        )
+
+        return configured_model_dimension(default_embedding_model_dir())
+    except Exception:  # noqa: BLE001 - 配置不可用时按未知处理
+        return None
+
+
+def configured_dimension_mismatch(dimension: int | None) -> int | None:
+    """集合维度与当前配置的嵌入模型维度不一致时返回配置维度。
+
+    独立 CLI 进程从不加载嵌入模型（``peek_embedding_dim`` 恒为 None），
+    只能按模型目录的 ``1_Pooling/config.json`` 推断；换模型却未重建知识
+    库时，`cli kb` 据此返回失败，才能充当脚本里的健康门禁。配置维度
+    不可推断（HuggingFace ID 未下载 / 目录缺配置）时返回 None。
+    """
+    if dimension is None:
+        return None
+    configured = _configured_embedding_dim()
+    if configured is None:
+        return None
+    return configured if int(configured) != int(dimension) else None
+
+
 def knowledge_status(
     db_path: str | Path | None = None,
     collection: str = DEFAULT_COLLECTION,
     include_path: bool = True,
     detail_errors: bool = True,
     lock_timeout: float | None = None,
+    check_configured_dim: bool = False,
 ) -> dict[str, Any]:
     """返回知识库状态：是否可用、集合名、片段数与数据库路径。
 
     Web 调用方传 ``include_path=False``（不泄露本机绝对路径）、
     ``detail_errors=False``（错误只进日志）、``lock_timeout``（导入持写锁
     期间快速返回「正在写入」而不是把请求线程堆在锁上）。
+    ``check_configured_dim=True`` 时，进程尚未加载嵌入模型（冷启动 / CLI）
+    也按模型目录配置推断维度并标记不一致；默认关闭以保持既有
+    best-effort 契约，供 Web 状态接口与 `cli kb` 显式启用。
     """
     db = Path(db_path) if db_path is not None else default_db_path()
     base: dict[str, Any] = {"collection": collection}
@@ -129,6 +162,10 @@ def knowledge_status(
         if dimension is not None:
             payload["dimension"] = dimension
         expected = _loaded_embedding_dim()
+        if expected is None and check_configured_dim:
+            # 冷进程 / 独立 CLI 没有已加载模型：按模型目录配置推断，
+            # 换模型未重建知识库时不再显示健康（doctor 早已按此告警）
+            expected = _configured_embedding_dim()
         if expected is not None and dimension is not None:
             payload["dimension_mismatch"] = int(dimension) != int(expected)
         return payload

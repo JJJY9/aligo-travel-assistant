@@ -99,6 +99,35 @@ def test_kb_status_json(monkeypatch):
     print("✓ kb --json 不可用退出码 1")
 
 
+def test_kb_status_flags_configured_dimension_mismatch(monkeypatch):
+    """独立 CLI 从不加载模型：换模型未重建时 kb 必须以失败退出。"""
+    from utils import knowledge_stats
+
+    monkeypatch.setattr(
+        knowledge_stats,
+        "knowledge_status",
+        lambda: {
+            "available": True,
+            "collection": "aligo_knowledge",
+            "documents": 3,
+            "path": "data/x.db",
+            "dimension": 512,
+        },
+    )
+    monkeypatch.setattr(
+        knowledge_stats, "configured_dimension_mismatch", lambda dimension: 1024
+    )
+    code, out = _capture(cli.run_knowledge_status_standalone, False)
+    assert code == 1, out
+    assert "不一致" in out and "init_knowledge_base.py" in out, out
+
+    code, out = _capture(cli.run_knowledge_status_standalone, True)
+    payload = json.loads(out)
+    assert code == 1 and payload["dimension_mismatch"] is True
+    assert payload["configured_dimension"] == 1024
+    print("✓ kb 冷进程按配置维度判失败（文本 / JSON）")
+
+
 def test_health_missing_runtime_dependencies(monkeypatch):
     """运行时依赖导入失败时给出提示而不是对 None 调用。"""
     monkeypatch.setattr(cli, "init_agentscope", None)
@@ -232,6 +261,7 @@ if __name__ == "__main__":
         test_health_json_failure,
         test_health_text_failure_strips_terminal_controls,
         test_kb_status_json,
+        test_kb_status_flags_configured_dimension_mismatch,
         test_health_missing_runtime_dependencies,
     ):
         mp = pytest.MonkeyPatch()

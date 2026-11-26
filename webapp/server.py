@@ -5188,7 +5188,11 @@ def create_app(model: Any = None) -> FastAPI:
         """
         response.headers.update(_enforce_kb_rate_limit(state, request))
         status = knowledge_status(
-            include_path=False, detail_errors=False, lock_timeout=0.5
+            include_path=False,
+            detail_errors=False,
+            lock_timeout=0.5,
+            # 冷进程（重启后尚未做任何检索）也要按模型目录配置发现维度不一致
+            check_configured_dim=True,
         )
         if status.get("dimension_mismatch"):
             # 集合能读但维度与当前嵌入模型不一致：所有检索 / 问答入口都会
@@ -5304,12 +5308,26 @@ def create_app(model: Any = None) -> FastAPI:
             # 可能来自第三方），写锁有界等待（导入持锁时快速 503，而不是
             # 把共享线程池的一个 worker 钉在导入全程并一直占着评测锁）
             status = knowledge_status(
-                include_path=False, detail_errors=False, lock_timeout=0.5
+                include_path=False,
+                detail_errors=False,
+                lock_timeout=0.5,
+                check_configured_dim=True,
             )
             if not status.get("available"):
                 raise HTTPException(
                     status_code=503,
                     detail=f"知识库不可用：{status.get('reason', '未知原因')}",
+                )
+            if status.get("dimension_mismatch"):
+                # 维度不一致时构造 Agent 必然失败：直接给出可执行的 503，
+                # 而不是让评测初始化抛底层异常后再映射
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "知识库向量维度与当前嵌入模型不一致，请重新运行"
+                        "初始化脚本重建：python .claude/skills/ask-question/"
+                        "script/init_knowledge_base.py"
+                    ),
                 )
 
             try:

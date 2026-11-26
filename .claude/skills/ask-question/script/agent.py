@@ -426,19 +426,24 @@ class RAGKnowledgeAgent(AgentBase):
             data_to_insert = []
             inserted_ids = []
 
+            # 一次批量编码：逐条 encode 在全局知识库写锁内执行（导入 / 面板
+            # 新增都走这里），5 万条上限时逐条前向 pass 是批量推理的 3 倍
+            # 以上耗时，写锁被拉长期间所有 RAG 检索都会因读锁超时而 503
+            contents = [doc["content"] for doc in documents]
+            vectors = (
+                self.embedding_model.encode(contents).tolist() if contents else []
+            )
+
             for i, doc in enumerate(documents):
                 # Milvus 要求 id 必须是 int64
                 doc_id = next_id + i
                 content = doc['content']
                 metadata: dict = doc.get('metadata', {})
 
-                # 生成向量
-                embedding = self.embedding_model.encode(content).tolist()
-
                 # Milvus 数据格式
                 data_to_insert.append({
                     "id": doc_id,
-                    "vector": embedding,
+                    "vector": vectors[i],
                     "content": content,
                     "metadata": json.dumps(metadata, ensure_ascii=False)  # 将metadata转为JSON字符串
                 })
@@ -946,9 +951,19 @@ class RAGKnowledgeAgent(AgentBase):
                 # 进程级共享：Web 每个会话各有一个 RAGKnowledgeAgent 实例，
                 # 按实例加载会让重排模型（~1GB）随会话数成倍复制；与嵌入
                 # 模型同一共享口径（utils/reranker_model）
-                from utils.reranker_model import get_shared_cross_encoder
+                from utils.reranker_model import (
+                    RerankerCooldownError,
+                    RerankerLoadingError,
+                    get_shared_cross_encoder,
+                )
 
                 self._reranker = get_shared_cross_encoder(model_name)
+            except (RerankerCooldownError, RerankerLoadingError) as exc:
+                # 共享加载器的瞬时状态（其它会话刚失败进入冷却 / 正在加载）：
+                # 本次按 RRF 顺序降级，但不能闩死本实例——否则一次网络抖动
+                # 会让冷却窗口内首访的所有会话永久失去精排
+                logger.info("重排模型暂不可用，本次跳过重排: %s", exc)
+                return documents
             except Exception as exc:  # noqa: BLE001 - 重排是增强项
                 self._reranker_failed = True
                 logger.warning(

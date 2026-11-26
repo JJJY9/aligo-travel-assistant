@@ -2577,6 +2577,119 @@ def test_rerank_skips_model_when_candidates_empty(monkeypatch):
     print("✓ 空候选不加载重排模型")
 
 
+def test_rerank_cooldown_does_not_latch_instance(monkeypatch):
+    """共享加载器冷却 / 加载中是瞬时状态：不得永久闩死本实例的重排。"""
+    import utils.reranker_model as reranker_model
+    from config import RAG_CONFIG
+
+    module = _load_skill_module("ask-question")
+    agent = object.__new__(module.RAGKnowledgeAgent)
+    agent._reranker = None
+    agent._reranker_failed = False
+    calls: list[str] = []
+
+    class _Model:
+        def predict(self, pairs):
+            return [0.9, 0.1]
+
+    def _loader(name):
+        calls.append(name)
+        if len(calls) == 1:
+            raise reranker_model.RerankerCooldownError("其它会话失败，冷却中")
+        return _Model()
+
+    monkeypatch.setattr(reranker_model, "get_shared_cross_encoder", _loader)
+    monkeypatch.setitem(RAG_CONFIG, "rerank_model", "fake-reranker")
+    docs = [
+        {"id": 1, "content": "住宿标准", "distance": 0.8},
+        {"id": 2, "content": "无关内容", "distance": 0.6},
+    ]
+    first = agent._rerank_documents("住宿标准", [dict(doc) for doc in docs])
+    assert [doc["id"] for doc in first] == [1, 2]
+    assert agent._reranker_failed is False, "他人冷却不得闩死本实例"
+    second = agent._rerank_documents("住宿标准", [dict(doc) for doc in docs])
+    assert calls == ["fake-reranker", "fake-reranker"], "冷却过后应重新尝试加载"
+    assert "rerank_score" in second[0], "共享模型加载成功后本实例应恢复精排"
+    print("✓ 共享冷却不闩死本实例，随后可恢复精排")
+
+
+def test_rerank_real_failure_still_latches_instance(monkeypatch):
+    """本实例真实加载失败（非共享瞬时态）仍永久跳过，避免反复分钟级加载。"""
+    import utils.reranker_model as reranker_model
+    from config import RAG_CONFIG
+
+    module = _load_skill_module("ask-question")
+    agent = object.__new__(module.RAGKnowledgeAgent)
+    agent._reranker = None
+    agent._reranker_failed = False
+    calls: list[str] = []
+
+    def _loader(name):
+        calls.append(name)
+        raise RuntimeError("model not found")
+
+    monkeypatch.setattr(reranker_model, "get_shared_cross_encoder", _loader)
+    monkeypatch.setitem(RAG_CONFIG, "rerank_model", "fake-reranker")
+    docs = [{"id": 1, "content": "住宿标准", "distance": 0.8}]
+    agent._rerank_documents("住宿标准", [dict(doc) for doc in docs])
+    assert agent._reranker_failed is True
+    agent._rerank_documents("住宿标准", [dict(doc) for doc in docs])
+    assert calls == ["fake-reranker"], "真实失败后本实例不再重试"
+    print("✓ 真实加载失败仍闩死本实例")
+
+
+def test_add_documents_batches_embedding(monkeypatch):
+    """add_documents 一次批量 encode：逐条前向 pass 在写锁内放大导入耗时。"""
+    module = _load_skill_module("ask-question")
+    agent = object.__new__(module.RAGKnowledgeAgent)
+    agent.initialized = True
+    agent.collection_name = "kb"
+    agent._milvus_db_path = "/tmp/kb-batch.db"
+
+    encoded: list[list[str]] = []
+
+    class _Embedding:
+        def encode(self, texts):
+            encoded.append(list(texts))
+
+            class _Vectors:
+                def tolist(self):
+                    return [[float(index)] for index in range(len(texts))]
+
+            return _Vectors()
+
+    class _Milvus:
+        inserted = None
+
+        def insert(self, collection_name, data):
+            self.inserted = data
+
+        def get_collection_stats(self, name):
+            return {"row_count": 3}
+
+    client = _Milvus()
+    monkeypatch.setattr(module, "get_milvus_client", lambda db: client)
+    agent.embedding_model = _Embedding()
+    agent._ensure_connection = lambda: None
+    agent._next_document_id = lambda: 7
+    agent._invalidate_bm25_cache = lambda: None
+
+    result = agent.add_documents(
+        [
+            {"content": "住宿标准", "metadata": {"title": "t1"}},
+            {"content": "报销流程"},
+        ]
+    )
+    assert result["status"] == "success", result
+    assert encoded == [["住宿标准", "报销流程"]], "必须一次批量编码"
+    assert [row["id"] for row in client.inserted] == [7, 8]
+    assert client.inserted[1]["vector"] == [1.0]
+    assert json.loads(client.inserted[0]["metadata"]) == {"title": "t1"}
+    print("✓ add_documents 批量编码且 id / 元数据逐条对应")
+
+
+
+
 def test_fetch_all_documents_parses_metadata_json(monkeypatch):
     """BM25 索引行里的 metadata 字符串要解析成 dict，分组才能生效。"""
     module = _load_skill_module("ask-question")
