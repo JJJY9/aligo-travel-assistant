@@ -1915,9 +1915,11 @@ class AligoWebApp:
                     wrap_usage_tracking(self.model),
                     self.breaker,
                     # 在途落库与删除并发：存储层写入前据此判断会话是否仍可写
-                    # （墓碑有效 = 已删除 → 返回 False，整轮不写回）
+                    # （墓碑有效 = 已删除 → 返回 False，整轮不写回）。
+                    # 守卫运行在存储写锁 / 事务内：不触发待补写墓碑的补写，
+                    # 否则高延迟 Redis 下 40 次往返会让锁持有时间远超预算
                     persist_guard=lambda: not self.is_recently_deleted(
-                        user_id, session_id
+                        user_id, session_id, replay_pending=False
                     ),
                 )
                 with self._sessions_lock:
@@ -2240,10 +2242,20 @@ class AligoWebApp:
         self._maybe_replay_pending()
         return self._tombstones_shared
 
-    def is_recently_deleted(self, user_id: str, session_id: str | None) -> bool:
+    def is_recently_deleted(
+        self,
+        user_id: str,
+        session_id: str | None,
+        *,
+        replay_pending: bool = True,
+    ) -> bool:
         if not session_id:
             return False
-        self._maybe_replay_pending()
+        if replay_pending:
+            # 存储层落库守卫在写锁 / 事务内调用本方法：补写 N 条待同步
+            # 墓碑（每条两次 Redis 往返）会把临界区拖过文件锁的 6 秒预算，
+            # 由请求入口 / 删除流程 / 健康检查负责补写即可
+            self._maybe_replay_pending()
         key = self._session_key(user_id, session_id)
         remaining: float | None = None
         token = ""
@@ -4420,13 +4432,18 @@ async def _acquire_chat_lock(
                 ) from None
             continue
         # 拿到锁后再确认一次断连：锁无竞争 / 恰在两次轮询之间释放时上面的
-        # 探测从未执行，接着构造会话并启动回合只是为已断开的客户端白干
-        if await request.is_disconnected():
+        # 探测从未执行，接着构造会话并启动回合只是为已断开的客户端白干。
+        # 探测本身抛异常 / 被取消时同样要归还锁：调用方拿不到 token、
+        # 不会再走 release，否则该用户的用户锁会永久处于 locked 状态
+        try:
+            if await request.is_disconnected():
+                raise HTTPException(
+                    status_code=499,
+                    detail=f"客户端已断开（请求 ID：{request_id}）",
+                )
+        except BaseException:
             lock.release()
-            raise HTTPException(
-                status_code=499,
-                detail=f"客户端已断开（请求 ID：{request_id}）",
-            )
+            raise
         return
 
 
@@ -6201,16 +6218,6 @@ def create_app(model: Any = None) -> FastAPI:
                     ),
                 )
             if cached is not None:
-                if cached.get("__incomplete__"):
-                    # 上一请求已落库但客户端断连没收到响应：不能重放
-                    # 空答案，也不能重新执行（会在历史里追加第二份问答）
-                    raise HTTPException(
-                        status_code=409,
-                        detail=str(
-                            cached.get("message")
-                            or "上一请求已处理但响应未送达，请刷新会话历史"
-                        ),
-                    )
                 cached_session_id = str(
                     cached.get("session_id") or payload.session_id or ""
                 )
@@ -6221,9 +6228,22 @@ def create_app(model: Any = None) -> FastAPI:
                 )
                 if cached_session_id and cached_deleted:
                     # 跨实例：本进程缓存未必被删除方清理，回放前按共享墓碑
-                    # 复核缓存响应所属会话
+                    # 复核缓存响应所属会话。必须先于 __incomplete__ 判断：
+                    # 二者可同时成立（断连回合已落库 → 会话被删除 → 原窗口
+                    # 同键重试），流式端点在同样状态下返回 404，这里不能
+                    # 持续 409「刷新历史」直到缓存 TTL
                     raise HTTPException(
                         status_code=404, detail="会话已删除，请开始新对话"
+                    )
+                if cached.get("__incomplete__"):
+                    # 上一请求已落库但客户端断连没收到响应：不能重放
+                    # 空答案，也不能重新执行（会在历史里追加第二份问答）
+                    raise HTTPException(
+                        status_code=409,
+                        detail=str(
+                            cached.get("message")
+                            or "上一请求已处理但响应未送达，请刷新会话历史"
+                        ),
                     )
                 response.headers.update(rate_headers)
                 response.headers["X-Idempotent-Replay"] = "1"

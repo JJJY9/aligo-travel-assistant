@@ -3826,6 +3826,61 @@ def test_checkpoint_reuse_requires_same_task_digest(tmp_path):
     print("✓ 检查点复用绑定任务摘要")
 
 
+def test_checkpoint_reruns_downstream_when_upstream_input_changes(tmp_path):
+    """检查点摘要绑定真实输入：上游结果变化后，下游计划措辞不变也要重跑。"""
+    from utils.execution_checkpoint import CheckpointStore
+
+    store = CheckpointStore(tmp_path, ttl_sec=3600)
+
+    def schedule(a_reason: str) -> list[dict]:
+        return [
+            {
+                "agent_name": "a",
+                "priority": 1,
+                "reason": a_reason,
+                "expected_output": "ea",
+            },
+            {
+                "agent_name": "b",
+                "priority": 2,
+                "reason": "r2",
+                "expected_output": "eb",
+            },
+        ]
+
+    first_a = _StubAgent("a", {"ver": 1})
+    first_b = _StubAgent("b", {"ok": True})
+    first = OrchestrationAgent(agent_registry={"a": first_a, "b": first_b})
+    first._checkpoint_store = store
+    asyncio.run(
+        first.reply(_intent(schedule("r1")), checkpoint_key="u:s:down")
+    )
+    assert store.load("u:s:down")["steps"].keys() >= {"a", "b"}
+
+    second_a = _StubAgent("a", {"ver": 2})
+    second_b = _StubAgent("b", {"ok": True})
+    second = OrchestrationAgent(agent_registry={"a": second_a, "b": second_b})
+    second._checkpoint_store = store
+    asyncio.run(
+        second.reply(
+            _intent(schedule("r1-changed")), checkpoint_key="u:s:down"
+        )
+    )
+    assert second_a.calls == 1, "计划漂移的上游必须重跑"
+    assert second_b.calls == 1, "上游输入变化后下游不能复用旧结果"
+
+    third_a = _StubAgent("a", {"ver": 3})
+    third_b = _StubAgent("b", {"ok": True})
+    third = OrchestrationAgent(agent_registry={"a": third_a, "b": third_b})
+    third._checkpoint_store = store
+    asyncio.run(
+        third.reply(
+            _intent(schedule("r1-changed")), checkpoint_key="u:s:down"
+        )
+    )
+    assert third_a.calls == 0 and third_b.calls == 0, "同输入重试仍应复用检查点"
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理

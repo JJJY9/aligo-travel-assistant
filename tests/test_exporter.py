@@ -8,10 +8,17 @@ import sys
 import tempfile
 from pathlib import Path
 
+import pytest
+
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from utils.exporter import export_files, render_markdown, write_export_files
+from utils.exporter import (
+    claim_export_path,
+    export_files,
+    render_markdown,
+    write_export_files,
+)
 
 
 def _base_data():
@@ -334,6 +341,72 @@ def test_write_export_files_matches_export_files_bytes():
     print("✓ 预清洗字节写盘与 export_files 产物一致")
 
 
+def test_claim_failure_leaves_no_placeholder(monkeypatch, tmp_path):
+    """md 占名失败（ENOSPC 等）不能在正式备份名下留 0 字节 json 占位。"""
+    import utils.exporter as exporter
+
+    real_open = os.open
+
+    def flaky_open(path, flags, *args, **kwargs):
+        if str(path).endswith(".md") and flags & os.O_EXCL:
+            raise OSError(28, "No space left on device")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(exporter.os, "open", flaky_open)
+    with pytest.raises(OSError):
+        export_files(_base_data(), tmp_path)
+    assert list(tmp_path.iterdir()) == [], "占名失败不能留下占位文件"
+
+
+def test_claim_keyboard_interrupt_cleans_placeholders(monkeypatch, tmp_path):
+    """BaseException（Ctrl-C / 进程中断）同样自清已占的 json 占位。"""
+    import utils.exporter as exporter
+
+    real_open = os.open
+
+    def interrupted_open(path, flags, *args, **kwargs):
+        if str(path).endswith(".md") and flags & os.O_EXCL:
+            raise KeyboardInterrupt()
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(exporter.os, "open", interrupted_open)
+    with pytest.raises(KeyboardInterrupt):
+        export_files(_base_data(), tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_claim_failure_then_retry_uses_base_name(monkeypatch, tmp_path):
+    """失败自清后重试应回到无后缀正式名，而不是被占位文件逼成 -1。"""
+    import utils.exporter as exporter
+
+    real_open = os.open
+    state = {"fail": True}
+
+    def maybe_fail(path, flags, *args, **kwargs):
+        if state["fail"] and str(path).endswith(".md") and flags & os.O_EXCL:
+            raise OSError(28, "No space left on device")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(exporter.os, "open", maybe_fail)
+    with pytest.raises(OSError):
+        export_files(_base_data(), tmp_path)
+    state["fail"] = False
+    paths = export_files(_base_data(), tmp_path)
+    assert [path.name for path in paths] == [
+        "u1_20261108T100000.json",
+        "u1_20261108T100000.md",
+    ]
+    assert all(path.stat().st_size > 0 for path in paths)
+
+
+def test_claim_export_path_is_exclusive(tmp_path):
+    """CLI 单文件导出占名：已存在返回 False（不覆盖先写者的快照）。"""
+    target = tmp_path / "session.md"
+    assert claim_export_path(target) is True
+    assert target.exists() and target.stat().st_size == 0
+    assert claim_export_path(target) is False
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -353,4 +426,30 @@ if __name__ == "__main__":
     test_export_user_names_are_casefold_unique()
     test_export_files_json_is_nan_safe_and_md_written()
     test_markdown_chat_body_escapes_html_and_backslash_cells()
+    import shutil
+
+    _tmp = Path(tempfile.mkdtemp())
+    try:
+        _mp = pytest.MonkeyPatch()
+        try:
+            test_claim_failure_leaves_no_placeholder(_mp, _tmp)
+        finally:
+            _mp.undo()
+        _mp = pytest.MonkeyPatch()
+        try:
+            test_claim_keyboard_interrupt_cleans_placeholders(_mp, _tmp)
+        finally:
+            _mp.undo()
+        _mp = pytest.MonkeyPatch()
+        try:
+            test_claim_failure_then_retry_uses_base_name(_mp, _tmp)
+        finally:
+            _mp.undo()
+    finally:
+        shutil.rmtree(_tmp, ignore_errors=True)
+    _tmp2 = Path(tempfile.mkdtemp())
+    try:
+        test_claim_export_path_is_exclusive(_tmp2)
+    finally:
+        shutil.rmtree(_tmp2, ignore_errors=True)
     print("\n全部通过")

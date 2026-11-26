@@ -1115,11 +1115,36 @@ class OrchestrationAgent(AgentBase):
         # 成功步骤时，同 client_turn_id 的重试若意图计划已变（reason /
         # expected_output / priority 不同），会把旧计划下的子结果拼进新
         # 回复。摘要沿用 retry 缓存的同源键，计划措辞变化即不复用。
-        task_digest = (
+        plan_digest = (
             hashlib.sha256(cache_key.encode("utf-8")).hexdigest()
             if cache_key
             else ""
         )
+        # 判定还必须绑定该步骤实际可见的输入：上游批次结果
+        # （previous_results）以及记忆偏好 / 抽取实体都不在计划文本里。
+        # 同键重试时上游重跑（计划漂移触发）而下游计划措辞恰好不变时，
+        # 只看计划摘要会复用「基于旧上游 / 旧偏好」的下游结果，拼出
+        # 自相矛盾的回复。结构化输入全为空时回退纯计划摘要，兼容旧格式
+        # 检查点与既有单步骤用例（安全方向：不命中就重跑）。
+        input_extras = {
+            "previous_results": previous_results,
+            "user_preferences": context.get("user_preferences") or {},
+            "key_entities": context.get("key_entities") or {},
+        }
+        if plan_digest and any(input_extras.values()):
+            extras_digest = hashlib.sha256(
+                json.dumps(
+                    input_extras,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            task_digest = hashlib.sha256(
+                f"{plan_digest}|{extras_digest}".encode("utf-8")
+            ).hexdigest()
+        else:
+            task_digest = plan_digest
         if checkpoint_store is not None and checkpoint_key:
             try:
                 state = await asyncio.to_thread(checkpoint_store.load, checkpoint_key)
