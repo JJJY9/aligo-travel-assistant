@@ -50,6 +50,21 @@ def test_wheel_install_falls_back_to_user_dir(monkeypatch, tmp_path=None):
     print("✓ wheel 安装（无 pyproject）回退用户数据目录")
 
 
+def test_env_override_strips_bom_and_quotes(monkeypatch, tmp_path=None):
+    """ALIGO_DATA_DIR 带 BOM / 成对引号（文件注入形态）仍指向目标目录。"""
+    import tempfile
+    from pathlib import Path
+
+    target = Path(tmp_path or tempfile.mkdtemp(prefix="chailv_paths_clean_"))
+    monkeypatch.setenv("ALIGO_DATA_DIR", '"' + str(target) + '"')
+    assert default_data_root() == target
+    monkeypatch.setenv("ALIGO_DATA_DIR", "'" + str(target) + "'")
+    assert default_data_root() == target
+    monkeypatch.setenv("ALIGO_DATA_DIR", chr(0xFEFF) + str(target))
+    assert default_data_root() == target
+    print("✓ ALIGO_DATA_DIR 去 BOM / 成对引号")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -60,6 +75,7 @@ if __name__ == "__main__":
 
     for case in (
         test_env_override_wins,
+        test_env_override_strips_bom_and_quotes,
         test_source_checkout_uses_repo_data,
         test_wheel_install_falls_back_to_user_dir,
     ):

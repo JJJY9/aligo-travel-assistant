@@ -8118,6 +8118,25 @@ def test_allowed_hosts_env_strips_bom(monkeypatch):
     print("✓ ALIGO_ALLOWED_HOSTS 去 BOM")
 
 
+def test_allowed_hosts_env_strips_injected_quotes(monkeypatch):
+    """成对引号注入的 ALIGO_ALLOWED_HOSTS 仍能命中，不再全站 400。"""
+    from webapp import server as server_module
+
+    monkeypatch.setenv("ALIGO_ALLOWED_HOSTS", '"aligo.example.com"')
+    assert server_module._host_allowed("aligo.example.com"), "整段引号必须剥离"
+    monkeypatch.setenv(
+        "ALIGO_ALLOWED_HOSTS", "'x.example.com,*.y.example.com'"
+    )
+    assert server_module._host_allowed("x.example.com")
+    assert server_module._host_allowed("a.y.example.com")
+    monkeypatch.setenv(
+        "ALIGO_ALLOWED_HOSTS", '"a.example.com","b.example.com"'
+    )
+    assert server_module._host_allowed("a.example.com"), "逐项引号必须剥离"
+    assert server_module._host_allowed("b.example.com")
+    print("✓ ALIGO_ALLOWED_HOSTS 去成对引号（整段 / 逐项）")
+
+
 def test_delete_session_busy_lock_refused(monkeypatch):
     """删除会话在用户锁忙碌时有界返回 409，不再排队到前端超时后仍执行。"""
     import asyncio as asyncio_module
@@ -16802,6 +16821,79 @@ def test_hsts_header_opt_in(monkeypatch):
         == "max-age=31536000"
     ), missing.headers
     print("✓ HSTS 显式开启后覆盖全部响应（含 404）")
+
+
+def test_hsts_env_parsing_strips_injected_noise():
+    """ALIGO_HSTS_MAX_AGE 与数值型配置同口径：去 BOM / 成对引号，非法值告警归零。"""
+    import subprocess
+
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "from webapp import server;"
+        "print(server._HSTS_MAX_AGE)"
+    )
+
+    def _run(value):
+        env = dict(os.environ)
+        env["ALIGO_HSTS_MAX_AGE"] = value
+        env["PYTHONIOENCODING"] = "utf-8"
+        return subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=project_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=120,
+        )
+
+    quoted = _run('"31536000"')
+    assert quoted.returncode == 0, quoted.stderr
+    assert quoted.stdout.strip() == "31536000", quoted.stdout
+    bom = _run(chr(0xFEFF) + "31536000")
+    assert bom.returncode == 0, bom.stderr
+    assert bom.stdout.strip() == "31536000", bom.stdout
+    invalid = _run("abc")
+    assert invalid.returncode == 0, invalid.stderr
+    assert invalid.stdout.strip() == "0", invalid.stdout
+    assert "不是整数" in invalid.stderr, invalid.stderr
+    print("✓ ALIGO_HSTS_MAX_AGE 去 BOM / 引号，非法值告警归零")
+
+
+def test_configure_app_logging_hides_httpx_request_lines():
+    """根日志 INFO 下不再打印 httpx 请求行（URL 可能内嵌网关凭据）。"""
+    import logging as logging_module
+
+    import httpx
+
+    from webapp import server as server_module
+
+    server_module._configure_app_logging()
+    httpx_logger = logging_module.getLogger("httpx")
+    assert httpx_logger.getEffectiveLevel() >= logging_module.WARNING
+
+    records = []
+
+    class _Capture(logging_module.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    root = logging_module.getLogger()
+    old_level = root.level
+    handler = _Capture()
+    root.addHandler(handler)
+    root.setLevel(logging_module.INFO)
+    try:
+        transport = httpx.MockTransport(lambda request: httpx.Response(200))
+        with httpx.Client(transport=transport) as client:
+            client.post("https://alice:S3cretPw@gw.example.com/v1/chat")
+    finally:
+        root.removeHandler(handler)
+        root.setLevel(old_level)
+    assert not any("S3cretPw" in message for message in records), records
+    print("✓ 应用日志不记录 httpx 请求行（含 base_url 凭据）")
 
 
 def test_chat_circuit_open_in_ask_refunds_rate_limit(monkeypatch):

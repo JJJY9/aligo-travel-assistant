@@ -9,9 +9,10 @@
 wheel 中的技能文件通过 ``[tool.setuptools.data-files]`` 安装到 ``sys.prefix``
 （普通安装）或用户目录（``--user`` 安装），因此安装后也能像源码运行一样动态加载技能。
 """
-import os
 import sys
 from pathlib import Path
+
+from utils.paths import clean_env_path
 
 ENV_SKILLS_DIR = "ALIGO_SKILLS_DIR"
 
@@ -66,7 +67,7 @@ def _user_base_skills() -> Path | None:
 def skill_roots() -> list[Path]:
     """按优先级返回候选技能目录列表（去重，保持顺序）。"""
     candidates: list[Path] = []
-    override = os.environ.get(ENV_SKILLS_DIR, "").strip()
+    override = clean_env_path(ENV_SKILLS_DIR)
     if override:
         candidates.append(Path(override).expanduser())
     candidates.append(Path(__file__).resolve().parent.parent / ".claude" / "skills")

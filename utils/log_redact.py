@@ -38,6 +38,13 @@ _AUTH_HEADER = re.compile(
     r"(?i)((?:proxy-)?authorization\s*['\"]?\s*[:=]\s*['\"]?"
     r"(?:bearer|basic|token)\s+)[^\s'\"},;]+"
 )
+# httpx / httpcore 发送前校验头值，失败时把整段头值 repr 进异常：
+# ``Illegal header value b'Bearer sk-…\n…'``。折行密钥的 \n 是字面转义，
+# 裸 Bearer 规则在空白处截断、sk- 规则在反斜杠处截断，都只遮一半；
+# 引号内整段就是凭据，整体遮蔽
+_ILLEGAL_HEADER_VALUE = re.compile(
+    r"(?i)(Illegal header value b?['\"])([^'\"\r\n]*)(['\"])"
+)
 # 裸密钥：网关错误体常原样引用请求密钥（如「Incorrect API key provided:
 # sk-…」）；健康检查 / doctor 把异常原文回显给调用方前必须遮蔽
 _BARE_API_KEY = re.compile(r"(?i)\b(?:sk|pk|rk|ak)-[A-Za-z0-9_\-]{12,}")
@@ -122,6 +129,7 @@ def redact_secret(text: object) -> str:
     cleaned = _LIBPQ_QUOTED_TOKEN.sub(r'\1"***"', cleaned)
     cleaned = _BARE_USERINFO.sub(r"\1:***@", cleaned)
     cleaned = _AUTH_HEADER.sub(r"\1***", cleaned)
+    cleaned = _ILLEGAL_HEADER_VALUE.sub(r"\1***\3", cleaned)
     cleaned = _KEY_VALUE.sub(r"\1***", cleaned)
     cleaned = _BARE_API_KEY.sub("***", cleaned)
     return cleaned

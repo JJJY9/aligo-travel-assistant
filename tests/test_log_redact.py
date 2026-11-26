@@ -229,6 +229,24 @@ def test_redact_secret_url_scheme_is_bounded_for_linear_time():
 _DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
+def test_redact_secret_masks_illegal_header_values():
+    """httpx 的 Illegal header value 异常把整段头值 repr 进文本，必须整体遮蔽。"""
+    secret = "sk-" + "A" * 20 + "\\n" + "B" * 16
+    cleaned = redact_secret(
+        "httpx.LocalProtocolError: Illegal header value b'Bearer " + secret + "'"
+    )
+    assert "A" * 20 not in cleaned, cleaned
+    assert "B" * 16 not in cleaned, cleaned
+    assert "Illegal header value" in cleaned
+    assert "***" in cleaned
+    # 无 sk- 前缀的 UUID 型密钥同样整段遮蔽
+    cleaned = redact_secret(
+        "Illegal header value b'123e4567-e89b-12d3-a456-\\n426614174000'"
+    )
+    assert "123e4567" not in cleaned, cleaned
+    print("✓ Illegal header value 异常整段遮蔽")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -239,6 +257,7 @@ if __name__ == "__main__":
     test_redact_secret_keeps_url_punctuation_passwords_out()
     test_redact_secret_masks_bare_api_keys()
     test_redact_secret_masks_auth_headers_and_colon_forms()
+    test_redact_secret_masks_illegal_header_values()
     test_redact_secret_masks_libpq_quoted_tokens()
     test_redact_secret_url_scheme_is_bounded_for_linear_time()
     test_redact_paths_hides_internal_paths_and_urls()

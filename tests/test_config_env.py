@@ -522,6 +522,66 @@ def test_resolved_timeout_rejects_non_finite():
     print("✓ 模型超时非有限值回退 120 秒")
 
 
+def test_oversized_rate_window_clamped():
+    """数百位的限流窗口被钳到 1 年上限：限流器 float() 不再 OverflowError。"""
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "import config;"
+        "from utils.rate_limit import create_rate_limiter;"
+        "ws = config.RATE_LIMIT_CONFIG['window_sec'];"
+        "create_rate_limiter('user', 30, ws);"
+        "print(ws);"
+        "print('OK')"
+    )
+    env = dict(os.environ)
+    env["CHAT_RATE_WINDOW_SEC"] = "9" * 400
+    env["PYTHONIOENCODING"] = "utf-8"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().split("\n")
+    assert lines[0] == str(366 * 86400), lines
+    assert lines[1] == "OK", lines
+    assert "超出合理上限" in result.stderr, result.stderr
+    print("✓ 超大限流窗口钳制到 1 年且限流器不崩溃")
+
+
+def test_oversized_redis_ttl_clamped():
+    """超过 int64 的 REDIS_TTL_SEC 被钳到 10 年上限：EXPIRE 不再报错。"""
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "import config;"
+        "print(config.STORAGE_CONFIG['redis_ttl_sec'])"
+    )
+    env = dict(os.environ)
+    env["REDIS_TTL_SEC"] = "9" * 400
+    env["PYTHONIOENCODING"] = "utf-8"
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(10 * 365 * 86400), result.stdout
+    assert "REDIS_TTL_SEC" in result.stderr, result.stderr
+    print("✓ 超大 Redis TTL 钳制到 10 年上限")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -546,6 +606,8 @@ if __name__ == "__main__":
         _mp.undo()
     test_numeric_and_bool_envs_strip_bom_and_strip_quotes()
     test_oversized_timeout_clamped_and_factory_survives()
+    test_oversized_rate_window_clamped()
+    test_oversized_redis_ttl_clamped()
     test_resolved_timeout_rejects_non_finite()
     test_rag_config_env_overrides()
     print("\n全部通过")

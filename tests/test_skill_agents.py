@@ -898,6 +898,9 @@ def test_all_search_backends_fail_reports_error(monkeypatch):
     monkeypatch.setattr(module, "DDGS_AVAILABLE", True)
 
     class _BoomDDGS:
+        def __init__(self, *args, **kwargs):
+            pass
+
         def text(self, *args, **kwargs):
             raise ConnectionError("search backend down")
 
@@ -908,6 +911,43 @@ def test_all_search_backends_fail_reports_error(monkeypatch):
     assert result["query_success"] is False
     assert "搜索失败" in result["results"]["error"]
     print("✓ 搜索后端全部失败时返回真实错误")
+
+
+def test_ddgs_proxy_env_resolution(monkeypatch):
+    """DDGS 不读 ALL_PROXY：显式解析代理并尊重 NO_PROXY 的后端主机排除。"""
+    module = _load_skill_module("query-info")
+    for name in (
+        "DDGS_PROXY",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+        "NO_PROXY",
+        "no_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    assert module._ddgs_proxy_for_backend("duckduckgo") is None
+
+    monkeypatch.setenv("ALL_PROXY", "http://127.0.0.1:7897")
+    assert (
+        module._ddgs_proxy_for_backend("duckduckgo")
+        == "http://127.0.0.1:7897"
+    )
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8899")
+    assert module._ddgs_proxy_for_backend("google") == "http://127.0.0.1:8899"
+
+    monkeypatch.setenv("DDGS_PROXY", "http://127.0.0.1:9999")
+    assert (
+        module._ddgs_proxy_for_backend("duckduckgo")
+        == "http://127.0.0.1:9999"
+    )
+
+    monkeypatch.delenv("DDGS_PROXY")
+    monkeypatch.setenv("NO_PROXY", "html.duckduckgo.com")
+    assert module._ddgs_proxy_for_backend("duckduckgo") is None
+    assert module._ddgs_proxy_for_backend("google") == "http://127.0.0.1:8899"
+    print("✓ DDGS 代理解析（ALL_PROXY / HTTPS_PROXY / DDGS_PROXY / NO_PROXY）")
 
 
 class _PlanTripLoader:
