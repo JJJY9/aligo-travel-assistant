@@ -582,7 +582,14 @@ def _resolve_knowledge_source_dir(knowledge_base_path: Path) -> Path:
         return knowledge_base_path
 
 
-def main() -> int:
+def main(documents_dir: str | None = None) -> int:
+    """初始化知识库。
+
+    ``documents_dir`` 指定要导入的文档目录（优先于 ``ALIGO_KB_DOCS_DIR``
+    环境变量与技能目录下的 ``data/documents``）：wheel 安装后内置文档目录
+    不会随包分发，用户需用 ``aligo kb-init --documents <目录>`` 指向自己的
+    文档；源码 checkout 不传参时行为与历史一致。
+    """
     print("=" * 70)
     print("初始化RAG知识库 (Plugin Version) - With Chunking")
     print("=" * 70)
@@ -592,7 +599,16 @@ def main() -> int:
     try:
         # 定义路径
         skill_root = current_dir.parent
-        documents_dir = skill_root / "data" / "documents"
+        override = (documents_dir or os.environ.get("ALIGO_KB_DOCS_DIR", "") or "").strip()
+        documents_dir = (
+            Path(override).expanduser() if override else skill_root / "data" / "documents"
+        )
+        if not documents_dir.is_dir():
+            # 默认目录也可能不存在：wheel 安装后内置文档不随包分发，
+            # 直接提示可执行入口，而不是笼统的「未加载到任何文档」
+            print(f"❌ 文档目录不存在：{documents_dir}")
+            print("   请用 --documents <目录> 或 ALIGO_KB_DOCS_DIR 指向存放 .txt 文档的目录")
+            return 1
         knowledge_base_path = _resolve_knowledge_base_path(skill_root)
         source_knowledge_dir = _resolve_knowledge_source_dir(knowledge_base_path)
 
@@ -887,4 +903,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    import argparse
+
+    parser = argparse.ArgumentParser(description="初始化 RAG 知识库（Milvus Lite）")
+    parser.add_argument(
+        "--documents",
+        default=None,
+        help="要导入的文档目录（默认 <技能目录>/data/documents；也可用 ALIGO_KB_DOCS_DIR）",
+    )
+    args = parser.parse_args()
+    sys.exit(main(documents_dir=args.documents))

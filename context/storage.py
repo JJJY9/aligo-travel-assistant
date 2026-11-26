@@ -78,6 +78,13 @@ _CREATE_WAIT_SEC = 5.0
 _pg_lock = threading.Lock()
 _pg_creating: dict[str, threading.Event] = {}
 _PG_CREATE_WAIT_SEC = 5.0
+# 瞬时启动错误的有界重试：docker compose / K8s 的数据库容器会在首次
+# initdb 或重启期间返回 57P03（starting up）或短暂 connection refused，
+# 一次探测失败就进入 60 秒冷却会让应用在数据库刚就绪时仍写 JSON。
+# 只重试明确的「正在启动 / 拒绝连接」，总等待 < 1 秒，不超过 leader 的
+# 5 秒等待窗口
+_PG_CONNECT_ATTEMPTS = 3
+_PG_CONNECT_BACKOFF_SEC = (0.25, 0.5)
 # 最近一次实际返回的后端（describe_backends 用真实状态而不是仅凭时间戳
 # 推断：冷却过期后、下一次成功创建之前，实际仍在使用回退后端）
 _ACTUAL_BACKEND: dict[str, str] = {}
@@ -89,6 +96,42 @@ def _failed_recently(key: str) -> bool:
 
 def _mark_failed(key: str) -> None:
     _FAILED_UNTIL[key] = time.monotonic() + _FAILURE_COOLDOWN_SEC
+
+
+def _pg_error_is_transient(exc: BaseException) -> bool:
+    """连接失败是否可能只是数据库正在启动 / 短暂拒绝（值得立即重试）。
+
+    只匹配明确的瞬时信号：SQLSTATE 57P03（cannot_connect_now）与驱动
+    文案里的 starting up / shutting down / connection refused。认证失败、
+    库不存在、超时等一律不重试。
+    """
+    sqlstate = getattr(exc, "sqlstate", None)
+    if not sqlstate:
+        sqlstate = getattr(getattr(exc, "diag", None), "sqlstate", None)
+    if sqlstate == "57P03":
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "the database system is starting up",
+            "the database system is shutting down",
+            "connection refused",
+        )
+    )
+
+
+def _create_postgres_memory(user_id: str, dsn: str) -> PostgresLongTermMemory:
+    """创建 PostgreSQL 长期记忆，瞬时启动错误按有界退避重试。"""
+    last_attempt = _PG_CONNECT_ATTEMPTS - 1
+    for attempt in range(_PG_CONNECT_ATTEMPTS):
+        try:
+            return PostgresLongTermMemory(user_id, dsn)
+        except Exception as exc:  # noqa: BLE001 - 由调用方决定回退 / strict
+            if attempt >= last_attempt or not _pg_error_is_transient(exc):
+                raise
+            time.sleep(_PG_CONNECT_BACKOFF_SEC[min(attempt, len(_PG_CONNECT_BACKOFF_SEC) - 1)])
+    raise AssertionError("unreachable")
 
 
 def _get_redis_client(url: str, force: bool = False):
@@ -321,7 +364,7 @@ def create_long_term_memory(
                     pg_fallback=True,
                 )
         try:
-            memory = PostgresLongTermMemory(user_id, dsn)
+            memory = _create_postgres_memory(user_id, dsn)
             _ACTUAL_BACKEND["long_term"] = "postgres"
             _clear_json_quarantine_marker(user_id, storage_path)
             logger.info("PostgreSQL 长期记忆已启用")

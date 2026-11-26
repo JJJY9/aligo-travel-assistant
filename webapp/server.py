@@ -125,7 +125,7 @@ from utils.session_markdown import (
     sanitize_body,
     sanitize_title,
 )
-from utils.skill_paths import resolve_skills_root, skill_scripts
+from utils.skill_paths import knowledge_init_command, resolve_skills_root, skill_scripts
 from utils.trip_conflicts import filter_trips_by_query as _filter_trips_by_query
 from utils.trip_conflicts import trip_state_label as _trip_state_label
 from utils.trip_conflicts import find_saved_trip as _find_saved_trip
@@ -3695,7 +3695,7 @@ def _knowledge_unavailable(action: str, exc: Exception) -> HTTPException:
             detail=(
                 "知识库集合不存在或无法加载（库文件存在但集合缺失 / 索引不可读），"
                 "请重新运行初始化脚本："
-                "python .claude/skills/ask-question/script/init_knowledge_base.py"
+                f"{knowledge_init_command()}"
             ),
         )
     # 可操作的临时状态：导入占用写锁 / 嵌入模型正在加载，给与
@@ -3715,7 +3715,7 @@ def _knowledge_unavailable(action: str, exc: Exception) -> HTTPException:
             status_code=503,
             detail=(
                 "知识库向量维度与当前嵌入模型不一致，请重新运行初始化脚本重建："
-                "python .claude/skills/ask-question/script/init_knowledge_base.py"
+                f"{knowledge_init_command()}"
             ),
         )
     return _storage_failure(action, exc)
@@ -5237,7 +5237,7 @@ def create_app(model: Any = None) -> FastAPI:
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503,
-                detail=f"{exc}（先运行 python .claude/skills/ask-question/script/init_knowledge_base.py）",
+                detail=f"{exc}（先运行 {knowledge_init_command()}）",
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 统一转为 503，避免泄露内部堆栈
             logger.warning("列出知识片段失败: %s", redact_paths(exc))
@@ -5491,7 +5491,7 @@ def create_app(model: Any = None) -> FastAPI:
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503,
-                detail=f"{exc}（先运行 python .claude/skills/ask-question/script/init_knowledge_base.py）",
+                detail=f"{exc}（先运行 {knowledge_init_command()}）",
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 嵌入 / 写入失败统一提示
             logger.warning("添加知识片段失败: %s", redact_paths(exc))
@@ -5544,7 +5544,7 @@ def create_app(model: Any = None) -> FastAPI:
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503,
-                detail=f"{exc}（先运行 python .claude/skills/ask-question/script/init_knowledge_base.py）",
+                detail=f"{exc}（先运行 {knowledge_init_command()}）",
             ) from exc
         except Exception as exc:  # noqa: BLE001 - 嵌入 / 写入失败统一提示
             logger.warning("更新知识片段失败: %s", redact_paths(exc))

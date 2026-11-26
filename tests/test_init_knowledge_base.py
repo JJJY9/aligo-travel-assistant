@@ -822,6 +822,85 @@ def test_discard_created_library_handles_directory_db(tmp_path):
     assert not target.exists(), "目录形态的数据库文件应被整体删除"
     print("✓ 目录形态的 milvus_lite.db 被正确清理")
 
+
+def test_missing_documents_override_returns_1(monkeypatch):
+    """--documents 指向不存在的目录：在触碰知识库之前退出 1 并给出提示。"""
+    module = _load_init_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "skill" / "script"
+        script.mkdir(parents=True)
+        module.current_dir = script
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.main(documents_dir=str(Path(tmp) / "missing-docs"))
+        assert code == 1, out.getvalue()
+        assert "文档目录不存在" in out.getvalue()
+    print("✓ --documents 缺失目录退出 1")
+
+
+def test_missing_documents_env_returns_1(monkeypatch):
+    """ALIGO_KB_DOCS_DIR 指向不存在的目录同样退出 1。"""
+    module = _load_init_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "skill" / "script"
+        script.mkdir(parents=True)
+        module.current_dir = script
+        monkeypatch.setenv("ALIGO_KB_DOCS_DIR", str(Path(tmp) / "no-docs"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.main()
+        assert code == 1, out.getvalue()
+        assert "文档目录不存在" in out.getvalue()
+    print("✓ ALIGO_KB_DOCS_DIR 缺失目录退出 1")
+
+
+def test_cli_kb_init_invokes_resolved_script(monkeypatch):
+    """aligo kb-init 通过 resolve_skills_root 定位脚本并透传 --documents。"""
+    import cli
+
+    from utils import skill_paths
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp) / "skills"
+        script = root / "ask-question" / "script" / "init_knowledge_base.py"
+        script.parent.mkdir(parents=True)
+        script.write_text("", encoding="utf-8")
+        monkeypatch.setattr(skill_paths, "resolve_skills_root", lambda: root)
+        captured: dict[str, list[str]] = {}
+
+        class _Done:
+            returncode = 0
+
+        def fake_run(command, check=False):
+            captured["command"] = command
+            return _Done()
+
+        monkeypatch.setattr(cli.subprocess, "run", fake_run)
+        docs = str(Path(tmp) / "docs")
+        code = cli.run_knowledge_init_standalone(documents=docs)
+        assert code == 0
+        assert captured["command"][1] == str(script), captured["command"]
+        assert captured["command"][-2:] == ["--documents", docs], captured["command"]
+    print("✓ kb-init 定位安装脚本并透传文档目录")
+
+
+def test_cli_kb_init_missing_script_returns_1(monkeypatch):
+    import cli
+
+    from utils import skill_paths
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(
+            skill_paths, "resolve_skills_root", lambda: Path(tmp) / "empty"
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.run_knowledge_init_standalone()
+        assert code == 1
+        assert "找不到初始化脚本" in out.getvalue()
+    print("✓ kb-init 脚本缺失退出 1")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_target_follows_runtime_when_skills_dir_overridden": "需要 tmp_path 夹具",
 }
@@ -942,6 +1021,26 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_preserved_edited_marker_survives_next_rebuild(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_missing_documents_override_returns_1(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_missing_documents_env_returns_1(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_cli_kb_init_invokes_resolved_script(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_cli_kb_init_missing_script_returns_1(_mp)
     finally:
         _mp.undo()
     if _DIRECT_RUN_SKIP:

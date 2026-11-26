@@ -7,13 +7,19 @@
 #   python cli.py            # 或 python -m webapp.server
 #
 # 说明：未配置这两个环境变量时，项目仍使用进程内短期记忆 + JSON 文件长期记忆。
+# 健康检查走 127.0.0.1 的 TCP + 账号 + 库名（pg_isready 不校验认证）；Redis
+# 开启 AOF 并挂卷——删除墓碑（TTL 1h）与会话纪元（TTL 24h）的跨实例保护
+# 依赖 Redis 数据在容器重启后仍然存在。
 services:
   redis:
     image: redis:7-alpine
-    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    command: ["redis-server", "--save", "", "--appendonly", "yes"]
     ports:
       # 只绑定本机，避免同网段其它机器访问无认证的 Redis
       - "127.0.0.1:6379:6379"
+    volumes:
+      # AOF 目录持久化：容器重启后墓碑 / 会话纪元 / 限流计数不丢
+      - aligo_redisdata:/data
     # 宿主机 / Docker 重启后自动拉起；容器健康前不要启动应用
     restart: unless-stopped
     healthcheck:
@@ -35,9 +41,11 @@ services:
       - aligo_pgdata:/var/lib/postgresql/data
     restart: unless-stopped
     # 首次 initdb 需要数秒：应用在容器健康前连接会触发 60 秒 JSON 回退，
-    # 造成本地 JSON 与 PostgreSQL 数据分叉
+    # 造成本地 JSON 与 PostgreSQL 数据分叉。-h 127.0.0.1 强制走 TCP：
+    # 不带 -h 时 pg_isready 连镜像 initdb 阶段的临时 unix socket 也会成功，
+    # --wait 会在真实 server 尚未监听 5432 时提前返回
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U aligo -d aligo"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U aligo -d aligo"]
       interval: 5s
       timeout: 3s
       retries: 12
@@ -45,3 +53,4 @@ services:
 
 volumes:
   aligo_pgdata:
+  aligo_redisdata:

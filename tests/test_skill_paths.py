@@ -193,6 +193,18 @@ def test_wheel_data_files_cover_skill_code():
     print(f"✓ wheel data-files 覆盖 {len(packaged)} 个技能文件（无知识库数据）")
 
 
+def test_knowledge_init_command_per_install_mode(monkeypatch):
+    """初始化提示按部署形态区分：源码给脚本路径，wheel 给 aligo kb-init。"""
+    from utils import paths as paths_module
+
+    monkeypatch.setattr(paths_module, "is_source_checkout", lambda *a, **k: True)
+    assert "init_knowledge_base.py" in skill_paths.knowledge_init_command()
+    monkeypatch.setattr(paths_module, "is_source_checkout", lambda *a, **k: False)
+    command = skill_paths.knowledge_init_command()
+    assert command.startswith("aligo kb-init"), command
+    print("✓ 知识库初始化提示区分源码 / wheel")
+
+
 def test_is_file_tolerates_oserror(monkeypatch):
     """Path.is_file 抛 OSError（权限不足）按「不存在」处理。"""
 
@@ -286,6 +298,7 @@ if __name__ == "__main__":
         test_is_file_tolerates_oserror,
         test_data_scheme_skills_fallbacks,
         test_user_base_skills_fallbacks,
+        test_knowledge_init_command_per_install_mode,
     ):
         mp = pytest.MonkeyPatch()
         try:

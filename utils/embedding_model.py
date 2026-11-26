@@ -84,6 +84,14 @@ def configured_model_dimension(model_path: str | Path) -> int | None:
     return None
 
 
+def _strip_data_prefix(candidate: Path) -> Path | None:
+    """去掉相对路径开头的 ``data/``（数据根目录本身已是 ``.../data``）。"""
+    parts = candidate.parts
+    if len(parts) > 1 and parts[0] == "data":
+        return Path(*parts[1:])
+    return None
+
+
 def _model_dir_candidates(candidate: Path, anchor: Path) -> list[Path]:
     """相对嵌入模型路径的候选锚点（顺序与 RAG 技能一致）。"""
     candidates: list[Path] = []
@@ -96,7 +104,13 @@ def _model_dir_candidates(candidate: Path, anchor: Path) -> list[Path]:
     try:
         from utils.paths import default_data_root
 
+        # 默认配置写的是 data/models/...，而 default_data_root() 本身就是
+        # 数据目录（ALIGO_DATA_DIR / wheel 用户目录）；直接拼接会得到
+        # <数据根>/data/models，模型放在 <数据根>/models 时永远找不到
         candidates.append(default_data_root() / candidate)
+        stripped = _strip_data_prefix(candidate)
+        if stripped is not None:
+            candidates.append(default_data_root() / stripped)
     except Exception:  # noqa: BLE001 - 旧版本无 utils.paths
         pass
     candidates.append(anchor / candidate)
@@ -132,8 +146,18 @@ def default_embedding_model_dir() -> Path:
     for resolved in _model_dir_candidates(candidate, anchor):
         if resolved.exists():
             return resolved
-    # 都不存在：返回技能安装根口径（最接近历史行为，错误信息里的路径
-    # 仍是用户最可能放置模型的位置）
+    # 都不存在：源码 checkout 返回技能安装根口径（历史行为，路径形如
+    # <仓库>/data/models/...）；wheel / ALIGO_DATA_DIR 下返回数据根口径
+    # <数据根>/models/...，与上面的搜索位置一致，doctor 提示的路径才是
+    # 用户应当放置模型的位置
+    try:
+        from utils.paths import default_data_root, is_source_checkout
+
+        stripped = _strip_data_prefix(candidate)
+        if stripped is not None and not is_source_checkout():
+            return default_data_root() / stripped
+    except Exception:  # noqa: BLE001 - 旧版本无 utils.paths
+        pass
     return anchor / candidate
 
 

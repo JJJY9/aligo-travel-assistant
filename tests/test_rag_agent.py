@@ -301,6 +301,33 @@ def test_skill_agent_anchors_model_to_repo_config_dir():
     print("✓ 相对模型路径以仓库 config 目录为首选锚点")
 
 
+def test_skill_agent_model_candidates_strip_data_prefix(monkeypatch):
+    """ALIGO_DATA_DIR / wheel 数据根已是 .../data：<数据根>/models 也要命中。"""
+    import importlib.util
+    import tempfile
+    from pathlib import Path
+
+    from utils import paths as paths_module
+
+    path = Path(project_root) / ".claude/skills/ask-question/script/agent.py"
+    spec = importlib.util.spec_from_file_location(
+        "_test_ask_question_agent_data_root", path
+    )
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    agent_cls = module.RAGKnowledgeAgent
+
+    with tempfile.TemporaryDirectory() as tmp:
+        monkeypatch.setattr(paths_module, "default_data_root", lambda: Path(tmp))
+        candidates = agent_cls._model_path_candidates(
+            Path("data/models/bge-small-zh-v1.5")
+        )
+        expected = Path(tmp) / "models" / "bge-small-zh-v1.5"
+        assert expected in candidates, candidates
+    print("✓ RAG 技能候选包含 <数据根>/models（不重复拼 data）")
+
+
 def test_grouped_missing_parts_listing_is_bounded():
     """declared parts 异常大时 missing_parts 有界，不把巨串注入 prompt。"""
     import importlib.util
@@ -355,4 +382,9 @@ if __name__ == "__main__":
     test_grouped_missing_parts_listing_is_bounded()
     test_rag_query_extraction_falls_back_to_raw_query()
     test_skill_agent_anchors_model_to_repo_config_dir()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_skill_agent_model_candidates_strip_data_prefix(_mp)
+    finally:
+        _mp.undo()
     test_strict_search_error_has_top_level_message()
