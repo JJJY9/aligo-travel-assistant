@@ -274,10 +274,27 @@ class CircuitBreaker:
             raise CircuitOpenError("服务暂时不可用，请稍后再试")
 
     def get_status(self) -> dict:
-        """当前状态摘要，便于日志或 status 命令"""
+        """当前状态摘要，便于日志或 status 命令。
+
+        整个快照在同一把锁内取值：分字段读取时 /api/metrics 可能采到
+        state=open 而 failure_count=0（另一请求恰在两次读取之间关闭熔断）
+        这类自相矛盾的组合。时间字段换算为本地墙钟秒（epoch），与日志 /
+        告警中的时间可直接比较（内部迁移仍用单调钟）。
+        """
+        with self._lock:
+            self._maybe_half_open()
+            state = self._state.value
+            failure_count = self._failure_count
+            last_failure = self._last_failure_time
+            opened = self._opened_at
+        offset = time.time() - time.monotonic()
         return {
-            "state": self.state.value,
-            "failure_count": self._failure_count,
-            "last_failure_time": self._last_failure_time,
-            "opened_at": self._opened_at,
+            "state": state,
+            "failure_count": failure_count,
+            "last_failure_time": (
+                None if last_failure is None else round(last_failure + offset, 3)
+            ),
+            "opened_at": (
+                None if opened is None else round(opened + offset, 3)
+            ),
         }

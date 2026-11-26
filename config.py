@@ -211,6 +211,7 @@ class ResilienceConfig(TypedDict):
     max_retries: int
     retry_base_delay_sec: float
     retry_max_delay_sec: float
+    turn_retry_budget_sec: float
     circuit_failure_threshold: int
     circuit_recovery_timeout_sec: float
     circuit_half_open_successes: int
@@ -326,6 +327,11 @@ RESILIENCE_CONFIG: ResilienceConfig = {
     "max_retries": 3,              # 单次请求最大重试次数（与 SYSTEM_CONFIG 对齐）
     "retry_base_delay_sec": 1.0,   # 重试退避基数（秒）
     "retry_max_delay_sec": 30.0,   # 重试退避上限（秒）
+    # 整个回合（意图 + 编排两段外层重试）的重试总预算（秒，0 表示不限）：
+    # 外层 3 次重试 × 内层逐智能体 2 次尝试，同一失败智能体在一次回合里
+    # 最多被完整执行 8 次，单次 120 秒读超时下可把用户锁与半开名额占住
+    # 十几分钟。预算只限制「再发起新的尝试」，不打断在途调用
+    "turn_retry_budget_sec": 300.0,
     "circuit_failure_threshold": 5, # 连续失败多少次后熔断
     "circuit_recovery_timeout_sec": 60.0,  # 熔断后多少秒进入半开
     "circuit_half_open_successes": 2,      # 半开状态下连续成功多少次后关闭

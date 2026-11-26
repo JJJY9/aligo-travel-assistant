@@ -2,8 +2,10 @@
 LLM 连接与可用性：重试退避、可重试错误判断、健康检查
 """
 import asyncio
+import errno
 import logging
 import re
+import time
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 
@@ -94,6 +96,35 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
         return None
 
 
+# 本地存储类 OSError 的 errno（磁盘满 / 只读 / I/O 错误 / 配额 / 占名）：
+# 与缺文件 / 权限 / 目录错误同口径，重试不会自愈，技能回复里的本地 I/O
+# 失败也不能被当成上游 LLM 故障重跑整轮并计入全局熔断。errno 为 None 的
+# 裸 OSError（socket 层 / 网关包装的网络错误）仍按可重试处理。
+_LOCAL_IO_ERRNOS = frozenset(
+    code
+    for code in (
+        errno.ENOSPC,
+        getattr(errno, "EROFS", None),
+        errno.EIO,
+        getattr(errno, "EDQUOT", None),
+        errno.EEXIST,
+        errno.ENOTEMPTY,
+        getattr(errno, "ENAMETOOLONG", None),
+        getattr(errno, "ELOOP", None),
+    )
+    if code is not None
+)
+
+# 配额耗尽以 429 返回（OpenAI 兼容网关的常见形态）：状态码分支会把它当成
+# 可重试的限流，重试只会反复失败。正文带这些标记时按永久故障处理，交给
+# 熔断器记账。
+_QUOTA_EXHAUSTED_MARKERS = (
+    "insufficient_quota",
+    "insufficient quota",
+    "billing_hard_limit_reached",
+)
+
+
 def is_retriable_error(exc: BaseException) -> bool:
     """
     判断是否为可重试错误（网络/超时/限流/5xx）。
@@ -107,6 +138,12 @@ def is_retriable_error(exc: BaseException) -> bool:
         exc,
         (FileNotFoundError, PermissionError, NotADirectoryError, IsADirectoryError),
     ):
+        return False
+    # 其余本地存储类 errno（磁盘满 / 只读 / I/O / 配额）同口径不重试
+    if isinstance(exc, OSError) and exc.errno in _LOCAL_IO_ERRNOS:
+        return False
+    text = str(exc).lower()
+    if any(marker in text for marker in _QUOTA_EXHAUSTED_MARKERS):
         return False
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError, ConnectionError, OSError)):
         return True
@@ -137,6 +174,8 @@ _PERMANENT_LLM_MARKERS = (
     "authentication",
     "unauthorized",
     "insufficient_quota",
+    "insufficient quota",
+    "billing_hard_limit_reached",
     "model_not_found",
 )
 
@@ -169,6 +208,7 @@ async def retry_with_backoff(
     base_delay_sec: float = 1.0,
     max_delay_sec: float = 30.0,
     jitter: bool = True,
+    deadline_monotonic: float | None = None,
 ) -> T:
     """
     对异步调用进行重试，使用指数退避（可选抖动）。
@@ -179,6 +219,9 @@ async def retry_with_backoff(
         base_delay_sec: 首次退避基数（秒）
         max_delay_sec: 退避上限（秒）
         jitter: 是否在退避时间上加随机抖动
+        deadline_monotonic: 可选的总预算截止时刻（``time.monotonic()``）。
+            外层「整轮重试」用它约束失败放大的总时长：超过截止时刻不再发起
+            新的尝试，直接抛出最后一次异常。内层单次调用的重试不传此参数。
 
     Returns:
         协程的返回值
@@ -188,6 +231,18 @@ async def retry_with_backoff(
     """
     last_exc: BaseException | None = None
     for attempt in range(max_retries + 1):
+        if (
+            deadline_monotonic is not None
+            and time.monotonic() >= deadline_monotonic
+        ):
+            # 整轮重试预算耗尽：保留最后一次真实异常（而不是超时异常），
+            # 让外层按原错误分类记账
+            logger.warning(
+                "整轮重试预算已耗尽（已尝试 %d 次），停止重试", attempt
+            )
+            if last_exc is not None:
+                raise last_exc
+            raise TimeoutError("重试预算已耗尽")
         try:
             return await coro_factory()
         except CircuitOpenError:
@@ -209,6 +264,12 @@ async def retry_with_backoff(
             retry_after = _retry_after_seconds(e)
             if retry_after is not None:
                 delay = min(max(delay, retry_after), max_delay_sec)
+            if deadline_monotonic is not None:
+                remaining = deadline_monotonic - time.monotonic()
+                if remaining <= 0:
+                    raise
+                # 退避睡眠同样受预算约束：睡完再判断会白白占用锁与额度
+                delay = min(delay, remaining)
             logger.warning(
                 "LLM call failed (attempt %d/%d), retry in %.1fs: %s",
                 attempt + 1,
