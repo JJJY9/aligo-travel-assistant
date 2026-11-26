@@ -2615,6 +2615,7 @@ async function scenarioHttpError(source) {
       state.userId = "u1";
       state.sessionId = "s1";
       state.partialHistory = false;
+      els.input.value = "你好";
       fetch = async (url) => {
         if (String(url).includes("/api/chat/stream")) {
           return {
@@ -2636,6 +2637,7 @@ async function scenarioHttpError(source) {
       healthText: els.healthText.textContent,
       healthClass: els.health.className,
       reconcileCalls: __reconcileCalls.slice(),
+      input: els.input.value,
     })`);
   };
   return {
@@ -3088,6 +3090,33 @@ function scenarioRenderCap(source) {
   // 用户消息气泡同样要有渲染上限（备份恢复允许单条消息接近 50MB）
   const userText = run(`capRenderText(${JSON.stringify(big)})`);
   const smallText = run('capRenderText("普通提问")');
+  // 截断点落在代理对中间时不能产出孤立代理（浏览器显示 U+FFFD）
+  const emojiCut = "a".repeat(199999) + "\u{1F600}" + "b".repeat(10);
+  const hasLoneSurrogate = run(`((text) => {
+    for (let index = 0; index < text.length; index += 1) {
+      const code = text.charCodeAt(index);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = text.charCodeAt(index + 1);
+        if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      } else if (code >= 0xdc00 && code <= 0xdfff) {
+        const prev = text.charCodeAt(index - 1);
+        if (!(prev >= 0xd800 && prev <= 0xdbff)) return true;
+      }
+    }
+    return false;
+  })((globalThis.__cut = capRenderText(${JSON.stringify(emojiCut)})))`);
+  const emojiCap = run("globalThis.__cut");
+  const emojiMd = run(`renderMarkdown(${JSON.stringify(emojiCut)})`);
+  const emojiMdLone = run(`((text) => {
+    for (let index = 0; index < text.length; index += 1) {
+      const code = text.charCodeAt(index);
+      if (code >= 0xd800 && code <= 0xdbff) {
+        const next = text.charCodeAt(index + 1);
+        if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      }
+    }
+    return false;
+  })(${JSON.stringify(emojiMd)})`);
   return {
     cut: html.includes("已截断显示"),
     cappedLength: html.length,
@@ -3095,6 +3124,10 @@ function scenarioRenderCap(source) {
     userCut: userText.includes("已截断显示"),
     userCappedLength: userText.length,
     userNormalUntouched: smallText === "普通提问",
+    emojiCapLone: hasLoneSurrogate,
+    emojiMdLone,
+    emojiCapSuffix: emojiCap.endsWith("…（已截断显示）"),
+    emojiCapLength: emojiCap.length,
   };
 }
 
@@ -3670,6 +3703,21 @@ async function scenarioFrontendDetailFixes(source) {
   `);
   const kbAnnounce = run("__kbStatus.slice()");
 
+  // agent / 意图显示名同样按自有属性查表：constructor / __proto__ 不能
+  // 渲染成函数源码
+  const agentDisplay = run(`({
+    constructorKey: agentDisplayName("constructor"),
+    protoKey: agentDisplayName("__proto__"),
+    upperConstructor: agentDisplayName("Constructor"),
+    known: agentDisplayName("Trip-Budget"),
+    unknown: agentDisplayName("Greeting_Agent"),
+    intentsConstructor: summarizeIntents(["constructor"]),
+    intentsProtoList: summarizeIntents(["__proto__", "toString", "valueOf"]),
+    intentsObject: summarizeIntents([{ type: "constructor" }]),
+    intentsKnown: summarizeIntents([{ type: "trip_planning" }]),
+    badge: makeBadge("constructor", "done").textContent,
+  })`);
+
   return {
     merged,
     restored,
@@ -3680,6 +3728,7 @@ async function scenarioFrontendDetailFixes(source) {
     tripReclickClean,
     tripLatestView,
     prefDisplay,
+    agentDisplay,
     pruned,
     prunedPut,
     degradedChips,
@@ -4319,6 +4368,670 @@ async function scenarioWebappRound(source) {
   return results;
 }
 
+async function scenarioStopReconcileParked(source) {
+  // 停止后切走会话：待对账登记必须保留（提问气泡已随消息区重建消失），
+  // 回到该会话时再对账，未落库的提问才能放回输入框
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    document.querySelector = () => null;
+    state.userId = "u1";
+    state.sessionId = "s2";
+    state.busy = false;
+    sessionLoadToken = 10;
+    refreshStatus = async () => {};
+    rememberStoppedTurn("s1", "未落库的问题", "t1", "已停止");
+  `);
+  const parked = await run(
+    'reconcileStoppedTurn("s1", "未落库的问题", 10, "t1")'
+  );
+  const afterParked = run(
+    "({ pending: state.pendingStoppedTurns.length, requests: __requests.length })"
+  );
+  // 在另一个会话里结束回合触发的 flush：不得丢弃旧会话登记、不得发请求
+  await run("flushPendingStoppedTurns()");
+  const afterFlush = run(
+    "({ pending: state.pendingStoppedTurns.length, requests: __requests.length })"
+  );
+  // 用户回到 s1：openSession 成功分支应调度一次补对账
+  run(`
+    state.sessionId = "s1";
+    globalThis.__flushes = 0;
+    flushPendingStoppedTurns = () => { __flushes += 1; return Promise.resolve(); };
+  `);
+  const openedPromise = run('openSession("s1")');
+  await tick();
+  env.__requests[env.__requests.length - 1].resolve({
+    title: "t",
+    messages: [{ role: "user", content: "hi" }],
+  });
+  const opened = await openedPromise;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  return {
+    parked,
+    after_parked: afterParked,
+    after_flush: afterFlush,
+    opened,
+    flushes: run("__flushes"),
+    pending_after_open: run("state.pendingStoppedTurns.length"),
+  };
+}
+
+async function scenarioStopReconcileSingle(source) {
+  // 600ms 定时器与 flush 并发对账同一回合：只允许一条链真正执行
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    document.querySelector = () => null;
+    state.userId = "u1";
+    state.sessionId = "s1";
+    globalThis.__implCalls = 0;
+    rememberStoppedTurn("s1", "Q1", "t1", "已停止");
+    reconcileStoppedTurnImpl = () => {
+      __implCalls += 1;
+      return new Promise((resolve) => setTimeout(() => resolve("deferred"), 40));
+    };
+  `);
+  const first = run('reconcileStoppedTurn("s1", "Q1", 0, "t1")');
+  const second = await run('reconcileStoppedTurn("s1", "Q1", 0, "t1")');
+  const firstResult = await first;
+  return {
+    first: firstResult,
+    second,
+    impl_calls: run("__implCalls"),
+    pending: run("state.pendingStoppedTurns.length"),
+  };
+}
+
+async function scenarioEditChipRestore(source) {
+  // 删除在途会话作废其加载：被作废的 openSession 不会补回编辑入口，
+  // deleteSession 必须自己补一次
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    document.querySelector = () => null;
+    refreshEditButtons = __origRefreshEditButtons;
+    loadSessions = async () => true;
+    refreshStatus = async () => {};
+    function el(cls) {
+      return {
+        className: cls || "",
+        dataset: {},
+        children: [],
+        parentNode: null,
+        classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+        appendChild(child) { child.parentNode = this; this.children.push(child); return child; },
+        remove() {
+          if (!this.parentNode) return;
+          const index = this.parentNode.children.indexOf(this);
+          if (index >= 0) this.parentNode.children.splice(index, 1);
+        },
+        querySelector(selector) {
+          const all = this.querySelectorAll(selector);
+          return all.length ? all[0] : null;
+        },
+        querySelectorAll(selector) {
+          const out = [];
+          const wantUser = selector === ".msg.user";
+          const wantBubble = selector === ".bubble";
+          const wantEdit = selector === ".user-edit";
+          const wantForm = selector === ".user-edit-form";
+          const walk = (node) => {
+            if (!node || !node.children) return;
+            for (const child of node.children) {
+              if (child.removed === true) continue;
+              const cls = String(child.className || "").split(/\\s+/);
+              const hit =
+                (wantUser && cls.includes("msg") && cls.includes("user")) ||
+                (wantBubble && cls.includes("bubble")) ||
+                (wantEdit && cls.includes("user-edit")) ||
+                (wantForm && cls.includes("user-edit-form"));
+              if (hit) out.push(child);
+              walk(child);
+            }
+          };
+          walk(this);
+          return out;
+        },
+      };
+    }
+    const messages = el("messages");
+    const user = el("msg user");
+    user.appendChild(el("bubble"));
+    messages.appendChild(user);
+    messages.appendChild(el("msg assistant"));
+    els.messages = messages;
+    state.userId = "u1";
+    state.sessionId = "B";
+    state.busy = false;
+    state.sessionLoading = false;
+    state.partialHistory = false;
+  `);
+  run("refreshEditButtons();");
+  const initial = run('els.messages.querySelectorAll(".user-edit").length');
+  // openSession(A) 开始：入口先被移除，loading 期间不再补
+  run(
+    'state.sessionLoading = true; state.sessionLoadingId = "A"; sessionLoadToken += 1; refreshEditButtons();'
+  );
+  const duringLoad = run('els.messages.querySelectorAll(".user-edit").length');
+  const promise = run('deleteSession("A")');
+  await tick();
+  env.__requests[0].resolve({ deleted: 1 });
+  await promise;
+  return {
+    initial,
+    during_load: duringLoad,
+    after_delete: run('els.messages.querySelectorAll(".user-edit").length'),
+    session_id: run("state.sessionId"),
+    session_loading: run("state.sessionLoading"),
+  };
+}
+
+async function scenarioTripLateUserGuard(source) {
+  // A 的行程删除 / 编辑 404 响应迟到且期间已切到 B：trip_id 跨账号同号，
+  // 不能清掉 B 正在编辑的表单或弹 A 的结果
+  const deleteCase = async (switchUser) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      document.querySelector = () => null;
+      refreshStatus = async () => {};
+      confirm = () => true;
+      globalThis.__toasts = [];
+      toast = (message) => { __toasts.push(message); };
+      state.userId = "user-a";
+      state.tripsExpanded = false;
+      state.tripEditingId = "trip_1";
+      els.tripDestination.value = "上海";
+      els.tripSubmit.textContent = "保存修改";
+      state.status = {
+        preferences: {},
+        trips: [{ trip_id: "trip_1", origin: "北京", destination: "上海", start_date: "2026-12-01", end_date: null, purpose: "出差" }],
+        trip_count: 1,
+        statistics: {},
+        storage: {},
+        usage: {},
+      };
+      renderOverview();
+      globalThis.__removeBtn = null;
+      const walk = (node) => {
+        if (!node || !node.children) return;
+        for (const child of node.children) {
+          if (child.title === "删除行程") globalThis.__removeBtn = child;
+          walk(child);
+        }
+      };
+      walk(els.trips);
+    `);
+    run("__removeBtn.click();");
+    // renderOverview 的天气请求也会入队：只取 DELETE
+    let del = null;
+    for (let i = 0; i < 200 && !del; i += 1) {
+      const index = env.__requests.findIndex(
+        (req) => req.args[1] && req.args[1].method === "DELETE"
+      );
+      if (index >= 0) del = env.__requests.splice(index, 1)[0];
+      else await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (!del) throw new Error("trip DELETE not queued");
+    if (switchUser) {
+      run(`
+        state.userId = "user-b";
+        state.tripEditingId = "trip_1";
+        els.tripForm.hidden = false;
+        els.tripDestination.value = "B-杭州";
+        els.tripSubmit.textContent = "保存修改";
+      `);
+    }
+    del.resolve({ deleted: 1 });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return run(`({
+      editing: state.tripEditingId,
+      destination: els.tripDestination.value,
+      submit: els.tripSubmit.textContent,
+      toasts: __toasts.slice(),
+    })`);
+  };
+  const addCase = async (switchUser) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      document.querySelector = () => null;
+      refreshStatus = async () => {};
+      globalThis.__toasts = [];
+      toast = (message) => { __toasts.push(message); };
+      state.userId = "user-a";
+      state.tripEditingId = "trip_1";
+      els.tripDestination.value = "上海";
+      els.tripStart.value = "2026-12-01";
+      els.tripSubmit.textContent = "保存修改";
+    `);
+    const promise = run('addTrip({ preventDefault() {} })');
+    const put = await waitRequest(env);
+    if (switchUser) {
+      run(`
+        state.userId = "user-b";
+        state.tripEditingId = "trip_1";
+        els.tripDestination.value = "B-杭州";
+        els.tripSubmit.textContent = "保存修改";
+      `);
+    }
+    put.reject(
+      Object.assign(new Error("行程不存在或已被删除"), { status: 404 })
+    );
+    await promise;
+    return run(`({
+      editing: state.tripEditingId,
+      destination: els.tripDestination.value,
+      submit: els.tripSubmit.textContent,
+      toasts: __toasts.slice(),
+    })`);
+  };
+  return {
+    deleteSwitched: await deleteCase(true),
+    deleteSameUser: await deleteCase(false),
+    addSwitched: await addCase(true),
+    addSameUser: await addCase(false),
+  };
+}
+
+async function scenarioDeleteInFlightSend(source) {
+  // 当前会话删除在途时不能发送；删除的是别的会话时不影响发送
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    document.querySelector = () => null;
+    confirm = () => true;
+    refreshStatus = async () => {};
+    loadSessions = async () => true;
+    state.ready = true;
+    state.userId = "u1";
+    state.sessionId = "s1";
+    state.busy = false;
+    state.sessions = [{ session_id: "s1", title: "a" }];
+    globalThis.__fetchCalls = 0;
+    globalThis.__bodies = [];
+    fetch = async (url, options) => {
+      __fetchCalls += 1;
+      __bodies.push(options && options.body ? JSON.parse(options.body) : null);
+      return { ok: true, status: 200, body: null };
+    };
+  `);
+  const del = run('deleteSession("s1")');
+  await tick();
+  const before = run("({ deleting: state.deletingSessions.has('s1'), busy: state.busy })");
+  run('els.input.value = "追问";');
+  await run('sendMessage("追问")');
+  const blocked = run(`({
+    toasts: __toasts.slice(),
+    fetchCalls: __fetchCalls,
+    input: els.input.value,
+  })`);
+  env.__requests[0].resolve({ deleted: 1 });
+  await del;
+  // 删除后立即提问：新会话正常发送
+  await run('sendMessage("新提问")');
+  const afterDelete = run(`({
+    fetchCalls: __fetchCalls,
+    lastBody: __bodies[__bodies.length - 1] || null,
+  })`);
+
+  // 反向：删除的是侧栏另一个会话，当前对话发送必须照常
+  const env2 = buildEnv(source);
+  const run2 = (code) => runIn(env2, code);
+  run2(`
+    document.querySelector = () => null;
+    refreshStatus = async () => {};
+    loadSessions = async () => true;
+    state.ready = true;
+    state.userId = "u1";
+    state.sessionId = "s1";
+    state.busy = false;
+    state.deletingSessions.add("s2");
+    globalThis.__fetchCalls = 0;
+    globalThis.__bodies = [];
+    fetch = async (url, options) => {
+      __fetchCalls += 1;
+      __bodies.push(options && options.body ? JSON.parse(options.body) : null);
+      return { ok: true, status: 200, body: null };
+    };
+  `);
+  await run2('sendMessage("正常提问")');
+  const otherSession = run2(`({
+    fetchCalls: __fetchCalls,
+    body: __bodies[0] || null,
+  })`);
+  return {
+    before,
+    blocked,
+    after_delete: afterDelete,
+    other_session: otherSession,
+  };
+}
+
+async function scenarioTripImportFailure(source) {
+  // 导入部分失败（503）/ 客户端超时：已可能落库，必须刷新面板
+  const importFile = (env) => runIn(env, "importTripsFromFile");
+  const utf8Bytes = Array.from(Buffer.from("destination,杭州", "utf8"));
+  const file = {
+    size: utf8Bytes.length,
+    arrayBuffer: async () => new Uint8Array(utf8Bytes).buffer,
+  };
+  const runCase = async (kind) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      globalThis.__toasts = [];
+      toast = (message) => { __toasts.push(message); };
+      confirm = () => true;
+      state.userId = "user-a";
+      els.memorySheet.hidden = false;
+      globalThis.__refreshCalls = 0;
+      globalThis.__refreshOptions = [];
+      refreshStatus = async (options = {}) => { __refreshCalls += 1; __refreshOptions.push(options); };
+      globalThis.__urls = [];
+      getJSON = (url) => {
+        __urls.push(url);
+        if (__urls.length === 1) {
+          return Promise.resolve({ format: "csv", rows: 2, created: 1, updated: 0, skipped: [], skipped_total: 0 });
+        }
+        const kind = ${JSON.stringify(kind)};
+        if (kind === "partial") {
+          return Promise.reject(Object.assign(new Error("导入部分失败：已提交 1 条新增、0 条更新；重试会按同路线同日期去重，可安全重跑"), { status: 503 }));
+        }
+        if (kind === "timeout") {
+          return Promise.reject(new Error("请求超时，请稍后重试"));
+        }
+        if (kind === "switched") {
+          state.userId = "user-b";
+          return Promise.reject(Object.assign(new Error("导入部分失败：已提交 1 条新增、0 条更新"), { status: 503 }));
+        }
+        return Promise.reject(Object.assign(new Error("bad request"), { status: 400 }));
+      };
+    `);
+    await importFile(env)(file);
+    return run(`({
+      toasts: __toasts.slice(),
+      refreshCalls: __refreshCalls,
+      refreshOptions: __refreshOptions.slice(),
+      urls: __urls.slice(),
+      buttonText: els.tripImport.textContent,
+      buttonDisabled: els.tripImport.disabled,
+    })`);
+  };
+  return {
+    partial: await runCase("partial"),
+    timeout: await runCase("timeout"),
+    badRequest: await runCase("badRequest"),
+    switched: await runCase("switched"),
+  };
+}
+
+async function scenarioUserSwitchStorageBlocked(source) {
+  // 浏览器拒绝存储：切换仍对当前标签页生效，但提示必须说明重载会回退
+  const env = buildEnv('localStorage.setItem("aligo.userId", "alice");\n' + source);
+  const run = (code) => runIn(env, code);
+  const map = new Map([["aligo.userId", "alice"]]);
+  env.localStorage = {
+    getItem: (key) => (map.has(key) ? map.get(key) : null),
+    setItem() {
+      throw new Error("QuotaExceededError");
+    },
+    removeItem: (key) => map.delete(key),
+  };
+  env.sessionStorage = {
+    getItem: () => null,
+    setItem() {
+      throw new Error("QuotaExceededError");
+    },
+    removeItem() {},
+  };
+  run(`
+    document.querySelector = () => null;
+    confirm = () => true;
+    state.busy = false;
+    els.userIdInput.value = "bob";
+    loadSessions = async () => {};
+    refreshStatus = () => {};
+    closeMemorySheet = () => {};
+    renderOverview = () => {};
+    resetTripForm = () => {};
+    resetKnowledgeForm = () => {};
+    resetPreferenceForm = () => {};
+  `);
+  await run("saveUser()");
+  const switched = run(
+    '({ userId: state.userId, toasts: __toasts.slice(), local: localStorage.getItem("aligo.userId") })'
+  );
+  const reloadEnv = buildEnv(
+    'localStorage.setItem("aligo.userId", "alice");\n' + source
+  );
+  return { switched, reload: runIn(reloadEnv, "state.userId") };
+}
+
+async function scenarioDeleteSessionLateResponse(source) {
+  // A 的删除成功响应迟到且期间已切到 B：不能改 B 的列表 / 总数 / 游标
+  const runCase = async (switchUser) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      document.querySelector = () => null;
+      confirm = () => true;
+      refreshStatus = async () => {};
+      loadSessions = async () => true;
+      state.userId = "user-a";
+      state.sessionId = "sess-a";
+      state.sessions = [{ session_id: "sess-a" }];
+      state.sessionTotal = 1;
+      state.sessionsOffset = 1;
+      state.busy = false;
+      state.searchQuery = "";
+    `);
+    const promise = run('deleteSession("sess-a")');
+    const del = await waitRequest(env);
+    if (switchUser) {
+      run(`
+        state.userId = "user-b";
+        state.sessionId = null;
+        state.sessions = [{ session_id: "y" }, { session_id: "z" }];
+        state.sessionTotal = 2;
+        state.sessionsOffset = 2;
+        state.sessionsLoadedQuery = "";
+      `);
+    }
+    del.resolve({ deleted: 1 });
+    await promise;
+    return run(`({
+      sessions: state.sessions.map((item) => item.session_id),
+      total: state.sessionTotal,
+      offset: state.sessionsOffset,
+      toasts: __toasts.slice(),
+    })`);
+  };
+  return {
+    switched: await runCase(true),
+    sameUser: await runCase(false),
+  };
+}
+
+async function scenarioSessionDeleteUnknown(source) {
+  // 删除响应中断（超时 / 5xx）：服务端可能已删除，必须按服务端列表对账
+  const runCase = async (status) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      document.querySelector = () => null;
+      confirm = () => true;
+      refreshStatus = async () => {};
+      loadSessions = async () => {
+        state.sessions = [{ session_id: "B" }];
+        state.sessionTotal = 1;
+        state.sessionsOffset = 1;
+        return true;
+      };
+      state.userId = "u1";
+      state.sessionId = "A";
+      state.sessions = [{ session_id: "A" }, { session_id: "B" }];
+      state.sessionTotal = 2;
+      state.sessionsOffset = 2;
+      state.searchQuery = "";
+      state.busy = false;
+    `);
+    const promise = run("deleteSession('A')");
+    const del = await waitRequest(env);
+    del.reject(
+      status
+        ? Object.assign(new Error("请求失败（HTTP " + status + "）"), { status })
+        : new Error("请求超时，请稍后重试")
+    );
+    await tick();
+    const listRequests = env.__requests.length;
+    await promise;
+    const stateAfter = run(`({
+      sessions: state.sessions.map((item) => item.session_id),
+      total: state.sessionTotal,
+      offset: state.sessionsOffset,
+      sessionId: state.sessionId,
+      welcome: __showWelcome,
+      toasts: __toasts.slice(),
+    })`);
+    stateAfter.list_requests = listRequests;
+    return stateAfter;
+  };
+  return {
+    timeout: await runCase(0),
+    serverError: await runCase(502),
+    conflict: await runCase(409),
+  };
+}
+
+async function scenarioTripFilterFailureStale(source) {
+  // 展开行程刷新失败保留旧列表：计数文案不能假装旧结果就是新条件的匹配
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    document.querySelector = () => null;
+    globalThis.__toasts = [];
+    toast = (message) => { __toasts.push(String(message)); };
+    state.userId = "u1";
+    state.status = { preferences: {}, trips: [], trip_count: 312, statistics: {}, storage: {}, usage: {} };
+    state.tripsExpanded = true;
+    state.tripsAll = [1, 2, 3].map((i) => ({
+      trip_id: "trip_" + i, origin: "北京", destination: "上海",
+      start_date: "2026-12-0" + i, end_date: null, purpose: "出差",
+    }));
+    state.tripsAllTotal = 312;
+    state.tripsFilter = "";
+    state.tripsStatusFilter = "";
+    state.tripsLoadedFilter = "";
+    state.tripsLoadedStatus = "";
+    els.memorySheet.hidden = false;
+  `);
+  run('state.tripsFilter = "北京";');
+  // renderOverview 里的天气请求也在 __requests 里：按 URL 找行程请求
+  const waitTripsRequest = async () => {
+    for (let i = 0; i < 200; i += 1) {
+      const index = env.__requests.findIndex((req) =>
+        String(req.args[0]).includes("/api/trips?")
+      );
+      if (index >= 0) return env.__requests.splice(index, 1)[0];
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    throw new Error("trips request not queued");
+  };
+  const promise = run("loadExpandedTrips()");
+  const request = await waitTripsRequest();
+  request.reject(Object.assign(new Error("读取行程失败"), { status: 503 }));
+  await promise;
+  const failed = run(`({
+    count: els.tripFilterCount.textContent,
+    rows: els.trips.children.length,
+    toasts: __toasts.slice(),
+  })`);
+  // 静默失败（refreshStatus 路径）：不 toast，但同样不能声称匹配
+  run('state.tripsFilter = "广州"; state.tripsAllTotal = 7; __toasts.length = 0;');
+  const silent = run("loadExpandedTrips({ silentFailure: true })");
+  const silentReq = await waitTripsRequest();
+  silentReq.reject(Object.assign(new Error("读取行程失败"), { status: 429 }));
+  await silent;
+  const silentResult = run(`({
+    count: els.tripFilterCount.textContent,
+    toasts: __toasts.slice(),
+  })`);
+  // 成功后自愈：计数恢复为真实匹配数
+  run('state.tripsFilter = "上海";');
+  const success = run("loadExpandedTrips()");
+  const successReq = await waitTripsRequest();
+  successReq.resolve({
+    trips: [{ trip_id: "trip_9", origin: "北京", destination: "上海", start_date: "2026-12-09", end_date: null, purpose: "出差" }],
+    total: 1,
+  });
+  await success;
+  const recovered = run("els.tripFilterCount.textContent");
+  return { failed, silent: silentResult, recovered };
+}
+
+async function scenarioEditDeleteOutcome(source) {
+  // 编辑重发的 deleteLastTurn 超时 / 5xx：结果未知，不能谎称失败
+  const runCase = async (status, message) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      document.querySelector = () => null;
+      globalThis.__created = [];
+      const __origCreate = document.createElement.bind(document);
+      document.createElement = (tag) => {
+        const node = __origCreate(tag);
+        __created.push(node);
+        return node;
+      };
+      state.userId = "u1";
+      state.sessionId = "s1";
+      state.busy = false;
+      state.sessionLoading = false;
+      state.ready = true;
+      globalThis.__bubble = {
+        textContent: "",
+        children: [],
+        querySelector: () => null,
+        appendChild(child) { this.children.push(child); return child; },
+      };
+      globalThis.__node = {
+        classList: { add() {}, remove() {} },
+        querySelector: (sel) => (sel === ".bubble" ? __bubble : null),
+      };
+      els.messages = {
+        querySelectorAll: (sel) =>
+          sel === ".msg.assistant" ? [{ dataset: { turnId: "t1" } }] : [],
+      };
+    `);
+    run('startEditUserNode(__node, "原问题");');
+    run(
+      '__created.find((node) => node.className === "user-edit-input").value = "修改后的问题";'
+    );
+    run(
+      '__created.find((node) => node.className === "save").click();'
+    );
+    const request = await waitRequest(env);
+    request.reject(
+      status
+        ? Object.assign(new Error(message), { status })
+        : new Error(message)
+    );
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    return run(`({
+      toasts: __toasts.slice(),
+      saveText: __created.find((node) => node.className === "save").textContent,
+      saveDisabled: __created.find((node) => node.className === "save").disabled,
+    })`);
+  };
+  return {
+    timeout: await runCase(0, "请求超时，请稍后重试"),
+    serverError: await runCase(502, "请求失败（HTTP 502）"),
+    conflict: await runCase(409, "会话正在生成回复，请稍后再试"),
+  };
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -4453,6 +5166,28 @@ async function main() {
     payload = await scenarioMetricsPanel(source);
   } else if (scenario === "webappRound") {
     payload = await scenarioWebappRound(source);
+  } else if (scenario === "stopReconcileParked") {
+    payload = await scenarioStopReconcileParked(source);
+  } else if (scenario === "stopReconcileSingle") {
+    payload = await scenarioStopReconcileSingle(source);
+  } else if (scenario === "editChipRestore") {
+    payload = await scenarioEditChipRestore(source);
+  } else if (scenario === "tripLateUserGuard") {
+    payload = await scenarioTripLateUserGuard(source);
+  } else if (scenario === "deleteInFlightSend") {
+    payload = await scenarioDeleteInFlightSend(source);
+  } else if (scenario === "tripImportFailure") {
+    payload = await scenarioTripImportFailure(source);
+  } else if (scenario === "userSwitchStorageBlocked") {
+    payload = await scenarioUserSwitchStorageBlocked(source);
+  } else if (scenario === "deleteSessionLateResponse") {
+    payload = await scenarioDeleteSessionLateResponse(source);
+  } else if (scenario === "sessionDeleteUnknown") {
+    payload = await scenarioSessionDeleteUnknown(source);
+  } else if (scenario === "tripFilterFailureStale") {
+    payload = await scenarioTripFilterFailureStale(source);
+  } else if (scenario === "editDeleteOutcome") {
+    payload = await scenarioEditDeleteOutcome(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
