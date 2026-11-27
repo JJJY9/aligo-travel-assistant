@@ -533,8 +533,9 @@ function clockTime(timestamp) {
 
 let toastTimer = null;
 function toast(message) {
-  els.toast.textContent = message;
+  // 先取消 hidden 再写文本：隐藏期间的内容变更不会被 role=status 播报
   els.toast.hidden = false;
+  els.toast.textContent = message;
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => {
     els.toast.hidden = true;
@@ -5804,6 +5805,9 @@ function currentTheme() {
 
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
+  // 与 theme.js 一致：内联 color-scheme 保证滚动条 / 原生控件跟随主题，
+  // 运行期切换时也要同步，否则会压住样式表里的深色 color-scheme
+  document.documentElement.style.colorScheme = theme;
   try {
     safeStorageSet("local", "aligo.theme", theme);
   } catch {

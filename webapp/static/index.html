@@ -107,7 +107,7 @@
   <div class="app" id="app">
     <aside class="sidebar" id="sidebar" aria-label="会话与账户">
       <div class="side-head">
-        <a class="brand" href="#" id="brandHome" aria-label="开始新对话">
+        <a class="brand" href="#" id="brandHome" aria-label="Aligo 智能旅行助手，开始新对话">
           <span class="brand-mark"><svg class="icon"><use href="#i-route"></use></svg></span>
           <span class="brand-text"><strong>Aligo</strong><small>智能旅行助手</small></span>
         </a>
@@ -353,7 +353,7 @@
         <div class="doctor-list" id="doctorList" role="status" aria-live="polite">尚未运行</div>
       </section>
       <section class="sheet-section">
-        <h3>偏好 <button class="trip-export" id="addPrefBtn" type="button">添加偏好</button></h3>
+        <h3 aria-label="偏好">偏好 <button class="trip-export" id="addPrefBtn" type="button">添加偏好</button></h3>
         <form class="trip-form" id="prefForm" hidden>
           <div class="trip-form-row">
             <select id="prefType" aria-label="偏好类型">
@@ -373,7 +373,7 @@
         <div class="pref-list" id="overview">加载中…</div>
       </section>
       <section class="sheet-section">
-        <h3>最近行程 <button class="trip-export" id="expandTrips" type="button" hidden>查看全部</button><button class="trip-export" id="addTripBtn" type="button">添加行程</button><button class="trip-export" id="exportTrips" type="button" hidden>导出全部日历</button><button class="trip-export" id="exportTripsCsv" type="button" hidden>导出 CSV</button><button class="trip-export" id="exportTripsHtml" type="button" hidden>导出台账 HTML</button><button class="trip-export" id="tripsDedupe" type="button" hidden>清理重复</button><button class="trip-export" id="tripImport" type="button">导入行程</button><input id="tripImportFile" type="file" accept=".csv,.ics,text/csv,text/calendar" hidden /></h3>
+        <h3 aria-label="最近行程">最近行程 <button class="trip-export" id="expandTrips" type="button" hidden>查看全部</button><button class="trip-export" id="addTripBtn" type="button">添加行程</button><button class="trip-export" id="exportTrips" type="button" hidden>导出全部日历</button><button class="trip-export" id="exportTripsCsv" type="button" hidden>导出 CSV</button><button class="trip-export" id="exportTripsHtml" type="button" hidden>导出台账 HTML</button><button class="trip-export" id="tripsDedupe" type="button" hidden>清理重复</button><button class="trip-export" id="tripImport" type="button">导入行程</button><input id="tripImportFile" type="file" accept=".csv,.ics,text/csv,text/calendar" hidden /></h3>
         <form class="trip-form" id="tripForm" hidden>
           <div class="trip-form-row">
             <input id="tripOrigin" maxlength="100" placeholder="出发地（可选）" aria-label="出发地" />
