@@ -440,48 +440,90 @@ def list_documents(
 def _list_documents(
     client: Any, limit: int, offset: int, query: str, category: str
 ) -> dict[str, Any]:
-    documents: list[dict[str, Any]] = [
-        {
-            "id": int(row.get("id", 0) or 0),
-            "content": str(row.get("content", "")),
-            "metadata": _parse_metadata(row.get("metadata")),
-        }
-        for row in _iter_all_rows(client)
-    ]
-    documents.sort(key=lambda item: item["id"], reverse=True)
-
     needle = query.strip().lower()
+    wanted_category = category.strip()
+    start = max(0, int(offset))
+    size = max(0, int(limit))
     if needle:
+        # 关键词要扫正文与元数据：保留全量物化路径（搜索本就低频）
+        documents: list[dict[str, Any]] = [
+            {
+                "id": int(row.get("id", 0) or 0),
+                "content": str(row.get("content", "")),
+                "metadata": _parse_metadata(row.get("metadata")),
+            }
+            for row in _iter_all_rows(client)
+        ]
+        documents.sort(key=lambda item: item["id"], reverse=True)
         documents = [
             doc
             for doc in documents
             if needle in doc["content"].lower()
             or needle in json.dumps(doc["metadata"], ensure_ascii=False).lower()
         ]
+        if wanted_category:
+            documents = [
+                doc
+                for doc in documents
+                if str(doc["metadata"].get("category", "")).strip()
+                == wanted_category
+            ]
+        return {"total": len(documents), "items": documents[start : start + size]}
 
-    wanted_category = category.strip()
+    # 无关键词的浏览 / 翻页：两阶段取数。先只扫 id（分类过滤附带
+    # metadata）排序、过滤、切片出当前页，再按本页 ≤100 个 id 取回
+    # content/metadata——此前每翻一页都把整库正文物化进内存并 json.loads
+    # 全部元数据（5 万片段约 5 秒、单请求峰值 37MB）。
+    id_rows: list[tuple[int, Any]] = [
+        (
+            int(row.get("id", 0) or 0),
+            row.get("metadata") if wanted_category else None,
+        )
+        for row in _iter_all_rows(
+            client,
+            output_fields=["id", "metadata"] if wanted_category else ["id"],
+        )
+    ]
+    id_rows.sort(key=lambda pair: pair[0], reverse=True)
     if wanted_category:
-        documents = [
-            doc
-            for doc in documents
-            if str(doc["metadata"].get("category", "")).strip() == wanted_category
+        id_rows = [
+            (doc_id, metadata)
+            for doc_id, metadata in id_rows
+            if str(_parse_metadata(metadata).get("category", "")).strip()
+            == wanted_category
         ]
-
-    total = len(documents)
-    start = max(0, int(offset))
-    size = max(0, int(limit))
-    return {"total": total, "items": documents[start : start + size]}
+    page_ids = [doc_id for doc_id, _ in id_rows[start : start + size]]
+    rows = _rows_by_ids(client, page_ids, ["content", "metadata"])
+    items: list[dict[str, Any]] = []
+    for doc_id in page_ids:
+        row = rows.get(doc_id)
+        if row is None:
+            # 本页取回前被并发删除（写路径已被读锁挡住，这里只是防御）
+            continue
+        items.append(
+            {
+                "id": doc_id,
+                "content": str(row.get("content", "")),
+                "metadata": _parse_metadata(row.get("metadata")),
+            }
+        )
+    return {"total": len(id_rows), "items": items}
 
 
 def list_categories() -> list[dict[str, Any]]:
     """统计知识片段的分类分布（供维护面板的筛选下拉框使用）。"""
-    # 分类统计要覆盖全部片段（列表已全量扫描，这里只是不设分页上限）
-    items = list_documents(limit=10**9, offset=0)["items"]
+    # 分类只存在 metadata：只扫 id + metadata，不再借道 list_documents
+    # 把整库正文拉进内存（面板打开时这里会与列表扫描各触发一次）
+    client = _client()
+    _load_collection(client, COLLECTION_NAME)
     counts: dict[str, int] = {}
-    for item in items:
-        category = str(item.get("metadata", {}).get("category", "")).strip()
-        if category:
-            counts[category] = counts.get(category, 0) + 1
+    with _read_lock():
+        for row in _iter_all_rows(client, output_fields=["id", "metadata"]):
+            category = str(
+                _parse_metadata(row.get("metadata")).get("category", "")
+            ).strip()
+            if category:
+                counts[category] = counts.get(category, 0) + 1
     return [
         {"category": name, "count": count}
         for name, count in sorted(counts.items(), key=lambda pair: (-pair[1], pair[0]))
@@ -717,17 +759,22 @@ def _document_info(client: Any, doc_id: int) -> tuple[int, str]:
     return parts, str(meta.get("group") or "") if parts > 1 else ""
 
 
-def _iter_all_rows(client: Any):
+def _iter_all_rows(
+    client: Any, output_fields: list[str] | None = None
+):
     """遍历集合的全部行。
 
     单次 query 受 limit（16384）与 offset 组合上限约束；query_iterator 由
     引擎分批下发，集合超过单页规模时也不会漏行（CLI 导入不受条数限制）。
+
+    ``output_fields`` 可缩小投影（默认 id/content/metadata）：只做 id 排序
+    与分页时传 ``["id"]`` / ``["id", "metadata"]``，避免把整库正文拉进内存。
     """
     iterator = client.query_iterator(
         collection_name=COLLECTION_NAME,
         filter="id >= 0",
         batch_size=_SCAN_BATCH,
-        output_fields=["id", "content", "metadata"],
+        output_fields=list(output_fields or ["id", "content", "metadata"]),
     )
     try:
         while True:

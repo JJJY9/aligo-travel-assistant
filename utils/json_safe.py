@@ -54,25 +54,43 @@ def strip_nul(value: Any) -> Any:
     return value
 
 
-def sanitize_json(value: Any, _depth: int = 0) -> Any:
+def sanitize_json(
+    value: Any, _depth: int = 0, *, strip_nuls: bool = False
+) -> Any:
     """把 NaN / Infinity 归一为 None、孤立代理项转义（递归处理列表与字典）。
 
     嵌套超过 ``MAX_JSON_DEPTH`` 的子树返回 None：这类结构在序列化 /
     响应的其它环节同样会触发 RecursionError，截断比整条接口 500 可用。
+
+    ``strip_nuls=True`` 在同一次遍历里顺带移除字符串值与字典键中的 NUL
+    （备份导出需要这一遍）：此前清洗后再整树跑一次 ``strip_nul``，大备份
+    要多付一份全量拷贝与约百毫秒 CPU。
     """
     if _depth >= MAX_JSON_DEPTH:
         return None
     if isinstance(value, float) and not math.isfinite(value):
         return None
     if isinstance(value, str):
-        return _safe_text(value)
+        text = _safe_text(value)
+        return text.replace("\x00", "") if strip_nuls else text
     if isinstance(value, list):
-        return [sanitize_json(item, _depth + 1) for item in value]
+        return [
+            sanitize_json(item, _depth + 1, strip_nuls=strip_nuls)
+            for item in value
+        ]
     if isinstance(value, dict):
-        return {
-            _safe_text(key) if isinstance(key, str) else key: sanitize_json(
-                item, _depth + 1
-            )
-            for key, item in value.items()
-        }
+        cleaned: dict[Any, Any] = {}
+        for key, item in value.items():
+            if isinstance(key, str):
+                key_text = _safe_text(key)
+                if strip_nuls:
+                    key_text = key_text.replace("\x00", "")
+                cleaned[key_text] = sanitize_json(
+                    item, _depth + 1, strip_nuls=strip_nuls
+                )
+            else:
+                cleaned[key] = sanitize_json(
+                    item, _depth + 1, strip_nuls=strip_nuls
+                )
+        return cleaned
     return value

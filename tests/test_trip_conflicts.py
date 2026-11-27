@@ -4,7 +4,7 @@
 """
 import os
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -97,6 +97,22 @@ def test_large_history_fast_and_correct():
     ]
     assert optimized == _naive_conflicts(trips[:50], trips)
     print(f"✓ {count} 条行程：冲突对 {total}（二分实现与参考一致）")
+
+
+def test_trips_with_conflicts_reuses_precomputed_intervals():
+    """调用方预计算的区间表（同一请求内 /api/status 复用）优先于重新解析。"""
+    first = {"trip_id": "a", "start_date": "2026-01-01", "end_date": "2026-01-02"}
+    second = {"trip_id": "b", "start_date": "2026-01-10", "end_date": "2026-01-11"}
+    pinned = {
+        id(first): (datetime(2026, 1, 1), datetime(2026, 1, 9)),
+        id(second): (datetime(2026, 1, 8), datetime(2026, 1, 11)),
+    }
+    views = trips_with_conflicts([first], [first, second], intervals=pinned)
+    assert views[0]["conflict_count"] == 1, "应按传入区间判定重叠"
+    # 不传区间表时按原始日期计算（既有语义不变：两条互不重叠）
+    plain = trips_with_conflicts([first], [first, second])
+    assert plain[0]["conflict_count"] == 0
+    print("✓ 冲突计算复用预计算区间")
 
 
 def test_conflicts_capped_with_exact_count():
@@ -418,6 +434,7 @@ if __name__ == "__main__":
     test_large_history_fast_and_correct()
     test_conflict_order_uses_parsed_dates()
     test_conflicts_capped_with_exact_count()
+    test_trips_with_conflicts_reuses_precomputed_intervals()
     test_find_saved_trip_normalizes_identity_fields()
     test_find_saved_trip_distinguishes_origin()
     test_trip_interval_parses_identity_dates()

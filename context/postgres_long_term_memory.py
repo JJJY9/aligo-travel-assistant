@@ -432,6 +432,39 @@ class PostgresLongTermMemory:
                             )
                         except Exception as exc:  # noqa: BLE001 - 仅影响读取性能
                             logger.warning("无法创建消息时间索引（读取会稍慢）: %s", exc)
+                        try:
+                            # 会话级操作（详情 / 删除 / 编辑末条 / 改名 / 置顶 /
+                            # 归档）都按 user_id + session_id 过滤：没有该索引时
+                            # 只能先走 (user_id,...) 索引再逐行回堆取 session_id
+                            # 过滤，等于每次扫一遍该用户的全部消息（接近导入
+                            # 上限的账号要数十到近两百毫秒）。CONCURRENTLY 不阻塞
+                            # 并发写入；构建失败只记录、下次构造重试，中断留下
+                            # 的无效索引先清理
+                            cursor.execute(
+                                "SELECT i.indisvalid FROM pg_index i "
+                                "JOIN pg_class c ON c.oid = i.indexrelid "
+                                "WHERE c.relname = %s",
+                                ("idx_aligo_chat_user_session",),
+                            )
+                            session_index_row = cursor.fetchone()
+                            if (
+                                session_index_row is not None
+                                and not session_index_row[0]
+                            ):
+                                cursor.execute(
+                                    "DROP INDEX CONCURRENTLY IF EXISTS "
+                                    "idx_aligo_chat_user_session"
+                                )
+                            cursor.execute(
+                                "CREATE INDEX CONCURRENTLY IF NOT EXISTS "
+                                "idx_aligo_chat_user_session "
+                                "ON aligo_chat_messages "
+                                "(user_id, session_id, created_at, id)"
+                            )
+                        except Exception as exc:  # noqa: BLE001 - 仅影响会话读取性能
+                            logger.warning(
+                                "无法创建消息会话索引（会话读取会稍慢）: %s", exc
+                            )
                     finally:
                         with contextlib.suppress(Exception):
                             cursor.execute(

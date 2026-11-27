@@ -12,7 +12,7 @@ from typing import Any
 
 from utils.atomic_write import write_bytes_atomic, write_text_atomic
 from utils.console import strip_terminal_controls
-from utils.json_safe import sanitize_json, strip_nul
+from utils.json_safe import sanitize_json
 from utils.session_markdown import sanitize_body
 from utils.stored_message import render_stored_message
 
@@ -43,9 +43,11 @@ def sanitize_backup_data(data: dict[str, Any]) -> dict[str, Any]:
     按「消息元数据含非有限数」整条拒绝；NUL 同理。这里额外解析助手 JSON
     文本、递归清洗后用规范 JSON 写回，并移除所有字符串里的 NUL。
     """
-    cleaned = sanitize_json(data)
-    if not isinstance(cleaned, dict):
-        return cleaned
+    # 非 dict 数据保持原口径（不清 NUL）；dict 在外层一次遍历里同时完成
+    # 代理项 / 非有限数归一与 NUL 剔除，不再整树二次深拷贝
+    if not isinstance(data, dict):
+        return sanitize_json(data)
+    cleaned = sanitize_json(data, strip_nuls=True)
     history = cleaned.get("chat_history")
     if isinstance(history, list):
         for message in history:
@@ -54,7 +56,7 @@ def sanitize_backup_data(data: dict[str, Any]) -> dict[str, Any]:
             content = message.get("content")
             if not isinstance(content, str):
                 continue
-            text = content.replace("\x00", "")
+            text = content
             if message.get("role") != "user" and text.lstrip().startswith(("{", "[")):
                 try:
                     parsed = json.loads(text)
@@ -62,17 +64,17 @@ def sanitize_backup_data(data: dict[str, Any]) -> dict[str, Any]:
                     parsed = None
                 if isinstance(parsed, (dict, list)):
                     try:
-                        # NUL 可能以 ``\u0000`` 转义形式藏在字符串值里：
-                        # sanitize_json 不管 NUL，必须再 strip_nul（含字典键），
-                        # 否则导出成功的备份在恢复时该消息被整条拒绝
+                        # 助手 JSON 内部的 NUL（含 ``\u0000`` 转义形式与
+                        # 字典键）在导入端会被整条拒绝：解析后与代理项、
+                        # 非有限数在同一遍清洗里剔除
                         text = json.dumps(
-                            strip_nul(sanitize_json(parsed)),
+                            sanitize_json(parsed, strip_nuls=True),
                             ensure_ascii=False,
                         )
                     except (TypeError, ValueError):
                         pass
             message["content"] = text
-    return strip_nul(cleaned)
+    return cleaned
 
 
 def render_markdown(data: dict[str, Any]) -> str:

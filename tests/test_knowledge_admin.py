@@ -159,6 +159,101 @@ def test_list_categories_counts(monkeypatch):
     print("✓ 知识分类统计（按数量倒序 / 忽略未分类）")
 
 
+def test_list_documents_two_phase_skips_content_without_query(monkeypatch):
+    """浏览 / 翻页只扫 id（分类时加 metadata），仅当前页取正文。
+
+    此前每翻一页都把整库正文物化进内存并解析全部元数据（5 万片段约 5 秒、
+    单请求峰值 37MB）；关键词搜索仍需正文，保留全量物化路径。
+    """
+    rows = [
+        {
+            "id": index,
+            "content": f"内容{index}",
+            "metadata": json.dumps(
+                {"category": "住宿" if index % 2 else "交通"},
+                ensure_ascii=False,
+            ),
+        }
+        for index in range(1, 31)
+    ]
+    calls = []
+
+    class _RecordingClient(_FakeMilvusClient):
+        def query_iterator(
+            self,
+            collection_name,
+            batch_size=1000,
+            limit=-1,
+            filter="",
+            output_fields=None,
+        ):
+            calls.append(("iterator", list(output_fields or [])))
+            return super().query_iterator(
+                collection_name,
+                batch_size=batch_size,
+                limit=limit,
+                filter=filter,
+            )
+
+        def query(
+            self,
+            collection_name,
+            filter="",
+            output_fields=None,
+            limit=10,
+            offset=0,
+        ):
+            calls.append(("query", list(output_fields or [])))
+            return super().query(
+                collection_name,
+                filter=filter,
+                output_fields=output_fields,
+                limit=limit,
+                offset=offset,
+            )
+
+    fake = _RecordingClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+
+    page = knowledge_admin.list_documents(limit=5, offset=20)
+    assert page["total"] == 30
+    assert [item["id"] for item in page["items"]] == [10, 9, 8, 7, 6]
+    assert any("content" in fields for kind, fields in calls if kind == "query")
+    iterator_fields = [fields for kind, fields in calls if kind == "iterator"]
+    assert iterator_fields, calls
+    assert all("content" not in fields for fields in iterator_fields), calls
+
+    calls.clear()
+    by_category = knowledge_admin.list_documents(category="住宿", limit=2)
+    assert by_category["total"] == 15
+    assert [item["id"] for item in by_category["items"]] == [29, 27]
+    iterator_fields = [fields for kind, fields in calls if kind == "iterator"]
+    assert iterator_fields, calls
+    assert all(
+        "content" not in fields and "metadata" in fields
+        for fields in iterator_fields
+    ), calls
+
+    # 关键词搜索要扫正文：仍走全量物化
+    calls.clear()
+    searched = knowledge_admin.list_documents(query="内容7")
+    assert searched["total"] == 1
+    assert searched["items"][0]["id"] == 7
+    iterator_fields = [fields for kind, fields in calls if kind == "iterator"]
+    assert any("content" in fields for fields in iterator_fields), calls
+
+    calls.clear()
+    categories = knowledge_admin.list_categories()
+    assert categories == [
+        {"category": "交通", "count": 15},
+        {"category": "住宿", "count": 15},
+    ]
+    iterator_fields = [fields for kind, fields in calls if kind == "iterator"]
+    assert iterator_fields, calls
+    assert all("content" not in fields for fields in iterator_fields), calls
+    print("✓ 列表两阶段取数（浏览不拉正文 / 搜索保留全量）")
+
+
 def test_add_document_maps_result(monkeypatch):
     from pathlib import Path
 
@@ -4104,6 +4199,7 @@ if __name__ == "__main__":
         test_list_documents_parses_sorts_and_filters,
         test_list_documents_pages_full_scan,
         test_list_categories_counts,
+        test_list_documents_two_phase_skips_content_without_query,
         test_add_document_maps_result,
         test_add_document_error_raises,
         test_add_document_splits_long_content,

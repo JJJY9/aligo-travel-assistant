@@ -316,6 +316,87 @@ def test_backup_sanitize_strips_escaped_nul_and_dict_keys():
     print("✓ 备份清洗清除转义 NUL 与字典键")
 
 
+def _legacy_sanitize_backup_data(data):
+    """旧实现（清洗后再整树 strip_nul 一遍）：新实现必须与它逐字节等价。"""
+    from utils.json_safe import sanitize_json, strip_nul
+
+    cleaned = sanitize_json(data)
+    if not isinstance(cleaned, dict):
+        return cleaned
+    history = cleaned.get("chat_history")
+    if isinstance(history, list):
+        for message in history:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            text = content.replace("\x00", "")
+            if message.get("role") != "user" and text.lstrip().startswith(("{", "[")):
+                try:
+                    parsed = json.loads(text)
+                except (ValueError, RecursionError):
+                    parsed = None
+                if isinstance(parsed, (dict, list)):
+                    try:
+                        text = json.dumps(
+                            strip_nul(sanitize_json(parsed)),
+                            ensure_ascii=False,
+                        )
+                    except (TypeError, ValueError):
+                        pass
+            message["content"] = text
+    return strip_nul(cleaned)
+
+
+def test_backup_sanitize_matches_legacy_bytes():
+    """合并后的单遍清洗（strip_nuls）与旧双遍实现输出逐字节一致。"""
+    from utils.exporter import sanitize_backup_data
+
+    nul = chr(0)
+    deep = {}
+    cursor = deep
+    for _ in range(60):
+        cursor["next"] = {}
+        cursor = cursor["next"]
+    data = {
+        "user_id": "u" + nul + "1",
+        "preferences": {
+            "home" + nul + "location": "北京",
+            "bad": float("nan"),
+            "deep": deep,
+            "list": ["a" + nul + "b", float("inf"), "x\ud800y"],
+        },
+        "chat_history": [
+            {
+                "role": "assistant",
+                "content": json.dumps(
+                    {
+                        "answer": "a" + nul + "b\u0000c",
+                        "meta": {"k" + nul: float("nan")},
+                        "nested": {"ok": "值"},
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+            {"role": "user", "content": "u" + nul + "q"},
+            {
+                "role": "assistant",
+                "content": "不是 JSON [" + nul + "] 原样保留",
+            },
+            "非字典消息" + nul,
+        ],
+    }
+    new = sanitize_backup_data(json.loads(json.dumps(data)))
+    old = _legacy_sanitize_backup_data(json.loads(json.dumps(data)))
+    assert json.dumps(new, ensure_ascii=False) == json.dumps(
+        old, ensure_ascii=False
+    ), "新清洗不得改变导出字节（导入幂等依赖清洗口径）"
+    # 非 dict 顶层维持旧口径（不清 NUL）
+    assert sanitize_backup_data(["a" + nul + "b"]) == ["a" + nul + "b"]
+    print("✓ 备份单遍清洗与旧实现逐字节一致")
+
+
 def test_write_export_files_matches_export_files_bytes():
     """预清洗字节直接写盘与 export_files 的产物逐字节一致。"""
     from utils.exporter import sanitize_backup_data, write_export_files
@@ -420,6 +501,7 @@ if __name__ == "__main__":
     test_markdown_strips_terminal_controls_everywhere()
     test_backup_sanitize_nested_nonfinite_and_nul()
     test_backup_sanitize_strips_escaped_nul_and_dict_keys()
+    test_backup_sanitize_matches_legacy_bytes()
     test_export_files_cleans_backup_before_write()
     test_export_files_same_clock_tick_does_not_overwrite()
     test_write_export_files_matches_export_files_bytes()
