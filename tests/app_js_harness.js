@@ -5407,6 +5407,65 @@ async function scenarioPerfRound(source) {
   return results;
 }
 
+async function scenarioTheme(source) {
+  // 主题初始化脚本：存储键必须与 app.js 的 applyTheme 一致，且同步
+  // color-scheme（避免深色系统下浅色偏好首帧闪深色）
+  const themePath = appPath.replace(/([\\/])app\.js$/, "$1theme.js");
+  const themeSource = fs.readFileSync(themePath, "utf8");
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const results = {};
+  run(`
+    globalThis.__themeKeys = [];
+    const __get = localStorage.getItem.bind(localStorage);
+    const __set = localStorage.setItem.bind(localStorage);
+    localStorage.getItem = (key) => { __themeKeys.push("get:" + key); return __get(key); };
+    localStorage.setItem = (key, value) => { __themeKeys.push("set:" + key); return __set(key, value); };
+  `);
+  const loadTheme = () => vm.runInContext(themeSource, env);
+  const snapshot = () =>
+    run(
+      '({ theme: document.documentElement.dataset.theme, scheme: document.documentElement.style.colorScheme || "" })'
+    );
+
+  // 1) 无存储偏好 + 系统浅色：回退浅色，并记录它读取的键
+  loadTheme();
+  const readKeys = run(
+    "__themeKeys.filter((entry) => entry.startsWith('get:'))"
+  );
+  results.empty = snapshot();
+  results.read_keys = readKeys;
+
+  // 2) 预置存储为深色（用 theme.js 自己读过的键）：必须还原为深色
+  const themeKey = readKeys.length ? readKeys[0].slice(4) : "";
+  run(
+    `localStorage.setItem(${JSON.stringify(themeKey)}, "dark"); __themeKeys.length = 0;`
+  );
+  loadTheme();
+  results.stored = Object.assign(snapshot(), {
+    key: themeKey,
+    set_keys: run("__themeKeys.filter((entry) => entry.startsWith('set:'))"),
+  });
+
+  // 3) 无存储偏好 + 系统深色：跟随系统
+  run("localStorage.clear(); __themeKeys.length = 0;");
+  env.matchMedia = () => ({
+    matches: true,
+    addEventListener() {},
+    removeEventListener() {},
+  });
+  loadTheme();
+  results.system_dark = snapshot();
+
+  // 4) app.js 的 applyTheme 必须写同一个键，并同步 color-scheme
+  run('__themeKeys.length = 0; applyTheme("dark");');
+  results.apply = Object.assign(snapshot(), {
+    stored: run(`localStorage.getItem(${JSON.stringify(themeKey)})`),
+    set_keys: run("__themeKeys.filter((entry) => entry.startsWith('set:'))"),
+  });
+  return results;
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -5573,6 +5632,8 @@ async function main() {
     payload = await scenarioEditDeleteOutcome(source);
   } else if (scenario === "perfRound") {
     payload = await scenarioPerfRound(source);
+  } else if (scenario === "theme") {
+    payload = await scenarioTheme(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

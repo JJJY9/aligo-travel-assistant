@@ -1569,6 +1569,24 @@ def test_kb_delete_stale_400_refreshes_list():
     print("✓ 删除 400 时刷新列表")
 
 
+def test_theme_boot_matches_apply_theme():
+    """theme.js 与 app.js 用同一存储键，首帧即写入 color-scheme。"""
+    results = _run_harness("theme")
+    read_keys = [entry[4:] for entry in results["read_keys"]]
+    assert read_keys and set(read_keys) == {"aligo.theme"}, results["read_keys"]
+    assert results["empty"] == {"theme": "light", "scheme": "light"}
+    stored_keys = [entry[4:] for entry in results["stored"]["set_keys"]]
+    assert stored_keys == []  # 启动脚本只读不写
+    assert results["stored"]["theme"] == "dark"
+    assert results["stored"]["scheme"] == "dark"
+    assert results["system_dark"] == {"theme": "dark", "scheme": "dark"}
+    applied = results["apply"]
+    assert applied["stored"] == "dark"
+    assert [entry[4:] for entry in applied["set_keys"]] == ["aligo.theme"]
+    assert applied["theme"] == "dark" and applied["scheme"] == "dark"
+    print("✓ 主题脚本与 applyTheme 共用键并同步 color-scheme")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -1673,4 +1691,5 @@ if __name__ == "__main__":
     test_trip_filter_failure_does_not_claim_match_count()
     test_edit_delete_unknown_outcome_message()
     test_perf_round_probe_and_render_budget()
+    test_theme_boot_matches_apply_theme()
     print("\n全部通过")

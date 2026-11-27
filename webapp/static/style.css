@@ -19,6 +19,8 @@
   --accent-soft: #fbe9e2;
   --teal: #0f6f69;
   --teal-soft: #e0f0ee;
+  /* 填充底：恒为深青，白字在其上始终满足 AA 对比度 */
+  --teal-fill: #0f6f69;
   --danger: #b42318;
   --danger-soft: #fdeceb;
   --user-bg: #162c34;
@@ -53,6 +55,7 @@
   --accent-soft: rgba(204, 70, 26, 0.16);
   --teal: #52b7ae;
   --teal-soft: rgba(82, 183, 174, 0.14);
+  --teal-fill: #0f6f69;
   --danger: #ff7a70;
   --danger-soft: rgba(255, 122, 112, 0.12);
   --user-bg: #1c3a43;
@@ -83,6 +86,7 @@ body {
 
 button, input, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
+button:disabled { cursor: default; }
 a { color: var(--teal); }
 [hidden] { display: none !important; }
 ::selection { background: var(--accent-soft); color: var(--accent-text); }
@@ -212,7 +216,6 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   flex: 1;
   min-width: 0;
   border: 0;
-  outline: 0;
   background: transparent;
   color: var(--sidebar-ink);
   font-size: 12.5px;
@@ -396,7 +399,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   border-radius: 50%;
   display: grid;
   place-items: center;
-  background: var(--teal);
+  background: var(--teal-fill);
   color: #fff;
   font-size: 13px;
   font-weight: 600;
@@ -646,6 +649,10 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 }
 .bubble.answer pre:hover .code-copy,
 .bubble.answer pre:focus-within .code-copy { opacity: 1; }
+/* 触屏没有 hover：复制按钮必须常显，否则手机 / 平板看不到入口 */
+@media (hover: none) {
+  .bubble.answer pre .code-copy { opacity: 1; }
+}
 .table-wrap { margin: 12px 0; overflow-x: auto; }
 .bubble.answer table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
 .bubble.answer th, .bubble.answer td { padding: 7px 10px; border: 1px solid var(--line); text-align: left; vertical-align: top; }
@@ -907,10 +914,13 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   color: var(--ink-2);
   font-size: 12.5px;
 }
-.ghost:hover { border-color: var(--accent); color: var(--accent); }
+.ghost:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.ghost:disabled { opacity: 0.55; cursor: default; }
 
 .sheet-section { margin-top: 18px; }
-.sheet-section h3 { margin: 0 0 8px; font-size: 11.5px; font-weight: 500; color: var(--ink-3); }
+/* flow-root：小节标题里的 .trip-export 用 float:right，不建立 BFC 时
+   后续 flex 列表 / 筛选行会被整块压到浮动右侧，窄屏下几乎不可用 */
+.sheet-section h3 { display: flow-root; margin: 0 0 8px; font-size: 11.5px; font-weight: 500; color: var(--ink-3); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .destination-chips { margin-top: 8px; }
 .usage-agents { margin-top: 8px; }
@@ -1017,14 +1027,21 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   font-size: 13px;
   outline: 0;
 }
+/* 行内编辑框的边框恒为强调色、又清零了 outline：不补回焦点轮廓时
+   键盘用户看不到落点。分组规则放在此处在源码顺序上压过
+   .user-edit-input:focus 的 outline: none */
+.hi-input:focus-visible,
+.pref-input:focus-visible,
+.user-edit-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 .trip-list { display: flex; flex-direction: column; gap: 6px; }
 /* 右侧预留「编辑 / 日历 / 删除」三个按钮的宽度（3×24 + 2×2 间距 + 6 右边距），
    触屏设备上按钮常显，预留不足会盖住日期文本 */
 .trip { position: relative; padding: 8px 86px 8px 10px; border-radius: 9px; background: var(--bg); font-size: 12.5px; }
 .trip-route { display: flex; justify-content: space-between; gap: 10px; font-weight: 600; }
-/* 窄屏：路线不折行（否则「杭 / 州」被拆断），长用途 / 描述在右侧换行 */
-.trip-route span:first-child { white-space: nowrap; }
+/* 窄屏：路线不折行（否则「杭 / 州」被拆断），长用途 / 描述在右侧换行；
+   首列必须可收缩并省略，否则超长机场名会把右侧用途列压成单字竖排 */
+.trip-route span:first-child { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .trip-route span:last-child { color: var(--ink-3); font-size: 11.5px; font-weight: 500; text-align: right; overflow-wrap: anywhere; }
 .trip-meta { margin-top: 2px; color: var(--ink-3); font-size: 11.5px; }
 .trip-status {
@@ -1112,13 +1129,19 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   /* 浮在面板之上但只作提示：不能吞掉下方按钮的点击 */
   pointer-events: none;
   transform: translateX(-50%);
+  /* 居中由 transform 提供：动画必须复用同一位移，直接用 rise 会把
+     translateX(-50%) 覆盖成 translateY，提示贴到视口左半屏起始处 */
+  animation: toast-rise 0.2s ease both;
+  width: max-content;
+  max-width: min(560px, calc(100vw - 32px));
+  overflow-wrap: anywhere;
+  text-align: center;
   padding: 8px 16px;
   border-radius: 999px;
   background: var(--ink);
   color: var(--bg);
   font-size: 12.5px;
   box-shadow: var(--shadow);
-  animation: rise 0.2s ease both;
 }
 
 .shortcut-glyph { font-size: 14px; font-weight: 700; line-height: 1; }
@@ -1170,6 +1193,10 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   from { opacity: 0; transform: translateY(6px); }
   to { opacity: 1; transform: none; }
 }
+@keyframes toast-rise {
+  from { opacity: 0; transform: translate(-50%, 6px); }
+  to { opacity: 1; transform: translate(-50%, 0); }
+}
 @keyframes spin { to { transform: rotate(360deg); } }
 @keyframes pulse {
   0%, 100% { transform: scale(0.55); opacity: 0.7; }
@@ -1198,18 +1225,35 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
     box-shadow: 0 0 40px rgba(0, 0, 0, 0.3);
   }
   .app.side-open .sidebar { transform: translateX(0); }
-  .app.side-collapsed .sidebar { width: 272px; flex-basis: 272px; border-right: 1px solid var(--sidebar-line); }
+  /* 折叠态的内边距只在桌面生效：这里必须补回，否则抽屉内容贴屏幕边缘 */
+  .app.side-collapsed .sidebar { width: 272px; flex-basis: 272px; padding: 18px 12px 14px; border-right: 1px solid var(--sidebar-line); }
   .side-collapse { display: none; }
   .thread { padding: 20px 16px 8px; }
   .composer-zone { padding: 8px 12px 10px; }
   .welcome h2 { font-size: 26px; }
   .suggestions { grid-template-columns: 1fr; }
   .msg.user { max-width: 88%; }
-  .health span { display: none; }
+  /* 视觉隐藏而非 display:none：窄屏只留 7px 状态点时，读屏仍要能读到
+     在线 / 降级 / 未连接文案 */
+  .health { position: relative; }
+  .health span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
 }
 
 @media (max-width: 520px) {
-  .topbar { padding: 0 10px; }
+  .topbar { padding: 0 10px; gap: 8px; }
+  .topbar-right { gap: 4px; }
+  /* 手机上顶栏只剩标题位置：打印 / 导出 HTML 是低频动作，先让位给标题 */
+  #printChat, #exportHtml { display: none; }
   .model-chip { display: none; }
   .thread { gap: 18px; }
   .bubble.answer { font-size: 14.5px; }
@@ -1220,7 +1264,7 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 @media print {
   body { background: #fff; color: #111; }
   .sidebar, .scrim, .sheet, .shortcut-overlay, .toast, .composer-zone,
-  .topbar-right, .follow-ups, .msg-foot, .trace, .earlier-more { display: none !important; }
+  .topbar-right, .menu-btn, .follow-ups, .msg-foot, .trace, .earlier-more { display: none !important; }
   .app { display: block; height: auto; overflow: visible; }
   .main { display: block; }
   .topbar { height: auto; padding: 0 0 10px; border-bottom: 1px solid #ddd; background: #fff; }
@@ -1240,6 +1284,9 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   .bubble.answer pre { background: #f5f5f5; color: #111; }
   .bubble.answer th { background: #f0f0f0; }
   .msg.assistant .msg-head { color: #555; }
+  /* 这些元素自带 ink-2 / ink-3 颜色，不会继承 .msg-head 的 #555 */
+  .msg-name { color: #333; }
+  .msg-time, .model-chip, .welcome p, .s-copy small { color: #555; }
   .bubble.answer a { color: #111; }
 }
 
@@ -1342,7 +1389,8 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
   font-weight: 500;
   cursor: pointer;
 }
-.trip-export:hover { text-decoration: underline; }
+.trip-export:hover:not(:disabled) { text-decoration: underline; }
+.trip-export:disabled { opacity: 0.55; cursor: default; }
 
 /* 手动添加行程表单 */
 .trip-form { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 10px; }
