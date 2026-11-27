@@ -95,6 +95,7 @@ from utils.knowledge_admin import (
     METADATA_VALUE_MAX_CHARS,
     _INTERNAL_META_KEYS,
     DocumentConflictError,
+    KnowledgeBusyError,
     add_document,
     cleanup_duplicate_contents,
     delete_document,
@@ -159,7 +160,12 @@ from utils.timestamps import chronological_key, to_aware
 from utils.turn_meta import extract_turn_meta
 from utils.usage import add_usage
 from utils.version import APP_VERSION
-from utils.weather import WeatherError, fetch_weather, peek_cached_weather
+from utils.weather import (
+    UpstreamQuotaError,
+    WeatherError,
+    fetch_weather,
+    peek_cached_weather,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1787,6 +1793,10 @@ class AligoWebApp:
         # mark/unmark/is_recently_deleted 会被 asyncio.to_thread 在线程池里执行，
         # 不同 user_id 的请求互不串行：OrderedDict 的迭代 + 删除必须加锁
         self._tombstone_lock = threading.Lock()
+        # 墓碑补写的单飞（非阻塞）：5 秒节流是 check-then-set，恢复期并发
+        # 请求可同时穿透；补写循环本身也远长于 5 秒节流（20 条 × 2-3 次
+        # 往返），没有这把锁就会重复 SET / 重复 INCR 会话纪元
+        self._replay_flight_lock = threading.Lock()
         # 会话缓存同样会被线程池里的 drop_session 与事件循环里的 get_session
         # 并发修改（插入 / move_to_end / popitem），需要独立互斥
         self._sessions_lock = threading.Lock()
@@ -1861,6 +1871,7 @@ class AligoWebApp:
             redis_client,
             client_factory=redis_factory,
             max_keys=rate_limit_max_keys,
+            probe_factory=_redis_probe_factory,
         )
         # 用户 ID 由请求方提供、可以轮换；再按纯客户端 IP 限流，防止换 ID 绕过
         self.ip_limiter = create_rate_limiter(
@@ -1870,6 +1881,7 @@ class AligoWebApp:
             redis_client,
             client_factory=redis_factory,
             max_keys=rate_limit_max_keys,
+            probe_factory=_redis_probe_factory,
         )
         # 知识库写入 / 导入 / 语义检索会触发嵌入模型推理，单独按客户端 IP 限流，
         # 不占用对话额度（Web 批量导入每批 200 条，60 次/分钟足够）
@@ -1880,6 +1892,7 @@ class AligoWebApp:
             redis_client,
             client_factory=redis_factory,
             max_keys=rate_limit_max_keys,
+            probe_factory=_redis_probe_factory,
         )
         # 备份导入的面板循环按 200 条/批调用导入接口：沿用知识库 60 次/分钟
         # 会让数万条的备份在窗口内必然 429，且重试时前几十批都是快速跳过的
@@ -1897,6 +1910,7 @@ class AligoWebApp:
             redis_client,
             client_factory=redis_factory,
             max_keys=rate_limit_max_keys,
+            probe_factory=_redis_probe_factory,
         )
         # 天气接口每次未命中会上游发两次请求；按客户端 IP 限流，
         # 保护 Open-Meteo 免费额度与共用线程池，不占用对话 / 知识库额度
@@ -1907,6 +1921,7 @@ class AligoWebApp:
             redis_client,
             client_factory=redis_factory,
             max_keys=rate_limit_max_keys,
+            probe_factory=_redis_probe_factory,
         )
         # 面板数据读接口（会话列表 / 状态 / 导出 / 台账）每次请求都全量读取
         # 用户历史，且走共享线程池；不设额度时几十个并发读就能把线程池占满
@@ -1918,6 +1933,7 @@ class AligoWebApp:
             redis_client,
             client_factory=redis_factory,
             max_keys=rate_limit_max_keys,
+            probe_factory=_redis_probe_factory,
         )
         # 用户数据写接口（偏好 / 会话元数据 / 行程 / 删除）：每次写都会全量
         # 重载并重写用户记忆、占用共享文件锁与数据库连接，必须与读接口分开
@@ -1929,6 +1945,7 @@ class AligoWebApp:
             redis_client,
             client_factory=redis_factory,
             max_keys=rate_limit_max_keys,
+            probe_factory=_redis_probe_factory,
         )
         # 全量导出会同时持有数份整库拷贝（实测峰值约为逻辑大小的 8 倍）：
         # 只按次数限流挡不住 40 个并发导出同时申请数 GB 内存，这里限制
@@ -2364,14 +2381,25 @@ class AligoWebApp:
         return replayed
 
     def _maybe_replay_pending(self) -> None:
-        """有界触发补写（最多每 5 秒一次），避免每个请求都尝试 Redis。"""
+        """有界触发补写（最多每 5 秒一次），避免每个请求都尝试 Redis。
+
+        节流判定与补写循环在同一把非阻塞单飞锁内：并发请求不会同时穿透
+        check-then-set，也不会在一轮补写（最长 20 条 × 数秒）还没结束时
+        再起一轮——重复 SET 虽幂等，重复 INCR 会话纪元与写放大没有意义。
+        请求线程拿不到锁直接跳过（补写本来就是尽力而为的后台补偿）。
+        """
         if not self._pending_shared_tombstones:
             return
-        now = time.monotonic()
-        if now < self._pending_replay_at:
+        if not self._replay_flight_lock.acquire(blocking=False):
             return
-        self._pending_replay_at = now + 5.0
-        self.replay_pending_tombstones()
+        try:
+            now = time.monotonic()
+            if now < self._pending_replay_at:
+                return
+            self._pending_replay_at = now + 5.0
+            self.replay_pending_tombstones()
+        finally:
+            self._replay_flight_lock.release()
 
     def mark_deleted(self, user_id: str, session_id: str) -> str:
         """记录短时墓碑，阻止在途对话把刚删除的会话写回，返回本请求的 token。
@@ -3048,6 +3076,15 @@ def _limiter_degraded(limiter: Any) -> bool:
     return bool(getattr(limiter, "degraded", False))
 
 
+def _redis_probe_factory() -> Any:
+    """限流恢复探测专用的 Redis 取客户端：不等别人的创建波次。
+
+    健康 / 指标探测有 2 秒总预算，wait=True 的工厂在并发创建波次中会跟随
+    等待最多 5 秒；权威记账（check / refund）仍用 wait=True 的工厂。
+    """
+    return get_shared_redis_client(wait=False)
+
+
 # 健康 / 指标接口对限流桶做恢复探测的总预算（秒）：7 个桶串行 EVAL 在
 # 慢 Redis 恢复时最坏叠加 7×socket 超时（约 10s），健康检查 / 抓取会被
 # 拖超时。单次探测上界对齐共享客户端的 socket_timeout（约 1.5s）。
@@ -3295,6 +3332,21 @@ def _refund_write_rate_limit(state: AligoWebApp, request: Request) -> None:
     except Exception as exc:  # noqa: BLE001 - 归还是尽力而为
         logger.warning(
             "归还写入限流额度失败: %s", _redacted_exc_log_text(exc)
+        )
+
+
+def _refund_weather_rate_limit(state: AligoWebApp, request: Request) -> None:
+    """归还一次天气限流额度（全进程上游额度用尽时使用）。
+
+    该拒绝没有发出任何上游请求：与其它 _refund_* 同口径归还原额，否则
+    客户端把 429 当上游故障重试，会继续消耗 IP 天气桶。
+    """
+    client = _rate_identity(_client_host(request))
+    try:
+        state.weather_limiter.refund(client)
+    except Exception as exc:  # noqa: BLE001 - 归还是尽力而为
+        logger.warning(
+            "归还天气限流额度失败: %s", _redacted_exc_log_text(exc)
         )
 
 
@@ -4980,11 +5032,15 @@ async def _acquire_chat_lock(
     lock: asyncio.Lock,
     request_id: str,
     timeout: float = _CHAT_LOCK_WAIT_SEC,
+    user_id: str | None = None,
 ) -> None:
     """等待同一用户的对话锁：期间检查客户端是否已断开，超时给出明确 503。
 
     排队期间没有响应头与心跳，代理读超时（60s）会让客户端拿到 504；
     服务端不应在锁释放后继续为已断开的请求构造会话、启动回合。
+
+    ``user_id`` 提供时用于超时文案归因：持锁者可能是备份恢复而不是对话，
+    「同一用户已有对话正在进行」会误导用户。
     """
     deadline = time.monotonic() + timeout
     while True:
@@ -4998,12 +5054,20 @@ async def _acquire_chat_lock(
                     detail=f"客户端已断开（请求 ID：{request_id}）",
                 ) from None
             if time.monotonic() >= deadline:
+                busy = "同一用户已有对话正在进行"
+                if user_id is not None:
+                    try:
+                        if request.app.state.aligo.is_user_import_active(
+                            user_id
+                        ):
+                            # 持锁者是备份恢复：如实说明，避免让用户以为
+                            # 自己的对话卡住了（恢复期间对话本就会被串行化）
+                            busy = "该账号正在恢复备份"
+                    except Exception:  # noqa: BLE001 - 归因失败保持原文案
+                        pass
                 raise HTTPException(
                     status_code=503,
-                    detail=(
-                        "同一用户已有对话正在进行，请稍后再试"
-                        f"（请求 ID：{request_id}）"
-                    ),
+                    detail=f"{busy}，请稍后再试（请求 ID：{request_id}）",
                     headers={"Retry-After": "5"},
                 ) from None
             continue
@@ -5030,6 +5094,7 @@ async def _bounded_user_lock(
     request_id: str,
     timeout: float = _CHAT_LOCK_WAIT_SEC,
     on_acquire_failure: Any = None,
+    user_id: str | None = None,
 ):
     """有界等待并自动释放的用户锁（对话 / 导入共用）。
 
@@ -5039,7 +5104,7 @@ async def _bounded_user_lock(
     记录日志，不能掩盖原始的取锁异常。
     """
     try:
-        await _acquire_chat_lock(request, lock, request_id, timeout)
+        await _acquire_chat_lock(request, lock, request_id, timeout, user_id)
     except BaseException:
         if on_acquire_failure is not None:
             try:
@@ -5412,6 +5477,18 @@ def create_app(model: Any = None) -> FastAPI:
             data = await loop.run_in_executor(
                 _get_weather_executor(), fetch_weather, name
             )
+        except UpstreamQuotaError as exc:
+            # 全进程上游额度用尽：没有发出任何上游请求，属本地限流而非
+            # 上游故障——归还原额并按 429 + Retry-After 返回，客户端不会
+            # 把 503 当服务故障继续重试（重试只会继续累积 IP 天气桶）
+            await asyncio.to_thread(_refund_weather_rate_limit, state, request)
+            logger.warning("天气查询失败：%s", "上游额度已用尽")
+            raise _rate_limited_exception(
+                request,
+                "天气查询过于频繁",
+                state.weather_limiter.limit,
+                exc.retry_after,
+            ) from exc
         except WeatherError as exc:
             message = str(exc)
             not_found = message.startswith("未找到城市")
@@ -5423,7 +5500,11 @@ def create_app(model: Any = None) -> FastAPI:
                 "未找到城市" if not_found else "气象服务暂时不可用",
             )
             detail = message if not_found else "天气服务暂时不可用，请稍后再试"
-            raise HTTPException(status_code=status_code, detail=detail) from exc
+            raise HTTPException(
+                status_code=status_code,
+                detail=detail,
+                headers=None if not_found else {"Retry-After": "5"},
+            ) from exc
         return JSONResponse(content=jsonable_encoder(data), headers=headers)
 
     @app.get("/api/metrics")
@@ -5748,6 +5829,17 @@ def create_app(model: Any = None) -> FastAPI:
                     # 与问答链路同一相似度阈值：低于阈值的命中不计入
                     min_score=float(RAG_CONFIG.get("min_score", 0.5)),
                 )
+                # 心跳每 TTL/3 才续期一次，短评测可能在第一个续期间隔内就
+                # 发现不了锁已失效（主从切换丢键等）：收尾前用只读脚本复核
+                # 一次归属（不刷新 TTL），失败不影响结果、只影响并发标记
+                verify = getattr(state.eval_lock, "verify_owned", None)
+                if callable(verify):
+                    try:
+                        verify(token)
+                    except Exception as exc:  # noqa: BLE001 - 复核失败不改变结论
+                        logger.warning(
+                            "检索评测锁归属复核失败: %s", _redacted_exc_log_text(exc)
+                        )
                 # 心跳续期发现共享锁已失效（过期后被其它实例拿走），或配置了
                 # Redis 但加锁时回退到进程内（共享锁实际不存在）：本次评测
                 # 可能与之并发，结果需要打标而不能当作独占评测
@@ -6086,6 +6178,13 @@ def create_app(model: Any = None) -> FastAPI:
                 ) from exc
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except KnowledgeBusyError as exc:
+                # 写锁 / 读锁忙是零成本拒绝（未写入任何片段）：退还刚扣的
+                # 导入额度，与槽位忙路径同口径，重试不会耗尽共享桶
+                await asyncio.to_thread(
+                    _refund_import_rate_limit, state, request
+                )
+                raise _knowledge_unavailable("导入失败", exc) from exc
             except Exception as exc:  # noqa: BLE001 - 导入失败统一提示
                 logger.warning("导入知识片段失败: %s", redact_paths(exc))
                 raise _knowledge_unavailable("导入失败", exc) from exc
@@ -6123,6 +6222,12 @@ def create_app(model: Any = None) -> FastAPI:
                 ) from exc
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except KnowledgeBusyError as exc:
+                # 同导入端点：锁忙是零成本拒绝，退还导入额度
+                await asyncio.to_thread(
+                    _refund_import_rate_limit, state, request
+                )
+                raise _knowledge_unavailable("预览失败", exc) from exc
             except Exception as exc:  # noqa: BLE001 - 预览失败统一提示
                 logger.warning("预览导入知识片段失败: %s", redact_paths(exc))
                 raise _knowledge_unavailable("预览失败", exc) from exc
@@ -6696,7 +6801,12 @@ def create_app(model: Any = None) -> FastAPI:
             # 否则长回合期间的重试会在服务恢复后仍被 429
             await asyncio.to_thread(_refund_write_rate_limit, state, request)
             raise HTTPException(
-                status_code=409, detail="会话正在生成回复，请稍后再试"
+                status_code=409,
+                detail=(
+                    "该账号正在恢复备份，请稍后再试"
+                    if state.is_user_import_active(user_id)
+                    else "会话正在生成回复，请稍后再试"
+                ),
             ) from None
         try:
             def _exists() -> bool:
@@ -6840,7 +6950,12 @@ def create_app(model: Any = None) -> FastAPI:
                     _refund_write_rate_limit, state, request
                 )
             raise HTTPException(
-                status_code=409, detail="会话正在生成回复，请稍后再试"
+                status_code=409,
+                detail=(
+                    "该账号正在恢复备份，请稍后再试"
+                    if state.is_user_import_active(user_id)
+                    else "会话正在生成回复，请稍后再试"
+                ),
             ) from None
         try:
 
@@ -6993,6 +7108,7 @@ def create_app(model: Any = None) -> FastAPI:
             request,
             state.lock_for(payload.user_id),
             _request_id(request),
+            user_id=payload.user_id,
             on_acquire_failure=lambda: _refund_rate_limit_async(
                 state, payload.user_id, request
             ),
@@ -7279,7 +7395,9 @@ def create_app(model: Any = None) -> FastAPI:
         # 空流。锁在流结束时释放。
         lock = state.lock_for(payload.user_id)
         try:
-            await _acquire_chat_lock(request, lock, rid)
+            await _acquire_chat_lock(
+                request, lock, rid, user_id=payload.user_id
+            )
         except HTTPException:
             # 取锁阶段（超时 503 / 断连 499）没有任何 LLM 调用：归还入口
             # 已扣的额度，避免重试风暴在服务恢复后仍被 429
@@ -8355,6 +8473,7 @@ def create_app(model: Any = None) -> FastAPI:
             state.lock_for(user_id),
             _request_id(request),
             timeout=10.0,
+            user_id=user_id,
             on_acquire_failure=_refund_on_lock_failure,
         ):
             return await asyncio.to_thread(_run)
@@ -8817,6 +8936,7 @@ def create_app(model: Any = None) -> FastAPI:
                 state.lock_for(user_id),
                 _request_id(request),
                 timeout=10.0,
+                user_id=user_id,
                 on_acquire_failure=_refund_kb_on_lock_failure,
             ):
                 sessions_dropped_in_queue: set[str] = set()

@@ -1120,9 +1120,12 @@ def test_upstream_window_limits_rotating_cities(monkeypatch):
     monkeypatch.setattr(
         weather.requests, "get", lambda *a, **k: calls.append(1) or _Response(_geo())
     )
-    with pytest.raises(weather.WeatherError) as excinfo:
+    with pytest.raises(weather.UpstreamQuotaError) as excinfo:
         weather.fetch_weather("北京")
     assert "频繁" in str(excinfo.value)
+    assert 1 <= excinfo.value.retry_after <= 60, (
+        "额度用尽属本地限流：必须带真实恢复等待，供端点回 429"
+    )
     assert calls == [], "额度用尽后不能再请求上游"
     # 失败缓存已登记：紧随其后的请求快速失败
     with pytest.raises(weather.WeatherError):

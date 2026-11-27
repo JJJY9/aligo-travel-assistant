@@ -124,34 +124,40 @@ def knowledge_status(
         busy_error = KnowledgeBusyError
     except Exception:  # noqa: BLE001 - 维护模块不可用时保持原行为
         lock_ctx = contextlib.nullcontext()
+    def _load_probe(client: Any) -> dict[str, Any] | None:
+        """加载探测（锁外调用）：不可用时返回状态 payload。
+
+        元数据可读不代表集合可用：索引 sidecar 由旧版写入 / 文件损坏时，
+        has_collection / get_collection_stats 仍正常而 load 必然失败，
+        此前状态显示健康、所有数据面端点却 503（用户只能得到通用「暂时
+        不可用」）。加载是幂等的，且 milvus-lite 自身按集合串行化——必须
+        放在知识库读锁之外：冷加载可达数秒，持读锁会让并发的知识库写
+        在 1 秒写锁预算内被判成「正在写入」（实际没有任何写者）。
+        """
+        loader = getattr(client, "load_collection", None)
+        if not callable(loader):
+            return None
+        try:
+            loader(collection)
+        except Exception as exc:  # noqa: BLE001 - 加载失败即不可用
+            logger.warning("知识库集合加载失败：%s", type(exc).__name__)
+            reason = (
+                "集合无法加载（索引损坏或版本不兼容），"
+                "请重新运行初始化脚本"
+            )
+            # Windows 非 ASCII 路径下索引必然写盘失败，重跑初始化脚本
+            # 只会再次「成功」并再次损坏——直接给出真实原因与规避方式
+            hint = knowledge_path_encoding_hint(db)
+            if hint:
+                reason = f"{reason}；{hint}"
+            return {**base, "available": False, "reason": reason}
+        return None
+
     def _snapshot(client: Any) -> dict[str, Any]:
+        # 集合可能在锁外探测后被其它路径删除：锁内复核一次，避免把
+        # 「集合不存在」误报成「状态查询失败」
         if not client.has_collection(collection):
             return {**base, "available": False, "reason": "集合不存在"}
-        # 元数据可读不代表集合可用：索引 sidecar 由旧版写入 / 文件损坏时，
-        # has_collection / get_collection_stats 仍正常而 load 必然失败，
-        # 此前状态显示健康、所有数据面端点却 503（用户只能得到通用「暂时
-        # 不可用」）。这里做一次加载探测（已加载时是 no-op；2.x 无该调用
-        # 时跳过，保持旧行为）。
-        loader = getattr(client, "load_collection", None)
-        if callable(loader):
-            try:
-                loader(collection)
-            except Exception as exc:  # noqa: BLE001 - 加载失败即不可用
-                logger.warning("知识库集合加载失败：%s", type(exc).__name__)
-                reason = (
-                    "集合无法加载（索引损坏或版本不兼容），"
-                    "请重新运行初始化脚本"
-                )
-                # Windows 非 ASCII 路径下索引必然写盘失败，重跑初始化脚本
-                # 只会再次「成功」并再次损坏——直接给出真实原因与规避方式
-                hint = knowledge_path_encoding_hint(db)
-                if hint:
-                    reason = f"{reason}；{hint}"
-                return {
-                    **base,
-                    "available": False,
-                    "reason": reason,
-                }
         stats = client.get_collection_stats(collection)
         dimension = _collection_dimension(client, collection)
         payload = {
@@ -177,6 +183,17 @@ def knowledge_status(
     }
     try:
         client = get_milvus_client(str(db))
+        # 集合缺失 / 冷加载都不进读锁：加载可达数秒，持读锁会把并发写请求
+        # 顶到「知识库正在写入」的 1 秒写锁预算之外（实际没有写者）
+        try:
+            collection_missing = not client.has_collection(collection)
+        except Exception:  # noqa: BLE001 - 精简客户端 / 探测失败交给外层统一映射
+            collection_missing = False
+        if collection_missing:
+            return {**base, "available": False, "reason": "集合不存在"}
+        unavailable = _load_probe(client)
+        if unavailable is not None:
+            return unavailable
         if read_lock_factory is not None:
             try:
                 lock = (

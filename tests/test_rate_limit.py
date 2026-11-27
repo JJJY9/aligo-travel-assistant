@@ -702,6 +702,94 @@ def test_wrongtype_warning_throttled_and_key_visible(monkeypatch):
     print("✓ WRONGTYPE 告警限频且损坏键可见")
 
 
+def test_refund_success_does_not_clear_degraded(monkeypatch):
+    """refund 的 ZREMRANGEBYRANK 不受 denyoom 限制：成功不能当作写路径恢复。"""
+    from utils import rate_limit as module
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock["now"])
+
+    calls: list[str] = []
+
+    class _OomRedis:
+        def eval(self, script, numkeys, key, *args):
+            calls.append(script)
+            if "ZADD" in script:
+                raise ConnectionError("OOM command not allowed")
+            return 1
+
+    limiter = RedisRateLimiter(_OomRedis(), "user", 1, 60)
+    assert limiter.check("k") is None  # 写路径失败 → 进程内回退放行
+    assert limiter.degraded is True
+
+    clock["now"] += module.REDIS_FAILURE_COOLDOWN_SEC + 1
+    limiter._degraded_until = 0.0  # 冷却到期
+    before = len(calls)
+    limiter.refund("k")
+    assert len(calls) == before, "降级期间 refund 不应访问 Redis"
+    assert limiter.degraded is True, "refund 成功证明不了 ZADD 可用"
+    assert limiter._fallback.check("k") is None, "退款应记在进程内桶"
+
+    limiter._last_probe = 0.0
+    assert limiter.probe() is False, "权威写路径仍失败，探测不得谎报恢复"
+    assert limiter.degraded is True
+    print("✓ refund 成功不清除降级标记（健康 / 指标不谎报恢复）")
+
+
+def test_probe_uses_probe_factory(monkeypatch):
+    """健康 / 指标探测走 probe_factory（wait=False），权威记账仍走主工厂。"""
+    from utils import rate_limit as module
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock["now"])
+
+    calls = {"authoritative": 0, "probe": 0}
+
+    class _Healthy:
+        def eval(self, script, numkeys, key, *args):
+            return "-1"
+
+    def authoritative_factory():
+        calls["authoritative"] += 1
+        return _Healthy()
+
+    def probe_factory():
+        calls["probe"] += 1
+        return None
+
+    limiter = RedisRateLimiter(
+        None,
+        "user",
+        5,
+        60,
+        client_factory=authoritative_factory,
+        probe_factory=probe_factory,
+    )
+    assert limiter.probe() is False
+    assert calls == {"authoritative": 0, "probe": 1}, (
+        "探测只能用 probe_factory，不能跟随 wait=True 的创建波次"
+    )
+    assert limiter.check("k") is None
+    assert calls["authoritative"] == 1, "权威记账仍用主工厂"
+    assert limiter.degraded is False
+    print("✓ 限流探测走独立 probe_factory")
+
+
+def test_create_rate_limiter_passes_probe_factory():
+    """probe_factory 透传到 Redis 实现；进程内实现不需要它。"""
+    limiter = create_rate_limiter(
+        "x",
+        5,
+        60,
+        None,
+        client_factory=lambda: None,
+        probe_factory=lambda: None,
+    )
+    assert isinstance(limiter, RedisRateLimiter)
+    assert limiter._probe_factory is not None
+    print("✓ probe_factory 透传")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -752,7 +840,17 @@ if __name__ == "__main__":
             _mp.undo()
     test_wrongtype_key_falls_back_without_degrading_bucket()
     test_create_rate_limiter_passes_max_keys()
+    test_create_rate_limiter_passes_probe_factory()
     test_refund_returns_one_slot()
+    for _case in (
+        test_refund_success_does_not_clear_degraded,
+        test_probe_uses_probe_factory,
+    ):
+        _mp = pytest.MonkeyPatch()
+        try:
+            _case(_mp)
+        finally:
+            _mp.undo()
     _mp = pytest.MonkeyPatch()
     try:
         test_read_only_blip_does_not_degrade_or_reset_quota(_mp)

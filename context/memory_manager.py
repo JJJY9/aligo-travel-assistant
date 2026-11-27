@@ -370,10 +370,28 @@ class MemoryManager:
             if epoch_at_start is None:
                 return True
             start_available, start_value = epoch_at_start
+            if not start_available:
+                # 回合开始时就读不到纪元（Redis 未配置 / 故障）：提交侧无论
+                # 读到什么都走「任一不可读即放行」分支，这次强制读取必然被
+                # 丢弃。它发生在 JSON 后端的文件锁临界区内（force=True 会
+                # 跳过冷却、甚至现场建连 / 跟随创建波次数秒），无谓地吃掉
+                # 6 秒写锁预算——直接短路，不再发起网络访问
+                from .storage import shared_redis_configured
+
+                log = (
+                    logger.warning
+                    if shared_redis_configured()
+                    else logger.debug
+                )
+                log(
+                    "会话纪元开始值不可读（提交侧不读取），本轮按墓碑结果放行：%s",
+                    self.session_id,
+                )
+                return True
             now_available, now_value = tombstones.get_session_epoch_state(
                 self.user_id, self.session_id, force=True
             )
-            if not start_available or not now_available:
+            if not now_available:
                 # 未配置 Redis（单进程部署）时纪元本就不可读：这不是故障，
                 # 每轮打 WARNING 会刷屏；配置了却读不到才值得告警
                 from .storage import shared_redis_configured
@@ -384,9 +402,8 @@ class MemoryManager:
                     else logger.debug
                 )
                 log(
-                    "会话纪元不可读（开始=%s/提交=%s），本轮按墓碑结果放行：%s",
-                    start_available,
-                    now_available,
+                    "提交时会话纪元不可读（开始=%s），本轮按墓碑结果放行：%s",
+                    start_value,
                     self.session_id,
                 )
                 return True

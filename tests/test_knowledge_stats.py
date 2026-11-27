@@ -319,6 +319,58 @@ _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_status_load_failure_appends_non_ascii_hint": "需要 tmp_path 夹具",
 }
 
+def test_status_load_probe_does_not_hold_read_lock(monkeypatch):
+    """冷加载在锁外完成：并发写锁不被状态查询的加载探测顶到超时。"""
+    import threading
+
+    import utils.knowledge_admin as admin_module
+    import utils.knowledge_stats as module
+
+    entered = threading.Event()
+    release_evt = threading.Event()
+
+    class _Client:
+        def has_collection(self, name):
+            return True
+
+        def load_collection(self, name):
+            entered.set()
+            release_evt.wait(timeout=5)
+
+        def get_collection_stats(self, name):
+            return {"row_count": 1}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        db = Path(tmp) / "milvus_lite.db"
+        db.mkdir()
+        monkeypatch.setattr(module, "get_milvus_client", lambda path: _Client())
+        monkeypatch.setattr(
+            module, "_collection_dimension", lambda client, name: 384
+        )
+        monkeypatch.setattr(module, "_loaded_embedding_dim", lambda: None)
+        result: dict = {}
+        worker = threading.Thread(
+            target=lambda: result.update(
+                status=module.knowledge_status(db, lock_timeout=0.5)
+            )
+        )
+        worker.start()
+        try:
+            assert entered.wait(timeout=5), "加载探测应开始"
+            acquired = admin_module._WRITE_LOCK.acquire_write(timeout=0.3)
+            try:
+                assert acquired, "加载探测不得占用知识库读锁"
+            finally:
+                if acquired:
+                    admin_module._WRITE_LOCK.release_write()
+        finally:
+            release_evt.set()
+            worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert result["status"]["available"] is True
+    print("✓ 状态查询的加载探测在知识库读锁之外")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -334,6 +386,7 @@ if __name__ == "__main__":
         test_loaded_dimension_probe_failure,
         test_status_options_mask_path_and_details,
         test_status_lock_timeout_reports_busy,
+        test_status_load_probe_does_not_hold_read_lock,
     ):
         mp = pytest.MonkeyPatch()
         try:

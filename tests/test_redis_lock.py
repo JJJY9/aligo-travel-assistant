@@ -42,6 +42,8 @@ class _FlakyRedis:
     def set(self, key, value, nx=False, ex=None):
         if self.fail:
             raise ConnectionError("redis blip")
+        if nx and key in self.store:
+            return False
         self.store[key] = value
         return True
 
@@ -56,7 +58,8 @@ class _FlakyRedis:
             return 1
         if "EXPIRE" in script:
             return 1
-        return 0
+        # 归属复核脚本（只读 GET 比对）
+        return 1
 
 
 class _ApplyThenTimeout:
@@ -66,6 +69,9 @@ class _ApplyThenTimeout:
         self.store: dict[str, str] = {}
 
     def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            # 真实 Redis 的 SET NX 在键存在时返回 False，不覆盖、不抛超时
+            return False
         self.store[key] = value
         raise TimeoutError("set response timeout")
 
@@ -84,6 +90,9 @@ class _ApplyThenRenewRedis:
         self.renew_ok = 0
 
     def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            # 真实 Redis 的 SET NX 在键存在时返回 False，不覆盖、不抛超时
+            return False
         self.store[key] = value
         raise TimeoutError("set response timeout")
 
@@ -473,6 +482,121 @@ def test_set_timeout_degraded_clears_after_successful_renew():
     print("✓ SET 超时后成功续期解除降级标记")
 
 
+class _ReleaseFailsRedis:
+    """SET NX 语义真实，可让 release 的 CAS DEL 连续失败（模拟 Redis 抖动）。"""
+
+    def __init__(self) -> None:
+        self.store: dict[str, str] = {}
+        self.release_failures = 0
+
+    def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            return False
+        self.store[key] = value
+        return True
+
+    def eval(self, script, numkeys, key, *args):
+        if "DEL" in script:
+            if self.release_failures > 0:
+                self.release_failures -= 1
+                raise ConnectionError("redis blip")
+            if self.store.get(key) == args[0]:
+                del self.store[key]
+                return 1
+            return 0
+        if "EXPIRE" in script:
+            return 1 if self.store.get(key) == args[0] else 0
+        return 1 if self.store.get(key) == args[0] else 0
+
+
+def test_release_failure_then_reacquire_cleans_own_residual_key():
+    """release 的 CAS DEL 失败后，本实例下次加锁应先清掉自己的残留键。
+
+    否则键要等 TTL（最长约 5 分钟）自然过期，期间评测端点一直误报
+    「已有检索评测在运行」。
+    """
+    client = _ReleaseFailsRedis()
+    key = "aligo:test:stale-release"
+    lock = DistributedLock(client, key, ttl_sec=30)
+    first = lock.acquire()
+    assert first and first != "__local__"
+
+    client.release_failures = 1
+    lock.release(first)
+    assert client.store.get(key) == first, "释放失败时键应残留至 TTL"
+    assert lock._local.locked() is False, "本地互斥必须归还"
+
+    second = lock.acquire()
+    assert second and second != "__local__", (
+        "本实例应清理自己的残留键后重新加锁，而不是等 TTL"
+    )
+    assert client.store.get(key) == second
+    assert lock.degraded is False
+    lock.release(second)
+    assert key not in client.store
+    print("✓ 释放失败后的残留键由本实例下一次加锁清理")
+
+
+def test_residual_token_does_not_delete_other_instance_key():
+    """残留 token 已不匹配（键被其它实例取得）时不得删除他人的锁。"""
+    client = _ReleaseFailsRedis()
+    key = "aligo:test:stale-other"
+    lock = DistributedLock(client, key, ttl_sec=30)
+    first = lock.acquire()
+    client.release_failures = 1
+    lock.release(first)
+
+    client.store[key] = "another-instance"
+    assert lock.acquire() is None, "他人持有时必须返回 None"
+    assert client.store[key] == "another-instance", "不得误删其它实例的锁"
+    assert lock._local.locked() is False
+    assert lock._stale_release_token is None, "已失效的待清理 token 应被丢弃"
+    print("✓ 残留 token 失效时不误删他人的锁")
+
+
+def test_verify_owned_detects_takeover():
+    """收尾复核发现锁已被他人取得时置 lost，且释放不误删他人键。"""
+    client = _FlakyRedis()
+    key = "aligo:test:verify"
+    lock = DistributedLock(client, key, ttl_sec=300)
+    token = lock.acquire()
+    assert token
+    assert lock.verify_owned(token) is True
+
+    client.store[key] = "other-instance"
+    assert lock.verify_owned(token) is False
+    assert lock.lost is True
+    lock.release(token)
+    assert client.store[key] == "other-instance"
+    print("✓ 收尾复核检测锁被他人取得")
+
+
+def test_verify_owned_unreachable_keeps_lost_state():
+    """复核时 Redis 不可达：无法判断，不得误置 lost。"""
+    client = _FlakyRedis()
+    lock = DistributedLock(client, "aligo:test:verify-down", ttl_sec=300)
+    token = lock.acquire()
+    assert token
+    client.fail = True
+    assert lock.verify_owned(token) is None
+    assert lock.lost is False
+    client.fail = False
+    lock.release(token)
+    print("✓ 复核不可达时维持既有 lost 状态")
+
+
+def test_verify_owned_local_token_is_true():
+    """进程内回退锁（未配置 Redis）的复核恒为 True。"""
+    from utils.redis_lock import _LOCAL_TOKEN
+
+    lock = DistributedLock(None, "aligo:test:verify-local", ttl_sec=30)
+    token = lock.acquire()
+    assert token == _LOCAL_TOKEN
+    assert lock.verify_owned(token) is True
+    lock.release(token)
+    print("✓ 本地回退锁的归属复核恒为真")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_cross_instance_lock": "需要真实 Redis（TEST_REDIS_URL）",
 }
@@ -496,6 +620,11 @@ if __name__ == "__main__":
     test_transient_renew_failure_keeps_lock()
     test_stale_renewal_does_not_mark_new_hold_lost()
     test_set_timeout_degraded_clears_after_successful_renew()
+    test_release_failure_then_reacquire_cleans_own_residual_key()
+    test_residual_token_does_not_delete_other_instance_key()
+    test_verify_owned_detects_takeover()
+    test_verify_owned_unreachable_keeps_lost_state()
+    test_verify_owned_local_token_is_true()
     _mp = pytest.MonkeyPatch()
     try:
         test_heartbeat_start_failure_rolls_back(_mp)

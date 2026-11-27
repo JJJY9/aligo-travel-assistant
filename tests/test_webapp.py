@@ -14062,6 +14062,28 @@ def test_knowledge_eval_api(monkeypatch):
     degraded = client.get("/api/knowledge/eval")
     assert degraded.status_code == 200 and "warning" in degraded.json()
 
+    # 收尾只读复核发现锁已失效（心跳间隔内被主从切换丢失）：结果同样打标
+    class _StaleEvalLock:
+        lost = False
+        degraded = False
+
+        def acquire(self):
+            return "token"
+
+        def release(self, token):
+            pass
+
+        def verify_owned(self, token):
+            self.lost = True
+            return False
+
+    state.eval_lock = _StaleEvalLock()
+    monkeypatch.setitem(server_module.STORAGE_CONFIG, "redis_url", "")
+    state.kb_limiter = RateLimiter(limit=3, window_sec=60)
+    stale = client.get("/api/knowledge/eval")
+    assert stale.status_code == 200
+    assert "共享锁不可用" in stale.json().get("warning", "")
+
     # 零命中诊断与共享锁告警必须同时保留（此前后写者覆盖先写者）
     def zero_hit_evaluate(*args, **kwargs):
         return {
@@ -14086,6 +14108,8 @@ def test_knowledge_eval_api(monkeypatch):
 
     # 未配置 Redis 时进程内锁是正常模式，不应误报
     monkeypatch.setitem(server_module.STORAGE_CONFIG, "redis_url", "")
+    state.eval_lock = _LostEvalLock()
+    state.eval_lock.lost = False
     state.kb_limiter = RateLimiter(limit=3, window_sec=60)
     single = client.get("/api/knowledge/eval")
     assert single.status_code == 200 and "warning" not in single.json()
@@ -17966,7 +17990,7 @@ def test_import_lock_timeout_refunds_kb_rate_limit(monkeypatch):
     state = client.app.state.aligo
     user_id = _unique_user("web_import_lock_refund")
 
-    async def lock_timeout(request, lock, request_id, timeout=10.0):
+    async def lock_timeout(request, lock, request_id, timeout=10.0, user_id=None):
         raise server_module.HTTPException(
             status_code=503, detail="同一用户已有操作正在进行，请稍后再试"
         )
@@ -18235,7 +18259,7 @@ def test_chat_lock_timeout_refunds_rate_limit(monkeypatch):
     user_id = _unique_user("web_test_refund_lock")
     user_key = f"testclient:{user_id}"
 
-    async def lock_timeout(request, lock, request_id, timeout=50.0):
+    async def lock_timeout(request, lock, request_id, timeout=50.0, user_id=None):
         raise server_module.HTTPException(
             status_code=503, detail="同一用户已有对话正在进行，请稍后再试"
         )
@@ -18348,7 +18372,7 @@ def test_trips_dedupe_lock_timeout_refunds_quota(monkeypatch):
     state.read_limiter = RateLimiter(limit=4, window_sec=60)
     client = TestClient(app)
 
-    async def lock_timeout(request, lock, request_id, timeout=50.0):
+    async def lock_timeout(request, lock, request_id, timeout=50.0, user_id=None):
         raise server_module.HTTPException(
             status_code=503, detail="同一用户已有对话正在进行，请稍后再试"
         )
@@ -18833,6 +18857,204 @@ def test_close_all_skips_in_use_sessions():
     assert idle.closed is True
     assert not state.sessions
     print("✓ close_all 跳过在途会话")
+
+
+def test_chat_lock_timeout_reports_import_resume(monkeypatch):
+    """持锁者是备份恢复时，超时文案如实归因，不再误报「已有对话在进行」。"""
+    import asyncio as asyncio_module
+
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    user_id = _unique_user("web_test_lock_import_reason")
+    state.begin_user_import(user_id)
+    monkeypatch.setattr(server_module, "_CHAT_LOCK_POLL_SEC", 0.01)
+
+    class _Request:
+        def __init__(self) -> None:
+            self.app = app
+
+        async def is_disconnected(self) -> bool:
+            return False
+
+    async def _timed_out():
+        lock = asyncio_module.Lock()
+        await lock.acquire()
+        try:
+            await server_module._acquire_chat_lock(
+                _Request(), lock, "rid", timeout=0.05, user_id=user_id
+            )
+        finally:
+            lock.release()
+
+    try:
+        with pytest.raises(server_module.HTTPException) as info:
+            asyncio_module.run(_timed_out())
+        assert info.value.status_code == 503
+        assert "恢复备份" in info.value.detail
+        assert (info.value.headers or {}).get("Retry-After") == "5"
+    finally:
+        state.end_user_import(user_id)
+        _cleanup(user_id)
+    print("✓ 用户锁超时按真实持锁操作归因（备份恢复）")
+
+
+def test_delete_session_busy_lock_reports_import_resume(monkeypatch):
+    """删除会话的 409 在备份恢复持锁时同样如实归因。"""
+    import asyncio as asyncio_module
+
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    client = TestClient(app)
+
+    class _StuckLock:
+        async def acquire(self):
+            await asyncio_module.sleep(30)
+
+        def release(self):
+            pass
+
+    monkeypatch.setattr(state, "lock_for", lambda user_id: _StuckLock())
+    monkeypatch.setattr(server_module, "_DELETE_LOCK_TIMEOUT_SEC", 0.05)
+    user_id = _unique_user("web_test_delete_import_reason")
+    state.begin_user_import(user_id)
+    try:
+        response = client.delete(
+            "/api/sessions/s-busy", params={"user_id": user_id}
+        )
+        assert response.status_code == 409
+        assert "恢复备份" in response.json()["detail"]
+    finally:
+        state.end_user_import(user_id)
+    print("✓ 删除会话锁忙 409 按备份恢复归因")
+
+
+def test_kb_import_busy_lock_refunds_quota(monkeypatch):
+    """知识库写锁忙（零成本拒绝）退还导入额度；普通失败不退款。"""
+    from utils import knowledge_admin
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+    original_limit = state.import_limiter.limit
+    state.import_limiter.limit = 5
+
+    def busy(*args, **kwargs):
+        raise knowledge_admin.KnowledgeBusyError(
+            "知识库正在写入（导入进行中），请稍后重试"
+        )
+
+    monkeypatch.setattr(server_module, "import_documents", busy)
+    try:
+        response = client.post(
+            "/api/knowledge/import", json={"documents": [{"content": "x"}]}
+        )
+        assert response.status_code == 503
+        assert response.headers.get("Retry-After") == "5"
+        assert state.import_limiter.status("testclient")[0] == 5, (
+            "写锁忙的零成本 503 必须归还导入桶额度"
+        )
+        preview = client.post(
+            "/api/knowledge/import/preview",
+            json={"documents": [{"content": "x"}]},
+        )
+        assert preview.status_code == 503
+        assert state.import_limiter.status("testclient")[0] == 5, (
+            "预览同样归还导入桶额度"
+        )
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("milvus down")
+
+        monkeypatch.setattr(server_module, "import_documents", boom)
+        failed = client.post(
+            "/api/knowledge/import", json={"documents": [{"content": "x"}]}
+        )
+        assert failed.status_code == 503
+        assert state.import_limiter.status("testclient")[0] == 4, (
+            "非零成本失败不应退款（不扩大退款范围）"
+        )
+    finally:
+        state.import_limiter.limit = original_limit
+    print("✓ 知识库写锁忙退还导入额度（普通失败不退款）")
+
+
+def test_weather_upstream_quota_maps_429_and_refunds(monkeypatch):
+    """全进程上游额度用尽：429 + Retry-After + 额度头，并归还 IP 天气桶。"""
+    from utils.weather import UpstreamQuotaError
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+
+    def quota(city):
+        raise UpstreamQuotaError("天气查询过于频繁，请稍后再试", retry_after=7)
+
+    monkeypatch.setattr(server_module, "fetch_weather", quota)
+    before = state.weather_limiter.status("testclient")[0]
+    response = client.get(
+        "/api/weather", params={"city": "上游额度测试城"}
+    )
+    assert response.status_code == 429, response.text[:300]
+    assert response.headers.get("Retry-After") == "7"
+    assert response.headers.get("X-RateLimit-Limit") == str(
+        state.weather_limiter.limit
+    )
+    assert "天气查询过于频繁" in response.json()["detail"]
+    assert state.weather_limiter.status("testclient")[0] == before, (
+        "未发出上游请求的额度拒绝必须归还天气桶"
+    )
+    print("✓ 天气上游额度用尽映射 429 并归还额度")
+
+
+def test_pending_tombstone_replay_is_single_flight(monkeypatch):
+    """恢复期并发触发补写只允许一轮：节流判定与补写循环互斥。"""
+    import threading as _threading
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    entered = _threading.Event()
+    release_evt = _threading.Event()
+    runs: list[int] = []
+
+    def slow_replay(limit=20):
+        runs.append(1)
+        entered.set()
+        release_evt.wait(timeout=5)
+        return 0
+
+    monkeypatch.setattr(state, "replay_pending_tombstones", slow_replay)
+    state._pending_shared_tombstones[("u-single", "s-single")] = (
+        "tok",
+        time.monotonic() + 3600,
+    )
+    state._pending_replay_at = 0.0
+    try:
+        first = _threading.Thread(target=state._maybe_replay_pending)
+        first.start()
+        assert entered.wait(timeout=5), "第一轮补写应启动"
+        # 第一轮仍在运行时，即使节流时间已过也必须直接跳过
+        state._pending_replay_at = 0.0
+        second = _threading.Thread(target=state._maybe_replay_pending)
+        second.start()
+        second.join(timeout=2)
+        assert not second.is_alive(), "第二个触发必须立即返回"
+        assert len(runs) == 1, "补写必须单飞，不能重复执行"
+        # 恢复节流窗口，供「结束后仍受 5 秒节流」断言使用
+        state._pending_replay_at = time.monotonic() + 5.0
+        release_evt.set()
+        first.join(timeout=5)
+        assert not first.is_alive()
+        state._maybe_replay_pending()
+        assert len(runs) == 1, "结束后 5 秒节流仍然生效"
+    finally:
+        release_evt.set()
+        state._pending_shared_tombstones.pop(("u-single", "s-single"), None)
+        state._pending_replay_at = 0.0
+    print("✓ 墓碑补写单飞（并发触发不重复执行）")
 
 
 if __name__ == "__main__":
