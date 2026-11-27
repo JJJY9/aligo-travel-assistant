@@ -1501,7 +1501,7 @@ class OrchestrationAgent(AgentBase):
                 "status": "error",
                 "agent_name": agent_name,
                 "data": {"error": f"执行超时（>{_AGENT_TIMEOUT_SEC:g} 秒）"},
-                "message": "智能体执行超时",
+                "message": f"执行超时（>{_AGENT_TIMEOUT_SEC:g} 秒）",
                 "_timed_out": True,
             }
 

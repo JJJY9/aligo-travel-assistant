@@ -8,6 +8,7 @@ OrchestrationAgent 返回的 results 列表包含各子智能体的结构化输�
 from typing import Any
 
 import logging
+import re
 
 from utils.preference_values import (
     EXPLANATORY_PREF_KEYS,
@@ -17,6 +18,42 @@ from utils.preference_values import (
 )
 
 logger = logging.getLogger(__name__)
+
+# 六个简单技能文档化的结果键：answer 缺失（外部技能包 / 人工修过的
+# 记录）时，通用兜底仍能取出正文，不让数据静默丢弃
+_SIMPLE_SKILL_RESULT_KEYS = (
+    "budget_advice",
+    "packing_list",
+    "checklist",
+    "transport_advice",
+    "safety_tips",
+    "trip_notes",
+)
+
+_FENCE_OPEN_RE = re.compile(r"^( {0,3})(`{3,})(.*)$")
+
+
+def _balance_code_fences(text: str) -> str:
+    """补齐未闭合的 Markdown 代码围栏，避免吞并后续智能体结果。
+
+    同一轮多个技能结果以空行拼接：某个答案里未闭合的 ```（模型输出被
+    截断在围栏内）会让后续结果在 Web / 历史渲染里全部变成代码。按块
+    补齐后各块自闭合，也不改变任何公开契约。围栏行按 CommonMark 允许
+    最多 3 个空格缩进。
+    """
+    open_ticks = 0
+    for line in text.split("\n"):
+        match = _FENCE_OPEN_RE.match(line)
+        if not match:
+            continue
+        ticks = len(match.group(2))
+        if open_ticks == 0:
+            open_ticks = ticks
+        elif ticks >= open_ticks and not match.group(3).strip():
+            open_ticks = 0
+    if open_ticks:
+        return text + "\n" + "`" * open_ticks
+    return text
 
 
 def normalize_missing_items(items: Any) -> list[str]:
@@ -161,7 +198,7 @@ def result_to_markdown(result_data: dict[str, Any]) -> str:
             # 用户只看到「已处理您的请求。」，数据被静默丢弃
             rendered = _fallback_text(data)
         if rendered:
-            blocks.append(rendered)
+            blocks.append(_balance_code_fences(rendered))
 
     return "\n\n".join(blocks) if blocks else "已处理您的请求。"
 
@@ -171,7 +208,15 @@ def _fallback_text(data: Any) -> str:
     if isinstance(data, str):
         return data.strip()
     if isinstance(data, dict):
-        for key in ("answer", "content", "message", "summary", "text", "output"):
+        for key in (
+            "answer",
+            "content",
+            "message",
+            "summary",
+            "text",
+            "output",
+            *_SIMPLE_SKILL_RESULT_KEYS,
+        ):
             value = data.get(key)
             if isinstance(value, str) and value.strip():
                 return value
@@ -475,6 +520,7 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
         "text",
         "description",
         "output",
+        *_SIMPLE_SKILL_RESULT_KEYS,
     ):
         value = data.get(key)
         if isinstance(value, str) and value.strip():

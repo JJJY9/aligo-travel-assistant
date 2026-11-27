@@ -36,7 +36,7 @@ from utils.atomic_write import write_bytes_atomic, write_text_atomic
 from utils.errors import MemoryPersistenceError
 from utils.identifiers import is_valid_web_id, is_valid_web_session_id
 from utils.paths import default_data_root
-from utils.llm_resilience import retry_with_backoff
+from utils.llm_resilience import RetryBudgetExhausted, retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
 from utils.preference_values import (
     has_preference_value,
@@ -741,6 +741,10 @@ class AligoCLI:
                 except MemoryPersistenceError:
                     # 记忆写盘失败与 LLM 健康无关，不计入熔断（与 ConversationRuntime 一致）
                     raise
+                except RetryBudgetExhausted:
+                    # 整轮重试预算耗尽不是 LLM 故障：不计入熔断，文案由
+                    # 外层按普通错误展示（「本轮处理时间超出预算，请重试」）
+                    raise
                 except Exception:
                     if self.circuit_breaker:
                         self.circuit_breaker.record_failure()
@@ -821,6 +825,9 @@ class AligoCLI:
                 raise
             except MemoryPersistenceError:
                 # 记忆写盘失败与 LLM 健康无关，不计入熔断（与 ConversationRuntime 一致）
+                raise
+            except RetryBudgetExhausted:
+                # 整轮重试预算耗尽不是 LLM 故障：不计入熔断
                 raise
             except Exception:
                 if self.circuit_breaker:
@@ -1607,6 +1614,14 @@ class AligoCLI:
                     # orchestration 把非 JSON 技能输出包成 {"output": ...}：
                     # 缺这个键时只显示「✓ X已完成」、正文被丢弃
                     "output",
+                    # 六个简单技能文档化的结果键（answer 缺失的外部技能包 /
+                    # 人工修过的记录仍能取出正文；仅在其它键全部缺失时生效）
+                    "budget_advice",
+                    "packing_list",
+                    "checklist",
+                    "transport_advice",
+                    "safety_tips",
+                    "trip_notes",
                 ]
                 fallback_content = ""
                 

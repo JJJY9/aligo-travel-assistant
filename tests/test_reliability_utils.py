@@ -963,6 +963,57 @@ def test_get_status_wall_clock(monkeypatch):
     print("✓ 熔断快照同锁读取且时间为墙钟")
 
 
+def test_retry_budget_exhausted_uses_dedicated_marker():
+    """第一次尝试前预算就耗尽：抛 RetryBudgetExhausted（仍属 TimeoutError），
+    调用方据此不计入 LLM 熔断。"""
+    import utils.llm_resilience as lr
+
+    async def factory():
+        raise AssertionError("预算耗尽时不应再发起尝试")
+
+    async def scenario():
+        with pytest.raises(lr.RetryBudgetExhausted) as info:
+            await retry_with_backoff(
+                factory,
+                max_retries=3,
+                base_delay_sec=0.0,
+                max_delay_sec=0.0,
+                jitter=False,
+                deadline_monotonic=0.0,
+            )
+        assert isinstance(info.value, TimeoutError)
+        assert "超出预算" in str(info.value)
+
+    asyncio.run(scenario())
+    print("✓ 预算耗尽抛专用异常（仍属 TimeoutError）")
+
+
+def test_retry_budget_exhaustion_not_counted_against_circuit():
+    """慢回合的预算耗尽不是 LLM 故障：熔断计数不增，转成用户可读文案。"""
+    from agents.conversation import ConversationRuntime
+    from utils.errors import UserFacingError
+    from utils.llm_resilience import RetryBudgetExhausted
+
+    breaker = CircuitBreaker(failure_threshold=5, recovery_timeout_sec=10)
+    runtime = object.__new__(ConversationRuntime)
+    runtime.circuit_breaker = breaker
+    runtime._probe_recorded = False
+
+    async def exhausted():
+        raise RetryBudgetExhausted("本轮处理时间超出预算，请重试")
+
+    async def scenario():
+        with pytest.raises(UserFacingError) as info:
+            await runtime._call_with_resilience(
+                exhausted, max_retries=0, base_delay=0.0, max_delay=0.0
+            )
+        assert "超出预算" in str(info.value)
+
+    asyncio.run(scenario())
+    assert breaker.get_status()["failure_count"] == 0
+    print("✓ 预算耗尽不计入熔断并返回用户文案")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -1118,4 +1169,6 @@ if __name__ == "__main__":
         test_get_status_wall_clock(_mp)
     finally:
         _mp.undo()
+    test_retry_budget_exhausted_uses_dedicated_marker()
+    test_retry_budget_exhaustion_not_counted_against_circuit()
     print("\n全部通过")
