@@ -727,10 +727,13 @@ class MemoryManager:
         if not self.llm_model:
             return ""
 
-        # 失败冷却先检查：冷却期内直接返回，避免每轮都为了几秒后必然
-        # 被丢弃的结果做一遍阻塞查询
+        # 失败冷却先检查：冷却期内不做阻塞查询、不调用 LLM。但已有成功
+        # 总结时继续返回缓存——一次瞬时读失败不该让仍与窗口匹配的总结
+        # 从上下文里消失 60 秒（与 get_recent_summary_async 的先缓存后
+        # 冷却口径一致）
         if time.monotonic() < self._summary_failure_until:
-            return ""
+            cached = self._summary_cache
+            return cached[1] if cached is not None else ""
 
         # 聊天窗口 / 行程查询是阻塞 IO（JSON 文件、PostgreSQL 网络往返），
         # 放到线程池执行：留在事件循环线程会冻结同进程所有 SSE 流，
@@ -748,7 +751,10 @@ class MemoryManager:
             logger.warning(
                 "读取总结输入失败，跳过摘要: %s", redact_secret(exc)
             )
-            return ""
+            # 冷却期内不再发起阻塞查询：有成功总结时回退到它，避免一次
+            # 瞬时失败让跨会话事实整段消失；没有缓存仍返回空
+            cached = self._summary_cache
+            return cached[1] if cached is not None else ""
 
         # 如果既没有聊天记录也没有行程记录，直接返回
         if not history_from_other_sessions and not trip_history:

@@ -2244,7 +2244,11 @@ class LongTermMemory:
                 while index >= 0 and len(window) < limit:
                     if index < len(messages):
                         message = messages[index]
-                        if not _session_id_matches(message, exclude_session_id):
+                        # 与普通 limit 块、PG 的 created_at <= now()+1h
+                        # 同口径：未来的导入消息不能占满跨会话总结窗口
+                        if not _session_id_matches(
+                            message, exclude_session_id
+                        ) and not _is_future_message(message):
                             window.append(message)
                     index -= 1
                 window.reverse()

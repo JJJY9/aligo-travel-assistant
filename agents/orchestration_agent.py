@@ -748,6 +748,25 @@ class OrchestrationAgent(AgentBase):
         self._deferred_memory = None
         self._deferred_epoch = None
 
+    @staticmethod
+    def _agent_dialogue_item(item: Any) -> Any:
+        """给子智能体的对话副本：剥掉内部 metadata 与助手 `_meta`。
+
+        短期记忆原样保存 ``metadata.client_turn_id``（回合 id 回填 / 删除
+        要读），助手 content 里也带 `_meta` 账目；这些内部字段不能进入
+        子智能体 prompt。返回浅拷贝，不原地修改共享 dict。
+        """
+        if not isinstance(item, dict):
+            return item
+        clean = {
+            key: value for key, value in item.items() if key != "metadata"
+        }
+        if item.get("role") == "assistant" and isinstance(
+            item.get("content"), str
+        ):
+            clean["content"] = strip_turn_meta(item["content"])
+        return clean
+
     def _prepare_context(self, intention_data: dict[str, Any]) -> dict[str, Any]:
         """
         准备上下文信息，供子智能体使用
@@ -771,18 +790,12 @@ class OrchestrationAgent(AgentBase):
             recent_context = (
                 short_term.get_recent_context(3) if short_term is not None else []
             )
-            # 助手消息在短期记忆里原样带 _meta（回合 id 回填 / 删除要读）：
-            # 传给子智能体的副本剥掉内部账目，与意图上下文 strip_turn_meta
-            # 同口径——不能原地修改共享 dict，否则删除最后一轮找不到 turn_id
+            # 助手消息在短期记忆里原样带 _meta（回合 id 回填 / 删除要读），
+            # 用户消息带 metadata.client_turn_id：传给子智能体的副本统一
+            # 剥掉内部字段（与意图上下文 strip_turn_meta 同口径），不能
+            # 原地修改共享 dict，否则删除最后一轮找不到 turn_id
             context["recent_dialogue"] = [
-                (
-                    {**item, "content": strip_turn_meta(item["content"])}
-                    if isinstance(item, dict)
-                    and item.get("role") == "assistant"
-                    and isinstance(item.get("content"), str)
-                    else item
-                )
-                for item in recent_context
+                self._agent_dialogue_item(item) for item in recent_context
             ]
             # 用户本轮原话：偏好等抽取只依据该文本，避免把上下文 / 助手建议
             # 里的内容误当成用户偏好
