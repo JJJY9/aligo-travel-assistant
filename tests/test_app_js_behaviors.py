@@ -890,7 +890,38 @@ def test_send_message_http_error_not_connection_interruption():
         # 本轮必然未落库：输入框已被清空，必须把提问放回草稿，否则切走
         # 会话后正文只剩会随消息区重建消失的临时气泡
         assert data["input"] == "你好", data
-    print("✓ HTTP 错误不再触发停止对账 / 连接异常")
+        # 提问与错误气泡已移除（原因用 toast 展示）：留在界面会让直接
+        # 回车重发出现两条相同的提问气泡
+        assert data["users"] == 0, data
+        assert any("请求过于频繁" in t or "正在进行" in t for t in data["toasts"]), data
+    resend = results["resendRateLimited"]
+    assert resend["afterResend"]["users"] == 1, resend
+    print("✓ HTTP 错误不再触发停止对账 / 连接异常，重发不重复气泡")
+
+
+def test_sse_eof_tail_frame_is_dispatched():
+    """EOF 落在帧尾空行前：完整 data: 帧仍要派发，半帧解析失败被忽略。"""
+    results = _run_harness("sseEof")
+    assert results["noBlank"] == [{"type": "done", "reply": "tail"}], results
+    assert results["truncated"] == [], results
+    assert results["withBlank"] == [{"type": "done", "reply": "ok"}], results
+    print("✓ SSE EOF 尾帧补发（半帧不误派发）")
+
+
+def test_replay_error_clears_transient_and_reconciles():
+    """幂等回放 error（persisted=true）：提问不标临时，并登记停止对账刷新历史。"""
+    data = _run_harness("replayError")
+    assert data["transient"] != "1", data
+    assert len(data["reconcileCalls"]) == 1, data
+    call = data["reconcileCalls"][0]
+    assert call["sessionId"] == "s1", call
+    assert call["message"] == "重放提问", call
+    assert call["turnId"], call
+    assert call["reason"] == "上一请求已处理", call
+    # 登记被 flush 消费（桩替代了包装层，pending 由真实 forget 清理；这里
+    # 只验证对账被触发，登记保留语义不算本用例范围）
+    assert data["pending"] in (0, 1), data
+    print("✓ 幂等回放 error 清除临时标记并对账刷新历史")
 
 
 def test_startup_does_not_override_user_session_click():
@@ -1750,6 +1781,8 @@ if __name__ == "__main__":
     test_silent_reload_preserves_scroll()
     test_silent_reload_shows_appended_messages_and_keeps_expansion()
     test_sse_stream_parsing_robustness()
+    test_sse_eof_tail_frame_is_dispatched()
+    test_replay_error_clears_transient_and_reconciles()
     test_user_switch_clears_preference_cache()
     test_stop_reconcile_deferred_until_next_turn_ends()
     test_open_session_guards_deleting_and_unknown_empty()

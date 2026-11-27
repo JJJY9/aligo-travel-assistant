@@ -331,9 +331,15 @@ class MemoryManager:
         """
         return tombstones.get_session_epoch_state(self.user_id, self.session_id)
 
-    def session_deleted(self) -> bool:
-        """会话是否已被删除（共享墓碑；未配置 Redis 时不同进程不可见）。"""
-        return tombstones.is_session_deleted(self.user_id, self.session_id)
+    def session_deleted(self, force: bool = False) -> bool:
+        """会话是否已被删除（共享墓碑；未配置 Redis 时不同进程不可见）。
+
+        ``force=True`` 跳过 Redis 失败冷却、真实读取一次：检查点写入等
+        低频关键路径不能被一次瞬时故障在冷却窗口内静默关闭保护。
+        """
+        return tombstones.is_session_deleted(
+            self.user_id, self.session_id, force=force
+        )
 
     def persist_guard(
         self,

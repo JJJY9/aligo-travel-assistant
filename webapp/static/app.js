@@ -3916,6 +3916,10 @@ async function sendMessage(text, options = {}) {
   document.querySelectorAll(".follow-ups").forEach((row) => row.remove());
 
   let clearedRetiredThread = false;
+  // 本轮渲染的用户气泡（echo:false 的重新生成不新建）：HttpError 分支
+  // 需要把它与错误气泡一并移除，避免重发时出现两条相同的提问气泡
+  let turnUserNode = null;
+  let turnCleared = false;
   mutate(() => {
     if (state.retiredThreadVisible) {
       // 上一轮回答因会话被删除而未落库：可见线程不属于接下来的新会话，
@@ -3928,7 +3932,8 @@ async function sendMessage(text, options = {}) {
     // 线程被清空时 DOM 里已没有可复用的用户气泡（重新生成走 echo:false），
     // 必须补渲染，否则新会话只剩一条没有对应提问的回答
     if (options.echo !== false || clearedRetiredThread) {
-      els.messages.appendChild(renderUserNode(message));
+      turnUserNode = renderUserNode(message);
+      els.messages.appendChild(turnUserNode);
     }
   }, true);
   // 生成期间不保留上一条消息的编辑入口（结束后由 refreshEditButtons 移动到新提问）
@@ -4046,12 +4051,23 @@ async function sendMessage(text, options = {}) {
       // 服务端已明确响应（429 限流 / 503 锁占用 / 422 校验等）：不是连接
       // 中断。展示服务端原因，不执行停止对账（服务端没有执行本轮，重发
       // 由用户决定），也不把顶栏健康状态改成「连接异常」。
-      // 本轮必然未落库：请求在途时输入框已被清空，提问的唯一副本就是
-      // 这条临时气泡——切走会话后气泡随消息区重建消失，必须回填草稿
-      mutate(() => {
-        assistant.trace.fail(error.message);
-        assistant.fail(error.message);
-      });
+      // 本轮必然未落库：移除刚渲染的提问与错误气泡、原因用 toast 展示，
+      // 否则提问气泡留在界面（会话仍存在时不会消失），用户直接回车重发
+      // 会再渲染一条相同的提问，同一问题在界面上出现两次。
+      // 404（会话已删除）由上面的 HTTP 错误分支处理并已清空消息区
+      if (error.status !== 404) {
+        turnCleared = true;
+        mutate(() => {
+          if (turnUserNode) turnUserNode.remove();
+          assistant.root.remove();
+        });
+        toast(error.message);
+      } else {
+        mutate(() => {
+          assistant.trace.fail(error.message);
+          assistant.fail(error.message);
+        });
+      }
       restoreDraftText(message);
     } else if (!terminal) {
       // 浏览器原生网络错误文案（Failed to fetch / Load failed）直接展示
@@ -4096,8 +4112,10 @@ async function sendMessage(text, options = {}) {
     clearTimeout(headerTimer);
     state.controller = null;
     // 成功完成（done）才把本轮提问视为已写入服务端历史；停止 / 失败 / 中断
-    // 的提问没有落库，标记后不再显示「编辑」入口
-    if (state.sessionId) {
+    // 的提问没有落库，标记后不再显示「编辑」入口。
+    // HttpError 已移除本轮气泡（turnCleared）：此时 DOM 末尾是上一轮真实
+    // 已落库的提问，按 terminal=null 标记会误删它的「编辑」入口
+    if (state.sessionId && !turnCleared) {
       const users = els.messages.querySelectorAll(".msg.user");
       const lastUser = users[users.length - 1];
       if (lastUser) applyTurnPersistence(lastUser, terminal, assistant.persisted);
@@ -4409,44 +4427,62 @@ async function readEventStream(body, onEvent) {
   const decoder = new TextDecoder();
   let buffer = "";
 
+  // 按 SSE 分帧（\n\n）：同一事件的多个 data: 行拼接后再解析；注释行忽略
+  const dispatch = () => {
+    let boundary = buffer.indexOf("\n\n");
+    while (boundary >= 0) {
+      const chunk = buffer.slice(0, boundary);
+      buffer = buffer.slice(boundary + 2);
+      const dataLines = [];
+      chunk.split("\n").forEach((line) => {
+        if (!line || line.startsWith(":")) return;
+        const colon = line.indexOf(":");
+        const field = colon === -1 ? line : line.slice(0, colon);
+        if (field !== "data") return;
+        let payload = colon === -1 ? "" : line.slice(colon + 1);
+        if (payload.startsWith(" ")) payload = payload.slice(1);
+        dataLines.push(payload);
+      });
+      if (dataLines.length) {
+        let event = null;
+        try {
+          event = JSON.parse(dataLines.join("\n"));
+        } catch {
+          event = null; // 忽略无法解析的事件
+        }
+        // 非对象帧（如 data: null）不再交给 handleStreamEvent 触发 TypeError
+        if (event && typeof event === "object") onEvent(event);
+      }
+      boundary = buffer.indexOf("\n\n");
+    }
+  };
+
   try {
     while (true) {
       const { done, value } = await readWithIdleTimeout(reader);
-      if (done) break;
+      if (done) {
+        // EOF 收尾：上游代理可能把「截断在帧尾空行前」的 EOF 当正常结束，
+        // 此时最后一帧的 JSON 其实已完整（只是缺终止空行）。只在最后一行
+        // 是 data: 时补空行再派发一次；半截 JSON 解析失败会被忽略，
+        // 与现状一致。异常 / 中止路径不会走到这里，不会在 abort 后补发事件
+        buffer += decoder.decode();
+        buffer = buffer.replace(/\r\n/g, "\n");
+        const lastLine =
+          buffer
+            .split("\n")
+            .filter((line) => line.trim())
+            .pop() || "";
+        if (/^data\s*:/.test(lastLine)) buffer += "\n\n";
+        dispatch();
+        break;
+      }
       buffer += decoder.decode(value, { stream: true });
 
       // 代理 / 标准 SSE 服务可能使用 CRLF 分帧：先归一化（跨 chunk 的
       // \r\n 在下次追加后会合成完整序列再被替换），否则 indexOf("\n\n")
       // 永远命中不了、整条流在 EOF 时被当作「连接意外中断」
       buffer = buffer.replace(/\r\n/g, "\n");
-
-      let boundary = buffer.indexOf("\n\n");
-      while (boundary >= 0) {
-        const chunk = buffer.slice(0, boundary);
-        buffer = buffer.slice(boundary + 2);
-        // SSE 规范：同一事件的多个 data: 行按行拼接后再解析；注释行忽略
-        const dataLines = [];
-        chunk.split("\n").forEach((line) => {
-          if (!line || line.startsWith(":")) return;
-          const colon = line.indexOf(":");
-          const field = colon === -1 ? line : line.slice(0, colon);
-          if (field !== "data") return;
-          let payload = colon === -1 ? "" : line.slice(colon + 1);
-          if (payload.startsWith(" ")) payload = payload.slice(1);
-          dataLines.push(payload);
-        });
-        if (dataLines.length) {
-          let event = null;
-          try {
-            event = JSON.parse(dataLines.join("\n"));
-          } catch {
-            event = null; // 忽略无法解析的事件
-          }
-          // 非对象帧（如 data: null）不再交给 handleStreamEvent 触发 TypeError
-          if (event && typeof event === "object") onEvent(event);
-        }
-        boundary = buffer.indexOf("\n\n");
-      }
+      dispatch();
     }
   } finally {
     // 超时 / 中途异常时释放底层连接（测试替身可能只有 read，没有 cancel）
@@ -4474,10 +4510,12 @@ function resetDeletedSessionState(restoreText) {
 
 /* 依据本轮回合终态与落库结果设置「临时提问」标记：
    只有 done 且服务端确认已落库（persisted !== false）才清除；停止 / 失败 /
-   墓碑否决（persisted=false）一律保留标记，避免出现编辑入口与刷新后无声丢失。 */
+   墓碑否决（persisted=false）一律保留标记，避免出现编辑入口与刷新后无声丢失。
+   幂等回放的 error 终态（上一请求已处理、响应未送达）带 persisted=true：
+   该轮其实已写入历史，同样清除。 */
 function applyTurnPersistence(lastUser, terminal, persisted) {
   if (!lastUser) return;
-  if (terminal === "done" && persisted !== false) {
+  if ((terminal === "done" || persisted === true) && persisted !== false) {
     delete lastUser.dataset.transient;
   } else {
     lastUser.dataset.transient = "1";
@@ -4552,6 +4590,21 @@ function handleStreamEvent(assistant, event, userText) {
     }
     case "error": {
       const message = event.message || "处理失败";
+      // 幂等回放（该轮其实已落库、只是上次响应没送达）：标记为已保存，
+      // 并登记到既有停止对账队列——sendMessage 的 finally 会按
+      // client_turn_id 复核历史并静默重载，否则界面停在失败态、
+      // 已保存的回答始终不可见，后续消息还会接进看不到前文的会话
+      if (event.idempotent_replay) {
+        if (event.persisted === true) assistant.persisted = true;
+        if (state.sessionId) {
+          rememberStoppedTurn(
+            state.sessionId,
+            userText,
+            (assistant.root && assistant.root.dataset.turnId) || "",
+            "上一请求已处理",
+          );
+        }
+      }
       // 会话在其它标签页 / CLI 被删除后，继续用旧 id 发送只会反复失败，
       // 墓碑过期后还会复活该会话；这里直接切回新对话状态
       if (message.includes("会话已删除")) {

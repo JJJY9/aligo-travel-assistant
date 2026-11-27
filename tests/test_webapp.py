@@ -2139,10 +2139,335 @@ def test_chat_stream_incomplete_marker_replays_error():
             events
         )
         assert events[-1].get("idempotent_replay") is True
+        # 该标记只在整轮已落库时写下：回放必须声明 persisted=true，
+        # 前端据此清除「临时提问」标记而不是误判未保存
+        assert events[-1].get("persisted") is True, events[-1]
         assert "刷新会话历史" in events[-1]["message"]
     finally:
         _cleanup(user_id)
-    print("✓ 流式未完成幂等标记回放 error")
+    print("✓ 流式未完成幂等标记回放 error（带 persisted）")
+
+
+def test_cross_endpoint_incomplete_marker_returns_409():
+    """流式端点写入的「未完成」标记：换到非流式端点同键重试也返回 409。"""
+    from utils.idempotency import make_key
+
+    client = _client()
+    user_id = _unique_user("web_test_idem_cross_chat")
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "session_id": "sess-cross-chat",
+            "idempotency_key": "req-cross-chat",
+        }
+        state = client.app.state.aligo
+        key = make_key(
+            user_id,
+            "sess-cross-chat",
+            "req-cross-chat",
+            endpoint="chat_stream",
+            message="你好",
+        )
+        state.idempotency.put(
+            key,
+            {
+                "session_id": "sess-cross-chat",
+                "__incomplete__": True,
+                "message": "上一请求已处理但响应未送达，请刷新会话历史",
+            },
+        )
+        response = client.post("/api/chat", json=payload)
+        assert response.status_code == 409, response.text
+        assert "刷新会话历史" in response.json()["detail"]
+    finally:
+        _cleanup(user_id)
+    print("✓ 跨端点未完成标记在非流式端点返回 409")
+
+
+def test_cross_endpoint_incomplete_marker_replays_error_in_stream():
+    """非流式端点写入的「未完成」标记：流式端点同键重试回放 error 终态。"""
+    from utils.idempotency import make_key
+
+    client = _client()
+    user_id = _unique_user("web_test_idem_cross_stream")
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "session_id": "sess-cross-stream",
+            "idempotency_key": "req-cross-stream",
+        }
+        state = client.app.state.aligo
+        key = make_key(
+            user_id,
+            "sess-cross-stream",
+            "req-cross-stream",
+            endpoint="chat",
+            message="你好",
+        )
+        state.idempotency.put(
+            key,
+            {
+                "session_id": "sess-cross-stream",
+                "__incomplete__": True,
+                "message": "上一请求已处理但响应未送达，请刷新会话历史",
+            },
+        )
+        with client.stream(
+            "POST", "/api/chat/stream", json=payload
+        ) as response:
+            events = [
+                json.loads(line[5:].strip())
+                for line in response.iter_lines()
+                if line.startswith("data:")
+            ]
+        assert [event["type"] for event in events] == ["session", "error"], (
+            events
+        )
+        assert events[-1].get("persisted") is True
+    finally:
+        _cleanup(user_id)
+    print("✓ 跨端点未完成标记在流式端点回放 error")
+
+
+def test_cross_endpoint_success_payload_is_not_replayed():
+    """另一端点缓存的成功负载形状不同：不能跨端点回放，按新请求执行。"""
+    from utils.idempotency import make_key
+
+    client = _client()
+    user_id = _unique_user("web_test_idem_cross_success")
+    try:
+        payload = {
+            "message": "你好",
+            "user_id": user_id,
+            "session_id": "sess-cross-success",
+            "idempotency_key": "req-cross-success",
+        }
+        state = client.app.state.aligo
+        key = make_key(
+            user_id,
+            "sess-cross-success",
+            "req-cross-success",
+            endpoint="chat_stream",
+            message="你好",
+        )
+        state.idempotency.put(
+            key,
+            {
+                "type": "done",
+                "session_id": "sess-cross-success",
+                "reply": "cached-must-not-replay",
+            },
+        )
+        response = client.post("/api/chat", json=payload)
+        assert response.status_code == 200, response.text
+        assert response.json().get("reply") != "cached-must-not-replay"
+    finally:
+        _cleanup(user_id)
+    print("✓ 跨端点成功负载不回放，按新请求执行")
+
+
+def test_terminal_frame_delivered_probe():
+    """终态送达探测：未断连=True、已断连=False、探测异常按旧口径=True。"""
+    from webapp.server import _terminal_frame_delivered
+
+    class _Req:
+        def __init__(self, value):
+            self.value = value
+
+        async def is_disconnected(self):
+            if isinstance(self.value, Exception):
+                raise self.value
+            return self.value
+
+    async def scenario():
+        assert await _terminal_frame_delivered(_Req(False)) is True
+        assert await _terminal_frame_delivered(_Req(True)) is False
+        assert (
+            await _terminal_frame_delivered(_Req(RuntimeError("probe boom")))
+            is True
+        )
+
+    asyncio.run(scenario())
+    print("✓ 终态送达探测（异常不改变流行为）")
+
+
+def test_stream_internal_error_recorded_as_500():
+    """响应体自身抛错：scope 打 failed 标（不是 aborted），中间件记 500、不计耗时。"""
+    from utils.metrics import REQUEST_METRICS
+    from webapp.server import RequestContextMiddleware, _LeasedStreamingResponse
+
+    REQUEST_METRICS.reset()
+
+    class _Lease:
+        async def stop_turn(self):
+            return None
+
+        def after_stop(self):
+            return None
+
+        def release(self):
+            return None
+
+    async def body():
+        yield b"data: {}\n\n"
+        raise RuntimeError("stream bug")
+
+    async def stream_app(scope, receive, send):
+        response = _LeasedStreamingResponse(
+            body(), _Lease(), stream_state={"terminal_delivered": False}
+        )
+        await response(scope, receive, send)
+
+    middleware = RequestContextMiddleware(stream_app)
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        await asyncio.sleep(0)
+        return {"type": "http.request"}
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/chat/stream",
+        "headers": [(b"host", b"127.0.0.1")],
+        "asgi": {"spec_version": "2.3"},
+        "state": {},
+    }
+    try:
+        asyncio.run(middleware(scope, receive, send))
+        raise AssertionError("流内异常必须向上传播")
+    except RuntimeError:
+        pass
+    assert scope["state"].get("aligo_stream_failed") is True, scope
+    assert not scope["state"].get("aligo_stream_aborted"), scope
+    snapshot = REQUEST_METRICS.snapshot()
+    assert snapshot["by_status"].get("500") == 1, snapshot
+    assert "499" not in snapshot["by_status"], snapshot
+    assert snapshot["duration_samples"] == 0, "流式 500 不能计入延迟分位"
+    assert any(m.get("type") == "http.response.start" for m in sent)
+    REQUEST_METRICS.reset()
+    print("✓ 流内异常按 500 记账（不再伪装客户端中止）")
+
+
+def test_cancel_turn_with_budget_ignores_turn_failure():
+    """回合在取消前已自行失败：收尾不能把它的异常抛出顶替断连口径。"""
+    from webapp.server import _cancel_turn_with_budget
+
+    async def scenario():
+        async def failing():
+            raise RuntimeError("turn failed")
+
+        task = asyncio.ensure_future(failing())
+        await asyncio.sleep(0)
+        # 不得抛出：端点的断连 / 取消记账继续按原路径进行
+        await _cancel_turn_with_budget(None, task)
+        assert task.done()
+
+    asyncio.run(scenario())
+    print("✓ 收尾时回合已失败不顶替断连口径")
+
+
+def test_ask_cancellable_probe_error_stops_turn():
+    """断连探测自身抛异常：先取消并等待回合停稳，再向外抛。"""
+    from webapp.server import _ask_cancellable_on_disconnect
+
+    cancelled = {"value": False}
+
+    async def long_turn():
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            cancelled["value"] = True
+            raise
+
+    class _BadRequest:
+        async def is_disconnected(self):
+            raise RuntimeError("receive boom")
+
+    async def scenario():
+        try:
+            await _ask_cancellable_on_disconnect(
+                long_turn(), _BadRequest(), poll_interval=0.01
+            )
+        except RuntimeError as exc:
+            assert "receive boom" in str(exc)
+        else:  # pragma: no cover - 明确失败
+            raise AssertionError("探测异常必须向外传播")
+
+    asyncio.run(scenario())
+    assert cancelled["value"] is True, "探测异常时在途回合必须被取消"
+    print("✓ 断连探测异常时先停稳回合再抛出")
+
+
+def test_chat_stream_disconnect_after_session_build_returns_499(monkeypatch):
+    """取锁后、回合启动前客户端断开：返回 499，不为无人接收的请求开回合。"""
+    from starlette.requests import Request
+
+    calls = {"n": 0}
+
+    async def fake_is_disconnected(self):
+        calls["n"] += 1
+        # 取锁路径的探测放行；会话构造后的复检报告断开
+        return calls["n"] >= 2
+
+    monkeypatch.setattr(Request, "is_disconnected", fake_is_disconnected)
+    client = _client()
+    user_id = _unique_user("web_test_stream_dc_build")
+    try:
+        response = client.post(
+            "/api/chat/stream",
+            json={
+                "message": "你好",
+                "user_id": user_id,
+                "session_id": "sess-dc-build",
+            },
+        )
+        assert response.status_code == 499, response.text[:300]
+        assert calls["n"] >= 2
+    finally:
+        _cleanup(user_id)
+    print("✓ 会话构造后断连返回 499")
+
+
+def test_chat_stream_task_without_terminal_emits_error(monkeypatch):
+    """回合协程无终态退出（BaseException）：消费循环兜底发 error 而不是永久挂起。"""
+    from agents.conversation import ConversationRuntime
+
+    class _Fatal(BaseException):
+        pass
+
+    async def _fatal(self, message, on_event=None, turn_id=""):
+        raise _Fatal("boom")
+
+    monkeypatch.setattr(ConversationRuntime, "ask", _fatal)
+    client = _client()
+    user_id = _unique_user("web_test_stream_no_terminal")
+    try:
+        with client.stream(
+            "POST",
+            "/api/chat/stream",
+            json={
+                "message": "你好",
+                "user_id": user_id,
+                "session_id": "sess-no-terminal",
+            },
+        ) as response:
+            events = [
+                json.loads(line[5:].strip())
+                for line in response.iter_lines()
+                if line.startswith("data:")
+            ]
+        assert events, "至少应有 session 与 error 帧"
+        assert events[-1]["type"] == "error", events
+        assert "内部错误" in events[-1]["message"]
+    finally:
+        _cleanup(user_id)
+    print("✓ 回合无终态退出时兜底发送 error")
 
 
 def test_chat_creates_session_when_missing():

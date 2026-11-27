@@ -370,6 +370,69 @@ def test_transient_read_error_keeps_checkpoint(monkeypatch):
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_update_step_does_not_overwrite_unreadable(monkeypatch):
+    """瞬时读失败时 update_step 不能把整份状态覆盖成只含当前步骤。
+
+    读失败 ≠ 没有状态：整份覆盖会清空此前已成功写入的步骤，随后重试
+    把已完成的子智能体全部重跑（重复模型调用）。
+    """
+    from pathlib import Path as _Path
+
+    store, root = _store()
+    try:
+        store.save("u1:s1:t1:d", {"steps": {"a": 1}})
+        path = next(_Path(root).glob("*.json"))
+        real_read_text = _Path.read_text
+
+        def flaky_read_text(self, *args, **kwargs):
+            if self == path:
+                raise PermissionError(13, "被其它进程短暂占用")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(_Path, "read_text", flaky_read_text)
+        store.update_step("u1:s1:t1:d", "b", {"ok": True})
+        monkeypatch.setattr(_Path, "read_text", real_read_text)
+        state = store.load("u1:s1:t1:d")
+        assert state["steps"] == {"a": 1}, "瞬时读失败不能整份覆盖已保存步骤"
+        # 读取恢复后写入正常合并
+        store.update_step("u1:s1:t1:d", "b", {"ok": True})
+        assert store.load("u1:s1:t1:d")["steps"] == {
+            "a": 1,
+            "b": {"ok": True},
+        }
+        print("✓ 瞬时读失败时 update_step 跳过覆盖，恢复后正常合并")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_max_entries_tie_evicts_global_oldest():
+    """最大条目数并列时的实际淘汰口径（尽力而为，非绝对保证）。
+
+    每个用户各一条、新用户写入时 counts 全为 1：victim 是全局最旧条目
+    的归属——文档承诺已按此修正，行为用用例钉死。
+    """
+    store, root = _store(max_entries=3)
+    try:
+        keys = ["alice:s1:t1:d", "bob:s1:t1:d", "carol:s1:t1:d"]
+        for key in keys:
+            store.save(key, {"status": "ok"})
+        # 显式错开 mtime，保证「全局最旧」稳定可断言
+        now = time.time()
+        for offset, key in enumerate(keys):
+            path = Path(root) / f"{hashlib.sha256(key.encode()).hexdigest()}.json"
+            ts = now - (len(keys) - offset) * 10
+            os.utime(path, (ts, ts))
+        store.save("dave:s1:t1:d", {"status": "ok"})
+        assert len(store) == 3
+        assert store.load("alice:s1:t1:d") is None, "并列时淘汰全局最旧条目"
+        for key in keys[1:] + ["dave:s1:t1:d"]:
+            assert store.load(key) is not None, key
+        print("✓ 条目数并列时淘汰全局最旧（与修正后的文档承诺一致）")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+
 def test_clear_scope_transient_read_error_keeps_other_scope(monkeypatch):
     """会话删除批量读取时，其它作用域文件瞬时不可读不能被顺手删掉。"""
     from pathlib import Path as _Path
@@ -426,6 +489,7 @@ if __name__ == "__main__":
     test_corrupted_file_is_cleaned()
     test_max_entries_prunes_oldest()
     test_max_entries_prunes_per_owner()
+    test_max_entries_tie_evicts_global_oldest()
     test_key_is_hashed_on_disk()
     test_raw_key_not_written_to_disk()
     test_default_root_follows_data_dir()
@@ -442,6 +506,11 @@ if __name__ == "__main__":
     mp = _pytest.MonkeyPatch()
     try:
         test_transient_read_error_keeps_checkpoint(mp)
+    finally:
+        mp.undo()
+    mp = _pytest.MonkeyPatch()
+    try:
+        test_update_step_does_not_overwrite_unreadable(mp)
     finally:
         mp.undo()
     mp = _pytest.MonkeyPatch()
