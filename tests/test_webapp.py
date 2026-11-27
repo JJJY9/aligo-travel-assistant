@@ -9853,6 +9853,51 @@ def test_sessions_pagination():
         _cleanup(user_id)
 
 
+def test_sessions_listing_reuses_aggregation_for_repeat_requests(monkeypatch):
+    """无查询词的列表刷新复用上次聚合；标题 / 条数变化必须失效重算。"""
+    from context.storage import create_long_term_memory
+    from webapp import server as server_module
+
+    client = _client()
+    user_id = _unique_user("web_test_sessions_cache")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.add_chat_message("user", "聚合缓存", "cache-1")
+            store.add_chat_message("assistant", "回复", "cache-1")
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+
+        first = client.get("/api/sessions", params={"user_id": user_id}).json()
+        assert first["total"] == 1
+
+        original = server_module._group_sessions
+
+        def _boom(*args, **kwargs):
+            raise AssertionError("重复刷新不应重新聚合全量历史")
+
+        monkeypatch.setattr(server_module, "_group_sessions", _boom)
+        second = client.get("/api/sessions", params={"user_id": user_id}).json()
+        assert second == first, "缓存命中时响应必须与首次逐字段一致"
+
+        # 标题变化改变指纹：必须重新聚合并反映新标题
+        monkeypatch.setattr(server_module, "_group_sessions", original)
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            assert store.set_session_title("cache-1", "新标题")
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        third = client.get("/api/sessions", params={"user_id": user_id}).json()
+        assert third["sessions"][0]["title"] == "新标题"
+        print("✓ 会话列表聚合缓存命中且元数据变化自动失效")
+    finally:
+        _cleanup(user_id)
+
+
 def test_metrics_api():
     """GET /api/metrics 返回请求计数 / 状态 / 耗时与熔断器状态。"""
     from utils.metrics import REQUEST_METRICS

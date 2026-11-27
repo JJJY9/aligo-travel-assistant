@@ -1047,9 +1047,10 @@ def test_session_refresh_keeps_expanded_list():
     data = _run_harness("sessionRefresh")
     assert data["count"] == 250, data
     assert data["offset"] == 250, data
-    assert "limit=200" in data["first_url"], data
-    assert "offset=200" in data["second_url"], data
-    print("✓ 会话列表刷新按原数量续页合并")
+    # 刷新按已加载数量一次取回整窗，不再按 200 一页串行补取
+    assert "limit=250" in data["first_url"], data
+    assert data["pending_requests"] == 0, data
+    print("✓ 会话列表刷新一次取回已展开数量")
 
 
 def test_open_session_confirms_pending_edit():

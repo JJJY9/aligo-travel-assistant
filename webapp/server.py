@@ -167,6 +167,10 @@ MAX_REQUEST_BODY_BYTES = 2 * 1024 * 1024
 # 否则写接口可以无限追加，把用户记忆撑到永远无法导出的状态
 MAX_PREFERENCE_ENTRIES = 200
 MAX_TRIP_ENTRIES = 5000
+# 会话列表单页上限：刷新时前端按「已加载条数」一次取回整窗，避免为
+# 展开过的列表逐页串行重扫全量历史；服务端每页仍只切列表，响应体积
+# 由前端实际已加载量决定（仅本仓库前端调用该接口）
+SESSION_LIST_MAX_LIMIT = 1000
 # /api/knowledge/duplicates 的 limit=0「全部」上限：全量物化 + 序列化整个
 # 知识库会让单次请求把几百 MB 拉进内存；脚本需要全量时走 CLI kb-duplicates
 MAX_DUPLICATE_GROUPS_FULL = 2000
@@ -4599,6 +4603,72 @@ def _usage_summary_for_user(
     return summary
 
 
+# /api/sessions 每次请求都对整段历史重新聚合（q 为空时是 O(消息数) 的
+# 计数 / 标题 / 排序），而前端每回合结束、每次重命名 / 置顶 / 删除后都会
+# 刷新，翻页时每页还要再聚合一遍。按用户缓存无查询词的聚合结果，指纹取
+# O(1) 的首尾消息与元数据——会话标题 / 置顶 / 归档 / 历史条数或末条变化
+# 都会自然失效（编辑与删除只发生在末轮或改变条数）。缓存值为纯数据，
+# 出参仍经 sanitize_json 深拷贝，不会被下游改写。
+_SESSIONS_BASE_CACHE: dict[
+    str, tuple[tuple[Any, ...], list[dict[str, Any]], int]
+] = {}
+_SESSIONS_BASE_CACHE_MAX = 32
+_sessions_base_cache_lock = threading.Lock()
+
+
+def _sessions_base_fingerprint(
+    data: dict[str, Any], archived_mode: str
+) -> tuple[Any, ...]:
+    history = data.get("chat_history") or []
+    first = history[0] if history else {}
+    last = history[-1] if history else {}
+    titles = data.get("session_titles") or {}
+    return (
+        len(history),
+        str(first.get("timestamp") or ""),
+        len(str(first.get("content") or "")),
+        str(last.get("timestamp") or ""),
+        len(str(last.get("content") or "")),
+        tuple(sorted((str(key), str(value)) for key, value in titles.items())),
+        tuple(str(item) for item in data.get("pinned_sessions") or []),
+        tuple(str(item) for item in data.get("archived_sessions") or []),
+        _tz_epoch(),
+        archived_mode,
+    )
+
+
+def _sessions_base_for_user(
+    user_id: str, data: dict[str, Any], archived_mode: str
+) -> tuple[list[dict[str, Any]], int]:
+    """带缓存的会话聚合（/api/sessions 无查询词路径专用）。"""
+    fingerprint = _sessions_base_fingerprint(data, archived_mode)
+    with _sessions_base_cache_lock:
+        cached = _SESSIONS_BASE_CACHE.get(user_id)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1], cached[2]
+    live_ids: set[str] = set()
+    sessions = _group_sessions(
+        data["chat_history"],
+        1_000_000,
+        "",
+        data.get("session_titles") or {},
+        data.get("pinned_sessions") or [],
+        data.get("archived_sessions") or [],
+        archived_mode,
+        live_session_ids=live_ids,
+    )
+    archived_count = _archived_count(data, live_ids)
+    with _sessions_base_cache_lock:
+        if (
+            user_id not in _SESSIONS_BASE_CACHE
+            and len(_SESSIONS_BASE_CACHE) >= _SESSIONS_BASE_CACHE_MAX
+        ):
+            # 用户 ID 来自请求参数：缓存必须封顶，不能随访问过的用户增长
+            _SESSIONS_BASE_CACHE.pop(next(iter(_SESSIONS_BASE_CACHE)), None)
+        _SESSIONS_BASE_CACHE[user_id] = (fingerprint, sessions, archived_count)
+    return sessions, archived_count
+
+
 def _md_inline(value: object) -> str:
     """导出 Markdown 的单行内联文本：折叠空白 + 尖括号 / 右方括号转义。
 
@@ -6110,7 +6180,7 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request,
         response: Response,
         user_id: str = Query(..., pattern=_ID_PATTERN),
-        limit: int = Query(default=50, ge=1, le=200),
+        limit: int = Query(default=50, ge=1, le=SESSION_LIST_MAX_LIMIT),
         offset: int = Query(default=0, ge=0),
         q: str = Query(default="", max_length=100),
         archived: bool = Query(default=False),
@@ -6119,20 +6189,26 @@ def create_app(model: Any = None) -> FastAPI:
         # strict：与详情 / 写接口 / CLI 同口径——PG 故障期不能把回退 JSON
         # 的会话列表当「当前数据」展示（列表可点开的会话在详情却 503）
         data = _load_user_data(user_id, strict=True)
-        titles = data.get("session_titles") or {}
-        pinned = data.get("pinned_sessions") or []
-        archived_ids = data.get("archived_sessions") or []
-        live_ids: set[str] = set()
-        sessions = _group_sessions(
-            data["chat_history"],
-            1_000_000,
-            q,
-            titles,
-            pinned,
-            archived_ids,
-            "only" if archived else "exclude",
-            live_session_ids=live_ids,
-        )
+        archived_mode = "only" if archived else "exclude"
+        if q:
+            live_ids: set[str] = set()
+            sessions = _group_sessions(
+                data["chat_history"],
+                1_000_000,
+                q,
+                data.get("session_titles") or {},
+                data.get("pinned_sessions") or [],
+                data.get("archived_sessions") or [],
+                archived_mode,
+                live_session_ids=live_ids,
+            )
+            archived_count = _archived_count(data, live_ids)
+        else:
+            # 无查询词：聚合结果只取决于历史与元数据，重复刷新 / 翻页
+            # 直接复用上次的聚合，不必每页重扫全量历史
+            sessions, archived_count = _sessions_base_for_user(
+                user_id, data, archived_mode
+            )
         total = len(sessions)
         # 旧记忆 / 手写文件里的标题与首条消息可能含孤立代理项：列表响应
         # 序列化失败会让侧栏整个打不开，出口统一转义
@@ -6143,7 +6219,7 @@ def create_app(model: Any = None) -> FastAPI:
                 "offset": offset,
                 "limit": limit,
                 "archived": archived,
-                "archived_count": _archived_count(data, live_ids),
+                "archived_count": archived_count,
             }
         )
 

@@ -1748,23 +1748,46 @@ class PostgresLongTermMemory:
                 ) from exc
         return created, updated
 
+    @_session_meta_guard
     def set_session_titles(
         self, titles: dict[str, str], *, applied_out: set[str] | None = None
     ) -> int:
         """批量设置会话标题（备份恢复）：只对存在的会话生效，返回生效数。
 
         ``applied_out`` 回填实际写入的会话（导入迟到回滚按实际生效集合
-        扣减计数）。
+        扣减计数）。整批共用一次 advisory lock 与一条 unnest 写入：逐条
+        调用会为每个标题付 3 次同步往返（存在性 + UPSERT），备份里几百
+        个标题就把恢复时长放大到秒级。
         """
-        applied = 0
-        for session_id, title in titles.items():
-            cleaned = str(title).strip()
-            if cleaned and self.set_session_title(session_id, cleaned):
-                applied += 1
-                if applied_out is not None:
-                    applied_out.add(session_id)
-        return applied
+        entries = [
+            (str(session_id), str(title).strip()[:60])
+            for session_id, title in titles.items()
+            if str(title).strip() and str(session_id)
+        ]
+        if not entries:
+            return 0
+        existing = self._existing_sessions([session_id for session_id, _ in entries])
+        rows = [(session_id, title) for session_id, title in entries if session_id in existing]
+        if not rows:
+            return 0
+        self._execute(
+            """
+            INSERT INTO aligo_session_titles (user_id, session_id, title)
+            SELECT %s, s, t FROM unnest(%s::text[], %s::text[]) AS x(s, t)
+            ON CONFLICT (user_id, session_id)
+            DO UPDATE SET title = EXCLUDED.title, updated_at = now()
+            """,
+            (
+                self.user_id,
+                [session_id for session_id, _ in rows],
+                [title for _, title in rows],
+            ),
+        )
+        if applied_out is not None:
+            applied_out.update(session_id for session_id, _ in rows)
+        return len(rows)
 
+    @_session_meta_guard
     def set_sessions_pinned(
         self,
         session_ids: list[str],
@@ -1772,15 +1795,41 @@ class PostgresLongTermMemory:
         *,
         applied_out: set[str] | None = None,
     ) -> int:
-        """批量置顶 / 取消置顶（备份恢复）：返回实际生效数。"""
-        applied = 0
-        for session_id in session_ids:
-            if session_id and self.set_session_pinned(session_id, pinned):
-                applied += 1
-                if applied_out is not None:
-                    applied_out.add(session_id)
-        return applied
+        """批量置顶 / 取消置顶（备份恢复）：返回实际生效数。
 
+        与逐条版本同口径：已置顶的会话仍计入生效（幂等），不存在的
+        会话不计；重复 ID 按出现次数计数。置顶时间按列表顺序递增，
+        ``get_pinned_sessions`` 的排序与逐条插入一致。
+        """
+        ids = [str(session_id) for session_id in session_ids if session_id]
+        if not ids:
+            return 0
+        existing = self._existing_sessions(list(dict.fromkeys(ids)))
+        applied = [session_id for session_id in ids if session_id in existing]
+        if not applied:
+            return 0
+        unique_ids = list(dict.fromkeys(applied))
+        if pinned:
+            self._execute(
+                """
+                INSERT INTO aligo_pinned_sessions (user_id, session_id, pinned_at)
+                SELECT %s, s, now() + (ord - 1) * interval '1 microsecond'
+                FROM unnest(%s::text[]) WITH ORDINALITY AS x(s, ord)
+                ON CONFLICT DO NOTHING
+                """,
+                (self.user_id, unique_ids),
+            )
+        else:
+            self._execute(
+                "DELETE FROM aligo_pinned_sessions "
+                "WHERE user_id = %s AND session_id = ANY(%s)",
+                (self.user_id, unique_ids),
+            )
+        if applied_out is not None:
+            applied_out.update(applied)
+        return len(applied)
+
+    @_session_meta_guard
     def set_sessions_archived(
         self,
         session_ids: list[str],
@@ -1788,14 +1837,49 @@ class PostgresLongTermMemory:
         *,
         applied_out: set[str] | None = None,
     ) -> int:
-        """批量归档 / 恢复（备份恢复）：返回实际生效数。"""
-        applied = 0
-        for session_id in session_ids:
-            if session_id and self.set_session_archived(session_id, archived):
-                applied += 1
-                if applied_out is not None:
-                    applied_out.add(session_id)
-        return applied
+        """批量归档 / 恢复（备份恢复）：返回实际生效数。
+
+        计数与排序语义同 :meth:`set_sessions_pinned`（归档时间按列表
+        顺序递增，导出 / 恢复往返顺序稳定）。
+        """
+        ids = [str(session_id) for session_id in session_ids if session_id]
+        if not ids:
+            return 0
+        existing = self._existing_sessions(list(dict.fromkeys(ids)))
+        applied = [session_id for session_id in ids if session_id in existing]
+        if not applied:
+            return 0
+        unique_ids = list(dict.fromkeys(applied))
+        if archived:
+            self._execute(
+                """
+                INSERT INTO aligo_archived_sessions (user_id, session_id, archived_at)
+                SELECT %s, s, now() + (ord - 1) * interval '1 microsecond'
+                FROM unnest(%s::text[]) WITH ORDINALITY AS x(s, ord)
+                ON CONFLICT DO NOTHING
+                """,
+                (self.user_id, unique_ids),
+            )
+        else:
+            self._execute(
+                "DELETE FROM aligo_archived_sessions "
+                "WHERE user_id = %s AND session_id = ANY(%s)",
+                (self.user_id, unique_ids),
+            )
+        if applied_out is not None:
+            applied_out.update(applied)
+        return len(applied)
+
+    def _existing_sessions(self, session_ids: list[str]) -> set[str]:
+        """批量存在性查询：一次 DISTINCT 扫描取回仍持有消息的会话 ID。"""
+        if not session_ids:
+            return set()
+        rows = self._fetchall(
+            "SELECT DISTINCT session_id FROM aligo_chat_messages "
+            "WHERE user_id = %s AND session_id = ANY(%s)",
+            (self.user_id, session_ids),
+        )
+        return {str(row[0]) for row in rows}
 
     def _session_exists(self, session_id: str) -> bool:
         row = self._fetchone(

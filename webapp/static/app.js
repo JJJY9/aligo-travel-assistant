@@ -434,6 +434,9 @@ const reconcilingStoppedTurns = new Set();
 // （启动恢复）立即返回，不会把 state.ready 卡到旧请求超时
 let sessionLoadController = null;
 let sessionsRequestId = 0;
+// 会话列表刷新单页上限（与服务端 /api/sessions 的 limit 上限一致）：
+// 刷新按已加载条数一次取回整窗，避免为展开过的列表逐页串行重扫全量历史
+const SESSION_REFRESH_LIMIT_MAX = 1000;
 let statusRequestId = 0;
 // 行程列表（展开全部 / 状态刷新时的二次请求）共用序号：只应用最新一次结果，
 // 防止切换用户后旧用户的数据被渲染（行内删除按当前用户执行，会误删同名 trip_id）
@@ -3116,7 +3119,7 @@ async function loadSessions(query = state.searchQuery, options = {}) {
   // 重置（搜索 / 切换用户）取第一页；其它刷新（重命名 / 置顶 / 删除）
   // 保留用户已经「加载更多」展开的数量
   const targetCount = options.reset ? 50 : Math.max(50, state.sessions.length);
-  const limit = Math.min(200, targetCount);
+  const limit = Math.min(SESSION_REFRESH_LIMIT_MAX, targetCount);
   const params = new URLSearchParams({
     user_id: state.userId,
     limit: String(limit),
@@ -3130,8 +3133,8 @@ async function loadSessions(query = state.searchQuery, options = {}) {
     state.sessions = data.sessions || [];
     state.sessionsOffset = state.sessions.length;
     state.sessionTotal = Number(data.total || state.sessions.length);
-    // 单页上限 200：刷新不能把「加载更多」展开的列表悄悄截回 200 条——
-    // 按刷新前的数量继续取后续页并合并，达到目标或服务端取尽为止
+    // 单页上限 1000：刷新一次取回整个已加载窗口；仅在超过上限的极端
+    // 情况按刷新前数量继续取后续页并合并，达到目标或服务端取尽为止
     if (!options.reset && state.sessions.length < targetCount) {
       const seen = new Set(state.sessions.map((item) => item.session_id));
       let serverOffset = state.sessions.length;
@@ -3482,6 +3485,12 @@ async function openSession(sessionId, options = {}) {
           windowLastAssistantMeta = message.meta || null;
           nodes.push(node);
         }
+      }
+      for (const node of nodes) {
+        // 批量历史一次挂入窗口内的全部消息（最多 200 条）：rise 入场动画
+        // 会让整屏同时播放，长会话打开 / 补批时明显掉帧。批量节点固定
+        // 关闭动画；实时流式追加的单条消息不受影响
+        if (node.classList) node.classList.add("msg-static");
       }
       return {
         nodes,

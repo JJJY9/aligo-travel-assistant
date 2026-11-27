@@ -5505,6 +5505,55 @@ def test_batch_restore_dedupes_integer_metadata():
     print("✓ 批量恢复按字符串口径去重（整数 + 字符串等价）")
 
 
+def test_pg_batch_session_meta_single_roundtrip():
+    """批量恢复元数据：整批一次存在性查询 + 一条 unnest 写入（不再逐行往返）。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-bulk-meta"
+    fetches: list[tuple[str, tuple | None]] = []
+    executes: list[tuple[str, tuple | None]] = []
+    memory._fetchall = lambda sql, params=None: (
+        fetches.append((sql, params)) or [("s1",), ("s2",)]
+    )
+    memory._execute = lambda sql, params=None, replay_safe=True: executes.append(
+        (sql, params)
+    )
+    memory._advisory_lock = lambda name: contextlib.nullcontext()
+
+    applied: set[str] = set()
+    count = memory.set_session_titles(
+        {"s1": " 标题 ", "s2": "", "ghost": "不存在"}, applied_out=applied
+    )
+    assert count == 1 and applied == {"s1"}
+    assert len(fetches) == 1, "整批只做一次存在性查询"
+    assert len(executes) == 1, "整批只写一条 upsert"
+    assert "unnest" in executes[0][0]
+    assert executes[0][1][1:] == (["s1"], ["标题"])
+
+    applied.clear()
+    fetches.clear()
+    executes.clear()
+    count = memory.set_sessions_pinned(
+        ["s1", "s2", "s2", "ghost"], applied_out=applied
+    )
+    # 与逐条版本同口径：重复 ID 按出现次数计数、不存在的会话不计
+    assert count == 3 and applied == {"s1", "s2"}
+    assert len(fetches) == 1 and len(executes) == 1
+    assert "WITH ORDINALITY" in executes[0][0]
+    assert executes[0][1] == ("u-bulk-meta", ["s1", "s2"])
+
+    applied.clear()
+    executes.clear()
+    count = memory.set_sessions_archived(["s1", "ghost"], archived=False)
+    assert count == 1
+    assert "DELETE FROM aligo_archived_sessions" in executes[0][0]
+    assert executes[0][1] == ("u-bulk-meta", ["s1"])
+    print("✓ PG 批量会话元数据整批往返（计数 / 排序 / 删除口径一致）")
+
+
 def test_write_batch_covers_session_metadata_and_delete_last_turn(monkeypatch):
     """write_batch 覆盖单条元数据 setter 与 delete_last_turn（批内失败整批回滚）。"""
     import pytest
