@@ -263,6 +263,47 @@ def test_stats_dispatch(monkeypatch):
     print("✓ dispatch 层 stats 正常执行 / 严格参数")
 
 
+def test_stats_skips_blank_and_reserved_session_ids(monkeypatch):
+    """会话计数与 sessions 列表 / Web 同口径：空白串与保留字不算会话。"""
+    store = _FakeStore(
+        history=[
+            _message("s1"),
+            _message(""),
+            _message("   "),
+            _message(None),
+            _message(0),
+            _message("export"),
+        ],
+        archived=["s1", "", "   ", "export"],
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run("u-stats", as_json=True)
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["sessions"] == {"total": 2, "messages": 6, "archived": 1}
+    print("✓ stats 跳过空白 / 保留字会话")
+
+
+def test_stats_lightweight_summary_filters_ids(monkeypatch):
+    """轻量 chat_summary 返回空白 / 保留字时同样过滤（防御旧实现）。"""
+    store = _FakeStore(history=[_message("s1")])
+    store.get_chat_summary = lambda: {
+        "messages": 4,
+        "sessions": ["s1", "", "   ", "export", 0],
+    }
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run("u-stats", as_json=True)
+    assert code == 0
+    payload = json.loads(out)
+    assert payload["sessions"]["total"] == 2  # s1 + 整数 0
+    assert payload["sessions"]["messages"] == 4
+    print("✓ stats 轻量摘要过滤空白 / 保留字")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
@@ -302,6 +343,16 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_stats_counts_only_visible_preferences(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_stats_skips_blank_and_reserved_session_ids(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_stats_lightweight_summary_filters_ids(_mp)
     finally:
         _mp.undo()
     print("\n全部通过")

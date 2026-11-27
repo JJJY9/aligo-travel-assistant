@@ -172,6 +172,9 @@ def test_parse_eval_agent_args():
     assert cli._parse_eval_agent_args(["--count", "0"]) is None
     assert cli._parse_eval_agent_args(["--count", "abc"]) is None
     assert cli._parse_eval_agent_args(["--min-pass", "1.5"]) is None
+    assert cli._parse_eval_agent_args(["--min-pass", ".5"]) == (
+        20, 7, 0.5, False
+    )
     assert cli._parse_eval_agent_args(["--unknown"]) is None
     print("✓ eval-agent 参数解析")
 

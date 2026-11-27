@@ -34,6 +34,10 @@ def test_parse_eval_cases_args():
     # 0 条用例会产出空数据集却报成功（同族 eval-agent 的合法域是 1..5000）
     assert cli._parse_eval_cases_args(["--count", "0"]) is None
     assert cli._parse_eval_cases_args(["--count=0000"]) is None
+    # 前导零不影响数值：05000 即 5000（合法范围内）
+    assert cli._parse_eval_cases_args(["--count", "05000"]) == (
+        5000, 7, None, False, False
+    )
     assert cli._parse_eval_cases_args(["--seed", "-1"]) is None
     assert cli._parse_eval_cases_args(["--out"]) is None
     assert cli._parse_eval_cases_args(["--unknown"]) is None

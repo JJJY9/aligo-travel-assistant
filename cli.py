@@ -13,7 +13,7 @@ import subprocess
 import sys
 import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 # 添加项目根目录到路径
 project_root = os.path.dirname(os.path.abspath(__file__))
@@ -57,6 +57,8 @@ from utils.version import APP_VERSION
 
 _RUNTIME_IMPORT_ERROR: Exception | None = None
 try:
+    from rich.cells import cell_len as _rich_cell_len
+    from rich.cells import split_graphemes as _rich_split_graphemes
     from rich.console import Console
     from rich.markup import escape as _rich_markup
     from rich.prompt import Prompt
@@ -73,6 +75,23 @@ except Exception as exc:  # noqa: BLE001 - 依赖缺失时诊断命令仍要能�
     create_chat_model = init_agentscope = None  # type: ignore[assignment]
     MemoryManager = None  # type: ignore[assignment,misc]
     _trip_sort_key = None  # type: ignore[assignment]
+    _rich_cell_len = None  # type: ignore[assignment]
+    _rich_split_graphemes = None  # type: ignore[assignment]
+
+
+# 终端显示专用的不可见格式符：双向嵌入 / 覆盖 / 隔离、方向标记、零宽空格、
+# 词连接符、BOM、软连字符、行 / 段分隔符。零宽连接符 U+200C / U+200D 故意
+# 保留：ZWJ 是 emoji 组合序列与部分文字整形的一部分，剥掉会改变正常渲染。
+# 存储与导出保持原值（exporter / session_html 需要保真），只在终端显示层剥除。
+_DISPLAY_FORMAT_CONTROLS = re.compile(
+    "[\\u061c\\u00ad\\u200b\\u200e\\u200f\\u2028\\u2029"
+    "\\u202a-\\u202e\\u2060\\u2066-\\u2069\\ufeff]"
+)
+
+
+def _strip_display_unsafe(value: object) -> str:
+    """终端显示层清洗：剥终端控制序列 + 不可见格式符（含双向覆盖）。"""
+    return _DISPLAY_FORMAT_CONTROLS.sub("", strip_terminal_controls(value))
 
 
 def _markup_safe(value: object) -> str:
@@ -82,7 +101,7 @@ def _markup_safe(value: object) -> str:
     字符时，``[`` + ESC + ``red]`` 不会被转义，剥掉 ESC 后又拼成有效
     markup——样式注入或 unmatched 关闭标签的 MarkupError 终止 REPL。
     """
-    text = strip_terminal_controls(value)
+    text = _strip_display_unsafe(value)
     return _rich_markup(text) if _rich_markup is not None else text
 
 
@@ -105,7 +124,7 @@ def _plain_safe(value: object) -> str:
     rich 的反斜杠式转义只在 Rich 渲染时才有意义：直接写 stdout 会把
     ``[/x]`` 变成字面量 ``\[/x]``，错误文本被改形。
     """
-    return strip_terminal_controls(value)
+    return _strip_display_unsafe(value)
 
 
 def _table_cell(value: object) -> str:
@@ -119,7 +138,7 @@ def _single_line_safe(value: object) -> str:
     ``strip_terminal_controls`` 有意保留换行与制表符（导出正文需要）；
     列表行、标题回显与偏好值必须单行，否则存储内容可以用换行伪造列表行。
     """
-    return " ".join(strip_terminal_controls(str(value)).split())
+    return " ".join(_strip_display_unsafe(value).split())
 
 
 _WHITESPACE_CHUNK = 1 << 20
@@ -154,9 +173,15 @@ def _display_width(value: object) -> int:
 
     Python 的 ``str.ljust`` / 格式宽度按码点补齐，中文与 emoji 在等宽终端
     占 2 列，直接用 ``{:<32}`` 会让消息数、时间列随标题语种漂移。
+    ZWJ 组合 / VS16 / 键帽等 emoji 序列按码点相加会严重高估（👨‍👩‍👧 实占
+    2 列、逐码点算 6 列）：rich 可用时按字素簇测量（Rich Table 本身也用
+    同一实现）；rich 缺失（doctor / skills 等无运行时依赖场景）时回退。
     """
+    text = str(value)
+    if _rich_cell_len is not None:
+        return int(_rich_cell_len(text))
     width = 0
-    for char in str(value):
+    for char in text:
         width += _char_display_width(char)
     return width
 
@@ -169,7 +194,24 @@ def _char_display_width(char: str) -> int:
 
 
 def _truncate_display(value: str, limit: int) -> str:
-    """按显示宽度截断，不劈开宽字符（纯 ASCII 时与 ``[:limit]`` 等价）。"""
+    """按显示宽度截断，不劈开宽字符（纯 ASCII 时与 ``[:limit]`` 等价）。
+
+    rich 可用时按字素簇边界截断：ZWJ 组合 / 变体选择符不会被切在簇中间
+    （截出「半个 emoji」或孤立连接符）。
+    """
+    if _rich_split_graphemes is not None:
+        spans, total = _rich_split_graphemes(value)
+        if total <= limit:
+            return value
+        width = 0
+        end = 0
+        for start, stop, cell_width in spans:
+            if width + cell_width > limit:
+                end = start
+                break
+            width += cell_width
+            end = stop
+        return value[:end]
     width = 0
     out: list[str] = []
     for char in value:
@@ -209,6 +251,24 @@ def _valid_session_id(value: object) -> bool:
     if not isinstance(value, str) or not value or value.startswith("-"):
         return False
     return is_valid_web_session_id(value)
+
+
+def _countable_session_id(value: object) -> str | None:
+    """会话列表 / 统计同口径的会话 ID 归一；不计入返回 None。
+
+    整数 0 是合法会话 ID（与 Web 列表 / PG 同口径）；None 与纯空白串不是
+    会话。保留字（``export``）被 Web 静态导出路由遮蔽、面板永远打不开，
+    列表与统计同样不计入（直接寻址的 session-show / session-delete 仍可用，
+    作为清理 / 打捞入口）。
+    """
+    from utils.session_ids import RESERVED_SESSION_IDS
+
+    if value is None:
+        return None
+    text = str(value)
+    if not text.strip() or text in RESERVED_SESSION_IDS:
+        return None
+    return text
 
 
 def _valid_pref_type(value: object) -> bool:
@@ -282,6 +342,17 @@ def _stream_isatty(stream: object) -> bool:
         return bool(isatty()) if callable(isatty) else False
     except Exception:  # noqa: BLE001 - 判断失败按非终端处理
         return False
+
+
+def _pref_display_item(item: Any) -> str:
+    """偏好列表项的展示文本：对象 / 数组按 JSON（与 Web 面板一致），其余 ``str``。
+
+    对象项此前走 ``str(item)`` 显示成 Python repr（``{'city': '北京'}``），
+    与 Web 的 ``JSON.stringify`` 口径不同，复制回面板时还得手改引号。
+    """
+    if isinstance(item, (dict, list, tuple)):
+        return json.dumps(item, ensure_ascii=False)
+    return str(item)
 
 
 class AligoCLI:
@@ -764,6 +835,15 @@ class AligoCLI:
                 result_data = {"error": "解析结果失败"}
             # 同上：先转义孤立代理项，再做显示与落库
             result_data = sanitize_json(result_data)
+            if not isinstance(result_data, dict):
+                # 合法 JSON 但不是对象（如 "[]"）：后续 _display_results 的
+                # 兜底分支仍会 .get()，异常逃到外层把回答变成 traceback。
+                # 与 Web（ConversationRuntime）同口径按「格式错误」提示
+                self._command_failed = True
+                self.console.print(
+                    "❌ 编排结果格式错误，请重试", style="bold red"
+                )
+                return
 
             # 管道模式（脚本 / CI）的退出码：所有被调度的智能体都失败时
             # 没有任何有效回答，不能与成功回合同样以 0 结束。部分成功
@@ -984,6 +1064,11 @@ class AligoCLI:
         """显示执行结果 - 确保永远有回复"""
         from utils.result_formatter import normalize_results
 
+        if not isinstance(result_data, dict):
+            # 防御：合法 JSON 但不是对象时（历史版本 / 注入的假编排）仍要
+            # 走「没有结果」分支，不能让 .get() 抛 AttributeError
+            result_data = {}
+
         self.console.print()
 
         # 获取结果列表（模型 / 旧编排可能把 results 返回成对象或标量：
@@ -1098,7 +1183,7 @@ class AligoCLI:
         """结果字段的展示文本：列表「、」拼接、字典 JSON，其余 str。"""
         if isinstance(value, (list, tuple)):
             items = [
-                str(item)
+                _pref_display_item(item)
                 for item in value
                 if not (
                     item is None
@@ -1615,9 +1700,11 @@ class AligoCLI:
                     time_str = ""
 
                 dialogue_table.add_row(
-                    _terminal_safe(role_name),
-                    _terminal_safe(content),
-                    _terminal_safe(time_str),
+                    _table_cell(role_name),
+                    # 消息内容可以是多行（Web 多行输入 / 助手多行回答）：固定
+                    # 列宽的表格必须单行化，否则一条消息会拆成多行、后续列错位
+                    _table_cell(content),
+                    _table_cell(time_str),
                 )
 
             self.console.print(dialogue_table)
@@ -2247,6 +2334,23 @@ def _parse_user_and_json_args(args: list[str]) -> tuple[str, bool] | None:
     return user_id, as_json
 
 
+_UNIT_FLOAT_RE = re.compile(r"(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)")
+
+
+def _parse_unit_float(value: str) -> float | None:
+    """解析 0..1 的 ASCII 十进制小数（接受 ``.8`` / ``1.`` 写法）。
+
+    ``float()`` 与 argparse 都接受省略整数位 / 小数位的写法；拒绝 Unicode
+    数字、下划线、指数与空白（与 ``_parse_cli_int`` 同一严格度）。
+    """
+    if not _UNIT_FLOAT_RE.fullmatch(value):
+        return None
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        return None
+    return parsed
+
+
 def _parse_eval_args(args: list[str]) -> tuple[bool, float] | None:
     """解析 eval 的 ``[--json] [--min-hit5 X]``；非法参数返回 None。
 
@@ -2268,11 +2372,8 @@ def _parse_eval_args(args: list[str]) -> tuple[bool, float] | None:
                 value = args[index]
             else:
                 value = item[len("--min-hit5="):]
-            if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", value):
-                # 与 _parse_cli_int 一致：拒绝 Unicode 数字 / 下划线 / 空白
-                return None
-            parsed = float(value)
-            if not 0.0 <= parsed <= 1.0:
+            parsed = _parse_unit_float(value)
+            if parsed is None:
                 return None
             min_hit5 = parsed
         else:
@@ -2411,8 +2512,16 @@ def run_knowledge_status_standalone(as_json: bool = False) -> int:
     configured_dim = configured_dimension_mismatch(status.get("dimension"))
     if as_json:
         if configured_dim is not None:
+            # 集合维度与当前嵌入模型不一致时检索必然 503：JSON 的 available
+            # 必须与退出码 / 文本 / Web /api/knowledge 同口径（曾输出 true 但
+            # 退出码 1，脚本按 available 判断会当成可用）
             status = {
                 **status,
+                "available": False,
+                "reason": (
+                    f"知识库向量维度与当前嵌入模型不一致，请重新运行初始化"
+                    f"脚本重建：{knowledge_init_command()}"
+                ),
                 "dimension_mismatch": True,
                 "configured_dimension": configured_dim,
             }
@@ -2633,7 +2742,8 @@ def _parse_eval_cases_args(
                 value = args[index]
             else:
                 value = item[len("--count="):]
-            if not re.fullmatch(r"[0-9]{1,4}", value):
+            if not re.fullmatch(r"[0-9]{1,10}", value):
+                # 长度上限只防超长数字串；前导零（05000）与数值范围由下方判定
                 return None
             count = int(value)
             if count < 1 or count > 5000:
@@ -2760,7 +2870,8 @@ def _parse_eval_agent_args(
                 value = args[index]
             else:
                 value = item[len("--count="):]
-            if not re.fullmatch(r"[0-9]{1,4}", value):
+            if not re.fullmatch(r"[0-9]{1,10}", value):
+                # 长度上限只防超长数字串；前导零（05000）与数值范围由下方判定
                 return None
             count = int(value)
             if count < 1 or count > 5000:
@@ -2784,11 +2895,10 @@ def _parse_eval_agent_args(
                 value = args[index]
             else:
                 value = item[len("--min-pass="):]
-            if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", value):
+            parsed = _parse_unit_float(value)
+            if parsed is None:
                 return None
-            min_pass = float(value)
-            if not 0.0 <= min_pass <= 1.0:
-                return None
+            min_pass = parsed
         else:
             return None
         index += 1
@@ -2958,18 +3068,15 @@ def run_knowledge_export_standalone(
     path = Path(target) if target else Path("exports") / "knowledge-export.json"
     # 与 trips-export / session-export 一致：默认不覆盖已有文件，
     # 避免把用户数据（如误把 data/memory/*.json 当作导出路径）静默替换
-    try:
-        if not _claim_export_target(path, force):
-            print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
-            return 1
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(
-            path, json.dumps(payload, ensure_ascii=False, indent=2)
-        )
-    except (OSError, UnicodeEncodeError) as exc:
-        _remove_export_placeholder(path, force)
-        print(f"写入失败：{exc}")
-        return 1
+    rc = _write_export_target(
+        path,
+        force,
+        lambda target: write_text_atomic(
+            target, json.dumps(payload, ensure_ascii=False, indent=2)
+        ),
+    )
+    if rc:
+        return rc
     print(f"已导出 {len(documents)} 条知识片段到 {path}")
     return 0
 
@@ -3513,17 +3620,18 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
                 summary = chat_summary()
                 message_count = int(summary.get("messages") or 0)
                 session_ids = {
-                    str(item)
+                    sid
                     for item in (summary.get("sessions") or ())
-                    if item is not None
+                    if (sid := _countable_session_id(item)) is not None
                 }
             else:
                 history = store.get_chat_history()
                 message_count = len(history)
                 session_ids = {
-                    str(item.get("session_id"))
+                    sid
                     for item in history
-                    if item.get("session_id") is not None
+                    if (sid := _countable_session_id(item.get("session_id")))
+                    is not None
                 }
             archived = store.get_archived_sessions() or []
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
@@ -4916,6 +5024,22 @@ def _local_timestamp_text(value: str) -> str:
         return text[:19].replace("T", " ")
 
 
+def _json_timestamp_text(value: str) -> str:
+    """``--json`` 输出的时间戳归一为带偏移的 ISO（与 Web 列表同口径）。
+
+    存储里可能混有 PG 读回的带时区时间与 JSON 后端的 naive 本地时间：
+    原样输出会让同一响应同时出现两种形状，脚本按 tz-aware 解析会失败。
+    无法解析的值原样保留（不丢数据）。
+    """
+    from utils.timestamps import to_aware
+
+    text = str(value or "")
+    if not text:
+        return text
+    aware = to_aware(text)
+    return aware.isoformat() if aware is not None else text
+
+
 def _session_summaries(store, *, needle: str = "") -> list[dict]:
     """聚合会话摘要（标题 / 消息数 / 最近时间 / 置顶 / 归档），按更新时间倒序。
 
@@ -4932,13 +5056,10 @@ def _session_summaries(store, *, needle: str = "") -> list[dict]:
     grouped: dict[str, dict] = {}
     best_keys: dict[str, str] = {}
     for message in history:
-        session_id = message.get("session_id")
-        # 整数 0 是合法会话 ID（与 Web 列表 / PG 同口径）：只跳过 None / 空白串
-        if session_id is None or (
-            isinstance(session_id, str) and not session_id.strip()
-        ):
+        # 整数 0 是合法会话 ID：只跳过 None / 空白串 / 保留字（与 Web 列表同口径）
+        sid = _countable_session_id(message.get("session_id"))
+        if sid is None:
             continue
-        sid = str(session_id)
         entry = grouped.setdefault(
             sid,
             {"session_id": sid, "title": "", "messages": 0, "updated_at": ""},
@@ -5070,7 +5191,9 @@ def run_sessions_list_standalone(
                             "session_id": item["session_id"],
                             "title": item["title"],
                             "messages": item["messages"],
-                            "updated_at": item["updated_at"],
+                            "updated_at": _json_timestamp_text(
+                                item["updated_at"]
+                            ),
                             "pinned": item["pinned"],
                             "archived": item["archived"],
                             **(
@@ -5104,6 +5227,15 @@ def run_sessions_list_standalone(
         f"用户 {user_id}：{len(visible)} 个{scope}会话{keyword}"
         f"（共 {total_all} 个，归档 {archived_total} 个）"
     )
+    # 会话 ID 列宽动态取本页最长值（至少 16）：合法 ID 可达 64 个多字节
+    # 字符，固定 16 宽会把后续列整体推开；也不截断——用户要能从列表复制 ID
+    session_width = max(
+        16,
+        max(
+            _display_width(_single_line_safe(item["session_id"]))
+            for item in visible
+        ),
+    )
     for item in visible:
         if item["archived"]:
             status = "归档"
@@ -5119,7 +5251,7 @@ def run_sessions_list_standalone(
         # 中文 / emoji 每个占 2 列：按码点补空格会让消息数、时间列随
         # 标题语种漂移（默认中文提问派生的标题即触发）
         print(
-            f"  [{status}] {_pad_display(session_cell, 16)}"
+            f"  [{status}] {_pad_display(session_cell, session_width)}"
             f" {_pad_display(title, 32)}"
             f" {item['messages']:>3} 条  {updated}"
         )
@@ -5708,23 +5840,23 @@ def run_session_export_standalone(
     from utils.stored_message import render_stored_message
 
     if not _valid_web_id(user_id):
-        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-        return 1
+        return _export_fail(
+            "用户 ID 只能包含中文、字母、数字、下划线和短横线", to_stdout
+        )
     if not _valid_session_id(session_id):
-        print("会话 ID 只能包含中文、字母、数字、下划线和短横线")
-        return 1
+        return _export_fail(
+            "会话 ID 只能包含中文、字母、数字、下划线和短横线", to_stdout
+        )
     try:
         store = _open_cli_store(user_id)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"打开长期记忆失败：{exc}")
-        return 1
+        return _export_fail(f"打开长期记忆失败：{exc}", to_stdout)
     try:
         try:
             messages = store.get_chat_history(session_id=session_id)
             titles = store.get_session_titles()
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            print(f"读取会话失败：{exc}")
-            return 1
+            return _export_fail(f"读取会话失败：{exc}", to_stdout)
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -5738,8 +5870,7 @@ def run_session_export_standalone(
     titles = sanitize_json(titles)
 
     if not messages:
-        print(f"会话 {session_id} 不存在或没有消息")
-        return 1
+        return _export_fail(f"会话 {session_id} 不存在或没有消息", to_stdout)
 
     title = str(titles.get(session_id) or "")
     if not title:
@@ -5799,18 +5930,13 @@ def run_session_export_standalone(
             f"{_safe_export_component(session_id)}{suffix}"
         )
     )
-    try:
-        # 超长 / 非法默认名在占名阶段也可能抛 OSError（ENAMETOOLONG），
-        # 与写入失败同一提示，而不是未捕获 traceback
-        if not _claim_export_target(path, force):
-            print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
-            return 1
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(path, text)
-    except (OSError, UnicodeEncodeError) as exc:
-        _remove_export_placeholder(path, force)
-        print(f"写入失败：{exc}")
-        return 1
+    # 超长 / 非法默认名在占名阶段也可能抛 OSError（ENAMETOOLONG）：
+    # _write_export_target 与写入失败同一提示，而不是未捕获 traceback
+    rc = _write_export_target(
+        path, force, lambda target: write_text_atomic(target, text)
+    )
+    if rc:
+        return rc
     print(f"已导出会话 {session_id} 到 {path}（{len(messages)} 条消息）")
     return 0
 
@@ -5834,20 +5960,19 @@ def run_sessions_export_standalone(
     from pathlib import Path
 
     if not _valid_web_id(user_id):
-        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-        return 1
+        return _export_fail(
+            "用户 ID 只能包含中文、字母、数字、下划线和短横线", to_stdout
+        )
     try:
         store = _open_cli_store(user_id)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"打开长期记忆失败：{exc}")
-        return 1
+        return _export_fail(f"打开长期记忆失败：{exc}", to_stdout)
     try:
         try:
             messages = store.get_chat_history()
             titles = store.get_session_titles()
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            print(f"读取会话失败：{exc}")
-            return 1
+            return _export_fail(f"读取会话失败：{exc}", to_stdout)
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -5864,8 +5989,7 @@ def run_sessions_export_standalone(
     if not grouped:
         # 旧版本写入的消息没有 session_id：渲染器会跳过它们，不能写出
         # 「会话数 0」的空文件并谎报成功（README 约定无会话返回 1）
-        print(f"用户 {user_id}：没有可导出的会话")
-        return 1
+        return _export_fail(f"用户 {user_id}：没有可导出的会话", to_stdout)
     exported_messages = sum(len(items) for _, items in grouped)
 
     if html:
@@ -5895,16 +6019,11 @@ def run_sessions_export_standalone(
         if target
         else Path("exports") / f"aligo_sessions_{safe_user}{suffix}"
     )
-    try:
-        if not _claim_export_target(path, force):
-            print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
-            return 1
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_text_atomic(path, text)
-    except (OSError, UnicodeEncodeError) as exc:
-        _remove_export_placeholder(path, force)
-        print(f"写入失败：{exc}")
-        return 1
+    rc = _write_export_target(
+        path, force, lambda target: write_text_atomic(target, text)
+    )
+    if rc:
+        return rc
     print(f"已导出 {count} 个会话到 {path}（{exported_messages} 条消息）")
     return 0
 
@@ -5942,26 +6061,25 @@ def run_trips_export_standalone(
     )
 
     if not _valid_web_id(user_id):
-        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-        return 1
+        return _export_fail(
+            "用户 ID 只能包含中文、字母、数字、下划线和短横线", to_stdout
+        )
     try:
         store = _open_cli_store(user_id)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"打开长期记忆失败：{exc}")
-        return 1
+        return _export_fail(f"打开长期记忆失败：{exc}", to_stdout)
     try:
         quarantined = _recovered_corrupt_backup(store)
         if quarantined:
-            print(
+            return _export_fail(
                 f"导出中止：记忆文件损坏，已隔离备份到 {quarantined}"
-                "（当前会导出空文件，请先用备份文件恢复）"
+                "（当前会导出空文件，请先用备份文件恢复）",
+                to_stdout,
             )
-            return 1
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            print(f"读取行程失败：{exc}")
-            return 1
+            return _export_fail(f"读取行程失败：{exc}", to_stdout)
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -6060,19 +6178,16 @@ def run_trips_export_standalone(
         return 0
 
     path = Path(target) if target else Path("exports") / default_name
-    try:
-        if not _claim_export_target(path, force):
-            print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
-            return 1
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if ics:
-            write_bytes_atomic(path, text.encode("utf-8"))
-        else:
-            write_text_atomic(path, text)
-    except (OSError, UnicodeEncodeError) as exc:
-        _remove_export_placeholder(path, force)
-        print(f"写入失败：{exc}")
-        return 1
+    if ics:
+        rc = _write_export_target(
+            path, force, lambda target: write_bytes_atomic(target, text.encode("utf-8"))
+        )
+    else:
+        rc = _write_export_target(
+            path, force, lambda target: write_text_atomic(target, text)
+        )
+    if rc:
+        return rc
     suffix = "（iCalendar）" if ics else ("（HTML）" if html else "")
     filter_note = f"，筛选「{needle}」" if needle else ""
     if status_label:
@@ -6153,29 +6268,29 @@ def run_trip_calendar_standalone(
     )
 
     if not _valid_web_id(user_id):
-        print("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-        return 1
+        return _export_fail(
+            "用户 ID 只能包含中文、字母、数字、下划线和短横线", to_stdout
+        )
     if not _valid_web_id(trip_id):
-        print("行程 ID 只能包含中文、字母、数字、下划线和短横线")
-        return 1
+        return _export_fail(
+            "行程 ID 只能包含中文、字母、数字、下划线和短横线", to_stdout
+        )
     try:
         store = _open_cli_store(user_id)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-        print(f"打开长期记忆失败：{exc}")
-        return 1
+        return _export_fail(f"打开长期记忆失败：{exc}", to_stdout)
     try:
         quarantined = _recovered_corrupt_backup(store)
         if quarantined:
-            print(
+            return _export_fail(
                 f"导出中止：记忆文件损坏，已隔离备份到 {quarantined}"
-                "（当前会导出空文件，请先用备份文件恢复）"
+                "（当前会导出空文件，请先用备份文件恢复）",
+                to_stdout,
             )
-            return 1
         try:
             trips = store.get_trip_history(limit=None)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
-            print(f"读取行程失败：{exc}")
-            return 1
+            return _export_fail(f"读取行程失败：{exc}", to_stdout)
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -6183,16 +6298,18 @@ def run_trip_calendar_standalone(
 
     matches = [trip for trip in trips if trip_id_text(trip.get("trip_id")) == trip_id]
     if len(matches) > 1:
-        print("该 trip_id 对应多条行程，请先运行 python cli.py trips-dedupe 清理")
-        return 1
+        return _export_fail(
+            "该 trip_id 对应多条行程，请先运行 python cli.py trips-dedupe 清理",
+            to_stdout,
+        )
     if not matches:
-        print(f"行程 {trip_id} 不存在")
-        return 1
+        return _export_fail(f"行程 {trip_id} 不存在", to_stdout)
     text = render_trips_ics(matches, user_id)
     exported = count_ics_events(text)
     if not exported:
-        print(f"行程 {trip_id} 缺少出发日期，无法导出日历")
-        return 1
+        return _export_fail(
+            f"行程 {trip_id} 缺少出发日期，无法导出日历", to_stdout
+        )
     truncated_note = (
         "注意：返程日期无法解析，日历按单日导出"
         if trip_ics_end_unparsable(matches[0])
@@ -6230,16 +6347,11 @@ def run_trip_calendar_standalone(
             f"{_safe_export_component(trip_id, 'trip')}.ics"
         )
     )
-    try:
-        if not _claim_export_target(path, force):
-            print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
-            return 1
-        path.parent.mkdir(parents=True, exist_ok=True)
-        write_bytes_atomic(path, text.encode("utf-8"))
-    except (OSError, UnicodeEncodeError) as exc:
-        _remove_export_placeholder(path, force)
-        print(f"写入失败：{exc}")
-        return 1
+    rc = _write_export_target(
+        path, force, lambda target: write_bytes_atomic(target, text.encode("utf-8"))
+    )
+    if rc:
+        return rc
     print(f"已导出行程 {trip_id} 的日历到 {path}（iCalendar）")
     if truncated_note:
         print(truncated_note)
@@ -6965,12 +7077,14 @@ def run_trips_import_standalone(
     warnings = result.get("warnings") or []
     warnings_total = int(result.get("warnings_total", len(warnings)))
     if not result["rows"]:
-        # 与 Web 400 共用同一标签口径：CSV 物理行 / ICS 事件序号
+        # 与 Web 400 共用同一标签口径：CSV 物理行 / ICS 事件序号。原因串
+        # 来自不可信文件（多行 CSV 字段可带入换行 / ESC 伪造输出行），
+        # 与下方跳过列表同口径单行化
         detail = "；".join(
             (
-                f"{label}：{item['reason']}"
+                f"{label}：{_single_line_safe(item['reason'])}"
                 if (label := trip_skip_label(item.get("line", 0), result["format"]))
-                else str(item["reason"])
+                else str(_single_line_safe(item["reason"]))
             )
             for item in skipped[:5]
         )
@@ -7243,7 +7357,7 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
 
     def _list_items(value: list) -> list[str]:
         return [
-            str(item)
+            _pref_display_item(item)
             for item in value
             if not (
                 item is None or (isinstance(item, str) and not item.strip())
@@ -7482,7 +7596,17 @@ def run_preference_set_standalone(
         )
         return 0
     if isinstance(saved, list):
-        display = "、".join(str(item) for item in saved) or "—"
+        display = (
+            "、".join(
+                _pref_display_item(item)
+                for item in saved
+                if not (
+                    item is None
+                    or (isinstance(item, str) and not item.strip())
+                )
+            )
+            or "—"
+        )
     elif isinstance(saved, bool):
         display = "是" if saved else "否"
     elif saved is None or saved == "":
@@ -7574,6 +7698,10 @@ def _parse_kb_export_args(args: list[str]) -> tuple[str | None, bool, bool] | No
             to_stdout = True
         elif item.startswith("-"):
             return None
+        elif item == "":
+            # 显式空路径（如脚本里 `$OUT` 未设置）不是「未提供」：静默写默认
+            # exports/ 会让脚本以为写到了指定目录
+            return None
         elif target is None:
             target = item
         else:
@@ -7600,6 +7728,9 @@ def _parse_session_export_args(
         elif lowered == "--html":
             html = True
         elif item.startswith("-"):
+            return None
+        elif item == "":
+            # 显式空路径按用法错误拒绝（同 _parse_kb_export_args）
             return None
         else:
             paths.append(item)
@@ -7660,6 +7791,9 @@ def _parse_export_args(
             status = value.strip()
         elif item.startswith("-"):
             return None
+        elif item == "":
+            # 显式空路径按用法错误拒绝（同 _parse_kb_export_args）
+            return None
         else:
             paths.append(item)
         index += 1
@@ -7709,18 +7843,82 @@ def _claim_export_target(path: Path, force: bool) -> bool:
     return claim_export_path(path)
 
 
-def _remove_export_placeholder(path: Path, force: bool) -> None:
+def _remove_export_placeholder(
+    path: Path, force: bool, identity: tuple[int, int, int] | None = None
+) -> None:
     """写入失败时清掉非 ``--force`` 导出占下的空占位文件。
 
     否则正式导出名上会留下 0 字节文件，后续导出永远报「文件已存在」，
     并发读取者（备份脚本 / rsync）还可能把它当成有效备份。
+
+    ``identity`` 是占名后立即取到的 ``(st_dev, st_ino, st_size)``：写入
+    失败时若名字已被另一进程 ``--force`` 用完整快照替换，不能删别人的文件。
     """
     if force:
         return
+    if identity is not None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return
+        if (stat.st_dev, stat.st_ino, stat.st_size) != identity:
+            return
     try:
         path.unlink()
     except OSError:
         pass
+
+
+def _export_placeholder_identity(path: Path) -> tuple[int, int, int] | None:
+    """占名后记录占位文件身份（删除前据此确认仍是本次占下的空文件）。"""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino, stat.st_size)
+
+
+def _write_export_target(
+    path: Path, force: bool, write: Callable[[Path], object]
+) -> int:
+    """占名 + 原子写入单个导出文件；任何失败（含 Ctrl-C）都清理本次占位。
+
+    此前清理只写在 ``except (OSError, UnicodeEncodeError)``：大导出时
+    Ctrl-C / MemoryError 会把 0 字节占位留在正式导出名上，后续导出永远
+    报「文件已存在」。
+
+    Returns:
+        0 写入成功；1 目标已存在 / 占名或写入失败（消息已打印）
+    """
+    try:
+        if not _claim_export_target(path, force):
+            print(f"文件已存在：{path}（使用 --force 覆盖或指定其它路径）")
+            return 1
+    except (OSError, UnicodeEncodeError) as exc:
+        # claim_export_path 占名失败会自清，本次没有占位可删
+        print(f"写入失败：{exc}")
+        return 1
+    identity = None if force else _export_placeholder_identity(path)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write(path)
+    except (OSError, UnicodeEncodeError) as exc:
+        _remove_export_placeholder(path, force, identity)
+        print(f"写入失败：{exc}")
+        return 1
+    except BaseException:
+        _remove_export_placeholder(path, force, identity)
+        raise
+    return 0
+
+
+def _export_fail(message: str, to_stdout: bool) -> int:
+    """导出失败输出：``--stdout`` 是数据通道，错误走 stderr，避免污染产物。"""
+    if to_stdout:
+        print(message, file=sys.stderr)
+    else:
+        print(message)
+    return 1
 
 
 def _print_stdout(text: str, end: str = "\n") -> None:
@@ -7875,8 +8073,14 @@ def _main_impl():
                 item = items[index]
                 lowered = item.lower()
                 if lowered == "--documents":
-                    # 目录值不能以 - 开头（避免吞掉下一个选项）
-                    if index + 1 >= len(items) or items[index + 1].startswith("-"):
+                    # 目录值不能以 - 开头（避免吞掉下一个选项），也不能是
+                    # 空串（与 --documents= 空值同口径；否则空串会被当成
+                    # 未提供、静默改用内置文档目录初始化）
+                    if (
+                        index + 1 >= len(items)
+                        or items[index + 1].startswith("-")
+                        or not items[index + 1]
+                    ):
                         valid = False
                         break
                     documents = items[index + 1]
@@ -8181,7 +8385,9 @@ def _main_impl():
             )
         if arg == "trip-add":
             parsed_trip_add = _parse_trip_add_args(sys.argv[2:])
-            if parsed_trip_add is None:
+            if parsed_trip_add is None or not _valid_user_id(
+                parsed_trip_add["user_id"]
+            ):
                 _cli_fail(
                     "用法：python cli.py trip-add <user_id> --destination X "
                     "--start YYYY-MM-DD [--origin X] [--end YYYY-MM-DD] "
@@ -8203,7 +8409,11 @@ def _main_impl():
             )
         if arg == "trip-update":
             parsed_trip_update = _parse_trip_update_args(sys.argv[2:])
-            if parsed_trip_update is None:
+            if (
+                parsed_trip_update is None
+                or not _valid_user_id(parsed_trip_update["user_id"])
+                or not _valid_web_id(parsed_trip_update["trip_id"])
+            ):
                 _cli_fail(
                     "用法：python cli.py trip-update <user_id> <trip_id> "
                     "[--origin X] [--destination X] [--start YYYY-MM-DD] "
@@ -8234,7 +8444,13 @@ def _main_impl():
                     target = item
                 else:
                     other = item
-            if not valid or target is None or other is None:
+            if (
+                not valid
+                or target is None
+                or other is None
+                or not _valid_user_id(target)
+                or not _valid_web_id(other)
+            ):
                 _cli_fail(
                     "用法：python cli.py trip-delete <user_id> <trip_id> [--json]",
                     _args_have_json(sys.argv[2:]),
@@ -8269,7 +8485,9 @@ def _main_impl():
         if arg == "trips-dedupe":
             usage = "用法：python cli.py trips-dedupe <user_id> [--dry-run] [--json]"
             dedupe_positional, dedupe_flags = _split_positionals(sys.argv[2:])
-            if len(dedupe_positional) != 1:
+            if len(dedupe_positional) != 1 or not _valid_user_id(
+                dedupe_positional[0]
+            ):
                 _cli_fail(usage, _args_have_json(sys.argv[2:]))
                 sys.exit(2)
             dry_run = False
@@ -8300,7 +8518,9 @@ def _main_impl():
             sessions_positional, sessions_flags = _split_positionals(
                 sys.argv[2:], frozenset({"--query"})
             )
-            if len(sessions_positional) != 1:
+            if len(sessions_positional) != 1 or not _valid_user_id(
+                sessions_positional[0]
+            ):
                 _cli_fail(
                     usage,
                     _args_have_json(sys.argv[2:]),
@@ -8329,7 +8549,11 @@ def _main_impl():
                 "[--restore] [--json]"
             )
             archive_positional, archive_flags = _split_positionals(sys.argv[2:])
-            if len(archive_positional) != 2:
+            if (
+                len(archive_positional) != 2
+                or not _valid_user_id(archive_positional[0])
+                or not _valid_session_id(archive_positional[1])
+            ):
                 _cli_fail(usage, _args_have_json(sys.argv[2:]))
                 sys.exit(2)
             parsed_archive = _parse_archive_flags(archive_flags)
@@ -8358,7 +8582,12 @@ def _main_impl():
                     break
                 else:
                     positional.append(item)
-            if not valid or len(positional) != 2:
+            if (
+                not valid
+                or len(positional) != 2
+                or not _valid_user_id(positional[0])
+                or not _valid_session_id(positional[1])
+            ):
                 _cli_fail(
                     "用法：python cli.py session-delete <user_id> <session_id> [--json]",
                     _args_have_json(sys.argv[2:]),
@@ -8399,6 +8628,8 @@ def _main_impl():
                 or len(positional) < 2
                 or (reset and len(positional) == 3)
                 or (not reset and len(positional) != 3)
+                or not _valid_user_id(positional[0])
+                or not _valid_session_id(positional[1])
             ):
                 _cli_fail(
                     "用法：python cli.py session-title <user_id> <session_id> <标题|--reset> [--json]",
@@ -8427,7 +8658,12 @@ def _main_impl():
                     break
                 else:
                     positional.append(item)
-            if not valid or len(positional) != 2:
+            if (
+                not valid
+                or len(positional) != 2
+                or not _valid_user_id(positional[0])
+                or not _valid_session_id(positional[1])
+            ):
                 _cli_fail(
                     "用法：python cli.py session-pin <user_id> <session_id> [--off] [--json]",
                     _args_have_json(sys.argv[2:]),
@@ -8453,7 +8689,12 @@ def _main_impl():
                     break
                 else:
                     positional.append(item)
-            if not valid or len(positional) != 2:
+            if (
+                not valid
+                or len(positional) != 2
+                or not _valid_user_id(positional[0])
+                or not _valid_session_id(positional[1])
+            ):
                 _cli_fail(
                     "用法：python cli.py session-show <user_id> <session_id> [--json]",
                     _args_have_json(sys.argv[2:]),
@@ -8558,6 +8799,7 @@ def _main_impl():
                 not 1 <= len(export_args) <= 2
                 or not _valid_user_id(export_args[0])
                 or (len(export_args) == 2 and export_args[1].startswith("-"))
+                or (len(export_args) == 2 and export_args[1] == "")
                 or any(item.startswith("-") for item in export_args)
             ):
                 print(
@@ -8591,7 +8833,11 @@ def _main_impl():
                     break
                 else:
                     positional.append(item)
-            if not valid or len(positional) != 2:
+            if (
+                not valid
+                or len(positional) != 2
+                or not _valid_user_id(positional[0])
+            ):
                 _cli_fail(
                     "用法：python cli.py user-import <user_id> <json_path> "
                     "[--dry-run] [--skip-knowledge] [--json]",
@@ -8616,7 +8862,9 @@ def _main_impl():
             trips_positional, trips_flags = _split_positionals(
                 sys.argv[2:], frozenset({"--query", "--status"})
             )
-            if not 1 <= len(trips_positional) <= 2:
+            if not 1 <= len(trips_positional) <= 2 or not _valid_user_id(
+                trips_positional[0]
+            ):
                 print(trips_usage)
                 sys.exit(2)
             raw_export_args = trips_positional[1:] + trips_flags

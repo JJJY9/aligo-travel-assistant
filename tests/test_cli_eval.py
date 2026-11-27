@@ -218,6 +218,12 @@ def test_parse_eval_args(monkeypatch):
     assert cli._parse_eval_args(["--min-hit5", "1.1"]) is None
     assert cli._parse_eval_args(["--min-hit5", "-0.1"]) is None
     assert cli._parse_eval_args(["--min-hit5", "abc"]) is None
+    # float() / argparse 都接受的省略写法：.8 / 1.
+    assert cli._parse_eval_args(["--min-hit5", ".8"]) == (False, 0.8)
+    assert cli._parse_eval_args(["--min-hit5", "1."]) == (False, 1.0)
+    assert cli._parse_eval_args(["--min-hit5", "nan"]) is None
+    assert cli._parse_eval_args(["--min-hit5", "1e-1"]) is None
+    assert cli._parse_eval_args(["--min-hit5", "0_8"]) is None
     assert cli._parse_eval_args(["--bad"]) is None
     print("✓ eval 参数解析（阈值范围 / 缺值 / 未知参数）")
 

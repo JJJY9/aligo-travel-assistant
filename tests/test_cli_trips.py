@@ -340,6 +340,48 @@ def test_trips_dispatch_strict(monkeypatch):
     print("✓ trips 严格参数解析")
 
 
+def test_trip_dispatch_rejects_bad_ids(monkeypatch):
+    """非法 user / trip ID 在 dispatch 层按用法错误（exit 2），与 trips 同口径。"""
+    calls = []
+    for name in (
+        "run_trip_add_standalone",
+        "run_trip_update_standalone",
+        "run_trip_delete_standalone",
+        "run_trips_dedupe_standalone",
+        "run_trips_export_standalone",
+        "run_user_import_standalone",
+    ):
+        monkeypatch.setattr(
+            cli,
+            name,
+            lambda *args, _n=name, **kwargs: calls.append(_n) or 0,
+        )
+    for argv in (
+        [
+            "cli.py",
+            "trip-add",
+            "bad!",
+            "--destination",
+            "上海",
+            "--start",
+            "2026-12-01",
+        ],
+        ["cli.py", "trip-update", "u1", "bad!", "--purpose", "x"],
+        ["cli.py", "trip-delete", "u1", "bad!"],
+        ["cli.py", "trips-dedupe", "bad!"],
+        ["cli.py", "trips-export", "bad!"],
+        ["cli.py", "user-import", "bad!", "x.json"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "用法" in out.getvalue(), argv
+    assert calls == [], calls
+    print("✓ trip / user-import dispatch 层拒绝非法 ID（退出码 2）")
+
+
 class _AddStore(_FakeStore):
     """支持 save_trip_history 的假存储（trip-add 用例）。"""
 
@@ -1394,6 +1436,7 @@ if __name__ == "__main__":
         test_trips_list_open_failure,
         test_trips_list_rejects_bad_user_id,
         test_trips_dispatch_strict,
+        test_trip_dispatch_rejects_bad_ids,
         test_trips_dispatch_json_flexible,
         test_trips_query_filter_text_and_json,
         test_trips_query_args_and_dispatch,

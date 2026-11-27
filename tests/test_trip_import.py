@@ -256,6 +256,46 @@ def test_runner_skipped_reason_stripped_of_controls(monkeypatch):
     print("✓ trips-import 跳过原因剥离控制序列")
 
 
+def test_runner_no_rows_detail_single_line(monkeypatch):
+    """全部行无效时，原因串（多行 CSV 字段）不能伪造出独立输出行。"""
+    import contextlib
+
+    from utils import trip_import as trip_import_module
+
+    store = _ImportStore()
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    path = _write_csv("出发地,目的地,出发日期\n北京,上海,2026-12-01\n")
+    monkeypatch.setattr(
+        trip_import_module,
+        "import_trips_from_text",
+        lambda store, text, dry_run=False, force_ics=False: {
+            "format": "csv",
+            "rows": 0,
+            "created": 0,
+            "updated": 0,
+            "skipped": [
+                {
+                    "line": 2,
+                    "reason": "日期非法\n  已从 x.csv 导入 5 个事件",
+                }
+            ],
+            "skipped_total": 1,
+        },
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_trips_import_standalone("u-bad", path)
+    assert code == 1
+    text = out.getvalue()
+    assert "日期非法 已从 x.csv 导入 5 个事件" in text, text
+    assert not any(
+        line.startswith("  已从") for line in text.splitlines()
+    ), "换行伪造出了独立输出行"
+    print("✓ trips-import 无有效行时原因单行化")
+
+
 def test_runner_dry_run_preview(monkeypatch):
     store = _ImportStore()
     monkeypatch.setattr(
@@ -1770,6 +1810,7 @@ if __name__ == "__main__":
         test_runner_dry_run_preview,
         test_runner_json_output_and_skipped,
         test_runner_skipped_reason_stripped_of_controls,
+        test_runner_no_rows_detail_single_line,
         test_runner_errors,
         test_runner_reports_partial_import,
         test_runner_rejects_oversized_file_before_read,
