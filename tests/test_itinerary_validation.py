@@ -544,6 +544,104 @@ def test_number_prefers_amount_over_quantity():
     print("✓ 费用数字优先取带单位的金额")
 
 
+def test_cn_number_place_value_semantics():
+    """中文金额按位值解析：两千五=2500、一万五=15000、三千零五十=3050。"""
+    from utils.itinerary_validation import _cn_number
+
+    assert _cn_number("两千五") == 2500
+    assert _cn_number("一千五") == 1500
+    assert _cn_number("一万五") == 15000
+    assert _cn_number("三千零五十") == 3050
+    assert _cn_number("一百零五") == 105
+    assert _cn_number("一万零五") == 10005
+    assert _cn_number("十二") == 12
+    assert _cn_number("一百二十三") == 123
+    assert _cn_number("三千") == 3000
+    assert _cn_number("一万") == 10000
+    assert extract_requirements("去杭州出差3天，预算两千五")["budget"] == 2500
+    assert extract_requirements("预算一万五千元")["budget"] == 15000
+    assert extract_requirements("预算三千零五十元")["budget"] == 3050
+    print("✓ 中文金额位值解析")
+
+
+def test_itemized_cost_is_not_total_budget():
+    """机票 / 酒店等分项花费不能被当成整趟预算上限。"""
+    assert "budget" not in extract_requirements("机票花费2000，帮我规划3天杭州行程")
+    assert "budget" not in extract_requirements("酒店花费800，预算还没定")
+    assert "budget" not in extract_requirements("住宿费用800")
+    assert "budget" not in extract_requirements("门票费用600")
+    assert "budget" not in extract_requirements("人均花费800")
+    assert extract_requirements("总花费5000，机票2000")["budget"] == 5000
+    assert extract_requirements("全程费用5000")["budget"] == 5000
+    # 显式预算仍优先于任何分项
+    assert extract_requirements("酒店费用800，预算3000")["budget"] == 3000
+    print("✓ 分项花费不当作总预算")
+
+
+def test_activity_phrases_are_not_must_see():
+    """「想去爬山 / 泡温泉 / 吃火锅」等动作诉求不是必去景点。"""
+    for query in (
+        "周末想去爬山",
+        "想去泡温泉",
+        "想去逛街",
+        "想去滑雪",
+        "想去看升旗",
+        "想去吃火锅",
+        "想去听演唱会",
+    ):
+        assert "must_see" not in extract_requirements(query), query
+    # 真实地名仍保留，动作后缀从地名剥离
+    assert extract_requirements("想去西湖")["must_see"] == ["西湖"]
+    assert extract_requirements("想去颐和园爬山")["must_see"] == ["颐和园"]
+    assert extract_requirements("必去外滩看夜景")["must_see"] == ["外滩"]
+    print("✓ 动作诉求不进入必去项")
+
+
+def test_long_must_see_enumeration_beyond_200_chars():
+    """超过 200 字符的必去项枚举不能被静默截断。"""
+    names = [f"甲{i:02d}园林" for i in range(1, 50)]
+    query = "去北京玩5天，必去" + "、".join(names)
+    assert len("、".join(names)) > 200
+    assert extract_requirements(query)["must_see"] == names
+    print("✓ 超长必去项枚举完整保留")
+
+
+def test_extract_requirements_handles_numeric_overflow():
+    """超长数字 / 中文数字串不能让约束提取抛异常。"""
+    assert extract_requirements("玩" + "9" * 400 + ".5天") == {}
+    assert extract_requirements("玩" + "十" * 2000 + "天") == {}
+    assert extract_requirements("玩" + "9" * 5000 + "天") == {}
+    # 正向回归：合法数字不受长度上限误杀
+    assert extract_requirements("玩1.5天")["duration_days"] == 2
+    assert extract_requirements("玩三天")["duration_days"] == 3
+    assert extract_requirements("预算一万")["budget"] == 10000
+    print("✓ 超长数字串不抛异常")
+
+
+def test_out_of_range_time_reported_invalid():
+    """25:00 / 10:99 等越界时刻要报 invalid_time_range，不能静默跳过。"""
+    plan = {
+        "daily_plans": [
+            {
+                "activities": [
+                    {"time": "25:00-26:00", "title": "越界A"},
+                    {"time": "10:99-11:99", "title": "越界B"},
+                ]
+            }
+        ]
+    }
+    codes = [issue["code"] for issue in validate_itinerary(plan, {})]
+    assert codes.count("invalid_time_range") == 2, codes
+    # 22:00-24:00 仍是合法写法；无 time / 未支持写法不报
+    assert validate_itinerary(
+        {"daily_plans": [{"activities": [{"time": "22:00-24:00"}]}]}, {}
+    ) == []
+    assert validate_itinerary(
+        {"daily_plans": [{"activities": [{"title": "上午自由活动"}]}]}, {}
+    ) == []
+    print("✓ 越界时刻报 invalid_time_range")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -576,4 +674,10 @@ if __name__ == "__main__":
     test_must_see_checks_activity_identity_only()
     test_time_range_cross_midnight_and_dashes()
     test_number_prefers_amount_over_quantity()
+    test_cn_number_place_value_semantics()
+    test_itemized_cost_is_not_total_budget()
+    test_activity_phrases_are_not_must_see()
+    test_long_must_see_enumeration_beyond_200_chars()
+    test_extract_requirements_handles_numeric_overflow()
+    test_out_of_range_time_reported_invalid()
     print("\n全部通过")

@@ -106,6 +106,29 @@ def test_days_upper_bound_clamped():
     print("✓ 天数上限钳制")
 
 
+def test_duplicate_must_see_deduped_not_crowding():
+    """重复必去项去重后不再占用容量挤掉其它项，unscheduled 不漏报。"""
+    schedule = schedule_must_see(
+        ["A", "A", "B"],
+        days=1,
+        day_start=0,
+        day_end=300,
+        visit_min=120,
+        travel_min=30,
+    )
+    assert [item["name"] for item in schedule["days"][0]["items"]] == ["A", "B"]
+    assert schedule["unscheduled"] == []
+    order = schedule_must_see(
+        ["B", "A", "B"], days=1, day_start=0, day_end=600, visit_min=120
+    )
+    assert [item["name"] for item in order["days"][0]["items"]] == ["B", "A"]
+    crowded = schedule_must_see(
+        ["西湖", "西湖"], days=1, day_start=0, day_end=60, visit_min=120
+    )
+    assert crowded["unscheduled"] == ["西湖"]
+    print("✓ 重复必去项去重")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -117,4 +140,5 @@ if __name__ == "__main__":
     test_render_schedule_text()
     test_tight_window_counts_travel_only_between_items()
     test_days_upper_bound_clamped()
+    test_duplicate_must_see_deduped_not_crowding()
     print("\n全部通过")

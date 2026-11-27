@@ -363,6 +363,10 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
                     continue
                 pref_type = pref.get("type", "")
                 value = pref.get("value", "")
+                if str(pref_type).strip() in EXPLANATORY_PREF_KEYS:
+                    # 说明性条目（note / summary / status）不是偏好，落库侧
+                    # 已按同一口径过滤，回显不能宣称「已更新」
+                    continue
                 if not is_manageable_pref_type(pref_type):
                     # 落库侧会跳过的键（不可哈希 / 含 "/" / 超长）不回显
                     continue
@@ -412,9 +416,16 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
         return ""
 
     if agent_name == "information_query":
-        results = data.get("results")
+        results: Any = data.get("results")
         if not isinstance(results, dict):
-            results = data
+            nested_results = data.get("data")
+            if isinstance(nested_results, dict) and isinstance(
+                nested_results.get("results"), dict
+            ):
+                # 与 CLI 同一兜底：旧备份 / 导入结果可能再包一层 {"data": {...}}
+                results = nested_results["results"]
+            else:
+                results = data
         summary = results.get("summary") or results.get("message") or results.get("error")
         if not summary:
             return ""
@@ -429,11 +440,17 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
         return text
 
     if agent_name == "rag_knowledge":
-        answer = data.get("answer") or data.get("content")
+        payload: Any = data
+        if not (data.get("answer") or data.get("content")):
+            nested_payload = data.get("data")
+            if isinstance(nested_payload, dict):
+                # 与 CLI 同一兜底：历史 / 导入结果可能再包一层 {"data": {...}}
+                payload = nested_payload
+        answer = payload.get("answer") or payload.get("content")
         if not answer:
             return ""
         text = str(answer)
-        doc_names, snippets = rag_source_extracts(data)
+        doc_names, snippets = rag_source_extracts(payload)
         if doc_names:
             text += "\n\n**参考来源**"
             for doc_name in doc_names:

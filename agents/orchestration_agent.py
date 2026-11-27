@@ -18,6 +18,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -31,6 +32,7 @@ from agentscope.message import Msg
 
 from utils.agent_names import canonical_agent_name
 from utils.daemon_executor import DaemonThreadPoolExecutor
+from utils.entity_normalize import normalize_city
 from utils.json_safe import sanitize_json, strip_nul
 from utils.log_redact import redact_paths
 from utils.llm_resilience import (
@@ -206,14 +208,26 @@ def _trip_duration_days(value: Any) -> int | None:
         return None
     number: int | None
     if isinstance(value, (int, float)):
-        number = int(value)
+        # 小数时长（1.5 天）向上取整，与 itinerary_validation 的校验口径一致
+        try:
+            number = math.ceil(value)
+        except (OverflowError, ValueError):
+            return None
     else:
         text = _as_text(value).strip()
         if not text:
             return None
-        match = re.search(r"\d{1,3}", text)
+        # 负号不是时长；\d{1,3} 会把「3650」「2026-03-11」截成 365 / 202 天
+        # 绕过下面的 >365 守卫，与 int 分支（100000 → None）口径不一致
+        if text.startswith(("-", "－")):
+            return None
+        match = re.search(r"\d+(?:\.\d+)?", text)
         if match:
-            number = int(match.group(0))
+            raw = match.group(0)
+            # 超长数字串（float 溢出 / int 位数上限）不是时长
+            if len(raw) > 32:
+                return None
+            number = math.ceil(float(raw)) if "." in raw else int(raw)
         else:
             cn_digits = {
                 "一": 1,
@@ -242,8 +256,9 @@ def _trip_duration_days(value: Any) -> int | None:
         # 「周末 3 天」「假期 3 天」里的「周」不是周单位：文本已经给出
         # 天 / 日 / 晚时按天解释；只有纯周表达（两周、3 个星期）才 ×7，
         # 否则会把 3 天误算成 21 天并推导出离谱的返程日期
-        if ("周" in text or "星期" in text) and not any(
-            unit in text for unit in ("天", "日", "晚")
+        if (
+            ("周" in text or "星期" in text or re.search(r"个?礼拜(?!天)", text))
+            and not any(unit in text for unit in ("天", "日", "晚"))
         ):
             number *= 7
     if number is None or number <= 0 or number > 365:
@@ -841,6 +856,10 @@ class OrchestrationAgent(AgentBase):
                         # 上下文同样不能携带（与落库同一口径）
                         continue
                     pref_type = str(pref_type).strip()
+                    if pref_type in _PREF_EXPLANATORY_KEYS:
+                        # status / note / message 等说明性条目不是偏好：
+                        # 与旧字典分支同一口径，不进入后续批次上下文
+                        continue
                     if not has_preference_value(value):
                         continue
                     action = str(item.get("action") or "replace").strip().lower()
@@ -1191,6 +1210,10 @@ class OrchestrationAgent(AgentBase):
                         "duration": cached.get("duration"),
                     },
                 )
+                if retry_cache is not None and effective_key:
+                    # 与真正执行成功的路径同口径登记：同一轮的外层整轮回退
+                    # 重试走 retry_cache 快路径，不再重复补发进度事件
+                    retry_cache[effective_key] = cached
                 return cached
             if (
                 isinstance(cached, dict)
@@ -1383,21 +1406,30 @@ class OrchestrationAgent(AgentBase):
                 raise
             except asyncio.TimeoutError:
                 if attempt.done() and not attempt.cancelled():
-                    # 上限未触发：是技能自己的 TimeoutError
-                    raise attempt.exception() or asyncio.TimeoutError()
-                attempt.cancel()
-                try:
-                    await attempt
-                except asyncio.CancelledError:
-                    current = asyncio.current_task()
-                    cancelling = getattr(current, "cancelling", None)
-                    if callable(cancelling) and cancelling() > 0:
-                        # 收尾期间外层被取消（断连 / 停止）：如实传播，
-                        # 不能转成 timeout 错误结果继续跑完回合
-                        raise
-                except Exception:  # noqa: BLE001 - 技能收尾失败不影响超时结果
-                    pass
-                raise _AgentTimeoutInternal(agent_name) from None
+                    skill_exc = attempt.exception()
+                    if skill_exc is None:
+                        # 结果与上限触发落在同一事件循环批次：shield 已屏蔽
+                        # 外层取消，attempt 里是完整成功结果，必须照常解析——
+                        # 否则成功结果被当作技能超时丢弃，还会走可重试上抛
+                        # 触发整轮重试、重复调用模型（计费放大）
+                        response = attempt.result()
+                    else:
+                        # 上限未触发：是技能自己的 TimeoutError
+                        raise skill_exc
+                else:
+                    attempt.cancel()
+                    try:
+                        await attempt
+                    except asyncio.CancelledError:
+                        current = asyncio.current_task()
+                        cancelling = getattr(current, "cancelling", None)
+                        if callable(cancelling) and cancelling() > 0:
+                            # 收尾期间外层被取消（断连 / 停止）：如实传播，
+                            # 不能转成 timeout 错误结果继续跑完回合
+                            raise
+                    except Exception:  # noqa: BLE001 - 技能收尾失败不影响超时结果
+                        pass
+                    raise _AgentTimeoutInternal(agent_name) from None
 
             # 解析响应
             if isinstance(response.content, str):
@@ -1637,13 +1669,14 @@ class OrchestrationAgent(AgentBase):
         """
         if origin:
             return origin
+        destination = normalize_city(destination)
         want_end = end_date or start_date
         try:
             trips = self.memory_manager.long_term.get_trip_history(limit=None)
         except Exception:  # noqa: BLE001 - 推断失败退回空串（行为与旧版一致）
             trips = []
         for trip in trips:
-            if _trip_field(trip.get("destination")) != destination:
+            if normalize_city(_trip_field(trip.get("destination"))) != destination:
                 continue
             if _trip_date(trip.get("start_date")) != start_date:
                 continue
@@ -1727,6 +1760,10 @@ class OrchestrationAgent(AgentBase):
                             # 与 Web 请求模型同一约束，直接跳过
                             continue
                         pref_type = str(pref_type).strip()
+                        if pref_type in _PREF_EXPLANATORY_KEYS:
+                            # 说明性条目不是偏好：与旧字典分支同一口径，
+                            # 避免 status / note / message 被落库并回显
+                            continue
                         if not has_preference_value(pref_value):
                             continue
 
@@ -1821,7 +1858,14 @@ class OrchestrationAgent(AgentBase):
                             ("duration_days", ("duration_days", "duration")),
                         )
                         for target, sources in entity_aliases:
-                            if event_data.get(target) not in (None, ""):
+                            current = event_data.get(target)
+                            # 日期字段即使非空，不可解析也会被下方 _trip_date
+                            # 丢弃：按缺失处理，否则合法 key_entities.date
+                            # 被挡住、整条行程规划成功却不落库
+                            if current not in (None, "") and not (
+                                target in ("start_date", "end_date")
+                                and not _trip_date(current)
+                            ):
                                 continue
                             for source in sources:
                                 value = entities.get(source)
@@ -1835,8 +1879,10 @@ class OrchestrationAgent(AgentBase):
 
                     # 模型可能给出列表（多目的地）或数字，统一转成单行文本
                     # 再落库（不可哈希值会让统计更新抛 TypeError，整轮作废）
-                    origin = _trip_field(event_data.get("origin"))
-                    destination = _trip_field(event_data.get("destination"))
+                    origin = normalize_city(_trip_field(event_data.get("origin")))
+                    destination = normalize_city(
+                        _trip_field(event_data.get("destination"))
+                    )
                     start_date = _trip_date(event_data.get("start_date"))
                     end_date = _trip_date(event_data.get("end_date"))
                     if start_date and not end_date:
@@ -1876,10 +1922,49 @@ class OrchestrationAgent(AgentBase):
                             start_date,
                         )
                         end_date = ""
+                    # 本轮未给出返程日期：既有同趟行程（目的地 + 出发日）若
+                    # 已有真实返程区间，说明是同一趟行程的再次规划，沿用其
+                    # origin / end。否则「未知返程」会按单日身份（end=start）
+                    # 再插一条：统计与常去目的地翻倍，trips-dedupe 因身份含
+                    # end 无法归组，origin 还会被 home_location 误推成常住地
+                    if destination and start_date and not end_date:
+                        try:
+                            history = self.memory_manager.long_term.get_trip_history(
+                                limit=None
+                            )
+                        except Exception as exc:  # noqa: BLE001 - 读取失败按旧行为
+                            logger.warning(
+                                "读取历史行程失败（%s），按单日落库",
+                                type(exc).__name__,
+                            )
+                            history = []
+                        candidates = [
+                            old
+                            for old in history
+                            if normalize_city(str(old.get("destination") or ""))
+                            == destination
+                            and _trip_date(old.get("start_date")) == start_date
+                            and _trip_date(old.get("end_date"))
+                            and _trip_date(old.get("end_date")) != start_date
+                            and (
+                                not origin
+                                or normalize_city(str(old.get("origin") or ""))
+                                == origin
+                            )
+                        ]
+                        # 同日同目的地存在多条不同返程时不猜，保持原行为
+                        if len(candidates) == 1:
+                            end_date = _trip_date(candidates[0].get("end_date"))
+                            if not origin:
+                                origin = normalize_city(
+                                    str(candidates[0].get("origin") or "")
+                                )
                     purpose = _trip_field(event_data.get("trip_purpose"))
                     if destination and start_date:
-                        origin = self._infer_trip_origin(
-                            origin, destination, start_date, end_date
+                        origin = normalize_city(
+                            self._infer_trip_origin(
+                                origin, destination, start_date, end_date
+                            )
                         )
                         # 上一轮缺出发地已落库的同趟行程：本轮补出发地时
                         # 按身份（目的地 + 起止日期）找到旧行补齐 origin。
@@ -1897,7 +1982,9 @@ class OrchestrationAgent(AgentBase):
                                         limit=None
                                     ):
                                         if (
-                                            str(old.get("destination") or "")
+                                            normalize_city(
+                                                str(old.get("destination") or "")
+                                            )
                                             == destination
                                             and _trip_date(old.get("start_date"))
                                             == start_date
@@ -1947,12 +2034,12 @@ class OrchestrationAgent(AgentBase):
                                         old_end = _trip_date(
                                             old.get("end_date")
                                         )
-                                        old_origin = str(
-                                            old.get("origin") or ""
-                                        ).strip()
+                                        old_origin = normalize_city(
+                                            str(old.get("origin") or "")
+                                        )
                                         if (
-                                            str(
-                                                old.get("destination") or ""
+                                            normalize_city(
+                                                str(old.get("destination") or "")
                                             )
                                             == destination
                                             and old_start == start_date

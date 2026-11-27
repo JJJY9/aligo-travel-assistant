@@ -1046,6 +1046,80 @@ def test_preference_over_limit_value_not_rendered():
     print("✓ 超限偏好值不渲染「已更新」")
 
 
+def test_preference_list_explanatory_not_rendered():
+    """列表格式的 note / summary / status 说明性条目不能回显为「已更新」。"""
+    data = _wrap([
+        {
+            "agent_name": "preference",
+            "priority": 1,
+            "status": "success",
+            "data": {
+                "preferences": [
+                    {"type": "hotel_brands", "value": "汉庭"},
+                    {"type": "note", "value": "用户还提到下周去上海"},
+                    {"type": "summary", "value": "已记录"},
+                    {"type": "status", "value": "ok"},
+                ]
+            },
+        }
+    ])
+    md = result_to_markdown(data)
+    assert "已更新偏好" in md
+    assert "酒店偏好" in md and "汉庭" in md
+    assert "用户还提到下周去上海" not in md
+    assert "已记录" not in md
+    print("✓ 列表格式说明性 type 不回显")
+
+
+def test_information_query_nested_data_fallback():
+    """information_query 结果再包一层 data.data 时仍能渲染（与 CLI 同口径）。"""
+    data = _wrap([
+        {
+            "agent_name": "information_query",
+            "priority": 1,
+            "status": "success",
+            "data": {
+                "data": {
+                    "results": {
+                        "summary": "天气晴，25 度",
+                        "sources": [{"url": "https://example.com/a"}],
+                    }
+                }
+            },
+        }
+    ])
+    md = result_to_markdown(data)
+    assert "天气晴，25 度" in md
+    assert "https://example.com/a" in md
+    print("✓ information_query 嵌套 data.data 渲染")
+
+
+def test_rag_nested_data_fallback():
+    """rag_knowledge 结果再包一层 data.data 时仍能渲染（与 CLI 同口径）。"""
+    data = _wrap([
+        {
+            "agent_name": "rag_knowledge",
+            "priority": 1,
+            "status": "success",
+            "data": {
+                "data": {
+                    "answer": "住宿标准 500 元",
+                    "retrieved_documents": [
+                        {
+                            "content": "一线城市住宿标准 500 元。",
+                            "metadata": {"parent_doc": "差旅制度.txt"},
+                        }
+                    ],
+                }
+            },
+        }
+    ])
+    md = result_to_markdown(data)
+    assert "住宿标准 500 元" in md
+    assert "差旅制度.txt" in md
+    print("✓ rag_knowledge 嵌套 data.data 渲染")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -1083,6 +1157,9 @@ if __name__ == "__main__":
     test_itinerary_validation_warning_rendered()
     test_extra_skills_have_chinese_display_names()
     test_preference_over_limit_value_not_rendered()
+    test_preference_list_explanatory_not_rendered()
+    test_information_query_nested_data_fallback()
+    test_rag_nested_data_fallback()
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_render_agent_exception_falls_back(_mp)

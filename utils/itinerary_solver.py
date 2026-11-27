@@ -129,7 +129,13 @@ def schedule_must_see(
     输出：``{"days": [{"day", "items": [{"name", "start", "end"}]}],
     "unscheduled": [...], "solver": "cp-sat"|"greedy"}``。
     """
-    names = [str(name).strip() for name in must_see if str(name).strip()]
+    names: list[str] = []
+    for name in must_see:
+        text = str(name).strip()
+        # 保序去重：重复项会重复占用每日容量挤掉其它项，而 _build_schedule
+        # 用集合判定「已安排」时又会漏报真正的未安排项
+        if text and text not in names:
+            names.append(text)
     # 事件抽取给出的天数可能异常大：上限 366 天，避免为每天建列表 / CP-SAT
     # 变量导致内存与耗时失控
     days = max(0, min(366, int(days)))
