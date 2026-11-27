@@ -250,20 +250,21 @@ class SkillLoader:
         获取指定 Skill 的完整 markdown 内容（去除 frontmatter）
         用于执行阶段的 Prompt 注入
         """
-        if not self.skills:
-            self.load_skills()
-
         target_path = None
 
-        # 1. 优先尝试直接按目录名匹配 (最快)
+        # 1. 优先尝试直接按目录名匹配 (最快)：六个简单技能的 skill_name
+        #    就是目录名，命中即读，不必先做一次全量技能扫描（扫描是同步
+        #    I/O，会在事件循环上串行执行；frontmatter-name 技能走回退）
         test_dir_path = os.path.join(self.skills_dir, skill_name, "SKILL.md")
         if os.path.exists(test_dir_path):
             target_path = test_dir_path
 
-        # 2. 否则按 metadata name 查找：使用 load_skills 记录的同一份
-        #    路径映射，不再按 os.listdir 顺序重新扫描（重名技能时宣传与
-        #    注入必须指向同一份正文）
         if not target_path:
+            if not self.skills:
+                self.load_skills()
+            # 2. 否则按 metadata name 查找：使用 load_skills 记录的同一份
+            #    路径映射，不再按 os.listdir 顺序重新扫描（重名技能时宣传与
+            #    注入必须指向同一份正文）
             target_path = self._skill_md_paths.get(str(skill_name))
 
         if not target_path:

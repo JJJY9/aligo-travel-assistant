@@ -20,7 +20,12 @@ from agentscope.agent import AgentBase
 from agentscope.message import Msg
 
 from utils.access_log import MAX_LOG_TEXT, _safe_log_text
-from utils.json_parser import extract_json_from_async_response
+from utils.json_parser import (
+    extract_json_from_async_response,
+    iter_json_object_spans_with_repair,
+    repair_json_object_fragment,
+)
+from utils.json_safe import sanitize_json
 from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
 from utils.log_redact import redact_paths
 from utils.user_query import extract_user_query
@@ -40,80 +45,141 @@ _EXAMPLE_MARKERS = ("示例", "样例", "例如", "输出格式", "模板")
 _PREVIOUS_RESULTS_MAX_DEPTH = 9
 
 
+def _pick_envelope_value(
+    data: dict[str, Any], result_key: str
+) -> tuple[str, bool]:
+    """从信封字典取正文，并报告该对象是否为信封形状。
+
+    同一信封内优先取非占位文案：模型常把真实建议写进 ``answer`` /
+    ``data.answer``，而把 ``result_key`` 留在 SKILL.md 模板的「建议正文」
+    占位上——按键序取第一个非空字符串会把占位文案当成答案。结构化
+    （列表 / 对象）答案只取该字段值序列化后展示，不能把整个信封当正文。
+    """
+    shaped = not data or any(
+        key in data for key in (result_key, *_ENVELOPE_KEYS, "status", "skill")
+    )
+    values: list[Any] = []
+    for source in (data, data.get("data")):
+        if not isinstance(source, dict):
+            continue
+        for key in (result_key, *_ENVELOPE_KEYS):
+            candidate = source.get(key)
+            if isinstance(candidate, str):
+                if candidate.strip():
+                    values.append(candidate.strip())
+            elif isinstance(candidate, (list, dict)) and candidate:
+                values.append(candidate)
+    for value in values:
+        if isinstance(value, str) and value not in _PLACEHOLDER_ANSWERS:
+            return value, shaped
+    for value in values:
+        if not isinstance(value, str):
+            return json.dumps(value, ensure_ascii=False), shaped
+    for value in values:
+        if isinstance(value, str):
+            return value, shaped
+    return "", shaped
+
+
+def _has_meaningful_residual(text: str, spans: list[tuple[int, int]]) -> bool:
+    """候选信封之外是否还有可读正文（排除只剩空白 / 标点 / 围栏记号）。"""
+    masked = list(text)
+    for start, end in spans:
+        for index in range(max(0, start), min(len(masked), end)):
+            masked[index] = " "
+    residual = "".join(masked).strip()
+    return any(
+        char.isalnum() or "一" <= char <= "鿿" for char in residual
+    )
+
+
 def unwrap_answer_envelope(text: str, result_key: str = "answer") -> str:
     """模型按提示返回 JSON 信封时取正文，不把整个 JSON 当答案。
 
     模型常把信封包在 ```json 围栏里，并在前后加「好的，以下是建议：」
     这类串词：只在文本恰为裸 JSON / 首尾行恰为围栏时解包会把围栏 +
-    JSON 原样展示给用户。这里对文本里出现的每个围栏块与首个 ``{`` 到
-    末个 ``}`` 的片段都尝试解包。
+    JSON 原样展示给用户。这里对文本里出现的每个围栏块、每个顶层 JSON
+    对象（含尾逗号 / 字符串内裸换行 / 单引号等机械小瑕疵的修复结果）
+    与整段文本都尝试解包。
 
     SKILL.md 的输出示例也含 ``answer`` 等键：模型先回显示例再给出正式
     结果时，首个命中会把占位文案当答案（与 json_parser 的「最后对象
     优先」口径不一致）。因此收集全部命中，优先取非「示例 / 模板」
-    标签前导、非占位文案的最后一个信封。
+    标签前导、非占位文案的最后一个信封。信封形状却没有任何正文
+    （空信封 / 空 answer）或只剩模板占位时按空响应处理，交给上层
+    触发重试链路，不能把内部 JSON /「建议正文」当成功答案。
 
     简单技能与 RAG 技能共用同一解包实现；``result_key`` 为技能专属的
     结果键（排在最前，``_ENVELOPE_KEYS`` 作兜底）。
     """
     stripped = text.strip()
-    # 候选按在原文中的起点排序：围栏块、首个 { 到末个 } 的片段、整段
+    # 候选按在原文中的起点排序：围栏块、顶层对象、整段
     candidates: list[tuple[int, str]] = [
         (match.start(), match.group(1).strip())
         for match in re.finditer(r"```[^\n`]*\n?(.*?)```", stripped, re.S)
     ]
-    if "{" in stripped and "}" in stripped:
-        first = stripped.index("{")
-        candidates.append(
-            (first, stripped[first: stripped.rfind("}") + 1])
-        )
+    # 逐个顶层对象而不是「首个 { 到末个 }」的整段：模型先回显模板信封、
+    # 再给出未加围栏的正式结果时，整段解析必然失败、正式结果永远丢
+    for start, value, end, _looks in iter_json_object_spans_with_repair(stripped):
+        if value is not None and end is not None:
+            candidates.append((start, stripped[start:end]))
     candidates.append((0, stripped))
     candidates.sort(key=lambda item: item[0])
 
-    matched: list[tuple[int, str]] = []
+    matched: list[tuple[int, str, int]] = []
+    envelope_spans: list[tuple[int, int]] = []
+    dirty: list[tuple[int, str]] = []
+
+    def _record(start: int, candidate: str, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        value, shaped = _pick_envelope_value(data, result_key)
+        if value:
+            matched.append((start, value, len(candidate)))
+        elif shaped:
+            envelope_spans.append((start, start + len(candidate)))
+
     for start, candidate in candidates:
         if not (candidate.startswith("{") and candidate.endswith("}")):
             continue
         try:
             data = json.loads(candidate)
         except (json.JSONDecodeError, ValueError):
+            dirty.append((start, candidate))
             continue
-        if not isinstance(data, dict):
-            continue
-        value = ""
-        for source in (data, data.get("data")):
-            if not isinstance(source, dict):
-                continue
-            for key in (result_key, *_ENVELOPE_KEYS):
-                candidate_value = source.get(key)
-                if isinstance(candidate_value, str) and candidate_value.strip():
-                    value = candidate_value.strip()
-                    break
-            if value:
-                break
-        if value:
-            matched.append((start, value))
+        _record(start, candidate, data)
 
     if not matched:
+        # 严格解析全部失败的候选再按机械小瑕疵修复一遍：尾逗号 /
+        # 字符串内裸换行 / 单引号的模型信封不能原样漏给用户
+        for start, candidate in dirty:
+            _record(start, candidate, repair_json_object_fragment(candidate))
+        matched.sort(key=lambda item: item[0])
+
+    if not matched:
+        if envelope_spans:
+            # 信封形状但没有任何正文：按空响应处理触发重试
+            return ""
         return text
 
     def _example_labeled(start: int) -> bool:
         prefix = stripped[max(0, start - 40): start]
         return any(marker in prefix for marker in _EXAMPLE_MARKERS)
 
-    real = [value for start, value in matched if not _example_labeled(start)]
-    if real:
-        pool = real
-    elif all(
-        value in _PLACEHOLDER_ANSWERS and _example_labeled(start)
-        for start, value in matched
+    real = [value for start, value, _ in matched if not _example_labeled(start)]
+    pool = real if real else [value for _, value, _ in matched]
+    non_placeholder = [
+        value for value in pool if value not in _PLACEHOLDER_ANSWERS
+    ]
+    if non_placeholder:
+        return non_placeholder[-1]
+    # 只命中模板占位：信封之后还有正式 prose 时原样返回整段；
+    # 只有占位模板本身则按空响应触发重试
+    if _has_meaningful_residual(
+        stripped, [(start, start + length) for start, _, length in matched]
     ):
-        # 只回显了模板：原样返回整段文本（正式建议通常跟在其后）
         return text
-    else:
-        pool = [value for _, value in matched]
-    non_placeholder = [value for value in pool if value not in _PLACEHOLDER_ANSWERS]
-    return (non_placeholder or pool)[-1]
+    return ""
 
 
 class SimplePromptSkill(AgentBase):
@@ -165,11 +231,17 @@ class SimplePromptSkill(AgentBase):
             data = {"query": extract_user_query(content)}
         context = data.get("context")
         context = context if isinstance(context, dict) else {}
-        user_query = str(
-            context.get("rewritten_query")
-            or context.get("user_query")
-            or data.get("query")
-            or ""
+        # 与 utils.user_query 同口径：非字符串（list / dict）视为缺失，
+        # 回退用户原话，不能 str() 成 Python repr 当检索问题
+        raw_rewritten = context.get("rewritten_query")
+        raw_user = context.get("user_query")
+        raw_query = data.get("query")
+        user_query = (
+            raw_rewritten if isinstance(raw_rewritten, str) else ""
+        ) or (
+            raw_user if isinstance(raw_user, str) else ""
+        ) or (
+            raw_query if isinstance(raw_query, str) else ""
         )
         return data, user_query
 
@@ -219,6 +291,9 @@ class SimplePromptSkill(AgentBase):
         行程规划结果）：给它更深的裁剪深度，且超限时优先丢弃最旧的对话
         消息而不是砍掉它——字符级腰斩会让数据块不再是合法 JSON。
         """
+        # 旧版 / 手工写入的长期记忆可能残留 NaN / Infinity 或孤立代理项：
+        # 先归一（返回新对象，不改调用方），后续所有分支都输出严格 JSON
+        data = sanitize_json(data)
         text = json.dumps(data, ensure_ascii=False)
         if len(text) <= _CONTEXT_MAX_CHARS:
             return text
@@ -325,7 +400,10 @@ class SimplePromptSkill(AgentBase):
             if part and part.strip()
         )
         payload = self._neutralize(self._clip_context(data))
-        # 用户问题单独插值：同样中和分隔符并限制长度，不能只保护数据块
+        # 用户问题单独插值：同样中和分隔符并限制长度，不能只保护数据块。
+        # 问题槽有独立预算（与数据块 _CONTEXT_MAX_CHARS 同值但互不占用）：
+        # 数据块内的同一条提问按字段上限 4000 字符保留，Web 消息上限
+        # 4000 使其与问题槽不会叠加超限
         safe_query = self._neutralize(
             str(user_query or "")[:_CONTEXT_MAX_CHARS]
         )

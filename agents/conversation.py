@@ -35,7 +35,7 @@ from context.short_term_memory import (
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.errors import MemoryPersistenceError, UserFacingError
 from utils.json_safe import sanitize_json
-from utils.llm_resilience import retry_with_backoff
+from utils.llm_resilience import RetryBudgetExhausted, retry_with_backoff
 from utils.log_redact import redact_secret
 from utils.paths import default_data_root
 from utils.preference_values import has_preference_value, preference_prompt_lines
@@ -1255,6 +1255,10 @@ class ConversationRuntime:
             # 记忆写盘失败与 LLM 服务无关，不计入熔断（否则多次磁盘故障会让
             # 所有用户一起收到「服务暂时不可用」）
             raise
+        except RetryBudgetExhausted as exc:
+            # 整轮重试预算耗尽不是 LLM 故障（模型调用可能全部成功、只是
+            # 接近读超时）：不计入共享熔断，并把固定文案原样交给用户
+            raise UserFacingError(str(exc)) from exc
         except Exception:
             if self.circuit_breaker:
                 self.circuit_breaker.record_failure()

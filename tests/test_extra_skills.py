@@ -508,6 +508,152 @@ def test_extra_skill_prompt_substitutes_result_key():
     print("✓ 技能 prompt 替换 <result_key> 占位符")
 
 
+def test_extra_skill_non_string_or_empty_answer_is_retriable():
+    """结构化 answer 只展示字段值；空串 / 缺省 / 空信封按空响应上抛。"""
+    agent_class = _load("packing-list", "PackingListAgent")
+    list_answer = '{"status": "success", "packing_list": ["护照", "外套"]}'
+    agent = agent_class(model=_Model(response=list_answer))
+    out = asyncio.run(
+        agent.reply(Msg(name="orchestrator", content="行李清单", role="user"))
+    )
+    data = json.loads(out.content)
+    assert data["status"] == "success", data
+    assert data["answer"] == '["护照", "外套"]', data
+    assert '"status"' not in data["answer"], "不能把整个信封当答案"
+    for raw in (
+        '{"status": "success", "answer": ""}',
+        '{"status": "success"}',
+        "{}",
+    ):
+        agent = agent_class(model=_Model(response=raw))
+        with pytest.raises(ConnectionError):
+            asyncio.run(
+                agent.reply(
+                    Msg(name="orchestrator", content="行李清单", role="user")
+                )
+            )
+    print("✓ 结构化 answer 取字段值，空 answer / 空信封按空响应上抛")
+
+
+def test_extra_skill_placeholder_result_key_yields_to_real_answer():
+    """result_key 留在模板占位、真实建议在 answer / data.answer 时取真实值。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    agent = agent_class(model=None)
+    direct = (
+        '{"status": "success", "budget_advice": "建议正文", '
+        '"answer": "杭州三日预算约 2500 元"}'
+    )
+    assert agent._unwrap_answer(direct) == "杭州三日预算约 2500 元"
+    nested = (
+        '{"status": "success", "budget_advice": "建议正文", '
+        '"data": {"answer": "杭州三日预算约 2500 元"}}'
+    )
+    assert agent._unwrap_answer(nested) == "杭州三日预算约 2500 元"
+    print("✓ 信封占位文案让位于真实正文")
+
+
+def test_extra_skill_placeholder_only_triggers_retry():
+    """只回显模板占位且其后没有正文：按空响应处理，不展示「建议正文」。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    agent = agent_class(model=None)
+    template = (
+        '{"status": "success", "budget_advice": "建议正文", '
+        '"answer": "建议正文"}'
+    )
+    assert agent._unwrap_answer(template) == ""
+    # 模板之后还有正式 prose：原样返回整段（既有行为）
+    with_prose = (
+        "以下是输出示例：\n```json\n"
+        + template
+        + "\n```\n正式建议：杭州三日预算约 2500 元"
+    )
+    assert agent._unwrap_answer(with_prose) == with_prose
+    print("✓ 纯占位模板按空响应处理，带正式 prose 时原样保留")
+
+
+def test_extra_skill_unwraps_multiple_bare_objects():
+    """未加围栏的多个顶层对象：正式结果不能被整段解析失败吞掉。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    agent = agent_class(model=None)
+    template = '{"status": "success", "budget_advice": "建议正文"}'
+    real = '{"status": "success", "budget_advice": "杭州三日预算约 2500 元"}'
+    text = "模板：\n" + template + "\n正式：\n" + real
+    assert agent._unwrap_answer(text) == "杭州三日预算约 2500 元"
+    print("✓ 多个未加围栏的顶层对象逐个解包")
+
+
+def test_extra_skill_unwraps_repairable_envelope():
+    """尾逗号 / 字符串内裸换行 / 单引号的模型信封修复后取正文。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    agent = agent_class(model=None)
+    trailing = (
+        '{"status": "success", "budget_advice": "杭州三日预算约 2500 元",}'
+    )
+    assert agent._unwrap_answer(trailing) == "杭州三日预算约 2500 元"
+    raw_newline = (
+        '{"status": "success", "budget_advice": "第一行\n第二行"}'
+    )
+    assert agent._unwrap_answer(raw_newline) == "第一行\n第二行"
+    single = "{'status': 'success', 'budget_advice': '杭州三日预算约 2500 元'}"
+    assert agent._unwrap_answer(single) == "杭州三日预算约 2500 元"
+    print("✓ 可修复的小瑕疵信封取正文")
+
+
+def test_extra_skill_non_string_rewritten_query_falls_back():
+    """rewritten_query 为非字符串时回退 user_query，不再注入 Python repr。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    model = _Model()
+    agent = agent_class(model=model)
+    asyncio.run(
+        agent.reply(
+            Msg(
+                name="orchestrator",
+                content=json.dumps(
+                    {
+                        "context": {
+                            "rewritten_query": ["杭州", "北京"],
+                            "user_query": "去杭州出差预算多少",
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                role="user",
+            )
+        )
+    )
+    prompt = model.prompts[0]
+    question = prompt.split("【用户问题】", 1)[1].split("请给出", 1)[0]
+    assert "去杭州出差预算多少" in question
+    assert "['" not in question
+    print("✓ 非字符串 rewritten_query 回退用户原话")
+
+
+def test_extra_skill_context_sanitizes_non_finite_numbers():
+    """长期记忆残留的 NaN / Infinity 不能进入数据块（保持严格 JSON）。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    model = _Model()
+    agent = agent_class(model=model)
+    payload = json.dumps(
+        {
+            "context": {"rewritten_query": "预算"},
+            "previous_results": [{"score": float("nan"), "limit": float("inf")}],
+        }
+    )
+    asyncio.run(
+        agent.reply(Msg(name="orchestrator", content=payload, role="user"))
+    )
+    prompt = model.prompts[0]
+    block = prompt.split("<<<\n", 1)[1].split("\n>>>", 1)[0]
+
+    def _reject(value):
+        raise ValueError(value)
+
+    parsed = json.loads(block, parse_constant=_reject)
+    assert parsed["previous_results"][0]["score"] is None
+    assert parsed["previous_results"][0]["limit"] is None
+    print("✓ 数据块归一 NaN / Infinity（严格合法 JSON）")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -528,5 +674,12 @@ if __name__ == "__main__":
     test_extra_skill_single_oversized_previous_result_is_kept()
     test_extra_skill_prefers_last_envelope_over_echoed_template()
     test_extra_skill_prompt_substitutes_result_key()
+    test_extra_skill_non_string_or_empty_answer_is_retriable()
+    test_extra_skill_placeholder_result_key_yields_to_real_answer()
+    test_extra_skill_placeholder_only_triggers_retry()
+    test_extra_skill_unwraps_multiple_bare_objects()
+    test_extra_skill_unwraps_repairable_envelope()
+    test_extra_skill_non_string_rewritten_query_falls_back()
+    test_extra_skill_context_sanitizes_non_finite_numbers()
     test_registry_discovers_extra_skills()
     print("\n全部通过")

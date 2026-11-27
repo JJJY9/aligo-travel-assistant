@@ -18,6 +18,15 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+
+class RetryBudgetExhausted(TimeoutError):
+    """整轮重试预算耗尽（外层退避在第一次尝试前就无预算可用）。
+
+    此类回合里每次模型调用都可能成功、只是耗时接近读超时：它不是 LLM
+    故障，调用方不能把它计入共享熔断，否则几次就绪的慢回合会把所有用户
+    一起熔断。继承 TimeoutError 保持既有重试分类与契约不变。
+    """
+
 # 第三方 SDK 的连接类异常不是内置 OSError / ConnectionError 的子类，
 # 且消息可能只有 "Connection error."，按类名识别（避免 import 可选依赖）
 _RETRIABLE_EXCEPTION_NAMES = frozenset(
@@ -242,7 +251,7 @@ async def retry_with_backoff(
             )
             if last_exc is not None:
                 raise last_exc
-            raise TimeoutError("重试预算已耗尽")
+            raise RetryBudgetExhausted("本轮处理时间超出预算，请重试")
         try:
             return await coro_factory()
         except CircuitOpenError:

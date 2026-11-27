@@ -1120,6 +1120,44 @@ def test_rag_nested_data_fallback():
     print("✓ rag_knowledge 嵌套 data.data 渲染")
 
 
+def test_unclosed_code_fence_does_not_swallow_next_result():
+    """某个技能答案里未闭合的围栏不能把后续技能结果吞进同一个代码块。"""
+    data = _wrap([
+        {
+            "agent_name": "packing-list",
+            "status": "success",
+            "data": {"answer": "清单：\n```python\nprint(1)"},
+        },
+        {
+            "agent_name": "trip-budget",
+            "status": "success",
+            "data": {"answer": "预算约 2500 元"},
+        },
+    ])
+    md = result_to_markdown(data)
+    assert md.count("```") % 2 == 0, md
+    assert md.rstrip().endswith("预算约 2500 元"), md
+    print("✓ 未闭合围栏按块补齐，不吞并后续结果")
+
+
+def test_simple_skill_result_key_without_answer_still_renders():
+    """外部 / 人工记录只有六技能 result_key、缺 answer 时正文不被丢弃。"""
+    for agent, key in (
+        ("trip-budget", "budget_advice"),
+        ("packing-list", "packing_list"),
+        ("travel-checklist", "checklist"),
+        ("local-transport", "transport_advice"),
+        ("safety-tips", "safety_tips"),
+        ("trip-notes", "trip_notes"),
+    ):
+        data = _wrap([
+            {"agent_name": agent, "status": "success", "data": {key: "建议正文"}}
+        ])
+        md = result_to_markdown(data)
+        assert "建议正文" in md, (agent, md)
+    print("✓ 六技能 result_key 缺 answer 时仍渲染正文")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -1160,6 +1198,8 @@ if __name__ == "__main__":
     test_preference_list_explanatory_not_rendered()
     test_information_query_nested_data_fallback()
     test_rag_nested_data_fallback()
+    test_unclosed_code_fence_does_not_swallow_next_result()
+    test_simple_skill_result_key_without_answer_still_renders()
     _mp = __import__("pytest").MonkeyPatch()
     try:
         test_render_agent_exception_falls_back(_mp)

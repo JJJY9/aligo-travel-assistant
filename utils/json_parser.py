@@ -331,6 +331,12 @@ def has_unclosed_json_object(text: str) -> bool:
     return _has_unclosed_object(text)
 
 
+def repair_json_object_fragment(fragment: str) -> "dict | None":
+    """公共包装：按机械小瑕疵（尾逗号 / 字符串内裸控制字符 / 单引号）
+    修复并解析一个对象片段；无法修复时返回 ``None``。"""
+    return _repair_object_fragment(fragment)
+
+
 def has_unclosed_json_array(text: str) -> bool:
     """文本中是否还有未闭合的 ``[``（字符串感知，忽略转义）。
 
