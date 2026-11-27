@@ -1674,6 +1674,34 @@ def test_prepare_context_strips_turn_meta_from_recent_dialogue():
     print("✓ 子智能体上下文剥离 _meta，短期记忆原对象不变")
 
 
+def test_prepare_context_strips_user_message_metadata():
+    """用户消息的 metadata（含 client_turn_id）不进入子智能体上下文。"""
+    messages = [
+        {
+            "role": "user",
+            "content": "北京天气",
+            "metadata": {"client_turn_id": "turn-1", "usage": {"input_tokens": 1}},
+        },
+        {"role": "assistant", "content": "晴"},
+        {"role": "user", "content": "上海天气", "metadata": {}},
+    ]
+
+    class _ShortTerm:
+        def get_recent_context(self, n_turns=3):
+            return messages
+
+    memory = _StubMemory()
+    memory.short_term = _ShortTerm()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    dialogue = orchestrator._prepare_context({})["recent_dialogue"]
+
+    assert all("metadata" not in item for item in dialogue), dialogue
+    assert "turn-1" not in json.dumps(dialogue, ensure_ascii=False)
+    # 共享对象不得被原地修改：删除最后一轮仍要读原始 metadata 的 turn_id
+    assert messages[0]["metadata"]["client_turn_id"] == "turn-1"
+    print("✓ 子智能体上下文剥离用户消息 metadata")
+
+
 def test_agent_status_error_and_null_error():
     """status=error 视为失败；error 为 null 视为正常输出。"""
 

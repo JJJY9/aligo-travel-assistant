@@ -106,13 +106,16 @@ def note_redis_operation_failure(exc: BaseException) -> None:
 def note_redis_operation_success() -> None:
     """记录一次不在 ``_call_redis`` 内的真实 Redis 操作成功。
 
-    与 :func:`note_redis_operation_failure` 对称：偏好版本键 / 天气共享
-    缓存等操作成功后也要复位可用性标志，否则一次瞬时故障会让
-    ``/api/health`` 在没有对话流量时一直报 ``short_term_degraded``。
+    与 :func:`note_redis_operation_failure` 不对称：只复位「可达」标志，
+    不清 60 秒重试冷却。偏好版本键 / 天气共享缓存与短期记忆的成败并不
+    等价——主从切换后连到只读副本或 maxmemory noeviction 时，前者读成功、
+    后者写失败；若读成功也清零冷却，每轮偏好读取都会把 ``/api/health``
+    的降级状态抹成正常，并让下一条注定失败的短期记忆写入绕过节流。
+    冷却到期后仍需一次真实的短期记忆读成功才会重新报告可用
+    （``_call_redis`` 成功路径负责置 ``_redis_available``）。
     """
-    global _redis_available, _redis_degraded_until
+    global _redis_available
     _redis_available = True
-    _redis_degraded_until = 0.0
 
 
 def session_key(session_id: str, user_id: str = "") -> str:
@@ -864,6 +867,30 @@ def queue_clear(key: str) -> None:
         journal.ops.append(("clear", datetime.now().isoformat()))
 
 
+def _turn_aligned_tail(
+    messages: list[dict[str, Any]], n_turns: int | None
+) -> list[dict[str, Any]]:
+    """取最近 ``n_turns`` 轮对话，切片首条尽量对齐到用户提问。
+
+    编排前本轮用户提问会先暂存进短期记忆，窗口长度是奇数：直接按
+    ``2 * n`` 从尾部切片会以一条「失去提问的助手回答」开头，模型看到
+    2 个完整回合 + 当前提问而不是 3 个。这里从尾部取窗口后向前补回该
+    回答对应的提问（最多 ``2n + 1`` 条）；若提问已被窗口裁剪掉，则向后
+    跳过开头的孤儿回答，保证首条是 user。``n_turns=None`` 返回全量。
+    """
+    if n_turns is None:
+        return list(messages)
+    start = max(0, len(messages) - n_turns * 2)
+    while start < len(messages) and messages[start].get("role") != "user":
+        if start > 0 and messages[start - 1].get("role") == "user":
+            # 向前补回这条回答对应的提问：n 个完整回合 + 当前提问
+            start -= 1
+            break
+        # 窗口起点的提问已被裁剪：跳过孤儿回答
+        start += 1
+    return messages[start:]
+
+
 class ShortTermMemory:
     """
     短期记忆：存储最近的对话历史
@@ -929,9 +956,8 @@ class ShortTermMemory:
         if n_turns is None:
             return self.messages.copy()
 
-        # n轮 = 2n条消息
-        n_messages = n_turns * 2
-        return self.messages[-n_messages:] if len(self.messages) > n_messages else self.messages.copy()
+        # n轮 = 2n条消息；首条对齐到用户提问（编排前本轮提问已在窗口内）
+        return _turn_aligned_tail(self.messages, n_turns)
 
     def get_context_string(self, n_turns: int = 5) -> str:
         """
@@ -1132,19 +1158,13 @@ class RedisShortTermMemory:
         op_id = uuid.uuid4().hex
         content_id = message_content_id(message)
         mode = "ordered" if ordered else "append"
-        # 影子缓存复用同一个消息对象：时间戳与 Redis 中的 JSON 完全一致，
-        # 故障期截断时才能按完整消息项精确删除 Redis 里的对应项。
-        # 同一内容指纹（回填 / 重放重复提交）只镜像一次：实时消息时间戳
-        # 唯一，不会被误判；重复回填不能在影子里堆出重复问答。
-        if content_id not in {
-            message_content_id(item) for item in self._fallback.messages
-        }:
-            self._fallback._append_message(message)
 
-        def op() -> None:
+        def op() -> Any:
             # 幂等追加：op_id 写入 applied 集合与 RPUSH 在同一脚本里完成，
-            # 故障重放时同一消息不会重复追加（响应丢失语义下也成立）
-            self.client.eval(
+            # 故障重放时同一消息不会重复追加（响应丢失语义下也成立）。
+            # 返回值是真正写入的条数：seen / tomb 命中时为 0，影子缓存
+            # 不能镜像这条 Redis 明确没有接收的消息
+            return self.client.eval(
                 _ADD_MESSAGES_LUA,
                 5,
                 self.key,
@@ -1161,13 +1181,32 @@ class RedisShortTermMemory:
                 payload,
             )
 
-        _, via_redis = self._call_redis(
+        result, via_redis = self._call_redis(
             op,
             lambda: None,
             lambda journal: self._append_op(
                 journal, "add", (payload, op_id, content_id, mode)
             ),
         )
+        # 影子只镜像「确定已写入」或「Redis 失败（影子是唯一副本）」的消息：
+        # 脚本按 seen / tomb 跳过（pushed=0）说明 Redis 明确没有这条内容，
+        # 镜像会让降级读取把已删除的问答重新送进模型。脚本返回值不可识别
+        # （测试替身 / 自定义客户端）时保守保持旧行为——镜像。
+        pushed: int | None = None
+        if via_redis:
+            try:
+                pushed = int(result) if result is not None else None
+            except (TypeError, ValueError):
+                pushed = None
+        if not via_redis or pushed is None or pushed > 0:
+            # 影子缓存复用同一个消息对象：时间戳与 Redis 中的 JSON 完全
+            # 一致，故障期截断时才能按完整消息项精确删除 Redis 里的对应项。
+            # 同一内容指纹（回填 / 重放重复提交）只镜像一次：实时消息时间戳
+            # 唯一，不会被误判；重复回填不能在影子里堆出重复问答。
+            if content_id not in {
+                message_content_id(item) for item in self._fallback.messages
+            }:
+                self._fallback._append_message(message)
         if via_redis:
             # 成功拿到响应后 op_id 不会再被重放，从 applied 集合移除：集合
             # 只保留「写入结果不确定」的少量条目，不随消息总量增长
@@ -1189,6 +1228,11 @@ class RedisShortTermMemory:
             journal.started_at = None
         if journal.started_at is None:
             journal.started_at = time.monotonic()
+        if kind == "add":
+            # 每条新增记录自己的入队时刻：队列里只要还有较早的操作，
+            # journal.started_at 就会被钉在过去，超窗判断不能只看它，
+            # 否则冷却窗口内刚入队的新消息也会被一并丢弃
+            payload = tuple(payload) + (time.monotonic(),)
         journal.ops.append((kind, payload))
         cap = max(64, self.max_turns * 8)
         add_indexes = [
@@ -1222,35 +1266,76 @@ class RedisShortTermMemory:
         if ops and journal.started_at is not None:
             age = time.monotonic() - journal.started_at
             if age > _PENDING_MAX_AGE_SEC:
-                # 超过删除保护窗口：墓碑可能已过期而快照 / 删除不可复原，
-                # 重放排队新增可能复活已删除会话的对话，丢弃并记录条数
-                logger.warning(
-                    "短期记忆故障操作排队超过 %s 秒（%.0fs），丢弃 %s 条待重放操作：%s",
-                    int(_PENDING_MAX_AGE_SEC),
-                    age,
-                    len(ops),
-                    self.key,
-                )
-                ops.clear()
-                journal.started_at = None
+                # 超过删除保护窗口：超窗的新增可能复活已删除轮次，丢弃；
+                # 删除类操作（clear / truncate / remove / tombstone）幂等，
+                # 且各自带发起时刻 / 内容守卫，迟到重放仍然安全——整队
+                # 丢弃会让故障期的删除永久不落地，恢复后已删问答重新进入
+                # 模型上下文，删除方的队列也再无任何防复活记录
+                cutoff = time.monotonic() - _PENDING_MAX_AGE_SEC
+                kept: list[tuple[str, Any]] = []
+                dropped_adds = 0
+                for op in ops:
+                    kind, payload = op
+                    if kind == "add":
+                        enqueued = (
+                            payload[4]
+                            if isinstance(payload, tuple) and len(payload) > 4
+                            else journal.started_at
+                        )
+                        if enqueued is None or enqueued <= cutoff:
+                            dropped_adds += 1
+                            continue
+                    kept.append(op)
+                if dropped_adds:
+                    logger.warning(
+                        "短期记忆故障操作排队超过 %s 秒（%.0fs），丢弃 %s 条"
+                        "超窗新增（保留 %s 条删除类操作）：%s",
+                        int(_PENDING_MAX_AGE_SEC),
+                        age,
+                        dropped_adds,
+                        len(kept),
+                        self.key,
+                    )
+                ops[:] = kept
                 journal.stuck = ("", 0)
-                return
+                add_times = [
+                    payload[4]
+                    for kind, payload in ops
+                    if kind == "add"
+                    and isinstance(payload, tuple)
+                    and len(payload) > 4
+                ]
+                journal.started_at = min(add_times) if add_times else None
+                if not ops:
+                    return
         if ops and self.user_id and self.session_id:
             # 跨进程删除墓碑：其它实例 / CLI 已删除该会话时，本进程日志里
             # 排队的新增会把已删除对话重新写回 Redis 并注入模型上下文
-            # （进程内日志各管各的，删除方只能清掉自己的队列）。命中墓碑
-            # 即整体丢弃，并清空影子缓存，避免故障期继续从影子回放旧对话。
+            # （进程内日志各管各的，删除方只能清掉自己的队列）。新增整体
+            # 丢弃并清空影子缓存；删除类操作保留重放——否则 Redis 里残留
+            # 的内容会在后续读取时把已删除对话重新送回模型。
             from utils.tombstones import is_session_deleted
 
             # force：跳过墓碑模块的失败冷却真实读取一次——本检查紧邻真实
             # 网络调用，冷却期直接返回 False 会把已删除会话的排队消息放行
             if is_session_deleted(self.user_id, self.session_id, force=True):
-                logger.warning("会话已删除，丢弃短期记忆重放队列：%s", self.key)
-                ops.clear()
-                journal.started_at = None
+                kept = [op for op in ops if op[0] != "add"]
+                if not kept:
+                    logger.warning("会话已删除，丢弃短期记忆重放队列：%s", self.key)
+                    ops.clear()
+                    journal.started_at = None
+                    journal.stuck = ("", 0)
+                    self._fallback.messages = []
+                    return
+                logger.warning(
+                    "会话已删除，丢弃 %s 条新增、保留 %s 条删除类操作重放：%s",
+                    len(ops) - len(kept),
+                    len(kept),
+                    self.key,
+                )
+                ops[:] = kept
                 journal.stuck = ("", 0)
                 self._fallback.messages = []
-                return
         while ops:
             signature = repr(ops[0])
             try:
@@ -1475,6 +1560,30 @@ class RedisShortTermMemory:
         """执行 Redis 操作；连接级故障时回退影子缓存并进入 60 秒冷却。"""
         return self._call_redis(operation, fallback)[0]
 
+    def _shadow_session_deleted(self) -> bool:
+        """降级影子读取前的会话删除检查（实例级 60 秒节流）。
+
+        Redis 冷却 / 不可达期间 ``_replay_ops`` 的墓碑检查不会执行：其它
+        实例删除会话后，删除前的对话会一直从影子缓存进入模型，直到 Redis
+        恢复可读或进程退出。墓碑模块自带失败冷却，这里再按实例节流，避免
+        冷却窗口内每次读取都等满 socket 超时。
+        """
+        if not (self.user_id and self.session_id):
+            return False
+        now = time.monotonic()
+        last_checked = getattr(self, "_shadow_deleted_checked_at", 0.0)
+        if now - last_checked < _REDIS_RETRY_COOLDOWN_SEC:
+            return getattr(self, "_shadow_deleted_cached", False)
+        self._shadow_deleted_checked_at = now
+        try:
+            from utils.tombstones import is_session_deleted
+
+            deleted = bool(is_session_deleted(self.user_id, self.session_id))
+        except Exception:  # noqa: BLE001 - 删除检查失败不能阻断降级读取
+            deleted = False
+        self._shadow_deleted_cached = deleted
+        return deleted
+
     def _fallback_context(self, n_turns: int | None) -> list[dict[str, Any]]:
         """Redis 降级时的影子读取：按空闲时长对齐 Redis 的键 TTL 语义。
 
@@ -1491,11 +1600,12 @@ class RedisShortTermMemory:
             # 把清空后新写入影子的消息也一并抹掉
             self._shadow_touched = time.monotonic()
             self._shadow_last_activity = self._shadow_touched
+        if self._fallback.messages and self._shadow_session_deleted():
+            # 会话已被其它实例删除：Redis 冷却期 _replay_ops 的墓碑检查
+            # 不会执行，影子里的删除前对话不能再进入模型上下文
+            self._fallback.messages = []
         messages = self._fallback.get_recent_context()
-        if n_turns is None:
-            return list(messages)
-        n_messages = n_turns * 2
-        return messages[-n_messages:]
+        return _turn_aligned_tail(messages, n_turns)
 
     def add_message(
         self,
@@ -1620,7 +1730,7 @@ class RedisShortTermMemory:
             self._fallback.messages = messages[-window:]
             if n_turns is None:
                 return messages
-            return messages[-n_turns * 2:]
+            return _turn_aligned_tail(messages, n_turns)
 
         return self._redis(op, lambda: self._fallback_context(n_turns))
 

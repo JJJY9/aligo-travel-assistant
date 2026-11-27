@@ -2749,6 +2749,218 @@ def test_direct_run_caplog_shim_captures_logs():
         shim.close()
     print("✓ 直跑 caplog 替身捕获日志")
 
+def test_recent_context_aligns_turn_boundaries():
+    """编排前暂存的本轮提问使窗口为奇数：切片首条必须回到用户提问。"""
+    from context.short_term_memory import ShortTermMemory
+
+    memory = ShortTermMemory(max_turns=10)
+    for index in range(1, 4):
+        memory.add_message("user", f"U{index}")
+        memory.add_message("assistant", f"A{index}")
+    memory.add_message("user", "U4-当前提问")
+    contents = [m["content"] for m in memory.get_recent_context(3)]
+    assert contents == ["U1", "A1", "U2", "A2", "U3", "A3", "U4-当前提问"], contents
+    assert memory.get_context_string(3).splitlines()[0].startswith("用户:")
+
+    # 窗口起点是失去提问的助手回答（提问已被裁剪）：跳过孤儿回答
+    windowed = ShortTermMemory(max_turns=3)
+    for index in range(1, 4):
+        windowed.add_message("user", f"U{index}")
+        windowed.add_message("assistant", f"A{index}")
+    windowed.add_message("user", "U4-当前提问")
+    contents = [m["content"] for m in windowed.get_recent_context(3)]
+    assert contents[0] == "U2", contents
+    assert contents == ["U2", "A2", "U3", "A3", "U4-当前提问"], contents
+
+    # 偶数窗口（无在途提问）保持原口径
+    even = ShortTermMemory(max_turns=10)
+    for index in range(1, 4):
+        even.add_message("user", f"U{index}")
+        even.add_message("assistant", f"A{index}")
+    assert [m["content"] for m in even.get_recent_context(3)] == [
+        "U1",
+        "A1",
+        "U2",
+        "A2",
+        "U3",
+        "A3",
+    ]
+    print("✓ get_recent_context 按用户提问对齐回合")
+
+
+def test_redis_and_fallback_recent_context_turn_aligned(monkeypatch):
+    """Redis 窗口与降级影子使用同一回合对齐切片。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(
+        client, "s-align", max_turns=10, user_id="u1"
+    )
+    for index in range(1, 4):
+        memory.add_message("user", f"U{index}")
+        memory.add_message("assistant", f"A{index}")
+    memory.add_message("user", "U4-当前提问")
+    contents = [m["content"] for m in memory.get_recent_context(3)]
+    assert contents == ["U1", "A1", "U2", "A2", "U3", "A3", "U4-当前提问"], contents
+
+    # 降级影子：同一窗口同样对齐
+    client.fail = True
+    monkeypatch.setattr(module, "_redis_degraded_until", module.time.monotonic() + 60)
+    contents = [m["content"] for m in memory.get_recent_context(3)]
+    assert contents[-1] == "U4-当前提问" and contents[0] == "U1", contents
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    print("✓ Redis 与影子缓存读取同样按回合对齐")
+
+
+def test_tomb_skipped_push_does_not_mirror_shadow(monkeypatch):
+    """墓碑命中（Redis 明确未写入）时影子缓存不得镜像已删除消息。"""
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(
+        client, "s-tomb-shadow", max_turns=5, user_id="u1"
+    )
+    q_ts = memory.add_message("user", "已删除的提问")
+    a_ts = memory.add_message("assistant", "已删除的回答")
+    assert memory.truncate_last_turn("已删除的提问") == 2
+    assert client.data == []
+
+    # 另一实例用同一内容 / 时间戳回填：墓碑命中，Redis 与影子都不能有
+    other = module.RedisShortTermMemory(
+        client, "s-tomb-shadow", max_turns=5, user_id="u1"
+    )
+    other.seed_fallback_context(
+        [
+            {"role": "user", "content": "已删除的提问", "timestamp": q_ts},
+            {"role": "assistant", "content": "已删除的回答", "timestamp": a_ts},
+        ]
+    )
+    assert client.data == [], "墓碑命中不能写回 Redis"
+    assert other._fallback.messages == [], "墓碑命中不能镜像进影子缓存"
+
+    # 故障降级读取同样不能复活已删除内容
+    client.fail = True
+    monkeypatch.setattr(module, "_redis_degraded_until", module.time.monotonic() + 60)
+    assert other.get_recent_context() == []
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    print("✓ 墓碑命中不镜像影子，降级读取不复活已删内容")
+
+
+def test_replay_age_gate_keeps_fresh_adds_and_delete_ops(monkeypatch):
+    """超窗丢弃只针对超龄新增；冷却窗口内新入队的消息与删除操作保留重放。"""
+    from context import short_term_memory as module
+
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(
+        client, "s-age-fresh", max_turns=5, user_id="u1"
+    )
+    memory.add_message("user", "Q1")
+    memory.add_message("assistant", "A1")
+
+    # 故障起点入队一条旧新增（开始计速）
+    client.fail = True
+    memory.add_message("user", "Q2-old")
+    # 冷却窗口内再入队一条新鲜新增与一条删除
+    clock[0] = 4540.0
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    memory.add_message("user", "Q3-fresh")
+    assert memory.truncate_last_turn("Q3-fresh") == 1
+
+    # 恢复后首次访问：只丢超龄的 Q2-old，保留并重放 Q3-fresh 与删除
+    clock[0] = 4640.0
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    contents = [m["content"] for m in memory.get_recent_context()]
+    assert contents == ["Q1", "A1"], contents
+    assert memory._pending_ops == [], memory._pending_ops
+    print("✓ 年龄门只丢超龄新增，新鲜消息与删除操作照常重放")
+
+
+def test_replay_deleted_session_keeps_delete_ops(monkeypatch):
+    """会话已被删除时保留排队的清空操作重放，避免 Redis 残留内容复活。"""
+    from context import short_term_memory as module
+    from utils import tombstones
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [
+        _message("user", "SECRET-Q", "2026-01-01T00:00:00"),
+        _message("assistant", "SECRET-A", "2026-01-01T00:00:01"),
+    ]
+    memory = module.RedisShortTermMemory(
+        client, "s-del-clear", max_turns=5, user_id="u1"
+    )
+    client.fail = True
+    memory.clear()
+    assert [kind for kind, _ in memory._pending_ops] == ["clear"]
+
+    client.fail = False
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    monkeypatch.setattr(
+        tombstones,
+        "is_session_deleted",
+        lambda user_id, session_id, force=False: True,
+    )
+    assert memory.get_recent_context() == []
+    assert client.data == [], "排队的清空操作必须重放，Redis 不能残留旧内容"
+    assert memory._pending_ops == []
+    print("✓ 已删除会话保留删除类操作重放")
+
+
+def test_cross_module_success_keeps_redis_cooldown(monkeypatch):
+    """偏好 / 天气等跨模块成功只复位可达标志，不能清零短期记忆冷却。"""
+    from context import short_term_memory as module
+
+    try:
+        module.reset_redis_degraded()
+        module.note_redis_operation_failure(ConnectionError("redis down"))
+        assert module.redis_short_term_degraded() is True
+        module.note_redis_operation_success()
+        assert module.redis_short_term_available() is True
+        assert module.redis_short_term_degraded() is True, (
+            "跨模块读成功不能把短期记忆的降级冷却清零"
+        )
+    finally:
+        module.reset_redis_degraded()
+    print("✓ 跨模块成功不清零短期记忆重试冷却")
+
+
+def test_degraded_shadow_drops_deleted_session(monkeypatch):
+    """Redis 冷却期读取影子前先查会话墓碑：已删除会话的旧对话不再回放。"""
+    from context import short_term_memory as module
+    from utils import tombstones
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    memory = module.RedisShortTermMemory(
+        client, "s-shadow-deleted", max_turns=5, user_id="u1"
+    )
+    memory.add_message("user", "删除前的提问")
+    memory.add_message("assistant", "删除前的回答")
+    assert memory._fallback.messages, "在线写入应镜像进影子缓存"
+
+    client.fail = True
+    monkeypatch.setattr(module, "_redis_degraded_until", module.time.monotonic() + 60)
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        tombstones,
+        "is_session_deleted",
+        lambda user_id, session_id, force=False: (
+            calls.append((user_id, session_id)) or True
+        ),
+    )
+    assert memory.get_recent_context() == []
+    assert memory._fallback.messages == []
+    assert calls == [("u1", "s-shadow-deleted")]
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    print("✓ 降级影子读取前检查跨实例删除墓碑")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理

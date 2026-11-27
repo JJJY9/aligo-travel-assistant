@@ -6110,6 +6110,87 @@ def test_get_chat_history_exclude_limit_matches_full_filter():
     print("✓ 排除会话的尾部窗口与全量过滤结果一致")
 
 
+def test_get_chat_history_exclude_limit_skips_future_messages():
+    """排除会话 + limit 的快速路径与普通 limit 同口径跳过未来时间戳消息。"""
+    storage = tempfile.mkdtemp()
+    memory = LongTermMemory("u-future-window", storage)
+    for index in range(5):
+        memory.add_chat_message("user", f"real{index}", "s-other")
+    memory.add_chat_message("user", "当前会话", "s-cur")
+    for index in range(250):
+        memory.add_chat_message(
+            "user",
+            f"future{index}",
+            "s-other",
+            timestamp="2030-01-01T00:00:00",
+        )
+
+    window = memory.get_chat_history(limit=5, exclude_session_id="s-cur")
+    assert [m["content"] for m in window] == [
+        f"real{index}" for index in range(5)
+    ], window
+    expanded = memory.get_chat_history(limit=200, exclude_session_id="s-cur")
+    assert [m["content"] for m in expanded] == [
+        f"real{index}" for index in range(5)
+    ], expanded
+    # 普通 limit（不带 exclude）既有口径不受影响
+    plain = memory.get_chat_history(limit=5)
+    assert all("future" not in m["content"] for m in plain), plain
+    print("✓ 排除会话窗口同口径跳过未来时间戳消息")
+
+
+def test_summary_cooldown_falls_back_to_cached_summary():
+    """读输入瞬时失败进入冷却后仍返回已缓存的总结，冷却期不重复查询。"""
+    import asyncio
+
+    from context.memory_manager import MemoryManager
+
+    class _FlakyReadLongTerm(_FakeLongTerm):
+        def __init__(self, history):
+            super().__init__(history)
+            self.boom = False
+            self.reads = 0
+
+        def get_chat_history(
+            self, session_id=None, limit=None, exclude_session_id=None
+        ):
+            self.reads += 1
+            if self.boom:
+                raise RuntimeError("storage glitch")
+            return super().get_chat_history(
+                session_id=session_id,
+                limit=limit,
+                exclude_session_id=exclude_session_id,
+            )
+
+    model = _CountingModel()
+    manager = MemoryManager(
+        "u-summary-cd", "s-cur", storage_path=tempfile.mkdtemp(), llm_model=model
+    )
+    store = _FlakyReadLongTerm(
+        [
+            {
+                "role": "user",
+                "content": "历史消息",
+                "timestamp": "t1",
+                "session_id": "s1",
+            }
+        ]
+    )
+    manager.long_term = store
+    first = asyncio.run(manager.get_long_term_summary_async())
+    assert first and model.calls == 1
+
+    store.boom = True
+    assert asyncio.run(manager.get_long_term_summary_async()) == first
+    reads_after_failure = store.reads
+    # 冷却期内：不发起阻塞查询、不调用模型，直接返回缓存
+    assert asyncio.run(manager.get_long_term_summary_async()) == first
+    assert store.reads == reads_after_failure
+    assert model.calls == 1
+    print("✓ 总结冷却期回退缓存，不再整段丢失")
+
+
 def test_memory_manager_export_uses_snapshot():
     """MemoryManager.export_data 优先走 export_snapshot（不再逐项读取）。"""
     from context.memory_manager import MemoryManager

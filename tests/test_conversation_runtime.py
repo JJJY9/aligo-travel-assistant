@@ -1579,6 +1579,35 @@ def test_epoch_snapshot_read_before_context_and_intent():
     print("✓ 会话纪元在上下文 / 意图调用之前读取")
 
 
+def test_drain_runs_before_context_build():
+    """上一轮在途落库必须先 drain 完，再读本轮上下文（避免陈旧/错序）。"""
+    runtime, memory = _make_runtime()
+    order = []
+
+    async def drain(timeout_sec=10.0):
+        order.append("drain")
+        return True
+
+    runtime.drain_pending_persist = drain  # type: ignore[method-assign]
+    original_build = runtime._build_context
+
+    async def build(user_input):
+        order.append("context")
+        return await original_build(user_input)
+
+    runtime._build_context = build  # type: ignore[method-assign]
+
+    class _Intent(_FakeIntention):
+        async def reply(self, context):
+            order.append("intent")
+            return await super().reply(context)
+
+    runtime.intention_agent = _Intent()
+    asyncio.run(runtime.ask("你好"))
+    assert order[:3] == ["drain", "context", "intent"], order
+    print("✓ 上一轮落库 drain 先于上下文构建")
+
+
 def test_intent_success_does_not_reset_breaker_failures():
     """意图调用成功不清零熔断连续失败计数；编排成功才清零。"""
     from utils.circuit_breaker import CircuitBreaker
@@ -2124,6 +2153,7 @@ if __name__ == "__main__":
     test_normalized_schedule_filters_invalid_entries()
     test_deferred_memory_failure_is_surfaced_in_reply()
     test_epoch_snapshot_read_before_context_and_intent()
+    test_drain_runs_before_context_build()
     test_intent_success_does_not_reset_breaker_failures()
     test_summary_output_with_surrogate_is_sanitized()
     test_summary_window_ignores_future_timestamps()
