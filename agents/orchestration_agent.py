@@ -59,6 +59,35 @@ _AGENT_RETRY_MAX = 1
 _AGENT_RETRY_BASE_DELAY = 1.0
 _AGENT_RETRY_MAX_DELAY = 5.0
 
+
+def _warn_agent_timeout_ceiling() -> None:
+    """LLM_REQUEST_TIMEOUT_SEC 超过单智能体执行预算时明确告警。
+
+    config 允许把单次 HTTP read 超时调到 3600 秒，但子智能体另有 300 秒
+    总执行上限（含懒加载与一次重试）：配置越大，重试越可能在半途被取消
+    （已发出的调用照常计费却被丢弃）。只告警，不改上限——上限本身是
+    保护用户锁 / 会话锁的既有设计。
+    """
+    try:
+        from config import SYSTEM_CONFIG
+
+        configured = float(SYSTEM_CONFIG.get("timeout", 120))
+    except Exception:  # noqa: BLE001 - 配置异常由读取方负责报错
+        return
+    attempts = _AGENT_RETRY_MAX + 1
+    if configured * attempts > _AGENT_TIMEOUT_SEC:
+        logger.warning(
+            "LLM_REQUEST_TIMEOUT_SEC=%s 秒：单智能体最多 %s 次尝试，最坏可达"
+            " %s 秒，超过逐智能体执行上限 %s 秒；长生成仍会在上限处被取消",
+            configured,
+            attempts,
+            configured * attempts,
+            _AGENT_TIMEOUT_SEC,
+        )
+
+
+_warn_agent_timeout_ceiling()
+
 # 懒加载专用执行器：RAG 首次构造会在全局锁内 import torch 并加载（或联网
 # 下载）嵌入模型；放进默认线程池会在冷启动时占满 min(32, CPU+4) 个 token，
 # 把对话限流 / 记忆读写 / 会话构造等所有 asyncio.to_thread 一起阻塞。

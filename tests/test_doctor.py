@@ -407,10 +407,14 @@ def test_check_config_key_source_strips_env(monkeypatch):
     result = doctor_module.check_config()
     assert "config_local.py" in result.detail, result.detail
     # PowerShell / 记事本存出的 BOM 值：config 会回退，doctor 必须同口径
-    for blank in ("\ufeff", " \ufeff", "\ufeff \ufeff"):
+    for blank in ("\ufeff", " \ufeff", "\ufeff \ufeff", '""', "''", ' "  " '):
         monkeypatch.setenv("LLM_API_KEY", blank)
         result = doctor_module.check_config()
         assert "config_local.py" in result.detail, (repr(blank), result.detail)
+    # 成对引号包裹的非空值仍按环境变量来源
+    monkeypatch.setenv("LLM_API_KEY", '"sk-quoted-env"')
+    result = doctor_module.check_config()
+    assert "环境变量" in result.detail, result.detail
     monkeypatch.setenv("LLM_API_KEY", "  sk-env  ")
     result = doctor_module.check_config()
     assert "环境变量" in result.detail, result.detail

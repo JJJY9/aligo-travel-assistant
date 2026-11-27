@@ -53,6 +53,18 @@ def test_env_override_strips_bom_and_quotes(monkeypatch):
     print("✓ ALIGO_SKILLS_DIR 去 BOM / 成对引号")
 
 
+def test_relative_env_override_normalized_to_cwd(monkeypatch):
+    """相对 ALIGO_SKILLS_DIR 按进程 CWD 归一，不同启动目录不再漂移。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / "skills" / "demo").mkdir(parents=True)
+        monkeypatch.chdir(tmp)
+        monkeypatch.setenv(skill_paths.ENV_SKILLS_DIR, "skills")
+        assert skill_paths.resolve_skills_root() == (Path(tmp) / "skills").resolve()
+        # Windows 上 cwd 仍在临时目录时无法 rmdir：先离开再退出上下文
+        monkeypatch.chdir(project_root)
+    print("✓ 相对 ALIGO_SKILLS_DIR 按 CWD 归一")
+
+
 def test_prefix_fallback_for_installed_wheel(monkeypatch):
     """源码目录不存在时回退到 sys.prefix/.claude/skills（wheel data-files 位置）。"""
     monkeypatch.delenv(skill_paths.ENV_SKILLS_DIR, raising=False)
@@ -260,6 +272,11 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_env_override_strips_bom_and_quotes(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_relative_env_override_normalized_to_cwd(mp)
     finally:
         mp.undo()
     mp = pytest.MonkeyPatch()

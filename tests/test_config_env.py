@@ -469,6 +469,46 @@ def test_rag_config_env_overrides():
     print("✓ RAG 嵌入模型 / 检索阈值环境变量覆盖")
 
 
+def test_rag_bm25_ttl_invalid_value_clamped():
+    """RAG_BM25_TTL_SEC 的 0 / 负值会让缓存永不命中：告警并按 60 秒处理。"""
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "import config;"
+        "print(config.RAG_CONFIG['bm25_ttl_sec'])"
+    )
+    base_env = dict(os.environ)
+    base_env.pop("RAG_BM25_TTL_SEC", None)
+    base_env["PYTHONIOENCODING"] = "utf-8"
+
+    def _run(value):
+        env = dict(base_env)
+        if value is not None:
+            env["RAG_BM25_TTL_SEC"] = value
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=project_root,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stderr
+        return result.stdout.strip(), result.stderr
+
+    assert _run(None)[0] == "60"
+    assert _run("120")[0] == "120"
+    out, stderr = _run("0")
+    assert out == "60", out
+    assert "RAG_BM25_TTL_SEC" in stderr, stderr
+    out, stderr = _run("-5")
+    assert out == "60", out
+    assert "非法" in stderr, stderr
+    print("✓ RAG_BM25_TTL_SEC 0 / 负值告警并按 60 秒处理")
+
+
 def test_rate_limit_max_keys_and_ipv6_prefix_env():
     """RATE_LIMIT_MAX_KEYS / RATE_IPV6_PREFIX_LEN 读取与越界钳制。"""
     tmp = tempfile.mkdtemp(prefix="chailv_cfg_")
@@ -598,6 +638,7 @@ if __name__ == "__main__":
     test_create_chat_model_max_retries_param()
     test_kb_import_rate_limit_env()
     test_read_rate_limit_env()
+    test_rag_bm25_ttl_invalid_value_clamped()
     test_rate_limit_max_keys_and_ipv6_prefix_env()
     _mp = pytest.MonkeyPatch()
     try:

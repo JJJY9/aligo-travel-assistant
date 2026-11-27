@@ -757,10 +757,13 @@ class RequestContextMiddleware:
                 "客户端已断开 [%s] %s", request_id, _safe_log_text(path)[:200]
             )
         except Exception as exc:  # noqa: BLE001 - 兜底：未处理异常也要带上安全头与请求 ID
-            logger.exception(
-                "未处理的请求异常 [%s] %s",
+            # 不能 logger.exception：Formatter 会从未脱敏的异常对象重新格式化
+            # message + traceback，网关回显的 API Key / DSN 会绕开脱敏
+            logger.error(
+                "未处理的请求异常 [%s] %s: %s",
                 request_id,
                 _safe_log_text(path)[:200],
+                _redacted_exc_log_text(exc),
             )
             if response_started:
                 # 响应已开始（如流式输出中断），无法再补发 500，交由服务器断开连接
@@ -2726,7 +2729,10 @@ def _trusted_proxy_networks(raw: str) -> tuple[Any, ...]:
     """解析 TRUSTED_PROXY_CIDRS（逗号分隔 CIDR）；非法项告警并忽略。"""
     networks: list[Any] = []
     for item in str(raw or "").split(","):
-        item = item.strip()
+        # 与 _is_allowed_host 同口径：K8s / docker --env-file 会把逗号列表
+        # 逐项连引号注入（"a","b"），只 strip 会让每个 CIDR 都解析失败、
+        # 可信网段集合为空，XFF 被整体忽略后全部客户端共用一个限流桶
+        item = item.strip().strip("\"'").strip()
         if not item:
             continue
         try:
@@ -6802,7 +6808,9 @@ def create_app(model: Any = None) -> FastAPI:
                 )
             except MemoryPersistenceError as exc:
                 logger.warning(
-                    "打开会话失败（%s）: %s", _request_id(request), exc
+                    "打开会话失败（%s）: %s",
+                    _request_id(request),
+                    redact_paths(exc),
                 )
                 # 打开会话失败在任何 LLM 调用之前：归还入口已扣的额度，
                 # 否则存储恢复后的重试会被 429 锁在滑动窗口里
@@ -6864,8 +6872,11 @@ def create_app(model: Any = None) -> FastAPI:
                     detail=f"服务暂时不可用，请稍后再试（请求 ID：{_request_id(request)}）",
                 ) from exc
             except MemoryPersistenceError as exc:
+                # 与流式路径同口径：异常文本含绝对存储路径与底层 OSError
                 logger.warning(
-                    "对话存储失败（%s）: %s", _request_id(request), exc
+                    "对话存储失败（%s）: %s",
+                    _request_id(request),
+                    redact_paths(exc),
                 )
                 detail = _persistence_failure_detail(
                     exc, _request_id(request)

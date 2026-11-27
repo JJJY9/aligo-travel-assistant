@@ -2983,6 +2983,47 @@ def test_redacted_exc_log_text_masks_key_in_traceback():
     assert "Traceback" in text, "保留栈帧便于排查"
 
 
+def test_unhandled_exception_log_is_redacted(caplog):
+    """500 兜底日志不能把网关回显的 API Key 写进应用日志（不走 exc_info）。"""
+    import logging
+
+    from webapp.server import RequestContextMiddleware
+
+    canary = "sk-CANARY1234567890abcdef"
+
+    async def boom_app(scope, receive, send):
+        raise RuntimeError(
+            f"Error code: 401 - Incorrect API key provided: {canary}"
+        )
+
+    middleware = RequestContextMiddleware(boom_app)
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        await asyncio.sleep(0)
+        return {"type": "http.request"}
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/api/crash",
+        "headers": [(b"host", b"127.0.0.1")],
+    }
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(middleware(scope, receive, send))
+    assert canary not in caplog.text, caplog.text
+    assert "***" in caplog.text
+    assert any(
+        message.get("type") == "http.response.start"
+        and message.get("status") == 500
+        for message in sent
+    ), sent
+    print("✓ 500 兜底日志脱敏上游密钥")
+
+
 def test_chat_stream_error_log_is_redacted(monkeypatch, caplog):
     """流式兜底日志不能把网关回显的 API Key 写进应用日志。"""
     import logging
@@ -8206,6 +8247,23 @@ def test_allowed_hosts_env_strips_injected_quotes(monkeypatch):
     assert server_module._host_allowed("a.example.com"), "逐项引号必须剥离"
     assert server_module._host_allowed("b.example.com")
     print("✓ ALIGO_ALLOWED_HOSTS 去成对引号（整段 / 逐项）")
+
+
+def test_trusted_proxy_cidrs_env_strips_injected_quotes():
+    """逐项引号注入的 TRUSTED_PROXY_CIDRS 仍能命中（与 ALLOWED_HOSTS 同口径）。"""
+    from webapp import server as server_module
+
+    parse = server_module._trusted_proxy_networks
+    plain = parse("127.0.0.1/32,10.0.0.0/8")
+    assert len(plain) == 2, plain
+    for quoted in (
+        '"127.0.0.1/32","10.0.0.0/8"',
+        "'127.0.0.1/32','10.0.0.0/8'",
+    ):
+        assert parse(quoted) == plain, (quoted, parse(quoted))
+    # 整段引号（config._env_str 已剥）与裸值行为不变
+    assert parse('"10.0.0.0/8"') == parse("10.0.0.0/8")
+    print("✓ TRUSTED_PROXY_CIDRS 去逐项成对引号")
 
 
 def test_delete_session_busy_lock_refused(monkeypatch):

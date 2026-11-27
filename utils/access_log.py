@@ -15,6 +15,9 @@ import re
 MAX_LOG_TEXT = 200
 MAX_METHOD_TEXT = 16
 
+# 无法识别的取值只告警一次（access_log_format 每请求调用）
+_warned_formats: set[str] = set()
+
 
 def _safe_log_text(value: object) -> str:
     """去掉控制字符：uvicorn 会 percent-decode 路径，%0A 可伪造整行日志。
@@ -27,8 +30,24 @@ def _safe_log_text(value: object) -> str:
 
 
 def access_log_format() -> str:
-    """当前访问日志格式：``text``（默认）或 ``json``。"""
-    return os.environ.get("LOG_FORMAT", "text").strip().lower()
+    """当前访问日志格式：``text``（默认）或 ``json``。
+
+    与 config.py 的字符串型环境变量同一清洗口径（去 BOM / 成对引号 /
+    空白）：docker --env-file、K8s ConfigMap、Windows ``set VAR="json"``
+    会把引号连值一起注入，不清洗时 JSON 结构化日志静默失效且无告警。
+    """
+    value = os.environ.get("LOG_FORMAT", "").replace("\ufeff", "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    mode = value.lower() or "text"
+    if mode in {"text", "json"}:
+        return mode
+    if mode not in _warned_formats:
+        _warned_formats.add(mode)
+        logging.getLogger(__name__).warning(
+            "LOG_FORMAT=%r 不是 text/json，按 text 输出", mode[:40]
+        )
+    return "text"
 
 
 def format_access_log(

@@ -4112,3 +4112,29 @@ if __name__ == "__main__":
         )
     else:
         print(f"\n全部通过（{ran}/{total} 个用例）")
+
+
+def test_agent_timeout_ceiling_warns_when_llm_timeout_budget_exceeds(caplog):
+    """LLM_REQUEST_TIMEOUT_SEC × 尝试次数超过 300 秒时应明确告警（不改上限）。"""
+    import logging
+
+    from agents import orchestration_agent
+    from config import SYSTEM_CONFIG
+
+    old = SYSTEM_CONFIG["timeout"]
+    try:
+        SYSTEM_CONFIG["timeout"] = 600
+        caplog.clear()
+        with caplog.at_level(
+            logging.WARNING, logger="agents.orchestration_agent"
+        ):
+            orchestration_agent._warn_agent_timeout_ceiling()
+    finally:
+        SYSTEM_CONFIG["timeout"] = old
+    assert "LLM_REQUEST_TIMEOUT_SEC" in caplog.text, caplog.text
+    assert "300" in caplog.text and "1200" in caplog.text, caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="agents.orchestration_agent"):
+        orchestration_agent._warn_agent_timeout_ceiling()
+    assert caplog.text == "", caplog.text

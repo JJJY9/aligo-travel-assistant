@@ -4,6 +4,7 @@
 """
 import logging
 import os
+import pathlib
 import sys
 import tempfile
 import time
@@ -98,6 +99,47 @@ def test_preference_and_title_values_not_logged(caplog):
     assert "敏感标题内容XYZ" not in caplog.text
     assert "Saved preference: memo" in caplog.text
     print("✓ 偏好值 / 标题不进日志")
+
+
+def test_add_brand_and_airline_values_not_logged(caplog):
+    """JSON 后端的 add_hotel_brand / add_airline 也不得把偏好值写进日志。"""
+    memory = LongTermMemory("u-logredact-brand", tempfile.mkdtemp())
+    with caplog.at_level(logging.INFO):
+        memory.add_hotel_brand("敏感品牌ABC")
+        memory.add_airline("敏感航司XYZ")
+    assert "敏感品牌ABC" not in caplog.text, caplog.text
+    assert "敏感航司XYZ" not in caplog.text, caplog.text
+    assert "Added hotel brand preference" in caplog.text
+    assert "Added airline preference" in caplog.text
+    print("✓ add_hotel_brand / add_airline 不写偏好值")
+
+
+def test_migration_warnings_do_not_log_preference_values(caplog):
+    """迁移清洗丢弃畸形偏好时只记序号 / 类型，不打印住址 / 证件号原文。"""
+    import json
+
+    base = pathlib.Path(tempfile.mkdtemp(prefix="chailv_migrate_"))
+    address = "北京市朝阳区测试路 1 号"
+    id_number = "110101199001011234"
+    payload = {
+        "preferences": [
+            address,
+            {
+                "type": "preferences",
+                "value": [{"type": ["home_location"], "value": id_number}],
+            },
+        ]
+    }
+    (base / "u-migrate.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+    with caplog.at_level(logging.WARNING):
+        LongTermMemory("u-migrate", str(base))
+    assert address not in caplog.text, caplog.text
+    assert id_number not in caplog.text, caplog.text
+    assert "丢弃非对象的偏好记录" in caplog.text
+    assert "丢弃嵌套偏好中的非法条目" in caplog.text
+    print("✓ 迁移告警只记序号 / 类型，不含偏好原文")
 
 
 def test_redact_paths_hides_internal_paths_and_urls():
@@ -271,6 +313,8 @@ if __name__ == "__main__":
     _shim = _caplog_shim.CaplogShim()
     try:
         test_preference_and_title_values_not_logged(_shim)
+        test_add_brand_and_airline_values_not_logged(_shim)
+        test_migration_warnings_do_not_log_preference_values(_shim)
     finally:
         _shim.close()
     if _DIRECT_RUN_SKIP:

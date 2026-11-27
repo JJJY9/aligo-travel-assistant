@@ -255,7 +255,10 @@ SYSTEM_CONFIG: SystemConfig = {
     "max_retries": 3,
     # 非流式请求的 read 超时兜住整段生成时间：max_tokens=8192 在长行程 /
     # 大历史下可能超过 60s，60s 会让正常请求 ReadTimeout 并被应用层整轮
-    # 重试（重复计费）。默认 120s，可用 LLM_REQUEST_TIMEOUT_SEC 调整
+    # 重试（重复计费）。默认 120s，可用 LLM_REQUEST_TIMEOUT_SEC 调整。
+    # 注意：本值只决定单次 HTTP 请求的 read 超时；编排层对每个子智能体
+    # 另有独立的 300 秒总执行上限（含懒加载与一次重试），设到 300 以上
+    # 不会延长子智能体执行，超时任务仍会在上限处被取消
     "timeout": _env_int("LLM_REQUEST_TIMEOUT_SEC", 120),
 }
 
@@ -299,8 +302,22 @@ RAG_CONFIG: RAGConfig = {
         1, min(200, _env_int("RAG_RERANK_CANDIDATES", 20))
     ),
     "bm25_max_docs": max(1, _env_int("RAG_BM25_MAX_DOCS", 20000)),
-    "bm25_ttl_sec": max(0, _env_int("RAG_BM25_TTL_SEC", 60)),
+    # 0 / 负数留到下面统一钳制：消费方按 (now - cached) <= ttl 判定，
+    # 0 会让缓存永不命中、每次问答都在请求线程重建索引（数万片段）
+    "bm25_ttl_sec": _env_int("RAG_BM25_TTL_SEC", 60),
 }
+
+# BM25 缓存 TTL 的 0 / 负值语义与 REDIS_TTL_SEC 不同（消费方不是
+# 「0=永不过期」，而是永不命中）：每次问答都从 Milvus 拉全量片段同步
+# 重建索引（2 万片段约 0.4–0.5 GB），且全程无提示。按下限 1 秒的
+# 合理值 60 秒处理并告警
+if RAG_CONFIG["bm25_ttl_sec"] < 1:
+    logger.warning(
+        "RAG_BM25_TTL_SEC=%s 非法（需 >= 1 秒；0/负数会让 BM25 索引缓存"
+        "永不命中、每次问答都在请求线程重建索引），按 60 秒处理",
+        RAG_CONFIG["bm25_ttl_sec"],
+    )
+    RAG_CONFIG["bm25_ttl_sec"] = 60
 
 # 行程规划校验（v2.0）：五项检查失败后带原因重生成。
 # attempts 上限 3，默认 1（一次重生成；仍失败则保留问题列表返回）。
