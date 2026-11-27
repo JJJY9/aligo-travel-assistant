@@ -18375,6 +18375,47 @@ def test_session_detail_normalizes_usage():
     print("✓ 会话详情 usage 与汇总同口径")
 
 
+def test_session_detail_normalizes_elapsed():
+    """会话详情的 _meta.elapsed 与 /api/status 平均耗时同口径。
+
+    备份恢复可带入负数或超出 float 范围的耗时：面板平均值忽略它们，
+    页脚 / 执行路线此前原样渲染（-5s / Infinitys）。
+    """
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user = _unique_user("web_meta_elapsed")
+    try:
+        store = create_long_term_memory(user, str(MEMORY_DIR))
+        try:
+            store.add_chat_message("user", "hi", "s-elapsed")
+            store.add_chat_message(
+                "assistant",
+                json.dumps({"_meta": {"elapsed": -5.0}}, ensure_ascii=False),
+                "s-elapsed",
+            )
+            store.add_chat_message(
+                "assistant",
+                json.dumps({"_meta": {"elapsed": 10**400}}, ensure_ascii=False),
+                "s-elapsed",
+            )
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        response = client.get("/api/sessions/s-elapsed", params={"user_id": user})
+        assert response.status_code == 200, response.text
+        elapsed = [
+            message["meta"].get("elapsed")
+            for message in response.json()["messages"]
+            if message.get("meta")
+        ]
+        assert elapsed == [None, None], elapsed
+    finally:
+        _cleanup(user)
+    print("✓ 会话详情 elapsed 与汇总同口径")
+
+
 def test_lru_eviction_carries_pending_usage():
     """LRU 淘汰时未结算用量结转给重建的同名会话（否则用量永久少记）。"""
     app = create_app(model=UsageTrackingModel(_FakeModel()))
@@ -18424,6 +18465,32 @@ def test_pending_usage_carried_per_user():
         _cleanup(user_a)
         _cleanup(user_b)
     print("✓ 结转用量按用户分桶互不挤出")
+
+
+def test_pending_usage_carry_merges_instead_of_overwrite():
+    """同名会话已有结转账目时再次结转必须合并，不能覆盖旧账。
+
+    淘汰方在释放 _sessions_lock 后才结转，而重建方可能在锁内先弹出空值：
+    旧账只在稍后落入桶里，若随后新账直接赋值，旧未结算用量永久少记。
+    """
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.max_sessions = 2
+    user = _unique_user("web_test_pending_merge")
+    try:
+        session = state.get_session(user, "s-merge")
+        session.runtime.seed_unsettled_usage({"calls": 1, "total_tokens": 7})
+        state._carry_pending_usage(session)
+        session.runtime.seed_unsettled_usage({"calls": 1, "total_tokens": 11})
+        state._carry_pending_usage(session)
+        assert state._pending_usage[user]["s-merge"] == {
+            "calls": 2,
+            "total_tokens": 18,
+        }, state._pending_usage[user]
+    finally:
+        state.close_all()
+        _cleanup(user)
+    print("✓ 重复结转合并而非覆盖")
 
 
 def test_weather_executor_threads_are_daemon_and_not_registered():

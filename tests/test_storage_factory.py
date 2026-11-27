@@ -3561,23 +3561,27 @@ def test_pg_lazy_uid_column_migration():
 
 
 def test_pg_chat_summary_does_not_fetch_message_bodies():
-    """PG 会话概览只查计数与 DISTINCT 会话，不整表取回消息正文。"""
+    """PG 会话概览只查计数与 DISTINCT 会话，不整表取回消息正文。
+
+    计数与会话集合来自同一条语句（同一快照），避免 autocommit 下两条
+    查询之间发生删除时 CLI 报出任何单一时刻都不存在的组合。
+    """
     from context.postgres_long_term_memory import PostgresLongTermMemory
 
     store = object.__new__(PostgresLongTermMemory)
     store.user_id = "u1"
     calls: list[tuple[str, object]] = []
-    store._fetchone = lambda sql, params=None: (calls.append((sql, params)) or (7,))
-    store._fetchall = lambda sql, params=None: (
-        calls.append((sql, params)) or [("s1",), ("s2",), (None,)]
+    store._fetchone = lambda sql, params=None: (
+        calls.append((sql, params)) or (7, ["s1", "s2", None])
     )
     summary = store.get_chat_summary()
     assert summary["messages"] == 7
     assert summary["sessions"] == {"s1", "s2"}
+    assert len(calls) == 1, calls
     assert "COUNT(*)" in calls[0][0]
-    assert "DISTINCT session_id" in calls[1][0]
+    assert "array_agg(DISTINCT session_id)" in calls[0][0]
     assert all("content" not in sql for sql, _ in calls), "不应查询消息正文"
-    print("✓ PostgreSQL 会话概览只查计数（不读正文）")
+    print("✓ PostgreSQL 会话概览只查计数（单快照，不读正文）")
 
 
 def test_pg_delete_trips_verified_checks_identity_in_lock():
@@ -3720,6 +3724,41 @@ def test_migrate_clamps_inflated_counters_to_list_length():
     assert stats["total_messages"] == 1, stats
     assert stats["total_trips"] == 0, stats
     print("✓ 迁移把偏大的计数器对齐到列表长度")
+
+
+def test_migrate_rebuilds_understated_counters_from_lists():
+    """合法但偏小的计数器同样按列表重建（与 PG 的 COUNT(*) 同口径）。
+
+    手写 / 外部工具写出的统计若偏小，Markdown 导出与 CLI REPL 状态会读
+    计数器，与面板 / CLI stats（按列表长度）给出不同数字。
+    """
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-understated.json"
+    path.write_text(
+        json.dumps(
+            {
+                "chat_history": [
+                    {"role": "user", "content": "hi", "session_id": "s1"},
+                    {"role": "assistant", "content": "hello", "session_id": "s1"},
+                ],
+                "trip_history": [
+                    {"trip_id": "trip_1", "destination": "上海", "start_date": "2026-12-01"}
+                ],
+                "statistics": {
+                    "total_messages": 0,
+                    "total_trips": 0,
+                    "total_queries": 0,
+                    "last_trip_number": 1,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-understated", storage_dir)
+    stats = memory.get_statistics()
+    assert stats["total_messages"] == 2, stats
+    assert stats["total_trips"] == 1, stats
+    print("✓ 迁移把偏小的计数器对齐到列表长度")
 
 
 def test_migrate_repairs_bad_statistics_values():

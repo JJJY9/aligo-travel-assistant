@@ -116,6 +116,19 @@ def trip_interval(trip: dict[str, Any]) -> tuple[datetime, datetime] | None:
                 raw_end,
             )
         end = start
+    elif end.year == 9999:
+        # 9999-12-31 是模型常用的「返程未定」占位（与对话写入路径
+        # agents/orchestration_agent 丢弃 9999 返程的口径一致）：按真实
+        # 区间会把出行天数算成数百万天、行程永久「进行中」并与所有未来
+        # 行程互相重叠。读侧统一按出发当日计算，存储与导出仍保真保留。
+        _warn_trip_issue_once(
+            "placeholder-end",
+            (raw_end, trip.get("start_date")),
+            "行程 %s 的返程日期为 9999-12-31 占位（%r），按出发当日计算",
+            trip.get("trip_id"),
+            raw_end,
+        )
+        end = start
     if end < start:
         _warn_trip_issue_once(
             "inverted",

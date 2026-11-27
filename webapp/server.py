@@ -153,6 +153,7 @@ from utils.trip_import import (
 from utils.travel_stats import summarize_travel
 from utils.timestamps import chronological_key, to_aware
 from utils.turn_meta import extract_turn_meta
+from utils.usage import add_usage
 from utils.version import APP_VERSION
 from utils.weather import WeatherError, fetch_weather, peek_cached_weather
 
@@ -2020,7 +2021,13 @@ class AligoWebApp:
             bucket = self._pending_usage.get(session.user_id)
             if bucket is None:
                 bucket = self._pending_usage[session.user_id] = OrderedDict()
-            bucket[session.session_id] = pending
+            # 合并而非覆盖：淘汰方在释放 _sessions_lock 后才结转，而重建方
+            # 可能在锁内已先 _pop_pending_usage_locked 取到空值；此时桶里
+            # 可能已有同名会话的旧账（上次结转残留），直接赋值会让新账把
+            # 旧账覆盖成永久少记
+            bucket[session.session_id] = (
+                add_usage(bucket.get(session.session_id), pending) or pending
+            )
             bucket.move_to_end(session.session_id)
             # 只淘汰本用户自己的最旧条目：全局 FIFO 会让高流量用户把
             # 别人的结转账目挤出，被挤出者的用量永久少记
@@ -4468,6 +4475,26 @@ def _usage_zone(tz: str | None) -> ZoneInfo | None:
         return None
 
 
+def _display_elapsed(value: Any) -> Any:
+    """会话详情 _meta.elapsed 归一：与 /api/status 平均耗时同口径。
+
+    备份恢复可能带入负数或超出 float 范围的耗时：面板汇总只接受有限且
+    >=0 的值，而消息页脚 / 执行路线此前原样渲染（-5s / Infinitys）。
+    合法值保持原类型，坏值归 None（前端自然不渲染）。
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return value
+
+
 def _usage_summary(
     history: list[dict[str, Any]], tz: str | None = None
 ) -> dict[str, Any]:
@@ -6407,10 +6434,13 @@ def create_app(model: Any = None) -> FastAPI:
         rendered_messages = []
         for message in messages:
             rendered, meta = render_stored_message_with_meta(message)
-            if isinstance(meta, dict) and isinstance(meta.get("usage"), dict):
-                # 与 /api/status 汇总同口径：负数 / NaN 归零、缺 total 或
-                # total 与 input+output 冲突时按 input+output
-                meta = {**meta, "usage": _display_usage(meta["usage"])}
+            if isinstance(meta, dict):
+                if isinstance(meta.get("usage"), dict):
+                    # 与 /api/status 汇总同口径：负数 / NaN 归零、缺 total 或
+                    # total 与 input+output 冲突时按 input+output
+                    meta = {**meta, "usage": _display_usage(meta["usage"])}
+                if "elapsed" in meta:
+                    meta = {**meta, "elapsed": _display_elapsed(meta["elapsed"])}
             rendered_messages.append(
                 {
                     "role": message.get("role", "assistant"),

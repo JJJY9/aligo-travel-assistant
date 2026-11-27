@@ -1273,19 +1273,22 @@ class PostgresLongTermMemory:
 
         CLI stats 此前用 ``get_chat_history()`` 整表取回全部正文，只为数
         条数与会话集合：数十万条历史时峰值内存超过 1GB。
+
+        计数与会话集合合成一条语句：连接是 autocommit，分两条查询会各取
+        一个快照，并发删除恰好落在中间时 CLI 可报出任何单一时刻都不存在
+        的组合（消息数含已删会话、会话集合已不含它），与 Web 的单快照
+        口径分叉。
         """
         row = self._fetchone(
-            "SELECT COUNT(*) FROM aligo_chat_messages WHERE user_id = %s",
+            "SELECT COUNT(*), "
+            "array_agg(DISTINCT session_id) FILTER (WHERE session_id IS NOT NULL) "
+            "FROM aligo_chat_messages WHERE user_id = %s",
             (self.user_id,),
         )
-        rows = self._fetchall(
-            "SELECT DISTINCT session_id FROM aligo_chat_messages "
-            "WHERE user_id = %s AND session_id IS NOT NULL",
-            (self.user_id,),
-        )
+        sessions = row[1] if row and row[1] else ()
         return {
             "messages": int(row[0]) if row else 0,
-            "sessions": {str(session_id) for (session_id,) in rows if session_id},
+            "sessions": {str(session_id) for session_id in sessions if session_id},
         }
 
     def delete_chat_session(self, session_id: str) -> int:

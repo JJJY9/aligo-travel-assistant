@@ -71,7 +71,11 @@ def test_summarize_empty_and_invalid():
 
 
 def test_summarize_tolerates_date_max_end():
-    """终点为 9999-12-31 的行程不能使统计 OverflowError（面板 / CLI 永久 500）。"""
+    """终点 9999-12-31 按「返程未定」占位处理（与写入路径同口径）。
+
+    占位值不再当真实区间：单日行程不会把出行天数放大到数百万天，也不会
+    因 date.max 触发 OverflowError（面板 / CLI 永久 500）。
+    """
     long_trip = {
         "destination": "上海",
         "start_date": "2020-01-01",
@@ -83,11 +87,13 @@ def test_summarize_tolerates_date_max_end():
     ]
     summary = summarize_travel(trips, today=date(2026, 11, 6))
     assert summary["total_trips"] == 2
-    assert summary["total_days"] == (date.max - date(2020, 1, 1)).days + 1
+    assert summary["total_days"] == 6, summary
+    assert summary["active"] == 0, summary
+    assert summary["upcoming"] == 0, summary
 
     single = summarize_travel([long_trip], today=date(2026, 11, 6))
-    assert single["total_days"] == (date.max - date(2020, 1, 1)).days + 1
-    print("✓ date.max 终点的区间合并不再溢出")
+    assert single["total_days"] == 1, single
+    print("✓ 9999-12-31 占位返程按出发当日计入统计")
 
 
 def test_summarize_reuses_precomputed_intervals():

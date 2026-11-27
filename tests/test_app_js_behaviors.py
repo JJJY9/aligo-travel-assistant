@@ -99,6 +99,13 @@ def test_frontend_render_helpers():
     # 形状合法但非真实日历日：与后端 strptime 失败（按无日期处理）同口径
     assert results["date_invalid_calendar"] is None, results["date_invalid_calendar"]
     assert results["date_leap_valid"] == "2024-02-29", results["date_leap_valid"]
+    # 全角数字日期经备份恢复保真落库后，后端按身份口径算进行中；
+    # 前端必须同样归一，否则该行无徽标、卡片标签与服务器筛选分叉
+    assert results["date_full_width"] == "2026-03-12", results["date_full_width"]
+    # 9999-12-31 是「返程未定」占位：后端按出发当日计算，前端徽标同口径
+    assert results["status_placeholder_end"]["label"] == "已结束", (
+        results["status_placeholder_end"]
+    )
     assert results["highlight_plain"] == "no match here", "无命中时返回转义原文"
     assert results["highlight_meta"] == "<mark>a+b</mark> (x)", (
         "正则元字符按字面匹配，不能被当成模式"
