@@ -34,6 +34,16 @@ _SWEEP_INTERVAL_SEC = 0.5
 REDIS_KEY_PREFIX = "aligo:ratelimit"
 # Redis 故障后的回退冷却时间：期间直接用进程内限流，避免每个请求都等超时。
 REDIS_FAILURE_COOLDOWN_SEC = 60.0
+# 只读脚本（peek / status）失败后的短冷却：单次读超时不能证明写路径不可
+# 用，不能把整桶打进 60 秒降级（那会把已用额度清零、按实例数放大）；只
+# 暂停读探测一小段时间（压制读超时风暴），权威 check / refund 仍打 Redis，
+# 写失败才升级为整桶冷却。
+REDIS_READ_FAILURE_COOLDOWN_SEC = 2.0
+# WRONGTYPE 告警节流：坏键会让该键长期走进程内计数，每请求重复告警会
+# 刷爆日志；同一键 60 秒最多一条。
+CORRUPT_KEY_LOG_INTERVAL_SEC = 60.0
+# 损坏键表上限：外部误写 / 前缀冲突不应撑爆内存
+_CORRUPT_KEYS_MAX = 1000
 
 
 class CapacityRetry(float):
@@ -328,6 +338,8 @@ class RedisRateLimiter:
             limit=self.limit, window_sec=self.window_sec, max_keys=max_keys
         )
         self._degraded_until = 0.0
+        # 只读脚本失败后的短冷却（不降级整桶，见模块常量）
+        self._read_failed_until = 0.0
         # 是否正处于回退状态：失败后置 True，只有一次成功的 Redis 调用
         # 才会清除。不能用冷却窗口判断——冷却到期但从未重试成功时仍是降级
         self._degraded = client is None
@@ -337,11 +349,24 @@ class RedisRateLimiter:
         # 健康探测节流：/api/health 等接口未限流，廉价 GET 洪泛不能让每个
         # 请求都做一次 Redis 往返（最坏 1.5s socket 超时会占满线程池）
         self._last_probe = 0.0
+        # 键类型损坏（WRONGTYPE）的键：仅该键回退进程内计数（不降级整桶），
+        # 在健康 / 指标里可见；成功调用后自动移除
+        self._corrupt_keys: dict[str, float] = {}
+        self._corrupt_log_at: dict[str, float] = {}
 
     @property
     def degraded(self) -> bool:
         """是否处于进程内回退（启动不可达 / 运行中故障且尚未恢复）。"""
         return self._degraded
+
+    @property
+    def corrupt_keys(self) -> tuple[str, ...]:
+        """当前因键类型损坏（WRONGTYPE）回退进程内计数的键。
+
+        不并入 ``degraded``：桶本身仍健康、其它键继续共享 Redis，只是
+        这些键按实例计数；供健康 / 指标单独展示，避免「键坏了但全绿」。
+        """
+        return tuple(sorted(self._corrupt_keys))
 
     def _get_client(self) -> Any:
         """返回 Redis 客户端；启动时不可用则通过工厂重试获取。"""
@@ -356,36 +381,94 @@ class RedisRateLimiter:
     def _key(self, key: str) -> str:
         return f"{REDIS_KEY_PREFIX}:{self.name}:{key}"
 
-    def _eval(self, script: str, key: str, *args: Any) -> Any:
-        """执行 Lua 脚本；Redis 不可用时返回 None 表示应使用回退实现。"""
+    def _eval(
+        self, script: str, key: str, *args: Any, read_only: bool = False
+    ) -> Any:
+        """执行 Lua 脚本；Redis 不可用时返回 None 表示应使用回退实现。
+
+        ``read_only=True`` 用于 peek / status：这类调用失败只说明只读探测
+        不可靠，不代表权威记账（check / refund）不可用，因此只进入短冷却、
+        不降级整桶（降级会用空进程内桶，已用额度被清零）。
+        """
         # 冷却判定放在取客户端之前：启动不可达的路径不应每个请求都走一遍
         # 工厂（工厂内部虽有单飞，但连接惰性创建在冷却期也会被反复触发）
-        if time.monotonic() < self._degraded_until:
+        now = time.monotonic()
+        if now < self._degraded_until:
+            return None
+        if read_only and now < self._read_failed_until:
+            return None
+        if self._degraded and read_only:
+            # 已降级时只读查询不尝试恢复：Redis 可读不代表可写（OOM /
+            # 只读副本），恢复只能由真实的 check / probe 完成
             return None
         client = self._get_client()
         if client is None:
             self._degraded = True
             return None
         if self._degraded:
-            # 冷却到期后的恢复探测单飞：并发请求不各自等满 socket 超时
+            # 冷却到期后的恢复探测单飞（仅写路径到这里）：并发请求不各自
+            # 等满 socket 超时
             if not self._recovery_lock.acquire(blocking=False):
                 return None
             try:
-                return self._eval_client(client, script, key, *args)
+                return self._eval_client(
+                    client, script, key, *args, read_only=read_only
+                )
             finally:
                 self._recovery_lock.release()
-        return self._eval_client(client, script, key, *args)
+        return self._eval_client(
+            client, script, key, *args, read_only=read_only
+        )
 
-    def _eval_client(self, client: Any, script: str, key: str, *args: Any) -> Any:
+    def _note_corrupt_key(self, key: str) -> None:
+        """记录键类型损坏并做告警节流（该键回退进程内计数）。"""
+        full = self._key(key)
+        now = time.monotonic()
+        if (
+            full in self._corrupt_keys
+            or len(self._corrupt_keys) < _CORRUPT_KEYS_MAX
+        ):
+            self._corrupt_keys[full] = now
+        last = self._corrupt_log_at.get(full)
+        if last is None or now - last >= CORRUPT_KEY_LOG_INTERVAL_SEC:
+            self._corrupt_log_at[full] = now
+            logger.warning(
+                "限流键类型损坏（%s），该键回退为进程内计数", full
+            )
+            if len(self._corrupt_log_at) > _CORRUPT_KEYS_MAX:
+                oldest = min(
+                    self._corrupt_log_at,
+                    key=lambda name: self._corrupt_log_at[name],
+                )
+                self._corrupt_log_at.pop(oldest, None)
+
+    def _eval_client(
+        self,
+        client: Any,
+        script: str,
+        key: str,
+        *args: Any,
+        read_only: bool = False,
+    ) -> Any:
         try:
             result = client.eval(script, 1, self._key(key), *args)
         except Exception as exc:  # noqa: BLE001 - 限流后端故障不能影响请求
             if _is_wrongtype_error(exc):
                 # 单个键被其它数据占用：本次走进程内回退，但桶本身仍健康，
                 # 其它键继续共享 Redis；不要把整桶打进 60 秒冷却
+                self._note_corrupt_key(key)
+                return None
+            if read_only:
+                # 只读探测失败：不认定写路径不可用，只短暂暂停读探测，
+                # 权威 check / refund 仍走 Redis（成功即恢复共享计数）
+                self._read_failed_until = (
+                    time.monotonic() + REDIS_READ_FAILURE_COOLDOWN_SEC
+                )
                 logger.warning(
-                    "限流键类型损坏（%s），该键回退为进程内计数",
+                    "Redis 限流只读查询失败（%s），%s 秒内沿用本地计数：%s",
                     self._key(key),
+                    REDIS_READ_FAILURE_COOLDOWN_SEC,
+                    exc,
                 )
                 return None
             self._degraded_until = time.monotonic() + REDIS_FAILURE_COOLDOWN_SEC
@@ -396,8 +479,11 @@ class RedisRateLimiter:
                 REDIS_FAILURE_COOLDOWN_SEC,
             )
             return None
-        self._degraded = False
-        self._degraded_until = 0.0
+        if not read_only:
+            self._degraded = False
+            self._degraded_until = 0.0
+        self._read_failed_until = 0.0
+        self._corrupt_keys.pop(self._key(key), None)
         return result
 
     @staticmethod
@@ -416,7 +502,9 @@ class RedisRateLimiter:
 
     def peek(self, key: str) -> float | None:
         """不记录请求，返回现在发起请求会被限流的 Retry-After（否则 None）。"""
-        result = self._eval(_PEEK_SCRIPT, key, self.window_sec, self.limit)
+        result = self._eval(
+            _PEEK_SCRIPT, key, self.window_sec, self.limit, read_only=True
+        )
         if result is None:
             return self._fallback.peek(key)
         return self._retry_after(result)
@@ -470,7 +558,9 @@ class RedisRateLimiter:
 
     def status(self, key: str) -> tuple[int, float]:
         """返回 (剩余次数, 窗口重置剩余秒数)，不记录新请求。"""
-        result = self._eval(_STATUS_SCRIPT, key, self.window_sec, self.limit)
+        result = self._eval(
+            _STATUS_SCRIPT, key, self.window_sec, self.limit, read_only=True
+        )
         if result is None:
             return self._fallback.status(key)
         remaining, reset = result
@@ -482,7 +572,10 @@ class RedisRateLimiter:
         """清空该实例的进程内回退状态，并删除 Redis 中同名桶的全部键。"""
         self._fallback.reset()
         self._degraded_until = 0.0
+        self._read_failed_until = 0.0
         self._degraded = self._get_client() is None
+        self._corrupt_keys.clear()
+        self._corrupt_log_at.clear()
         client = self._client
         if client is None:
             return

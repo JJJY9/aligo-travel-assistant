@@ -57,6 +57,7 @@ from config import (
     RATE_LIMIT_CONFIG,
     RESILIENCE_CONFIG,
     STORAGE_CONFIG,
+    _env_bool,
     _env_int,
 )
 from config_agentscope import create_chat_model, init_agentscope, wrap_usage_tracking
@@ -285,16 +286,21 @@ _DOCS_SECURITY_HEADERS = _BASE_SECURITY_HEADERS + [
 
 
 def _security_headers_for(
-    path: str, *, docs_enabled: bool = False
+    path: str,
+    *,
+    docs_enabled: bool = False,
+    docs_paths: frozenset[str] = frozenset(),
 ) -> list[tuple[bytes, bytes]]:
-    """按路径返回安全响应头：仅当文档路由已注册时，文档页使用放宽 CSP。
+    """按路径返回安全响应头：仅真实文档路由使用放宽 CSP。
 
     文档关闭（默认）时 ``/docs`` 等路径是 404：这些 404 必须继续使用严格
     策略，否则「关闭文档」的部署仍会在错误响应上暴露出放宽后的 CSP 面。
+    文档开启时也只认 ``docs_paths`` 里的精确路由（``/docs``、``/redoc``、
+    OAuth 回调页）：按 ``/docs/`` 前缀放宽会让未命中路由的 404（如
+    ``/docs/x``、``/docs/../api/health``）也拿到 ``'unsafe-inline'`` 与
+    外部 CDN——路由之前的中间件看不到最终解析结果，只能按精确集合判定。
     """
-    if docs_enabled and (
-        path in ("/docs", "/redoc") or path.startswith(("/docs/", "/redoc/"))
-    ):
+    if docs_enabled and path in docs_paths:
         headers = _DOCS_SECURITY_HEADERS
     else:
         headers = _SECURITY_HEADERS
@@ -543,10 +549,18 @@ def _host_allowed(host_header: str) -> bool:
 class RequestContextMiddleware:
     """为每个 HTTP 请求生成 / 透传 X-Request-ID，并记录 /api/ 请求耗时。"""
 
-    def __init__(self, app: Any, docs_enabled: bool = False) -> None:
+    def __init__(
+        self,
+        app: Any,
+        docs_enabled: bool = False,
+        docs_paths: frozenset[str] = frozenset(),
+    ) -> None:
         self.app = app
-        # 文档路由是否已注册：只有注册时才给 /docs* 放宽 CSP
+        # 文档路由是否已注册：只有注册时才给文档页放宽 CSP
         self.docs_enabled = docs_enabled
+        # 真实文档路由的精确路径集合（由 create_app 从 FastAPI 实例派生）：
+        # 不按 /docs/ 前缀放宽，避免未命中路由的 404 也拿到宽松策略
+        self.docs_paths = docs_paths
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") != "http":
@@ -580,11 +594,12 @@ class RequestContextMiddleware:
         path = str(scope.get("path", ""))
         route_path = _route_path(scope)
         response_headers = _security_headers_for(
-            route_path, docs_enabled=self.docs_enabled
+            route_path,
+            docs_enabled=self.docs_enabled,
+            docs_paths=self.docs_paths,
         )
         docs_path = self.docs_enabled and (
-            route_path in ("/docs", "/redoc", "/openapi.json")
-            or route_path.startswith(("/docs/", "/redoc/"))
+            route_path in self.docs_paths or route_path == "/openapi.json"
         )
 
         async def send_wrapper(message: dict[str, Any]) -> None:
@@ -647,6 +662,17 @@ class RequestContextMiddleware:
                     # 新版 app.js 与旧 index.html 之类的混合缓存
                     if not cache_values:
                         headers_list.append((b"cache-control", b"no-cache"))
+                # 受管响应头一律以中间件为准：内层（未来新增的路由 / 应用级
+                # 中间件 / 异常处理器）若已设置同名头，先去重再追加，避免
+                # X-Frame-Options 出现 SAMEORIGIN + DENY 两个冲突值（浏览器
+                # 取值不一）或 X-Request-Id 出现两个值
+                managed = {key.lower() for key, _ in response_headers}
+                managed.add(b"x-request-id")
+                headers_list = [
+                    (key, value)
+                    for key, value in headers_list
+                    if key.lower() not in managed
+                ]
                 message["headers"] = (
                     headers_list
                     + response_headers
@@ -1364,7 +1390,10 @@ class TripDedupePayload(BaseModel):
     """
 
     user_id: str = Field(pattern=_ID_PATTERN)
-    dry_run: bool = False
+    # 破坏性操作的保守默认：省略字段只预览（与 KnowledgeDedupePayload 同
+    # 口径），真实删除必须显式传 dry_run=false——按 schema 只填必填字段的
+    # 脚本 / 第三方客户端不会跳过预览直接删除历史行程
+    dry_run: bool = True
 
 
 class SessionTitlePayload(BaseModel):
@@ -2708,20 +2737,26 @@ def _trusted_proxy_networks(raw: str) -> tuple[Any, ...]:
 
 
 def _is_trusted_proxy_peer(peer: str) -> bool:
-    """对端地址是否在可信代理网段内（非 IP 对端一律不可信）。"""
+    """对端地址是否在可信代理网段内（非 IP 对端一律不可信）。
+
+    双栈监听时对端可能以 IPv4 映射形式出现（``::ffff:172.18.0.1``）。运维
+    常把日志里看到的映射形式直接写进 ``TRUSTED_PROXY_CIDRS``：原始地址与
+    映射后的 IPv4 地址都要参与匹配，否则这类配置永远不命中（XFF 被整体
+    忽略、所有客户端共用代理 IP 的限流桶）。
+    """
     try:
         address = ipaddress.ip_address(str(peer or ""))
     except ValueError:
         # "testclient" / "unknown" / UNIX socket 等非 IP 对端
         return False
     mapped = getattr(address, "ipv4_mapped", None)
-    if mapped is not None:
-        address = mapped
+    candidates = (address,) if mapped is None else (address, mapped)
     for network in _trusted_proxy_networks(
         str(RATE_LIMIT_CONFIG.get("trusted_proxy_cidrs", ""))
     ):
-        if network.version == address.version and address in network:
-            return True
+        for candidate in candidates:
+            if network.version == candidate.version and candidate in network:
+                return True
     return False
 
 
@@ -2992,10 +3027,21 @@ def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
     degraded = any(_bucket_degraded(limiter) for limiter in limiters) or (
         backend == "memory" and configured
     )
+    # 键级损坏（WRONGTYPE）只影响单个键（该键回退进程内计数），不并入
+    # 桶级 degraded：单独暴露数量与样本，健康检查 / 指标才发现得了
+    corrupt_keys = sorted(
+        {
+            name
+            for limiter in limiters
+            for name in getattr(limiter, "corrupt_keys", ())
+        }
+    )
     return {
         "backend": backend,
         "configured": configured,
         "degraded": degraded,
+        "corrupt_keys": len(corrupt_keys),
+        "corrupt_key_samples": corrupt_keys[:5],
         "user_limit": state.rate_limiter.limit,
         "ip_limit": state.ip_limiter.limit,
         "kb_limit": state.kb_limiter.limit,
@@ -3073,6 +3119,14 @@ def _enforce_rate_limit(
         )
     user_retry = state.rate_limiter.check(user_key)
     if user_retry is not None:
+        # 并发下多个请求都能通过 peek、逐个记录 IP 桶后才在用户桶被拒：
+        # 归还刚记的 IP 名额，避免被 429 的请求连坐同 IP 的其它用户
+        try:
+            state.ip_limiter.refund(client)
+        except Exception as exc:  # noqa: BLE001 - 归还是尽力而为
+            logger.warning(
+                "归还 IP 限流额度失败: %s", _redacted_exc_log_text(exc)
+            )
         raise _over_limit(
             state.rate_limiter.limit,
             user_retry,
@@ -3112,6 +3166,13 @@ def _refund_rate_limit(
         )
 
 
+async def _refund_rate_limit_async(
+    state: AligoWebApp, user_id: str, request: Request
+) -> None:
+    """``_refund_rate_limit`` 的异步包装（取锁失败回调里归还额度）。"""
+    await asyncio.to_thread(_refund_rate_limit, state, user_id, request)
+
+
 def _refund_kb_rate_limit(state: AligoWebApp, request: Request) -> None:
     """归还一次知识库限流额度（零成本拒绝时使用）。
 
@@ -3125,6 +3186,44 @@ def _refund_kb_rate_limit(state: AligoWebApp, request: Request) -> None:
     except Exception as exc:  # noqa: BLE001 - 归还是尽力而为
         logger.warning(
             "归还知识库限流额度失败: %s", _redacted_exc_log_text(exc)
+        )
+
+
+def _refund_import_rate_limit(state: AligoWebApp, request: Request) -> None:
+    """归还一次导入限流额度（导入槽位繁忙等零成本拒绝时使用）。
+
+    知识库导入 / 预览与行程导入都先记账再抢导入槽位：槽位被占时返回
+    503「请稍后再试」，请求没有做任何导入工作，额度不能留在滑动窗口里
+    ——与 /api/import 的 ``_refund_kb_rate_limit`` 同口径。
+    """
+    client = _rate_identity(_client_host(request))
+    try:
+        state.import_limiter.refund(client)
+    except Exception as exc:  # noqa: BLE001 - 归还是尽力而为
+        logger.warning(
+            "归还导入限流额度失败: %s", _redacted_exc_log_text(exc)
+        )
+
+
+def _refund_read_rate_limit(state: AligoWebApp, request: Request) -> None:
+    """归还一次读限流额度（写接口取锁失败等零成本拒绝时使用）。"""
+    client = _rate_identity(_client_host(request))
+    try:
+        state.read_limiter.refund(client)
+    except Exception as exc:  # noqa: BLE001 - 归还是尽力而为
+        logger.warning(
+            "归还读取限流额度失败: %s", _redacted_exc_log_text(exc)
+        )
+
+
+def _refund_write_rate_limit(state: AligoWebApp, request: Request) -> None:
+    """归还一次写限流额度（写接口取锁失败等零成本拒绝时使用）。"""
+    client = _rate_identity(_client_host(request))
+    try:
+        state.write_limiter.refund(client)
+    except Exception as exc:  # noqa: BLE001 - 归还是尽力而为
+        logger.warning(
+            "归还写入限流额度失败: %s", _redacted_exc_log_text(exc)
         )
 
 
@@ -4718,9 +4817,27 @@ async def _bounded_user_lock(
     lock: asyncio.Lock,
     request_id: str,
     timeout: float = _CHAT_LOCK_WAIT_SEC,
+    on_acquire_failure: Any = None,
 ):
-    """有界等待并自动释放的用户锁（对话 / 导入共用）。"""
-    await _acquire_chat_lock(request, lock, request_id, timeout)
+    """有界等待并自动释放的用户锁（对话 / 导入共用）。
+
+    ``on_acquire_failure`` 在取锁失败（超时 503 / 断连 499）时调用：此时
+    调用方已扣的限流额度要退还（请求没有发生任何 LLM / 存储工作），否则
+    重试风暴会让额度留在滑动窗口里，服务恢复后同样被 429。回调异常只
+    记录日志，不能掩盖原始的取锁异常。
+    """
+    try:
+        await _acquire_chat_lock(request, lock, request_id, timeout)
+    except BaseException:
+        if on_acquire_failure is not None:
+            try:
+                await on_acquire_failure()
+            except Exception as exc:  # noqa: BLE001 - 归还失败不影响原始异常
+                logger.warning(
+                    "取锁失败后的额度归还回调出错: %s",
+                    _redacted_exc_log_text(exc),
+                )
+        raise
     try:
         yield
     finally:
@@ -4742,8 +4859,10 @@ def create_app(model: Any = None) -> FastAPI:
 
     # 交互式 API 文档默认关闭：/docs 加载 CDN 资源、/openapi.json 暴露完整
     # 端点与参数结构，是内网服务最常见的信息泄露面。需要时显式设置
-    # ALIGO_ENABLE_DOCS=1（README 的部署说明同口径）。
-    docs_enabled = os.environ.get("ALIGO_ENABLE_DOCS") == "1"
+    # ALIGO_ENABLE_DOCS=1（README 的部署说明同口径）。走 config._env_bool：
+    # 去 BOM / 成对引号，接受 1/true/yes/on，非法值告警——与 TRUST_PROXY_HEADERS
+    # 等安全开关同口径（裸 == "1" 会让 K8s ConfigMap 注入的 "1" 静默失效）
+    docs_enabled = _env_bool("ALIGO_ENABLE_DOCS", False)
     app = FastAPI(
         title="Aligo 智能旅行助手",
         version=APP_VERSION,
@@ -4753,12 +4872,28 @@ def create_app(model: Any = None) -> FastAPI:
         openapi_url="/openapi.json" if docs_enabled else None,
     )
     app.state.aligo = state
+    # 文档页的精确路由集合（FastAPI 的 Swagger / ReDoc / OAuth 回调）：
+    # 中间件在路由之前执行，只能按精确路径集合判定「真实文档页」，
+    # 前缀匹配会把未命中的 /docs/* 404 也放宽成 CDN + 'unsafe-inline'
+    docs_paths = frozenset(
+        path
+        for path in (
+            app.docs_url,
+            app.redoc_url,
+            app.swagger_ui_oauth2_redirect_url,
+        )
+        if path
+    )
     # Starlette 后注册的中间件在最外层：压缩放在内层，保证 RequestContextMiddleware
     # 能给压缩后的响应补安全头 / 请求 ID，并在异常时可靠地兜底 500。
     app.add_middleware(SelectiveGZipMiddleware, minimum_size=1024)
     # 分块传输没有 Content-Length，需在读取时按实际字节数兜底限制
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BODY_BYTES)
-    app.add_middleware(RequestContextMiddleware, docs_enabled=docs_enabled)
+    app.add_middleware(
+        RequestContextMiddleware,
+        docs_enabled=docs_enabled,
+        docs_paths=docs_paths,
+    )
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error_handler(
@@ -5011,10 +5146,12 @@ def create_app(model: Any = None) -> FastAPI:
             "version": APP_VERSION,
             "model": LLM_CONFIG.get("model_name", ""),
             "has_api_key": bool(LLM_CONFIG.get("api_key")),
-            "storage": describe_backends(),
+            "storage": describe_backends(wait_for_create=False),
             "rate_limit": rate["backend"],
             "rate_limit_configured": rate["configured"],
             "rate_limit_degraded": rate["degraded"],
+            # 键级损坏（WRONGTYPE）回退：不并入 degraded，单独可见
+            "rate_limit_corrupt_keys": rate["corrupt_keys"],
             # 并发会话容量：全部会话在用时的超额对话会收到 503（见
             # SessionCapacityError），运维需要能看到当前占用与上限
             "sessions": {
@@ -5106,6 +5243,10 @@ def create_app(model: Any = None) -> FastAPI:
             "# HELP aligo_rate_limit_degraded 1 if any rate limiter is in fallback.\n"
             "# TYPE aligo_rate_limit_degraded gauge\n"
             f"aligo_rate_limit_degraded {1 if rate['degraded'] else 0}\n"
+            "# HELP aligo_rate_limit_corrupt_keys Rate limit keys falling back "
+            "to in-process counting because of type corruption.\n"
+            "# TYPE aligo_rate_limit_corrupt_keys gauge\n"
+            f"aligo_rate_limit_corrupt_keys {rate['corrupt_keys']}\n"
             "# HELP aligo_rate_limit_backend Current rate limit backend (one-hot).\n"
             "# TYPE aligo_rate_limit_backend gauge\n"
             f'aligo_rate_limit_backend{{backend="{rate["backend"]}"}} 1\n'
@@ -5127,7 +5268,7 @@ def create_app(model: Any = None) -> FastAPI:
             "# TYPE aligo_sessions_max gauge\n"
             f"aligo_sessions_max {state.max_sessions}\n"
         )
-        backends = describe_backends()
+        backends = describe_backends(wait_for_create=False)
         body += (
             "# HELP aligo_storage_backend Current storage backend (one-hot).\n"
             "# TYPE aligo_storage_backend gauge\n"
@@ -5672,6 +5813,8 @@ def create_app(model: Any = None) -> FastAPI:
             await asyncio.to_thread(_enforce_import_rate_limit, state, request)
         )
         if not state.kb_import_queue_slots.acquire(blocking=False):
+            # 槽位被占是零成本拒绝：归还刚扣的导入额度，重试不会耗尽共享桶
+            await asyncio.to_thread(_refund_import_rate_limit, state, request)
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -5707,6 +5850,8 @@ def create_app(model: Any = None) -> FastAPI:
             await asyncio.to_thread(_enforce_import_rate_limit, state, request)
         )
         if not state.kb_import_queue_slots.acquire(blocking=False):
+            # 槽位被占是零成本拒绝：归还刚扣的导入额度，重试不会耗尽共享桶
+            await asyncio.to_thread(_refund_import_rate_limit, state, request)
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -6271,6 +6416,9 @@ def create_app(model: Any = None) -> FastAPI:
         try:
             await asyncio.wait_for(lock.acquire(), timeout=_DELETE_LOCK_TIMEOUT_SEC)
         except (asyncio.TimeoutError, TimeoutError):
+            # 取锁失败前没有任何删除 / 存储写入：归还刚扣的写额度，
+            # 否则长回合期间的重试会在服务恢复后仍被 429
+            await asyncio.to_thread(_refund_write_rate_limit, state, request)
             raise HTTPException(
                 status_code=409, detail="会话正在生成回复，请稍后再试"
             ) from None
@@ -6393,6 +6541,7 @@ def create_app(model: Any = None) -> FastAPI:
         session_id: str,
         expect: str | None,
         turn_id: str | None = None,
+        request: Request | None = None,
     ) -> dict[str, Any]:
         """删除最后一轮的共享实现（DELETE 查询串 / POST body 两种入口）。
 
@@ -6409,6 +6558,11 @@ def create_app(model: Any = None) -> FastAPI:
         try:
             await asyncio.wait_for(lock.acquire(), timeout=_DELETE_LOCK_TIMEOUT_SEC)
         except (asyncio.TimeoutError, TimeoutError):
+            # 取锁失败前没有任何删除 / 存储写入：归还入口已扣的写额度
+            if request is not None:
+                await asyncio.to_thread(
+                    _refund_write_rate_limit, state, request
+                )
             raise HTTPException(
                 status_code=409, detail="会话正在生成回复，请稍后再试"
             ) from None
@@ -6513,7 +6667,9 @@ def create_app(model: Any = None) -> FastAPI:
         查询串形式限制 6000 字（h11 请求行上限）；更长的提问用 POST body 形式。
         """
         await asyncio.to_thread(_enforce_write_rate_limit, state, request)
-        return await _delete_last_turn_impl(user_id, session_id, expect, turn_id)
+        return await _delete_last_turn_impl(
+            user_id, session_id, expect, turn_id, request=request
+        )
 
     @app.post("/api/sessions/{session_id}/last-turn")
     async def delete_last_turn_post(
@@ -6529,7 +6685,8 @@ def create_app(model: Any = None) -> FastAPI:
         """
         await asyncio.to_thread(_enforce_write_rate_limit, state, request)
         return await _delete_last_turn_impl(
-            payload.user_id, session_id, payload.expect, payload.turn_id
+            payload.user_id, session_id, payload.expect, payload.turn_id,
+            request=request,
         )
 
     @app.post("/api/chat")
@@ -6573,7 +6730,12 @@ def create_app(model: Any = None) -> FastAPI:
             _enforce_rate_limit, state, payload.user_id, request
         )
         async with _bounded_user_lock(
-            request, state.lock_for(payload.user_id), _request_id(request)
+            request,
+            state.lock_for(payload.user_id),
+            _request_id(request),
+            on_acquire_failure=lambda: _refund_rate_limit_async(
+                state, payload.user_id, request
+            ),
         ):
             if await asyncio.to_thread(
                 state.is_recently_deleted, payload.user_id, payload.session_id
@@ -6642,6 +6804,11 @@ def create_app(model: Any = None) -> FastAPI:
                 logger.warning(
                     "打开会话失败（%s）: %s", _request_id(request), exc
                 )
+                # 打开会话失败在任何 LLM 调用之前：归还入口已扣的额度，
+                # 否则存储恢复后的重试会被 429 锁在滑动窗口里
+                await asyncio.to_thread(
+                    _refund_rate_limit, state, payload.user_id, request
+                )
                 raise HTTPException(
                     status_code=_persistence_failure_status(exc),
                     detail=_persistence_failure_detail(
@@ -6651,6 +6818,11 @@ def create_app(model: Any = None) -> FastAPI:
             except SessionCapacityError as exc:
                 logger.warning(
                     "会话容纳上限（%s）: %s", _request_id(request), exc
+                )
+                # 容量拒绝同样没有发生 LLM 调用（并发会话满时正是重试
+                # 风暴场景）：归还额度，避免等待中的客户端被 429
+                await asyncio.to_thread(
+                    _refund_rate_limit, state, payload.user_id, request
                 )
                 raise HTTPException(
                     status_code=503,
@@ -6825,7 +6997,15 @@ def create_app(model: Any = None) -> FastAPI:
         # 的状态码；此前异常发生在首个事件之前，只能得到一个已建立又中断的
         # 空流。锁在流结束时释放。
         lock = state.lock_for(payload.user_id)
-        await _acquire_chat_lock(request, lock, rid)
+        try:
+            await _acquire_chat_lock(request, lock, rid)
+        except HTTPException:
+            # 取锁阶段（超时 503 / 断连 499）没有任何 LLM 调用：归还入口
+            # 已扣的额度，避免重试风暴在服务恢复后仍被 429
+            await asyncio.to_thread(
+                _refund_rate_limit, state, payload.user_id, request
+            )
+            raise
         lease: _SessionTurnLease | None = None
         stream_state = {
             "completed": False,
@@ -6945,12 +7125,20 @@ def create_app(model: Any = None) -> FastAPI:
                 )
             except MemoryPersistenceError as exc:
                 logger.warning("打开会话失败（%s）: %s", rid, redact_paths(exc))
+                # 打开会话失败在任何 LLM 调用之前：归还入口已扣的额度
+                await asyncio.to_thread(
+                    _refund_rate_limit, state, payload.user_id, request
+                )
                 raise HTTPException(
                     status_code=_persistence_failure_status(exc),
                     detail=_persistence_failure_detail(exc, rid),
                 ) from exc
             except SessionCapacityError as exc:
                 logger.warning("会话容纳上限（%s）: %s", rid, redact_paths(exc))
+                # 容量拒绝零 LLM 开销：归还额度（与相邻熔断分支同口径）
+                await asyncio.to_thread(
+                    _refund_rate_limit, state, payload.user_id, request
+                )
                 raise HTTPException(
                     status_code=503,
                     detail=f"{exc}（请求 ID：{rid}）",
@@ -7380,6 +7568,8 @@ def create_app(model: Any = None) -> FastAPI:
         # 超时，期间所有用户的导入都 503
         import_client = _rate_identity(_client_host(request))
         if not state.try_begin_import(import_client):
+            # 同来源并发上限拒绝是零成本（未做任何导入）：归还导入额度
+            _refund_import_rate_limit(state, request)
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -7389,6 +7579,8 @@ def create_app(model: Any = None) -> FastAPI:
             )
         if not state.import_queue_slots.acquire(blocking=False):
             state.end_import(import_client)
+            # 全局槽位已满同样零成本：归还导入额度（与上面同口径）
+            _refund_import_rate_limit(state, request)
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -7797,8 +7989,21 @@ def create_app(model: Any = None) -> FastAPI:
                 _close_long_term(store)
 
         # 长回合期间有界等待用户锁：超时明确 503，不让写请求无上限挂起
+        async def _refund_on_lock_failure() -> None:
+            # 取锁失败没有任何计划 / 删除工作：归还本次已扣的写桶（仅真实
+            # 删除扣过）与读桶额度，重试不会耗尽共享桶
+            if not dry_run:
+                await asyncio.to_thread(
+                    _refund_write_rate_limit, state, request
+                )
+            await asyncio.to_thread(_refund_read_rate_limit, state, request)
+
         async with _bounded_user_lock(
-            request, state.lock_for(user_id), _request_id(request), timeout=10.0
+            request,
+            state.lock_for(user_id),
+            _request_id(request),
+            timeout=10.0,
+            on_acquire_failure=_refund_on_lock_failure,
         ):
             return await asyncio.to_thread(_run)
 

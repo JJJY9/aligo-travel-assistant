@@ -682,7 +682,8 @@ def test_webapp_trips_dedupe_postgres(monkeypatch):
         assert [entry["trip_id"] for entry in data["duplicates"]] == ["dup-b"]
 
         applied = client.post(
-            "/api/trips/dedupe", json={"user_id": user_id}
+            "/api/trips/dedupe",
+            json={"user_id": user_id, "dry_run": False},
         )
         assert applied.status_code == 200, applied.text
         assert applied.json()["removed"] == 1

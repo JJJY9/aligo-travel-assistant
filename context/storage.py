@@ -134,13 +134,17 @@ def _create_postgres_memory(user_id: str, dsn: str) -> PostgresLongTermMemory:
     raise AssertionError("unreachable")
 
 
-def _get_redis_client(url: str, force: bool = False):
+def _get_redis_client(url: str, force: bool = False, wait: bool = True):
     """返回共享 Redis 客户端；``force=True`` 时跳过失败冷却强制尝试一次。
 
     删除会话 / 故障重放前的墓碑检查这类低频关键路径不能因冷却期返回
     None 而静默跳过共享保护：冷却只该节省高频枚举的等待时间。
     创建 / ping 全程持模块锁（双重检查）：并发波次只允许一个真实创建者，
     其余等待后命中缓存或冷却，避免连接风暴与多连接池泄漏。
+
+    ``wait=False`` 供健康 / 指标等只读视图：创建在途时直接返回当前缓存
+    状态（通常为 None，即显示回退后端），不等别人的创建波次——跟随者最多
+    等 ``_CREATE_WAIT_SEC``，未限流的健康洪泛会把共享线程池占满。
     """
     global _redis_generation
     with _redis_lock:
@@ -159,6 +163,10 @@ def _get_redis_client(url: str, force: bool = False):
             leader = False
             event = existing
     if not leader:
+        if not wait:
+            # 健康 / 指标视图不等创建波次：直接按当前缓存状态返回
+            with _redis_lock:
+                return _redis_clients.get(url)
         # 从_url + ping 的网络等待不占全局锁：等待同一 URL 的 leader 完成
         event.wait(_CREATE_WAIT_SEC)
         with _redis_lock:
@@ -420,15 +428,22 @@ def reset_failure_cache() -> None:
     reset_pref_version_failure()
 
 
-def describe_backends() -> dict[str, Any]:
+def describe_backends(wait_for_create: bool = True) -> dict[str, Any]:
     """返回当前实际使用的后端名称（供 /api/health 与界面展示）。
 
     ``*_configured`` 表示是否配置了对应后端：配置了但当前回退本地时，
-    界面可提示「已配置后端暂不可用」。
+    界面可提示「已配置后端暂不可用」。``wait_for_create=False`` 供健康 /
+    指标路径：Redis 客户端正在别的线程创建时不等待其完成（见
+    :func:`_get_redis_client`），最坏在极短窗口内显示回退后端。
     """
     url = STORAGE_CONFIG.get("redis_url") or ""
     dsn = STORAGE_CONFIG.get("postgres_dsn") or ""
-    short_term = "redis" if url and _get_redis_client(url) is not None else "memory"
+    redis_client = (
+        _get_redis_client(url)
+        if wait_for_create
+        else _get_redis_client(url, wait=False)
+    )
+    short_term = "redis" if url and redis_client is not None else "memory"
     long_term = _ACTUAL_BACKEND.get("long_term")
     if long_term is None:
         # 本进程还没创建过长期记忆：只能按配置与失败冷却推断

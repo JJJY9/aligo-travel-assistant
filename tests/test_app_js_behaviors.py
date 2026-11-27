@@ -836,8 +836,8 @@ def test_trips_dedupe_panel_flow():
     assert applied["urls"] == ["/api/trips/dedupe", "/api/trips/dedupe"], applied
     assert applied["methods"] == ["POST", "POST"]
     assert applied["bodies"][0] == {"user_id": "u-dedupe", "dry_run": True}
-    assert applied["bodies"][1] == {"user_id": "u-dedupe"}, (
-        "正式执行不能带 dry_run"
+    assert applied["bodies"][1] == {"user_id": "u-dedupe", "dry_run": False}, (
+        "正式执行必须显式 dry_run=false（服务端默认只预览）"
     )
     assert applied["contentTypes"] == ["application/json", "application/json"]
     assert applied["toasts"] == ["已清理 2 条重复行程"]
