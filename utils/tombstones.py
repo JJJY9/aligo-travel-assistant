@@ -134,16 +134,19 @@ def bump_session_epoch(
         logger.warning("写入会话纪元失败：%s", exc)
 
 
-def get_session_epoch_state(user_id: str, session_id: str) -> tuple[bool, str | None]:
+def get_session_epoch_state(
+    user_id: str, session_id: str, force: bool = False
+) -> tuple[bool, str | None]:
     """读取会话纪元，返回 ``(是否读到, 纪元值)``。
 
     ``(True, None)`` 表示「确实从未删除」；``(False, None)`` 表示 Redis
     未配置 / 失败冷却中 / 读取故障——调用方不能把两者都当成「没变化」或
     都当成「被删除」，否则一次瞬时故障会误否决未删除回合的落库（或让
-    删除保护静默失效）。
+    删除保护静默失效）。``force=True`` 供落库守卫等低频关键路径跳过失败
+    冷却真实尝试一次：冷却只该节省高频枚举的等待时间。
     """
     global _failure_until
-    client = _shared_client()
+    client = _shared_client(force=force)
     if client is None:
         return False, None
     try:

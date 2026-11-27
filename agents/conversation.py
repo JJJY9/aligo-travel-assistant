@@ -1164,8 +1164,19 @@ class ConversationRuntime:
                         )
                     except Exception:  # noqa: BLE001 - 状态不明按可用处理
                         redis_degraded = False
+                seed = getattr(
+                    self.memory.short_term,
+                    "seed_fallback_context",
+                    None,
+                )
                 try:
-                    if not redis_degraded:
+                    if not redis_degraded and callable(seed):
+                        # 在线回填同样按 timestamp 有序插入：其它实例可能
+                        # 已把最新回合写入同一 Redis 键，append 会把旧历史
+                        # 排到新回合之后，窗口尾部只剩旧轮次。该方法携带
+                        # 回合 id 并按内容指纹跨实例去重
+                        seed(recent)
+                    elif not redis_degraded:
                         items = list(recent)
                         for index, item in enumerate(items):
                             role = item.get("role")
@@ -1193,11 +1204,6 @@ class ConversationRuntime:
                         # 降级窗口：写入进程内影子缓存（不登记故障重放），
                         # 编排器 / 子智能体本轮也能读到回填的历史；恢复后
                         # 以 Redis 真实内容校正影子缓存
-                        seed = getattr(
-                            self.memory.short_term,
-                            "seed_fallback_context",
-                            None,
-                        )
                         if callable(seed):
                             seed(recent)
                 except Exception:  # noqa: BLE001 - 写回失败不影响本轮

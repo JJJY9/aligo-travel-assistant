@@ -332,7 +332,7 @@ def test_persist_turn_defaults_to_shared_tombstone_guard(monkeypatch):
 
     calls = []
 
-    def deleted(user_id, session_id):
+    def deleted(user_id, session_id, force=False):
         calls.append((user_id, session_id))
         return True
 
@@ -495,7 +495,9 @@ def test_memory_manager_persist_guard_vetoes_on_epoch_change(monkeypatch):
     epochs = {"state": (True, "2")}
     monkeypatch.setattr(tombstones, "is_session_deleted", lambda u, s, force=False: False)
     monkeypatch.setattr(
-        tombstones, "get_session_epoch_state", lambda u, s: epochs["state"]
+        tombstones,
+        "get_session_epoch_state",
+        lambda u, s, force=False: epochs["state"],
     )
     assert manager.persist_guard((True, "1"), None)() is False, (
         "回合开始后会话被删除（纪元变化）必须否决"

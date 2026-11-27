@@ -1615,6 +1615,47 @@ def test_persist_guard_skips_pending_tombstone_replay(monkeypatch):
     print("✓ 落库守卫跳过待补写墓碑")
 
 
+def test_persist_guard_force_reads_shared_tombstone_during_cooldown():
+    """共享墓碑重试窗口内，落库守卫（force_shared）仍真实读取一次。"""
+    import time as time_module
+
+    client = _client()
+    state = client.app.state.aligo
+    original = state._redis_client
+    calls: list[bool] = []
+
+    class _Shared:
+        def exists(self, key):
+            calls.append(True)
+            return 1
+
+    state._redis_client = _Shared()
+    state._tombstones_shared = False
+    state._tombstone_retry_at = time_module.monotonic() + 60
+    try:
+        assert (
+            state.is_recently_deleted(
+                "u-guard", "s-guard", replay_pending=False, force_shared=True
+            )
+            is True
+        ), "冷却期内共享墓碑仍须挡住已删除会话"
+        assert calls == [True]
+        calls.clear()
+        # 成功的共享读取会自愈重试窗口；重新置回窗口内验证非关键路径的省略
+        state._tombstones_shared = False
+        state._tombstone_retry_at = time_module.monotonic() + 60
+        assert (
+            state.is_recently_deleted("u-guard", "s-guard", replay_pending=False)
+            is False
+        ), "非关键路径在重试窗口内仍回退进程内墓碑"
+        assert calls == []
+    finally:
+        state._redis_client = original
+        state._tombstones_shared = True
+        state._tombstone_retry_at = 0.0
+    print("✓ 落库守卫在墓碑冷却期强制读取共享墓碑")
+
+
 def test_chat_lock_released_when_disconnect_probe_raises():
     """拿到用户锁后断连探测抛异常：锁必须归还，不能永久 locked。"""
     import asyncio
@@ -14352,6 +14393,48 @@ def test_usage_summary_tz_parameter_buckets_browser_day():
     fallback = _usage_summary(history, "Not/AZone")
     assert len(fallback["by_day"]) == 7
     print("✓ 用量 by_day 支持浏览器时区参数")
+
+
+def test_usage_summary_naive_timestamp_uses_browser_zone():
+    """JSON 后端的 naive 服务器墙钟也要按浏览器时区分桶（tz 不能只对 PG 生效）。"""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from utils.timestamps import to_aware
+    from webapp.server import _usage_summary
+
+    naive = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    aware = to_aware(naive.isoformat())
+    target = ZoneInfo("Pacific/Midway")  # UTC-11：与东八区 / UTC 都跨日
+    expected = aware.astimezone(target).date().isoformat()
+    server_day = naive.date().isoformat()
+    if expected == server_day:
+        pytest.skip("本机时区与 UTC-11 同一天，无法构造跨日用例")
+
+    meta = {
+        "usage": {"calls": 1, "input_tokens": 2, "output_tokens": 3, "total_tokens": 5},
+        "elapsed": 1.0,
+        "agents": [],
+    }
+    history = [
+        {
+            "role": "assistant",
+            "content": json.dumps({"results": [], "_meta": meta}, ensure_ascii=False),
+            "timestamp": naive.isoformat(),
+            "session_id": "s",
+        }
+    ]
+    usage = _usage_summary(history, "Pacific/Midway")
+    buckets = {day["date"]: day["tokens"] for day in usage["by_day"]}
+    assert buckets.get(expected) == 5, (buckets, expected)
+    assert buckets.get(server_day, 0) == 0, "naive 时间戳不能绕过 tz 参数"
+
+    # 缺省（CLI / 导出）仍是服务器本地日期口径
+    local_buckets = {
+        day["date"]: day["tokens"] for day in _usage_summary(history)["by_day"]
+    }
+    assert local_buckets.get(server_day) == 5, local_buckets
+    print("✓ 用量 by_day 对 naive 时间戳同样按浏览器时区分桶")
 
 
 def test_cached_chronological_key_invalidates_on_tz_change():

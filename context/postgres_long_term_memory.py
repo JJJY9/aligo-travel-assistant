@@ -14,6 +14,7 @@ import logging
 import re
 import secrets
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable
 from datetime import datetime
@@ -29,6 +30,7 @@ from utils.log_redact import redact_secret
 from utils.preference_values import merge_preference_value, preference_value_problem
 from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_export import normalized_uid_token
+from utils.turn_meta import extract_turn_meta
 
 
 def _pg_timestamp(value: str) -> str:
@@ -127,6 +129,11 @@ _TRIP_ORIGIN_KEY = "COALESCE(origin, '')"
 # 版本升级新增表由重新部署（进程重启）触发。
 _SCHEMA_READY: set[str] = set()
 _SCHEMA_LOCK = threading.Lock()
+# 等 schema 锁超时跳过一次 DDL 后的进程内退避窗口：跳过路径必须 O(1)，
+# 否则滚动扩容窗口内每个新会话构造都会再等满一次锁超时，把 Web 的
+# 会话构建线程池（6 个 worker）逐个钉住
+_SCHEMA_SKIP_UNTIL: dict[str, float] = {}
+_SCHEMA_SKIP_SEC = 30.0
 # 多实例同时首次启动时串行化建表（跨进程）；滚动发布中旧实例不持此锁，
 # 目录竞争错误按「对象已存在」容忍并重试一次
 _SCHEMA_ADVISORY_LOCK = "aligo:schema_ddl"
@@ -308,9 +315,15 @@ class PostgresLongTermMemory:
         with _SCHEMA_LOCK:
             if key in _SCHEMA_READY:
                 return
+            if _SCHEMA_SKIP_UNTIL.get(key, 0.0) > time.monotonic():
+                # 上一次等锁超时跳过了 DDL：退避窗口内直接返回，避免每个
+                # 新会话构造都再等满一次锁超时
+                return
             # 等锁超时跳过 DDL 时不标记完成：下次构造重试
             if self._create_schema():
                 _SCHEMA_READY.add(key)
+            else:
+                _SCHEMA_SKIP_UNTIL[key] = time.monotonic() + _SCHEMA_SKIP_SEC
 
     def _ensure_trip_uid_column(self) -> None:
         """懒迁移：uid_token 列缺失时补建（DDL 整批被跳过 / 升级窗口）。
@@ -362,8 +375,10 @@ class PostgresLongTermMemory:
         with self._conn.cursor() as cursor:
             # 建索引可能让持锁方占用较久：等待 schema 锁期间放宽
             # lock_timeout（连接默认 3 秒，等待锁超时会冒到构造函数、
-            # 让工厂把健康的 PostgreSQL 误判为故障并回退 JSON）
-            cursor.execute("SET lock_timeout = '60s'")
+            # 让工厂把健康的 PostgreSQL 误判为故障并回退 JSON）。只等 5 秒：
+            # 拿不到锁就跳过本次 DDL（表结构由持锁实例推进，幂等稍后重试），
+            # 不能让每个构造请求都卡满 60 秒
+            cursor.execute("SET lock_timeout = '5s'")
             locked = False
             try:
                 try:
@@ -1339,42 +1354,26 @@ class PostgresLongTermMemory:
             )
         return removed
 
-    def delete_last_turn(self, session_id: str, expect: str | None = None) -> int:
+    def delete_last_turn(
+        self,
+        session_id: str,
+        expect: str | None = None,
+        *,
+        turn_id: str | None = None,
+    ) -> int:
         """删除某个会话最后一轮对话（助手回答 + 对应用户提问），返回删除条数。
 
         「最后一轮」按 ``created_at, id`` 认定，与 :meth:`get_chat_history`
         的读取顺序一致：备份恢复会把旧消息以旧时间戳、新 id 写到表尾，
         按 id 认定会删掉刚恢复的旧一轮而不是界面显示的最后一轮。
         ``expect`` 不为 None 时先校验最后一轮的用户提问内容，不一致直接
-        返回 0；删除语句带「没有更新消息」条件，避免在多进程场景下与并发
-        写入交错后删错回合。
+        返回 0；``turn_id``（最后一轮助手消息的 ``_meta.client_turn_id``）
+        在同一事务、取得 chat_messages 写入锁之后复核，另一进程并发追加
+        同文提问时不会删错轮次，不一致返回 -1；删除语句带「没有更新消息」
+        条件，避免与并发写入交错。
         """
-        rows = self._fetchall(
-            "SELECT id, role, content, created_at FROM aligo_chat_messages "
-            "WHERE user_id = %s AND session_id = %s "
-            # 不再排除未来时间戳：界面（get_chat_history 无 limit）会展示
-            # 导入的 2030 行并把它当最后一轮，这里排除会让「编辑 / 重新
-            # 生成」删到更早的真实轮次（expect 永远 mismatch）。只保留
-            # 读取侧（limit）的未来过滤，供会话总结 / 短期回填窗口使用
-            "ORDER BY created_at DESC, id DESC LIMIT 2",
-            (self.user_id, session_id),
-        )
-        if not rows:
-            return 0
-        ids = [rows[0][0]]
-        last_user_content: str | None = None
-        if len(rows) >= 2 and rows[0][1] == "assistant" and rows[1][1] == "user":
-            ids.append(rows[1][0])
-            last_user_content = str(rows[1][2])
-        elif rows[0][1] == "user":
-            last_user_content = str(rows[0][2])
-        if expect is not None:
-            if last_user_content is None or last_user_content.strip() != expect.strip():
-                logger.info(
-                    "Skip deleting last turn of session %s: content mismatch", session_id
-                )
-                return 0
-        def _delete_rows() -> int:
+
+        def run() -> int:
             with self._conn.transaction(), self._conn.cursor() as cursor:
                 cursor.execute("SET LOCAL lock_timeout = '30s'")
                 cursor.execute(
@@ -1387,6 +1386,66 @@ class PostgresLongTermMemory:
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"aligo:chat_messages:{self.user_id}",),
                 )
+                # 最后一轮必须在取得写入锁之后读取：锁外的预检与真正删除
+                # 之间若有另一个进程（CLI / 另一实例）追加同文提问，删除
+                # 会把对方的轮次当成「最后一轮」而误删
+                cursor.execute(
+                    "SELECT id, role, content, created_at FROM aligo_chat_messages "
+                    "WHERE user_id = %s AND session_id = %s "
+                    # 不再排除未来时间戳：界面（get_chat_history 无 limit）会展示
+                    # 导入的 2030 行并把它当最后一轮，这里排除会让「编辑 / 重新
+                    # 生成」删到更早的真实轮次（expect 永远 mismatch）。只保留
+                    # 读取侧（limit）的未来过滤，供会话总结 / 短期回填窗口使用
+                    "ORDER BY created_at DESC, id DESC LIMIT 2",
+                    (self.user_id, session_id),
+                )
+                rows = list(cursor.fetchall())
+                if not rows:
+                    return 0
+                ids = [rows[0][0]]
+                last_user_content: str | None = None
+                if len(rows) >= 2 and rows[0][1] == "assistant" and rows[1][1] == "user":
+                    ids.append(rows[1][0])
+                    last_user_content = str(rows[1][2])
+                elif rows[0][1] == "user":
+                    last_user_content = str(rows[0][2])
+                if turn_id is not None:
+                    assistant_content: str | None = None
+                    if rows[0][1] == "assistant":
+                        assistant_content = str(rows[0][2])
+                    else:
+                        # 最后一轮只有孤儿提问（上一轮助手写入失败）：与 Web
+                        # 原预检同口径，按会话内最后一条助手消息比对回合 id
+                        cursor.execute(
+                            "SELECT content FROM aligo_chat_messages "
+                            "WHERE user_id = %s AND session_id = %s "
+                            "AND role = 'assistant' "
+                            "ORDER BY created_at DESC, id DESC LIMIT 1",
+                            (self.user_id, session_id),
+                        )
+                        assistant = cursor.fetchone()
+                        if assistant is not None:
+                            assistant_content = str(assistant[0])
+                    meta = (
+                        extract_turn_meta(assistant_content or "")
+                        if assistant_content is not None
+                        else None
+                    )
+                    if (
+                        not isinstance(meta, dict)
+                        or str(meta.get("client_turn_id") or "") != turn_id
+                    ):
+                        logger.info(
+                            "Skip deleting last turn of session %s: turn id mismatch",
+                            session_id,
+                        )
+                        return -1
+                if expect is not None:
+                    if last_user_content is None or last_user_content.strip() != expect.strip():
+                        logger.info(
+                            "Skip deleting last turn of session %s: content mismatch", session_id
+                        )
+                        return 0
                 # 「更新」按与读取一致的 created_at, id 排序判定：只看 id
                 # 会把恢复写入的旧消息误当成新消息，导致删除被意外拒绝
                 cursor.execute(
@@ -1439,7 +1498,7 @@ class PostgresLongTermMemory:
 
         # DELETE 匹配的是「当前最后一轮」：提交后响应丢失时重放可能删掉
         # 期间新到的同文本回合，不能自动重放（按持久化失败上报）
-        removed = self._run_with_retry(_delete_rows, replay_safe=False)
+        removed = self._run_with_retry(run, replay_safe=False)
         logger.info("Deleted last turn of session %s (%s messages)", session_id, removed)
         return removed
 

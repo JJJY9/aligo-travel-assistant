@@ -17,7 +17,7 @@ import time
 import weakref
 from collections import Counter
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import repeat
 from pathlib import Path
 from typing import Any, Iterator
@@ -36,8 +36,9 @@ from utils.preference_values import (
     has_preference_value,
     is_manageable_pref_type,
 )
-from utils.timestamps import chronological_key
+from utils.timestamps import chronological_key, to_aware
 from utils.trip_dedupe import trip_id_text
+from utils.turn_meta import extract_turn_meta
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +190,37 @@ def _stat_fingerprint(stat_info: os.stat_result) -> tuple[int, int, int] | None:
         return None
 
 
+# 「迁移备份已确认可解析」的进程级正面缓存：迁移结果未落盘期间（脏文件 +
+# 只读访问），每次新建实例都会重新校验整份备份。备份是整份账号数据的
+# 副本（可达数十 MB），按 (路径, stat 指纹) 缓存解析结果后，读接口不再
+# 每次加载都多解析一份同规模 JSON。只缓存成功结果：半截备份仍需每次
+# 尝试重建，指纹变化（原子替换 / 截断）会自然绕过缓存。
+_BACKUP_VALID_CACHE: dict[tuple[str, tuple[int, int, int]], None] = {}
+_BACKUP_VALID_CACHE_MAX = 64
+
+
+def _backup_parsed_valid(backup: str) -> bool:
+    """备份是否为可解析的 JSON 对象；成功结果按 stat 指纹缓存。"""
+    fingerprint: tuple[int, int, int] | None = None
+    try:
+        fingerprint = _stat_fingerprint(os.stat(backup))
+    except OSError:
+        return False
+    key = (backup, fingerprint) if fingerprint is not None else None
+    if key is not None and key in _BACKUP_VALID_CACHE:
+        return True
+    try:
+        with open(backup, encoding="utf-8") as existing:
+            valid = isinstance(json.load(existing), dict)
+    except (OSError, ValueError):
+        return False
+    if valid and key is not None:
+        if len(_BACKUP_VALID_CACHE) >= _BACKUP_VALID_CACHE_MAX:
+            _BACKUP_VALID_CACHE.clear()
+        _BACKUP_VALID_CACHE[key] = None
+    return valid
+
+
 def _postgres_configured() -> bool:
     """是否配置了 PostgreSQL 后端（JSON 只是故障回退时的临时载体）。"""
     try:
@@ -196,6 +228,26 @@ def _postgres_configured() -> bool:
 
         return bool(STORAGE_CONFIG.get("postgres_dsn"))
     except Exception:  # noqa: BLE001 - 读取失败按未配置
+        return False
+
+
+# 与 memory_manager / PostgreSQL 的「最近 N 条」口径一致：时间戳超前当前
+# 时刻一小时以上的消息视为异常导入数据，不进入 limit 窗口（短期回填 /
+# 总结）。否则未来消息排在本后端数组末尾，会永久占据窗口、把真实最近
+# 对话挤出模型上下文。
+_CHAT_FUTURE_SKEW = timedelta(hours=1)
+
+
+def _is_future_message(message: dict[str, Any]) -> bool:
+    """消息时间戳是否明显在未来（JSON 的 limit 读取与 PG 同口径排除）。"""
+    if not isinstance(message, dict):
+        return False
+    parsed = to_aware(message.get("timestamp"))
+    if parsed is None:
+        return False
+    try:
+        return parsed > datetime.now(parsed.tzinfo) + _CHAT_FUTURE_SKEW
+    except (OverflowError, ValueError, OSError):
         return False
 
 
@@ -1014,6 +1066,14 @@ class LongTermMemory:
                     "记忆主文件缺失且存在损坏隔离备份，已拒绝重建写入"
                     f"（备份：{evidence_path}）"
                 )
+            if self._dirty and not blocking_backups and not quarantined:
+                # 无主文件且无隔离证据（新账号首次写入失败 / 文件被删除）：
+                # 丢弃未落盘的修改，与 _load 的文件缺失口径一致。否则批内
+                # 回滚与写前重载都「无盘可读」而静默保留失败数据，下一次
+                # 成功写入会把已报告失败的偏好 / 行程 / 消息一并提交
+                self.data = self._init_data()
+                self._dirty = False
+                self._loaded_stat = None
             return
         except OSError as exc:
             # 文件被占用 / 瞬时 I/O 故障（Windows 共享冲突、杀软扫描）：
@@ -1151,12 +1211,8 @@ class LongTermMemory:
         """
         backup = f"{self.db_path}.migrate-backup"
         if os.path.exists(backup):
-            try:
-                with open(backup, encoding="utf-8") as existing:
-                    if isinstance(json.load(existing), dict):
-                        return
-            except (OSError, ValueError):
-                pass
+            if _backup_parsed_valid(backup):
+                return
             logger.warning("迁移备份不完整，重新生成：%s", backup)
         tmp_path: str | None = None
         try:
@@ -1183,6 +1239,16 @@ class LongTermMemory:
             os.chmod(backup, 0o600)
         except OSError:  # Windows 只映射只读位；权限本就不按 POSIX 位控制
             pass
+        # 刚生成的备份是当前合法文件的完整副本：登记正面缓存，下一次加载
+        # 不必再整份解析一次（键随指纹变化自动失效）
+        try:
+            fingerprint = _stat_fingerprint(os.stat(backup))
+        except OSError:
+            fingerprint = None
+        if fingerprint is not None:
+            if len(_BACKUP_VALID_CACHE) >= _BACKUP_VALID_CACHE_MAX:
+                _BACKUP_VALID_CACHE.clear()
+            _BACKUP_VALID_CACHE[(backup, fingerprint)] = None
         logger.warning("迁移修复前已备份原始记忆文件到 %s", backup)
 
     def _migrate_data(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -1196,21 +1262,55 @@ class LongTermMemory:
             迁移后的数据
         """
         # 1. 确保必需字段存在
+        destructive = False
         if "chat_history" not in data:
             data["chat_history"] = []
-        if not isinstance(data.get("session_titles"), dict):
+        # 会话元数据容器：键缺失（老格式 / 最小夹具）静默补默认；键存在但
+        # 类型错误属于破坏性修正——重置前必须置 destructive 触发迁移备份，
+        # 否则任意下一次写入会把重置后的快照落盘，用户自定标题 / 置顶 /
+        # 归档永久丢失且没有原始副本
+        if "session_titles" in data and not isinstance(data["session_titles"], dict):
+            logger.warning(
+                "会话标题容器类型错误（%s），重置为空",
+                type(data["session_titles"]).__name__,
+            )
             data["session_titles"] = {}
-        if not isinstance(data.get("pinned_sessions"), list):
+            destructive = True
+        data.setdefault("session_titles", {})
+        if "pinned_sessions" in data and not isinstance(data["pinned_sessions"], list):
+            logger.warning(
+                "置顶会话容器类型错误（%s），重置为空",
+                type(data["pinned_sessions"]).__name__,
+            )
             data["pinned_sessions"] = []
-        if not isinstance(data.get("archived_sessions"), list):
+            destructive = True
+        data.setdefault("pinned_sessions", [])
+        if "archived_sessions" in data and not isinstance(
+            data["archived_sessions"], list
+        ):
+            logger.warning(
+                "归档会话容器类型错误（%s），重置为空",
+                type(data["archived_sessions"]).__name__,
+            )
             data["archived_sessions"] = []
+            destructive = True
+        data.setdefault("archived_sessions", [])
         if "trip_history" not in data:
             data["trip_history"] = []
+        stats_present = "statistics" in data
         stats_missing = not isinstance(data.get("statistics"), dict)
         if stats_missing:
+            if stats_present:
+                # 与列表容器同口径：存在但形状错误是破坏性修正（统计内容
+                # 不可读、只能重建）；键完全缺失是极老格式 / 新账号的正常
+                # 初始状态，静默补默认即可
+                logger.warning(
+                    "统计容器类型错误（%s），重置为空",
+                    type(data["statistics"]).__name__,
+                )
+                destructive = True
             data["statistics"] = {}
         stats = data["statistics"]
-        destructive = False
         # 计数器存在但为 null / 字符串 / 布尔时按 0 处理：这类文件是合法
         # JSON，不修复的话每次写入（+= 1）都会抛 TypeError，而且永远不会
         # 进入损坏备份 / 自愈路径。缺失键（新建用户第一轮落盘后缺
@@ -2068,6 +2168,21 @@ class LongTermMemory:
             ]
 
         if limit:
+            if limit > 0:
+                # 反向收集满 limit 即停（O(limit) 而非整表过滤）：与 PG 的
+                # created_at <= now()+1h 同口径排除明显未来的导入消息，
+                # 否则它们会永久占据「最近 N 条」窗口，把真实最近对话挤出
+                # 短期回填与跨会话总结；无 limit 的导出 / 会话详情不过滤，
+                # 保留备份与历史回看保真
+                recent_window: list[dict[str, Any]] = []
+                index = len(messages) - 1
+                while index >= 0 and len(recent_window) < limit:
+                    message = messages[index]
+                    if not _is_future_message(message):
+                        recent_window.append(message)
+                    index -= 1
+                recent_window.reverse()
+                return recent_window
             return messages[-limit:]
         return messages
 
@@ -2177,12 +2292,23 @@ class LongTermMemory:
         return removed
 
     @_locked_mutation
-    def delete_last_turn(self, session_id: str, expect: str | None = None) -> int:
+    def delete_last_turn(
+        self,
+        session_id: str,
+        expect: str | None = None,
+        *,
+        turn_id: str | None = None,
+    ) -> int:
         """删除某个会话最后一轮对话（助手回答 + 对应用户提问），返回删除条数。
 
         ``expect`` 不为 None 时会校验最后一轮的用户提问内容：不一致说明这条
         提问并未真正写入（例如意图识别阶段就失败），此时不删除任何内容，
         避免误删上一轮已保存的对话。
+
+        ``turn_id`` 为调用方看到的最后一轮助手消息 ``_meta.client_turn_id``：
+        在与删除同一临界区内复核，另一进程（CLI / 另一实例，不受 Web 的
+        按用户锁约束）并发追加同文提问时不会被删错轮次；不一致返回 -1
+        （调用方按 mismatch 处理），不再需要删除前整会话预读。
         """
         history = self.data["chat_history"]
         indexes = [
@@ -2192,6 +2318,29 @@ class LongTermMemory:
         ]
         if not indexes:
             return 0
+        if turn_id is not None:
+            last_assistant = next(
+                (
+                    history[index]
+                    for index in reversed(indexes)
+                    if history[index].get("role") == "assistant"
+                ),
+                None,
+            )
+            meta = (
+                extract_turn_meta(str(last_assistant.get("content") or ""))
+                if last_assistant is not None
+                else None
+            )
+            if (
+                not isinstance(meta, dict)
+                or str(meta.get("client_turn_id") or "") != turn_id
+            ):
+                logger.info(
+                    "Skip deleting last turn of session %s: turn id mismatch",
+                    session_id,
+                )
+                return -1
         count = 1
         last_user_index = indexes[-1] if history[indexes[-1]].get("role") == "user" else None
         if (

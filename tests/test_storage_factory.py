@@ -2766,9 +2766,234 @@ def test_describe_backends_configured_flags(monkeypatch):
     print("✓ describe_backends 报告配置 / 回退状态")
 
 
+def test_describe_backends_empty_url_does_not_probe_redis(monkeypatch, caplog):
+    """未配置 REDIS_URL 时描述后端不得尝试创建客户端或误报「Redis 不可用」。"""
+    import logging
+
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "")
+    storage.reset_failure_cache()
+    try:
+        with caplog.at_level(logging.WARNING, logger="context.storage"):
+            storage.describe_backends()
+            storage.describe_backends(wait_for_create=False)
+        assert "Redis 不可用" not in caplog.text
+        assert "redis:" not in storage._FAILED_UNTIL
+    finally:
+        storage.reset_failure_cache()
+    print("✓ 未配置 Redis 时描述后端不触发连接探针")
+
+
+def test_json_chat_history_limit_excludes_future_messages():
+    """JSON 的 limit 读取排除未来时间戳（与 PG 同口径），无 limit 导出保真。"""
+    from datetime import datetime, timedelta
+
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-future-window", tempfile.mkdtemp())
+    memory.add_chat_message("user", "真实提问", "s1")
+    memory.add_chat_message("assistant", "真实回答", "s1")
+    future = (datetime.now() + timedelta(days=365)).isoformat()
+    for index in range(12):
+        memory.add_chat_message("user", f"未来{index}", "s1", timestamp=future)
+
+    window = memory.get_chat_history(limit=10, session_id="s1")
+    assert [item["content"] for item in window] == ["真实提问", "真实回答"], window
+    assert len(memory.get_chat_history(session_id="s1")) == 14, "无 limit 时保真"
+    assert len(memory.get_chat_history(limit=10)) == 2, "跨会话窗口同样排除未来"
+    print("✓ JSON 最近 N 条排除未来时间戳，导出路径保真")
+
+
+def test_migrate_bad_session_metadata_backs_up_before_reset():
+    """会话标题 / 置顶 / 归档 / 统计容器坏形状属破坏性修正：重置前留备份。"""
+    from context.long_term_memory import LongTermMemory
+
+    cases = [
+        ("session_titles", ["s1"], dict),
+        ("pinned_sessions", {"s1": True}, list),
+        ("archived_sessions", "s1", list),
+        ("statistics", ["x"], dict),
+    ]
+    for key, bad_value, expected_type in cases:
+        storage_dir = tempfile.mkdtemp()
+        payload = {
+            "chat_history": [],
+            "trip_history": [],
+            "preferences": [],
+            "session_titles": {},
+            "pinned_sessions": [],
+            "archived_sessions": [],
+            "statistics": {},
+        }
+        payload[key] = bad_value
+        db_path = Path(storage_dir) / "u-meta.json"
+        db_path.write_text(json.dumps(payload), encoding="utf-8")
+
+        memory = LongTermMemory("u-meta", storage_dir)
+        backup = Path(storage_dir) / "u-meta.json.migrate-backup"
+        assert backup.exists(), f"{key} 重置前必须留迁移备份"
+        assert json.loads(backup.read_text(encoding="utf-8")) == payload
+        assert isinstance(memory.data[key], expected_type), key
+
+        memory.add_chat_message("user", "hi", "s1")
+        flushed = json.loads(db_path.read_text(encoding="utf-8"))
+        assert isinstance(flushed[key], expected_type), key
+    print("✓ 元数据容器坏形状先备份再重置")
+
+
+def test_migrate_backup_parse_cache_avoids_reparsing(monkeypatch):
+    """迁移结果未落盘期间，重复加载不再整份解析已确认有效的备份。"""
+    import context.long_term_memory as ltm
+    from context.long_term_memory import LongTermMemory
+
+    storage_dir = tempfile.mkdtemp()
+    payload = {
+        "preferences": [
+            {"type": "home_location", "value": "A"},
+            {"type": "home_location", "value": "B"},
+        ]
+    }
+    db_path = Path(storage_dir) / "u-cache.json"
+    db_path.write_text(json.dumps(payload), encoding="utf-8")
+    backup = Path(storage_dir) / "u-cache.json.migrate-backup"
+    backup.write_text(json.dumps(payload), encoding="utf-8")
+
+    loads: list[str] = []
+    real_load = ltm.json.load
+
+    def counting(stream, *args, **kwargs):
+        name = str(getattr(stream, "name", ""))
+        if name.endswith(".migrate-backup"):
+            loads.append(name)
+        return real_load(stream, *args, **kwargs)
+
+    monkeypatch.setattr(ltm.json, "load", counting)
+    for _ in range(3):
+        memory = LongTermMemory("u-cache", storage_dir)
+        assert memory.get_preference().get("home_location") == "B"
+    assert len(loads) <= 1, f"有效备份被重复解析：{loads}"
+    print("✓ 有效迁移备份按 stat 指纹缓存，不再每次全量解析")
+
+
+def test_write_batch_rollback_without_main_file_discards_failed_writes():
+    """无主文件（新账号）时批内回滚也必须丢弃失败修改，不能被下次写入提交。"""
+    import pytest
+
+    from context.long_term_memory import LongTermMemory
+
+    storage_dir = tempfile.mkdtemp()
+    memory = LongTermMemory("u-batch-new", storage_dir)
+    assert not (Path(storage_dir) / "u-batch-new.json").exists()
+
+    with pytest.raises(RuntimeError):
+        with memory.write_batch():
+            memory.save_preference("home_location", "上海")
+            memory.save_trip_history(
+                {
+                    "origin": "北京",
+                    "destination": "上海",
+                    "start_date": "2026-12-01",
+                    "end_date": "2026-12-02",
+                }
+            )
+            raise RuntimeError("boom")
+
+    assert "home_location" not in memory.get_preference()
+    assert memory.get_trip_history(limit=None) == []
+
+    memory.increment_query_count()
+    saved = json.loads(
+        (Path(storage_dir) / "u-batch-new.json").read_text(encoding="utf-8")
+    )
+    assert saved["preferences"] == []
+    assert saved["trip_history"] == []
+    print("✓ 无主文件时批内回滚丢弃失败修改，后续写入不再携带")
+
+
+def test_delete_last_turn_turn_id_checked_inside_lock():
+    """turn_id 在删除临界区内复核：旧快照实例不会删掉并发进程的新回合。"""
+    from context.long_term_memory import LongTermMemory
+    from utils.turn_meta import attach_turn_meta
+
+    def _assistant(turn_id: str) -> str:
+        return json.dumps(
+            attach_turn_meta({"results": []}, {"client_turn_id": turn_id}),
+            ensure_ascii=False,
+        )
+
+    storage_dir = tempfile.mkdtemp()
+    first = LongTermMemory("u-turn-lock", storage_dir)
+    first.add_chat_turn("同一问题", _assistant("turn-a"), "s1")
+
+    # 另一个进程（新实例）追加同文提问：first 的内存快照仍是旧的一轮
+    other = LongTermMemory("u-turn-lock", storage_dir)
+    other.add_chat_turn("同一问题", _assistant("turn-b"), "s1")
+
+    assert (
+        first.delete_last_turn("s1", expect="同一问题", turn_id="turn-a") == -1
+    ), "锁内重载后看到的是 turn-b，不能按旧快照删掉并发回合"
+    assert len(first.get_chat_history(session_id="s1")) == 4
+    assert first.delete_last_turn("s1", expect="同一问题", turn_id="turn-b") == 2
+    assert len(first.get_chat_history(session_id="s1")) == 2
+    print("✓ 删除最后一轮在锁内按 turn_id 复核")
+
+
+def test_pg_schema_skip_backoff_avoids_repeated_lock_waits():
+    """schema 锁等待超时后进入退避窗口：下一次构造不再重复等锁。"""
+    import psycopg
+
+    from context import postgres_long_term_memory as pg_module
+
+    dsn = "postgresql://schema-skip-backoff/test"
+    pg_module._SCHEMA_READY.discard(dsn)
+    pg_module._SCHEMA_SKIP_UNTIL.pop(dsn, None)
+    statements: list[str] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            text = " ".join(str(sql).split())
+            statements.append(text)
+            if "pg_advisory_lock" in text and "unlock" not in text:
+                raise psycopg.errors.LockNotAvailable("lock timeout")
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+    store = object.__new__(pg_module.PostgresLongTermMemory)
+    store.dsn = dsn
+    store._conn = _Conn()
+    try:
+        store._ensure_schema()
+        assert statements, "首次构造应真实尝试 DDL"
+        assert any("lock_timeout = '5s'" in text for text in statements)
+        attempted = len(statements)
+        store._ensure_schema()
+        assert len(statements) == attempted, "退避窗口内不得再次尝试 DDL"
+        assert dsn in pg_module._SCHEMA_SKIP_UNTIL
+    finally:
+        pg_module._SCHEMA_READY.discard(dsn)
+        pg_module._SCHEMA_SKIP_UNTIL.pop(dsn, None)
+    print("✓ schema 锁超时后退避，不再逐个构造等满锁超时")
+
+
 def test_json_write_failures_raise():
     """所有 JSON 写操作在 _save 失败时都必须抛错（不能静默成功）。"""
     memory = LongTermMemory("u-persist-fail", tempfile.mkdtemp())
+    # 先落一份健康文件：失败写入会被下一次写前重载回滚到它（无主文件时
+    # 回滚为初始快照，删除 / 清空这类「有内容才写盘」的操作就没有可写项）
+    memory.save_preference("home_location", "北京")
+    memory.add_chat_message("user", "hi", "s1")
+    memory.save_trip_history(
+        {"origin": "北京", "destination": "上海", "start_date": "2026-12-05"}
+    )
     memory._save = lambda: False
     actions = [
         ("偏好", lambda: memory.save_preference("home_location", "北京")),
@@ -7362,10 +7587,36 @@ def test_pg_recent_reads_exclude_future_timestamps():
     """
     from context.postgres_long_term_memory import PostgresLongTermMemory
 
+    import contextlib as contextlib_module
+
     captured: list[str] = []
+
+    class _Cursor:
+        rowcount = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            captured.append(str(sql))
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
 
     class _Conn:
         autocommit = True
+
+        def transaction(self):
+            return contextlib_module.nullcontext()
+
+        def cursor(self):
+            return _Cursor()
 
     memory = object.__new__(PostgresLongTermMemory)
     memory.user_id = "u-future"

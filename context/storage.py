@@ -147,6 +147,10 @@ def _get_redis_client(url: str, force: bool = False, wait: bool = True):
     等 ``_CREATE_WAIT_SEC``，未限流的健康洪泛会把共享线程池占满。
     """
     global _redis_generation
+    if not url:
+        # 空 URL（默认本地部署从未配置 Redis）不是故障：不创建客户端、
+        # 不进入失败冷却、不打「Redis 不可用」告警
+        return None
     with _redis_lock:
         client = _redis_clients.get(url)
         if client is not None:

@@ -48,6 +48,7 @@ from utils.preference_values import (
     preference_value_problem,
 )
 from utils.result_formatter import normalize_missing_items
+from utils.turn_meta import strip_turn_meta
 
 logger = logging.getLogger(__name__)
 
@@ -770,7 +771,19 @@ class OrchestrationAgent(AgentBase):
             recent_context = (
                 short_term.get_recent_context(3) if short_term is not None else []
             )
-            context["recent_dialogue"] = recent_context
+            # 助手消息在短期记忆里原样带 _meta（回合 id 回填 / 删除要读）：
+            # 传给子智能体的副本剥掉内部账目，与意图上下文 strip_turn_meta
+            # 同口径——不能原地修改共享 dict，否则删除最后一轮找不到 turn_id
+            context["recent_dialogue"] = [
+                (
+                    {**item, "content": strip_turn_meta(item["content"])}
+                    if isinstance(item, dict)
+                    and item.get("role") == "assistant"
+                    and isinstance(item.get("content"), str)
+                    else item
+                )
+                for item in recent_context
+            ]
             # 用户本轮原话：偏好等抽取只依据该文本，避免把上下文 / 助手建议
             # 里的内容误当成用户偏好
             context["user_query"] = next(
