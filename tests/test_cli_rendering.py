@@ -488,6 +488,62 @@ def test_result_formatter_generic_output_field():
     print("✓ 通用兜底渲染识别 output 字段")
 
 
+def test_cli_realtime_renders_rag_sources():
+    """CLI 实时知识问答与 Web / 历史 / 导出同口径：展示参考来源与参考片段。"""
+    instance = _new_cli()
+    results = [
+        {
+            "agent_name": "rag_knowledge",
+            "status": "success",
+            "data": {
+                "answer": "一线城市住宿标准 600 元/晚。",
+                "retrieved_documents": [
+                    {
+                        "id": 3,
+                        "content": "一线城市住宿标准：500 元/晚，凭发票报销。",
+                        "metadata": {"parent_doc": "01_travel_standards.txt"},
+                    },
+                    {
+                        "id": 4,
+                        "content": "面板知识：住宿优先协议酒店。",
+                        "metadata": {"category": "住宿"},
+                    },
+                ],
+            },
+        }
+    ]
+    assert instance._generate_human_response(results) is True
+    output = instance._buffer.getvalue()
+    assert "参考来源" in output, output
+    assert "01_travel_standards.txt" in output, output
+    assert "参考片段" in output and "凭发票报销" in output, output
+
+
+def test_cli_rag_sources_escape_rich_markup():
+    """来源 / 片段里的第三方内容按字面展示，不触发 rich 标记解析。"""
+    instance = _new_cli()
+    results = [
+        {
+            "agent_name": "rag_knowledge",
+            "status": "success",
+            "data": {
+                "answer": "答案",
+                "retrieved_documents": [
+                    {
+                        "id": 1,
+                        "content": "片段含 [https://example.com] 与 [red]标记[/red]",
+                        "metadata": {"parent_doc": "[/red]"},
+                    }
+                ],
+            },
+        }
+    ]
+    assert instance._generate_human_response(results) is True
+    output = instance._buffer.getvalue()
+    assert "[/red]" in output, output
+    assert "[https://example.com]" in output, output
+
+
 def test_skill_loader_warns_missing_manifest(tmp_path, capsys):
     from utils.skill_loader import SkillLoader
 
@@ -574,6 +630,8 @@ if __name__ == "__main__":
     test_preferences_table_keeps_zero_and_lists()
     test_result_formatter_generic_output_field()
     test_cli_realtime_renders_itinerary_validation_warning()
+    test_cli_realtime_renders_rag_sources()
+    test_cli_rag_sources_escape_rich_markup()
     print("全部通过（capsys 相关用例请用 pytest 运行）")
     test_agent_error_uses_aggregated_message()
     if _DIRECT_RUN_SKIP:

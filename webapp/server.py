@@ -5511,7 +5511,12 @@ def create_app(model: Any = None) -> FastAPI:
                 logger.warning("检索评测初始化失败: %s", redact_paths(exc))
                 raise _knowledge_unavailable("评测初始化失败", exc) from exc
             if not agent.initialized:
-                raise HTTPException(status_code=503, detail="RAG 依赖未安装")
+                # 未初始化原因可能是缺依赖，也可能是缺库 / 维度不一致：
+                # agent 给出的专用提示（init_error）更准确，不能一律报「依赖未安装」
+                raise HTTPException(
+                    status_code=503,
+                    detail=getattr(agent, "init_error", "") or "RAG 依赖未安装",
+                )
             try:
                 # 全部评测问题逐个检索，首次会加载嵌入模型；接口为 sync，
                 # FastAPI 在线程池执行

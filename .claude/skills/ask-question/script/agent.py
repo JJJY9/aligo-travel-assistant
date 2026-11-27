@@ -36,6 +36,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 
 from utils.json_parser import extract_json_from_async_response
 from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
+from utils.simple_skill import unwrap_answer_envelope
 from utils.milvus_client import (  # noqa: F401 - shutdown_milvus_clients 供外部清理
     get_milvus_client,
     next_entity_id,
@@ -62,9 +63,11 @@ try:
     import pymilvus  # noqa: F401 - 仅用于检测依赖是否安装
     from sentence_transformers import SentenceTransformer  # noqa: F401 - 依赖检测
     DEPENDENCIES_AVAILABLE = True
+    _DEPENDENCY_ERROR_KIND = ""
 except (ImportError, OSError) as e:
     # Windows 缺 VC++ 运行库 / ABI 不匹配时 torch 导入抛 OSError(WinError 126)
     # 而不是 ImportError：漏掉会让整个技能模块加载失败，初始化降级提示不可达
+    _DEPENDENCY_ERROR_KIND = "oserror" if isinstance(e, OSError) else "import"
     logger.warning(f"RAG dependencies not available: {e}")
     logger.warning("Install with: pip install pymilvus sentence-transformers")
     DEPENDENCIES_AVAILABLE = False
@@ -80,6 +83,7 @@ from utils.hybrid_retrieval import (
 )
 from utils.access_log import _safe_log_text
 from utils.log_redact import redact_paths
+from utils.skill_paths import knowledge_init_command
 from utils.user_query import extract_user_query
 
 # 进程内集合初始化互斥：并发的首次构造都会看到 has_collection=False，
@@ -172,6 +176,21 @@ class RAGKnowledgeAgent(AgentBase):
         if not DEPENDENCIES_AVAILABLE:
             logger.error("RAG dependencies not installed. Install with: pip install pymilvus sentence-transformers")
             self.initialized = False
+            # 依赖已安装但原生库加载失败（Windows 缺 VC++ 运行库 / ABI 不匹配
+            # 时 torch 抛 OSError）与真的没装依赖是两回事：只给 pip 提示会让
+            # 用户重装仍无法恢复。异常原文只进日志（可能含本机路径），不进回复。
+            if _DEPENDENCY_ERROR_KIND == "oserror":
+                self.init_error = (
+                    "RAG 依赖已安装但原生库加载失败（常见原因：缺少 "
+                    "Microsoft Visual C++ 运行库，或 torch / numpy 版本不匹配）。"
+                    "可先安装 VC++ 运行库；仍失败请重装依赖："
+                    "pip install pymilvus sentence-transformers"
+                )
+            else:
+                self.init_error = (
+                    "缺少 RAG 依赖，请安装："
+                    "pip install pymilvus sentence-transformers"
+                )
             return
 
         # 配置只作为默认值：调用方显式传入的模型优先，否则系统永远是
@@ -197,7 +216,7 @@ class RAGKnowledgeAgent(AgentBase):
             self.initialized = False
             self.init_error = (
                 "知识库尚未初始化（找不到 milvus_lite.db），请先运行 "
-                "python .claude/skills/ask-question/script/init_knowledge_base.py"
+                f"{knowledge_init_command()}"
             )
             logger.error(self.init_error)
             return
@@ -211,8 +230,7 @@ class RAGKnowledgeAgent(AgentBase):
                 self.initialized = False
                 self.init_error = (
                     "知识库缺少集合（milvus_lite.db 存在但尚未初始化知识），"
-                    "请运行 python .claude/skills/ask-question/script/"
-                    "init_knowledge_base.py 或先导入知识文档"
+                    f"请运行 {knowledge_init_command()} 或先导入知识文档"
                 )
                 logger.error(self.init_error)
                 return
@@ -279,8 +297,7 @@ class RAGKnowledgeAgent(AgentBase):
                 self.initialized = False
                 self.init_error = (
                     "知识库缺少集合（milvus_lite.db 存在但尚未初始化知识），"
-                    "请运行 python .claude/skills/ask-question/script/"
-                    "init_knowledge_base.py 或先导入知识文档"
+                    f"请运行 {knowledge_init_command()} 或先导入知识文档"
                 )
                 logger.error(self.init_error)
                 return
@@ -388,7 +405,7 @@ class RAGKnowledgeAgent(AgentBase):
                     raise RuntimeError(
                         "知识库向量维度"
                         f" {dim} 与嵌入模型 {self.embedding_dim} 不一致，"
-                        "请重新运行 python init_knowledge_base.py 重建知识库"
+                        f"请重新运行 {knowledge_init_command()} 重建知识库"
                     )
             except (TypeError, ValueError):
                 return
@@ -1347,8 +1364,29 @@ class RAGKnowledgeAgent(AgentBase):
             else:
                 retried = _above_threshold(retried)
                 if retried:
+                    # 首轮命中已被 _covers_query 判定为未覆盖（擦边无关）：
+                    # 救援成功后不能与真实证据同权注入。只保留与重检索
+                    # 命中同组的分片（_assemble_grouped_documents 拼回
+                    # 多分片整篇需要），独立擦边片段丢弃，合并结果也不
+                    # 超过 top_k 的上下文预算。
+                    retried_groups = {
+                        str(meta.get("group"))
+                        for doc in retried
+                        for meta in [doc.get("metadata")]
+                        if isinstance(meta, dict) and meta.get("group")
+                    }
+
+                    def _same_group(doc: dict) -> bool:
+                        meta = doc.get("metadata")
+                        return (
+                            isinstance(meta, dict)
+                            and str(meta.get("group") or "") in retried_groups
+                        )
+
                     merged = {
-                        str(doc.get("id")): doc for doc in retrieved_docs
+                        str(doc.get("id")): doc
+                        for doc in retrieved_docs
+                        if _same_group(doc)
                     }
                     for doc in retried:
                         key = str(doc.get("id"))
@@ -1443,16 +1481,17 @@ class RAGKnowledgeAgent(AgentBase):
                     # 普通失败回答（用户本可重试恢复）
                     raise ConnectionError("模型服务返回空响应")
 
-                # 清理 LLM 可能输出的 JSON 格式
-                answer_str = answer.strip()
-                if answer_str.startswith("{") and answer_str.endswith("}"):
-                    try:
-                        json_obj = json.loads(answer_str)
-                        # 如果 LLM 输出了 {"answer": "..."} 或 {"content": "..."}
-                        if isinstance(json_obj, dict):
-                            answer = json_obj.get("answer") or json_obj.get("content") or answer
-                    except Exception:
-                        pass
+                # 清理 LLM 可能输出的 JSON 格式：围栏 / 前后串词 / 示例
+                # 回显与简单技能共用同一解包实现（ask-question 的
+                # SKILL.md 同样含 "answer" 示例，模型照抄时会原样展示）
+                answer_text = (
+                    answer
+                    if isinstance(answer, str)
+                    else json.dumps(answer, ensure_ascii=False)
+                )
+                answer = unwrap_answer_envelope(answer_text)
+                if not answer.strip():
+                    raise ConnectionError("模型服务返回空响应")
 
             except Exception as e:
                 if is_retriable_error(e) or is_permanent_llm_error(e):
@@ -1481,6 +1520,9 @@ class RAGKnowledgeAgent(AgentBase):
             "answer": answer,
             "retrieved_documents": [
                 {
+                    # 片段 id 供来源回指面板中的具体条目（Web 添加的片段
+                    # 只有分类、没有标题，参考来源需按 id 回退展示）
+                    "id": doc.get("id"),
                     # 参考片段取「命中分片」的原文：多分片文档的 content
                     # 是整篇拼接，其前缀通常是 part 1 而不是证据段
                     "content": (

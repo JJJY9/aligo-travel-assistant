@@ -75,7 +75,9 @@ def test_top_k_truncation():
 
 def test_empty_cases():
     result = evaluate_retrieval(lambda query, top_k: [], cases=(), top_k=5)
-    assert result == {
+    assert result["mode"] == "vector"
+    assert "纯向量" in result["note"]
+    assert {k: v for k, v in result.items() if k not in ("mode", "note")} == {
         "total": 0,
         "hit1": 0.0,
         "hit3": 0.0,
@@ -97,6 +99,10 @@ def test_min_score_filters_low_similarity_and_warns():
     assert result["hit5"] == 0.0 and result["mrr"] == 0.0
     assert "warning" in result and "题库" in result["warning"]
     assert "min_score" in result["warning"], "告警需提示阈值排查，不能只引导换题库"
+    # 口径说明：评测是纯向量 top-K，不含 BM25 / 混合召回（避免被当成聊天可用率）
+    assert result.get("mode") == "vector", result
+    assert "纯向量" in str(result.get("note")), result
+    assert "BM25" in str(result.get("note")), result
 
     def search_high(query, top_k):
         return [{"content": "关键词", "distance": 0.8}]

@@ -1561,6 +1561,26 @@ class AligoCLI:
                     self.console.print(_markup_safe(str(answer)))
                     current_agent_shown = True
 
+                # 参考来源 / 参考片段：与 Web / 历史 / 导出的 Markdown
+                # 渲染共用同一收集口径，终端主路径也能看到知识溯源
+                from utils.result_formatter import rag_source_extracts
+                source_data = data if isinstance(data, dict) else {}
+                if not source_data.get("retrieved_documents"):
+                    nested_data = source_data.get("data")
+                    if isinstance(nested_data, dict):
+                        source_data = nested_data
+                doc_names, snippets = rag_source_extracts(source_data)
+                if doc_names:
+                    self.console.print("\n[bold]参考来源[/bold]")
+                    for doc_name in doc_names:
+                        self.console.print(f"  {_markup_safe(doc_name)}", style="dim")
+                    current_agent_shown = True
+                if snippets:
+                    self.console.print("\n[bold]参考片段[/bold]")
+                    for snippet in snippets:
+                        self.console.print(f"  > {_markup_safe(snippet)}", style="dim")
+                    current_agent_shown = True
+
             # 记忆查询
             elif agent_name == "memory_query":
                 query_result = data.get("answer") or data.get("result") or data.get("content")
@@ -2659,16 +2679,21 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
             )
         return 1
     if not agent.initialized:
+        # 未初始化原因可能是缺依赖，也可能是缺库 / 维度不一致：优先用
+        # agent 的专用提示（init_error），不能一律报「依赖未安装」
+        init_error = getattr(agent, "init_error", "") or (
+            "RAG 依赖未安装（pip install -r requirements.txt）"
+        )
         if as_json:
             print(
                 json.dumps(
-                    {"ok": False, "error": "RAG 依赖未安装"},
+                    {"ok": False, "error": init_error},
                     ensure_ascii=False,
                     indent=2,
                 )
             )
         else:
-            print("评测失败：RAG 依赖未安装（pip install -r requirements.txt）")
+            print(f"评测失败：{_plain_safe(init_error)}")
         return 1
 
     try:
@@ -2709,6 +2734,10 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
         f"检索评测：{result['total']} 个问题 · hit@1 {result['hit1']:.0%} · "
         f"hit@3 {result['hit3']:.0%} · hit@5 {result['hit5']:.0%} · MRR {result['mrr']:.2f}"
     )
+    # 口径说明（server / rag_eval 同源）：避免把评测 hit@K 误读为聊天可用率
+    eval_note = result.get("note")
+    if eval_note:
+        print(f"口径：{eval_note}")
     if not passed:
         if result["hit5"] == 0:
             print("提示：所有问题均未命中，可能是索引未加载 / 知识库故障，而非切分策略问题")

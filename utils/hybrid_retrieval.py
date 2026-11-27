@@ -17,6 +17,11 @@ from typing import Any, Sequence
 
 _TOKEN_RE = re.compile(r"[a-z0-9_]+|[一-鿿]+")
 
+# 疑问/客套词字符表（与技能侧检索噪声清洗口径对齐）。跨词二元组伪影
+# （「股票怎么买」按相邻字切出的 票怎）与疑问词共用这些字符，命中的
+# 若全是这类词，说明内容词一个都没匹配上，不能当真实证据。
+_QUESTION_NOISE_CHARS = frozenset("怎么什么如何吗呢吧啊呀嘛哪")
+
 # 进程级缓存失效版本号：技能脚本可能以不同模块名被加载多次（懒加载注册器、
 # 测试重复导入），每个副本各有一份模块级缓存；知识写入方 bump 版本号后，
 # 所有副本在下一次读取时都会判定缓存过期，不必互相持有对方的缓存对象
@@ -192,6 +197,9 @@ class BM25Index:
         按缺失词的质量缩水；绝对证据量让只命中一个高频词（idf≈1）的
         片段停在 0.5 上下，必须命中更多 / 更罕见的查询词才能接近 1.0。
         长度中性（不做文档长度归一）；TF 仍影响 BM25 排序本身。
+
+        命中词全部是疑问/客套词或跨词二元组伪影（与疑问词共用字符）时
+        返回 0：真实内容词一个都没匹配上的片段不能以高分通过 min_score。
         """
         terms = self._query_idf_terms(query)
         if not terms or not self.documents:
@@ -199,6 +207,13 @@ class BM25Index:
         tf = Counter(tokenize(content))
         matched = [(term, idf) for term, idf in terms if tf.get(term)]
         if not matched:
+            return 0.0
+        trusted_matched = [
+            (term, idf)
+            for term, idf in matched
+            if term in self._idf and not (set(term) & _QUESTION_NOISE_CHARS)
+        ]
+        if not trusted_matched:
             return 0.0
         # 跨词二元组（「磁悬浮怎么坐」里的 浮怎 / 么坐）是连续中文串按相邻
         # 字切词的伪影、不在任何文档里：按 unseen IDF 计入覆盖度分母会把
@@ -209,7 +224,9 @@ class BM25Index:
         # 如「结婚」「请假」）仍按 unseen 计入，保留「内容词全 OOV 时
         # 基准不坍缩」的防护。
         unseen = self._unseen_idf()
-        rare_hit = unseen > 0 and any(idf >= unseen / 2 for _, idf in matched)
+        rare_hit = unseen > 0 and any(
+            idf >= unseen / 2 for _, idf in trusted_matched
+        )
         in_library_chars: set[str] = set()
         if rare_hit:
             for term, _ in terms:

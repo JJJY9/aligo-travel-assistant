@@ -1519,6 +1519,56 @@ def test_perf_round_probe_and_render_budget():
     print("✓ 性能热路径（探针不阻塞 / 单次渲染 / 隐藏面板早退）")
 
 
+def test_kb_semantic_refresh_quiet_keeps_mode():
+    """语义模式收尾刷新失败（429）：保留语义视图、不 toast、不切关键词列表。"""
+    results = _run_harness("kbSemanticRefreshQuiet")
+    quiet = results["quiet"]
+    assert quiet["mode"] is True, quiet
+    assert quiet["semanticQuery"] == "住宿", quiet
+    assert quiet["toasts"] == [], quiet
+    assert quiet["rendered"] == 0, quiet
+    noisy = results["noisy"]
+    assert noisy["mode"] is False, "非静默刷新失败仍按原逻辑退出语义模式"
+    assert any("语义结果刷新失败" in t for t in noisy["toasts"]), noisy
+    assert results["settled"] is True
+    print("✓ 语义收尾刷新失败保留语义视图")
+
+
+def test_kb_category_change_keeps_unsubmitted_query():
+    """语义模式下切换分类：搜索框里未提交的输入不能被静默丢弃。"""
+    results = _run_harness("kbCategoryDraft")
+    assert results["beforeMode"] is True
+    assert results["mode"] is False
+    assert results["query"] == "差旅"
+    assert "q=%E5%B7%AE%E6%97%85" in results["url"], results["url"]
+    assert "category=%E4%BD%8F%E5%AE%BF" in results["url"], results["url"]
+    print("✓ 切换分类保留未提交搜索词")
+
+
+def test_kb_import_busy_not_reported_as_partial_write():
+    """导入槽位繁忙 503：零写入拒绝不能被误报成「可能已写入」并多余刷新。"""
+    results = _run_harness("kbImportBusy")
+    assert results["toasts"] == [
+        "已有知识库导入任务在处理，请稍后再试（请求 ID：0123456789abcdef）"
+    ], results["toasts"]
+    assert results["pendingUrls"] == []
+    assert results["refreshCalls"] == 0
+    assert results["importing"] is False
+    assert results["buttonText"] == "导入 JSON"
+    assert results["disabled"] is False
+    print("✓ 导入槽位繁忙不冒充部分写入")
+
+
+def test_kb_delete_stale_400_refreshes_list():
+    """删除返回 400（结构冲突）：提示并刷新列表，行不本地删除。"""
+    results = _run_harness("kbDeleteStale400")
+    assert any("已刷新列表" in t for t in results["toasts"]), results["toasts"]
+    assert results["refreshArgs"] == [{"silentFailure": True}]
+    assert results["removed"] is False
+    assert results["deleting"] == []
+    print("✓ 删除 400 时刷新列表")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -1595,6 +1645,10 @@ if __name__ == "__main__":
     test_retry_checks_turn_persisted_first()
     test_download_suppresses_concurrency_and_times_out()
     test_kb_search_state_machine()
+    test_kb_semantic_refresh_quiet_keeps_mode()
+    test_kb_category_change_keeps_unsubmitted_query()
+    test_kb_import_busy_not_reported_as_partial_write()
+    test_kb_delete_stale_400_refreshes_list()
     test_send_message_confirms_pending_edit_draft()
     test_session_html_export_uses_full_server_endpoint()
     test_session_refresh_keeps_expanded_list()

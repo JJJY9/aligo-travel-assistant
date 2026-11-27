@@ -48,6 +48,7 @@ async def ask_question(user_query: str):
             "error": (
                 "RAG 未初始化，请先运行 "
                 "python .claude/skills/ask-question/script/init_knowledge_base.py"
+                "（wheel 安装：aligo kb-init --documents <文档目录>）"
             )
         }
     user_msg = Msg(name="user", content=user_query, role="user")
@@ -63,14 +64,14 @@ data = asyncio.run(ask_question("北京的住宿标准是多少？"))
 
 - `status`: `"success"` 或 `"no_knowledge"`
 - `answer`: 自然语言答案
-- `retrieved_documents`: 列表，每项含 `content`, `metadata`
+- `retrieved_documents`: 列表，每项含 `id`, `content`, `metadata`
 - `query`: 用户问题
 
 ## 知识库
 
 - 路径：默认 `.claude/skills/ask-question/data/rag_knowledge/`（Milvus Lite；旧部署的 `rag_knowledge/` 仍作为回退），由 `utils.knowledge_paths.default_knowledge_dir` 统一解析
 - 源文档：`data/documents/`，共 8 类（差旅标准、报销、预订、FAQ、紧急处理、平台指南、城市指南、环保）
-- 首次使用前需执行：`python .claude/skills/ask-question/script/init_knowledge_base.py`
+- 首次使用前需执行：`python .claude/skills/ask-question/script/init_knowledge_base.py`（wheel 安装：`aligo kb-init --documents <文档目录>`）
 
 
 ## 回答生成指南

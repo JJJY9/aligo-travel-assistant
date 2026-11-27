@@ -2247,7 +2247,176 @@ def test_rag_retries_when_first_hit_does_not_cover_simplified_terms():
     assert len(calls) == 2, calls
     text = json.dumps(payload, ensure_ascii=False)
     assert "磁悬浮" in text, "擦边误命中不能阻断救援重检"
+    # 首轮擦边片段已被 _covers_query 判定为未覆盖：救援成功后不能与真实
+    # 证据同权注入答案与参考文档
+    assert "高铁" not in text, "被判定未覆盖的擦边片段不能进入答案"
+    assert all(
+        "高铁" not in str(doc.get("content"))
+        for doc in payload["retrieved_documents"]
+    ), payload["retrieved_documents"]
     print("✓ 边缘误命中仍触发简化查询重检索")
+
+
+def _bare_rag_agent(agent_class, model):
+    """构造不连真实 Milvus / 嵌入模型的 RAG Agent（仅注入 fake search）。"""
+
+    class _Agent(agent_class):
+        def __init__(self):
+            from agentscope.agent import AgentBase
+
+            AgentBase.__init__(self)
+            self.name = "RAGKnowledgeAgent"
+            self.initialized = True
+            self.model = model
+
+            class _Loader:
+                def get_skill_content(self, name):
+                    return ""
+
+            self.skill_loader = _Loader()
+
+    return _Agent()
+
+
+def test_rag_retry_merge_bounded_by_top_k():
+    """首轮 5 条无关擦边 + 重检索 5 条相关：合并后不超过 top_k 条。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+    agent = _bare_rag_agent(agent_class, _FakeModel())
+    agent.top_k = 5
+    calls: list[str] = []
+
+    def fake_search(query, k=None, s=False, hybrid=False, min_distance=None):
+        calls.append(str(query))
+        if len(calls) == 1:
+            return [
+                {
+                    "id": f"u{i}",
+                    "content": f"无关片段{i}：机场贵宾厅使用规则",
+                    "metadata": {},
+                    "distance": 0.50 + i / 100,
+                }
+                for i in range(5)
+            ]
+        return [
+            {
+                "id": f"r{i}",
+                "content": f"住宿标准为每晚 600 元（第{i}条）",
+                "metadata": {},
+                "distance": 0.60 + i / 100,
+            }
+            for i in range(5)
+        ]
+
+    agent.search_knowledge = fake_search
+    out = asyncio.run(
+        agent.reply(Msg(name="x", content="磁悬浮怎么坐？", role="user"))
+    )
+    payload = json.loads(out.content)
+    assert len(calls) == 2, calls
+    docs = payload["retrieved_documents"]
+    assert len(docs) <= 5, docs
+    assert all("住宿标准" in doc["content"] for doc in docs), docs
+    print("✓ 重检索合并结果不超过 top_k 且不含首轮无关片段")
+
+
+def test_rag_retry_keeps_same_group_fragments():
+    """首轮片段与重检索命中同属一个多分片文档：保留以拼回整篇。"""
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+    agent = _bare_rag_agent(agent_class, _FakeModel())
+    calls: list[str] = []
+
+    def fake_search(query, k=None, s=False, hybrid=False, min_distance=None):
+        calls.append(str(query))
+        if len(calls) == 1:
+            return [
+                {
+                    "id": "10",
+                    "content": "出行方式说明：高铁与飞机是常见出差交通方式",
+                    "metadata": {"group": "g1", "part": 1, "parts": 2},
+                    "distance": 0.52,
+                }
+            ]
+        return [
+            {
+                "id": "11",
+                "content": "磁悬浮（8分钟到龙阳路）",
+                "metadata": {"group": "g1", "part": 2, "parts": 2},
+                "distance": 0.62,
+            }
+        ]
+
+    agent.search_knowledge = fake_search
+    out = asyncio.run(
+        agent.reply(Msg(name="x", content="磁悬浮怎么坐？", role="user"))
+    )
+    payload = json.loads(out.content)
+    text = json.dumps(payload, ensure_ascii=False)
+    assert len(calls) == 2, calls
+    # 同组分片被保留并拼回整篇：retrieved_parts=2/parts=2 说明首轮 part 1
+    # 与重检索 part 2 都在（展示用的片段快照只取命中分片）
+    docs = payload["retrieved_documents"]
+    assert len(docs) == 1, docs
+    meta = docs[0].get("metadata") or {}
+    assert meta.get("parts") == 2 and meta.get("retrieved_parts") == 2, docs
+    assert "磁悬浮" in text, payload
+    print("✓ 重检索保留同组分片以拼回整篇")
+
+
+class _EnvelopeModel:
+    """返回固定文本的模型（模拟输出 JSON 信封 / 围栏 / 前导串词）。"""
+
+    def __init__(self, text):
+        self.text = text
+
+    async def __call__(self, messages, **kwargs):
+        return self.text
+
+
+def _reply_with_model_text(model_text: str) -> dict:
+    agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
+    agent = _bare_rag_agent(agent_class, _EnvelopeModel(model_text))
+
+    def fake_search(query, k=None, s=False, hybrid=False, min_distance=None):
+        return [
+            {
+                "id": "1",
+                "content": "一线城市住宿标准为每晚上限 600 元",
+                "metadata": {"parent_doc": "01_travel_standards.txt"},
+                "distance": 0.82,
+            }
+        ]
+
+    agent.search_knowledge = fake_search
+    out = asyncio.run(
+        agent.reply(Msg(name="x", content="住宿标准是多少？", role="user"))
+    )
+    return json.loads(out.content)
+
+
+def test_rag_answer_envelope_unwraps_fenced_and_prefixed():
+    """```json 围栏 / 前导串词包裹的信封取正文，不原样展示给用户。"""
+    body = "北京住宿标准为每晚上限 600 元。"
+    cases = [
+        f'```json\n{{"answer": "{body}"}}\n```',
+        f'好的，以下是答案：\n{{"answer": "{body}"}}',
+        f'好的，以下是答案：\n```json\n{{"answer": "{body}"}}\n```',
+    ]
+    for text in cases:
+        payload = _reply_with_model_text(text)
+        assert payload["answer"] == body, payload["answer"]
+    # 纯文本答案（无信封）原样返回
+    payload = _reply_with_model_text("住宿标准为每人每晚 600 元。")
+    assert payload["answer"] == "住宿标准为每人每晚 600 元。"
+    print("✓ RAG 答案信封支持围栏 / 前导串词解包")
+
+
+def test_rag_answer_envelope_non_string_answer_stays_text():
+    """answer 为非字符串（嵌套对象）时不把 Python repr 展示给用户。"""
+    payload = _reply_with_model_text('{"answer": {"北京": "600 元/晚"}}')
+    answer = payload["answer"]
+    assert isinstance(answer, str), answer
+    assert "{'" not in answer, answer
+    print("✓ RAG 答案嵌套对象不渲染 Python repr")
 
 
 def test_rag_bounded_query_uses_last_question_sentence(caplog):
@@ -5065,7 +5234,74 @@ def test_rag_agent_degrades_when_native_dependency_raises_oserror(monkeypatch):
     payload = json.dumps(json.loads(out.content), ensure_ascii=False)
     assert "WinError" not in payload, payload
     assert "pip install" in payload, payload
+    # OSError 是「依赖已装但原生库加载失败」：提示 VC++ 运行库，而不是让
+    # 用户盲目重装依赖
+    assert "Visual C++" in payload or "运行库" in payload, payload
     print("✓ RAG 原生依赖 OSError 时降级为可操作提示")
+
+
+def test_rag_agent_degrades_when_dependency_missing(monkeypatch):
+    """真的缺依赖（ImportError）只给安装命令，不误导用户装 VC++ 运行库。"""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name in ("pymilvus", "sentence_transformers"):
+            raise ImportError(f"No module named {name!r}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    path = os.path.join(
+        project_root, ".claude", "skills", "ask-question", "script", "agent.py"
+    )
+    module_name = "_test_rag_missing_dep_agent"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+    assert module.DEPENDENCIES_AVAILABLE is False
+    agent = module.RAGKnowledgeAgent(name="x", model=None)
+    assert getattr(agent, "initialized", True) is False
+    out = asyncio.run(
+        agent.reply(Msg(name="u", content="差旅标准", role="user"))
+    )
+    payload = json.dumps(json.loads(out.content), ensure_ascii=False)
+    assert "pip install" in payload, payload
+    assert "Visual C++" not in payload and "运行库" not in payload, payload
+    print("✓ RAG 缺依赖时给出安装命令而非运行库提示")
+
+
+def test_rag_init_error_uses_install_mode_command(monkeypatch, tmp_path):
+    """未初始化提示按安装形态给出可执行命令（wheel 下不再是仓库相对脚本）。"""
+    import utils.paths as paths_module
+
+    module = _load_skill_module("ask-question")
+    monkeypatch.setattr(module, "DEPENDENCIES_AVAILABLE", True)
+    monkeypatch.setattr(paths_module, "is_source_checkout", lambda: False)
+    agent = module.RAGKnowledgeAgent(
+        name="x",
+        model=None,
+        knowledge_base_path=str(tmp_path),
+        create_if_missing=False,
+    )
+    assert agent.initialized is False
+    assert "aligo kb-init" in agent.init_error, agent.init_error
+    assert ".claude/skills" not in agent.init_error, agent.init_error
+
+    # 源码 checkout：提示与旧口径逐字一致（仓库相对脚本）
+    monkeypatch.setattr(paths_module, "is_source_checkout", lambda: True)
+    agent = module.RAGKnowledgeAgent(
+        name="x",
+        model=None,
+        knowledge_base_path=str(tmp_path),
+        create_if_missing=False,
+    )
+    assert agent.init_error.endswith("init_knowledge_base.py"), agent.init_error
+    print("✓ RAG 未初始化提示按安装形态给出可执行命令")
 
 
 if __name__ == "__main__":

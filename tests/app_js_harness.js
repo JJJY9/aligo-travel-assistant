@@ -2240,6 +2240,219 @@ function scenarioChatPersisted(source) {
   return results;
 }
 
+async function scenarioKbSemanticRefreshQuiet(source) {
+  // 语义模式下的收尾刷新：silentFailure 必须透传——429 时保留语义视图、
+  // 不 toast、不切回关键词列表；非静默对照仍按原逻辑退出并提示
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    els.kbList = { textContent: "", scrollTop: 0, firstChild: null, appendChild() {} };
+    els.kbListStatus = { textContent: "" };
+    els.kbMore = { hidden: true, disabled: false };
+    els.kbSemantic = { disabled: false, textContent: "语义搜索" };
+    els.kbSearch = { value: "住宿" };
+    globalThis.__rendered = 0;
+    renderSemanticResults = () => { __rendered += 1; };
+    renderKnowledgeDocuments = () => {};
+    refreshKnowledgeCategories = () => {};
+    announceKbListSummary = () => {};
+    updateKnowledgeMore = () => {};
+    state.kbSemanticMode = true;
+    state.kbSemanticQuery = "住宿";
+    state.kbQuery = "";
+    state.kbItems = [];
+  `);
+  const drain = async () => {
+    for (let i = 0; i < 20; i += 1) {
+      await tick();
+      if (!env.__requests.length) break;
+      const request = env.__requests.shift();
+      request.resolve({ total: 0, items: [], categories: [], results: [] });
+    }
+  };
+  const limited = () =>
+    Object.assign(new Error("知识库操作过于频繁，请约 60 秒后重试"), {
+      status: 429,
+    });
+
+  const quietPromise = run(
+    "refreshKnowledgeDocuments({ silentFailure: true, refreshCategories: false })",
+  );
+  const quietReq = await waitRequest(env);
+  quietReq.reject(limited());
+  await quietPromise;
+  const quiet = run(
+    "({ mode: state.kbSemanticMode, semanticQuery: state.kbSemanticQuery, toasts: __toasts.slice(), rendered: __rendered })",
+  );
+  await drain();
+
+  let settled = false;
+  const noisyPromise = run("refreshKnowledgeDocuments({ refreshCategories: false })");
+  const noisyReq = await waitRequest(env);
+  noisyReq.reject(limited());
+  noisyPromise.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  for (let i = 0; i < 30 && !settled; i += 1) {
+    await tick();
+    for (const request of env.__requests.splice(0)) {
+      request.resolve({ total: 0, items: [], categories: [] });
+    }
+  }
+  const noisy = run("({ mode: state.kbSemanticMode, toasts: __toasts.slice() })");
+  return { quiet, noisy, settled };
+}
+
+async function scenarioKbCategoryDraft(source) {
+  // 语义模式下切换分类：搜索框里未提交的输入不能被静默丢弃
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    const makeField = () => ({
+      value: "",
+      handlers: {},
+      addEventListener(type, fn) {
+        (this.handlers[type] = this.handlers[type] || []).push(fn);
+      },
+      dispatch(type, event) {
+        (this.handlers[type] || []).forEach((fn) => fn(event || {}));
+      },
+    });
+    els.kbSearch = makeField();
+    els.kbCategoryFilter = makeField();
+    els.kbList = { textContent: "", scrollTop: 0, firstChild: null, appendChild() {} };
+    els.kbListStatus = { textContent: "" };
+    els.kbMore = { hidden: true, disabled: false, addEventListener() {} };
+    els.kbSemantic = {
+      disabled: false,
+      textContent: "语义搜索",
+      addEventListener() {},
+    };
+    renderSemanticResults = () => {};
+    renderKnowledgeDocuments = () => {};
+    refreshKnowledgeCategories = () => {};
+    announceKbListSummary = () => {};
+    updateKnowledgeMore = () => {};
+    state.kbQuery = "";
+    state.kbCategory = "";
+    bindEvents();
+  `);
+  // 输入「差旅」但防抖未触发（未回车），随即发起语义搜索
+  run('els.kbSearch.value = "差旅";');
+  const semanticPromise = run("runSemanticSearch()");
+  const searchReq = await waitRequest(env);
+  searchReq.resolve({ results: [], total: 0 });
+  await semanticPromise;
+  const beforeMode = run("state.kbSemanticMode");
+  // 切换分类：退出语义模式后的关键词刷新必须带上未提交的搜索词
+  run('els.kbCategoryFilter.value = "住宿"; els.kbCategoryFilter.dispatch("change", {});');
+  const docReq = await waitRequest(env);
+  const url = docReq.args[0];
+  docReq.resolve({ total: 0, items: [] });
+  await tick();
+  return {
+    beforeMode,
+    url,
+    query: run("state.kbQuery"),
+    mode: run("state.kbSemanticMode"),
+  };
+}
+
+async function scenarioKbImportBusy(source) {
+  // 导入槽位繁忙（503「已有知识库导入任务在处理」）：零写入拒绝不能被
+  // 误报成「服务端可能已写入」，也不触发多余刷新
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    els.kbImport = { textContent: "", disabled: false };
+    els.kbImportFile = {
+      value: "x",
+      files: [{
+        size: 100,
+        arrayBuffer: async () => new TextEncoder().encode(
+          JSON.stringify([{ content: "片段" }]),
+        ),
+      }],
+    };
+    els.memorySheet = { hidden: false };
+    globalThis.__refreshCalls = 0;
+    refreshKnowledge = async () => { __refreshCalls += 1; };
+    refreshKnowledgeDocuments = async () => { __refreshCalls += 1; };
+    confirm = () => true;
+    state.kbImporting = false;
+  `);
+  const promise = run("importKnowledgeFile()");
+  const preview = await waitRequest(env);
+  preview.resolve({ would_import: 1, skipped: 0 });
+  const imp = await waitRequest(env);
+  imp.reject(
+    Object.assign(
+      new Error("已有知识库导入任务在处理，请稍后再试（请求 ID：0123456789abcdef）"),
+      { status: 503 },
+    ),
+  );
+  await promise;
+  return {
+    toasts: run("__toasts.slice()"),
+    pendingUrls: env.__requests.map((request) => request.args[0]),
+    refreshCalls: run("__refreshCalls"),
+    importing: run("state.kbImporting"),
+    buttonText: run("els.kbImport.textContent"),
+    disabled: run("els.kbImport.disabled"),
+  };
+}
+
+async function scenarioKbDeleteStale400(source) {
+  // 删除返回 400（片段已变成多分片 / 整组结构变化）：刷新列表让该行
+  // 渲染出「删除整组」，与编辑保存 409 分支同口径
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    const row = {
+      dataset: { id: "11", group: "" },
+      removed: false,
+      querySelector: () => null,
+      remove() { this.removed = true; },
+    };
+    globalThis.__row = row;
+    els.kbList = {
+      querySelector: (selector) => (selector.includes('11') ? row : null),
+      querySelectorAll: () => [],
+    };
+    els.memorySheet = { hidden: false };
+    state.kbItems = [{ id: 11 }];
+    state.kbDeleting = new Set();
+    globalThis.__refreshArgs = [];
+    refreshKnowledge = async () => {};
+    refreshKnowledgeDocuments = async (options) => {
+      __refreshArgs.push(options || {});
+    };
+    confirm = () => true;
+  `);
+  const promise = run("removeKnowledgeDocument({id: 11, metadata: {}})");
+  const del = await waitRequest(env);
+  del.reject(
+    Object.assign(
+      new Error(
+        "该片段属于多分片文档，请整组删除（CLI 加 --group / 接口加 group=1）",
+      ),
+      { status: 400 },
+    ),
+  );
+  await promise;
+  return {
+    toasts: run("__toasts.slice()"),
+    refreshArgs: run("__refreshArgs.slice()"),
+    removed: run("__row.removed"),
+    deleting: run("Array.from(state.kbDeleting)"),
+  };
+}
+
 function scenarioKbImportSummary(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
@@ -5254,6 +5467,14 @@ async function main() {
     payload = await scenarioSessionSearchFailure(source);
   } else if (scenario === "kbSearchFlow") {
     payload = await scenarioKbSearchFlow(source);
+  } else if (scenario === "kbSemanticRefreshQuiet") {
+    payload = await scenarioKbSemanticRefreshQuiet(source);
+  } else if (scenario === "kbCategoryDraft") {
+    payload = await scenarioKbCategoryDraft(source);
+  } else if (scenario === "kbImportBusy") {
+    payload = await scenarioKbImportBusy(source);
+  } else if (scenario === "kbDeleteStale400") {
+    payload = await scenarioKbDeleteStale400(source);
   } else if (scenario === "downloadGuards") {
     payload = await scenarioDownloadGuards(source);
   } else if (scenario === "reconcile") {
