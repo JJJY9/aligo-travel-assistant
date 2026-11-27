@@ -5939,6 +5939,41 @@ def test_rate_limit_info_reports_import_bucket_degraded():
     print("✓ 导入 / 读 / 写接口限流桶降级计入健康汇总")
 
 
+def test_rate_limit_info_reports_corrupt_keys_without_degrading():
+    """键级损坏（WRONGTYPE）单独暴露，不并入桶级 degraded。"""
+    import types
+
+    from webapp import server as server_module
+
+    def _bucket(limit, corrupt=()):
+        return types.SimpleNamespace(
+            backend="redis",
+            limit=limit,
+            degraded=False,
+            window_sec=60,
+            corrupt_keys=corrupt,
+        )
+
+    state = types.SimpleNamespace(
+        rate_limiter=_bucket(1, ("aligo:ratelimit:user:k1",)),
+        ip_limiter=_bucket(2),
+        kb_limiter=_bucket(3),
+        weather_limiter=_bucket(4),
+        import_limiter=_bucket(5),
+        read_limiter=_bucket(6),
+        write_limiter=_bucket(7),
+    )
+    info = server_module._rate_limit_info(state)
+    assert info["degraded"] is False, "键级损坏不并入桶级 degraded"
+    assert info["corrupt_keys"] == 1
+    assert info["corrupt_key_samples"] == ["aligo:ratelimit:user:k1"]
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    data = TestClient(app).get("/api/health").json()
+    assert data.get("rate_limit_corrupt_keys") == 0
+    print("✓ 键级损坏单独暴露（不并入桶级 degraded）")
+
+
 def test_chat_maps_circuit_open_and_storage_errors(monkeypatch):
     """/api/chat 的 CircuitOpenError / MemoryPersistenceError 都映射 503。"""
     from utils.circuit_breaker import CircuitOpenError
@@ -9208,13 +9243,22 @@ def test_trips_dedupe_endpoint_dry_run_and_apply(monkeypatch):
     assert [entry["trip_id"] for entry in data["duplicates"]] == ["t2"]
     assert store.deleted == [], "预览不能删除任何行程"
 
-    applied = client.post(
+    # 省略 dry_run 只预览（默认 True）：按 schema 只填必填字段不能静默删除
+    omitted = client.post(
         "/api/trips/dedupe", json={"user_id": "u-dedupe"}
+    )
+    assert omitted.status_code == 200, omitted.text
+    omitted_data = omitted.json()
+    assert omitted_data["dry_run"] is True and omitted_data["removed"] == 0
+    assert store.deleted == [], "省略 dry_run 不能删除任何行程"
+
+    applied = client.post(
+        "/api/trips/dedupe", json={"user_id": "u-dedupe", "dry_run": False}
     )
     assert applied.status_code == 200, applied.text
     assert applied.json()["removed"] == 1
     assert [trip["trip_id"] for trip in store.trips] == ["t1", "t3"]
-    print("✓ /api/trips/dedupe 预览与执行")
+    print("✓ /api/trips/dedupe 预览与执行（省略 dry_run 默认只预览）")
 
 
 def test_trips_dedupe_failure_detail_redacts_paths(monkeypatch):
@@ -9242,7 +9286,8 @@ def test_trips_dedupe_failure_detail_redacts_paths(monkeypatch):
     )
     client = _client()
     response = client.post(
-        "/api/trips/dedupe", json={"user_id": "u-dedupe-redact"}
+        "/api/trips/dedupe",
+        json={"user_id": "u-dedupe-redact", "dry_run": False},
     )
     assert response.status_code == 503, response.text[:300]
     detail = response.json()["detail"]
@@ -9269,7 +9314,7 @@ def test_trips_dedupe_endpoint_errors_and_ambiguous(monkeypatch):
         server_module, "_open_long_term", lambda user_id, **kwargs: _Boom()
     )
     response = _client().post(
-        "/api/trips/dedupe", json={"user_id": "u-dedupe"}
+        "/api/trips/dedupe", json={"user_id": "u-dedupe", "dry_run": False}
     )
     assert response.status_code == 503
     assert "读取行程失败" in response.json()["detail"]
@@ -9308,7 +9353,7 @@ def test_trips_dedupe_endpoint_errors_and_ambiguous(monkeypatch):
         server_module, "_open_long_term", lambda user_id, **kwargs: ambiguous
     )
     data = _client().post(
-        "/api/trips/dedupe", json={"user_id": "u-dedupe"}
+        "/api/trips/dedupe", json={"user_id": "u-dedupe", "dry_run": False}
     ).json()
     assert data["removed"] == 0
     assert data["ambiguous_ids"] == ["dup"]
@@ -9408,7 +9453,8 @@ def test_trips_dedupe_concurrent_requests_keep_one(monkeypatch):
 
     def call(client):
         return client.post(
-            "/api/trips/dedupe", json={"user_id": "u-race"}
+            "/api/trips/dedupe",
+            json={"user_id": "u-race", "dry_run": False},
         ).json()
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -10218,7 +10264,7 @@ def test_prometheus_storage_gauges_reflect_state(monkeypatch):
     monkeypatch.setattr(
         server_module,
         "describe_backends",
-        lambda: {
+        lambda wait_for_create=True: {
             "short_term": "redis",
             "long_term": "json",
             "short_term_configured": True,
@@ -12438,6 +12484,88 @@ def test_docs_csp_allows_cdn():
         else:
             os.environ["ALIGO_ENABLE_DOCS"] = previous
     print("✓ 文档页面放宽 CSP，普通页面保持严格策略")
+
+
+def test_docs_csp_only_on_exact_document_routes(monkeypatch):
+    """文档开启时仅真实文档路由放宽 CSP：未命中的 /docs/* 404 保持严格。"""
+    previous = os.environ.get("ALIGO_ENABLE_DOCS")
+    os.environ["ALIGO_ENABLE_DOCS"] = "1"
+    try:
+        client = _client()
+        for path in ("/docs", "/docs/oauth2-redirect", "/redoc"):
+            response = client.get(path)
+            assert response.status_code == 200, (path, response.status_code)
+            assert "cdn.jsdelivr.net" in response.headers.get(
+                "content-security-policy", ""
+            ), path
+        for path in ("/docs/x", "/redoc/x"):
+            response = client.get(path)
+            assert response.status_code == 404, (path, response.status_code)
+            csp = response.headers.get("content-security-policy", "")
+            assert "cdn.jsdelivr.net" not in csp, path
+            assert "script-src 'self'" in csp, path
+    finally:
+        if previous is None:
+            os.environ.pop("ALIGO_ENABLE_DOCS", None)
+        else:
+            os.environ["ALIGO_ENABLE_DOCS"] = previous
+    print("✓ 仅真实文档路由放宽 CSP（/docs/* 404 严格）")
+
+
+def test_docs_env_parsing_matches_bool_switch(monkeypatch):
+    """ALIGO_ENABLE_DOCS 与其它布尔开关同口径：引号 / BOM / true / 空格。"""
+    bom_one = chr(0xFEFF) + "1"
+    for value in ('"1"', bom_one, "true", " 1 "):
+        monkeypatch.setenv("ALIGO_ENABLE_DOCS", value)
+        assert _client().get("/docs").status_code == 200, value
+    monkeypatch.setenv("ALIGO_ENABLE_DOCS", "enabled")
+    assert _client().get("/docs").status_code == 404
+    print("✓ ALIGO_ENABLE_DOCS 解析与布尔开关同口径")
+
+
+def test_security_headers_deduplicate_inner_values():
+    """内层已设置受管安全头时，出口只保留中间件的值（不出现重复冲突头）。"""
+    from webapp.server import RequestContextMiddleware
+
+    async def inner(scope, receive, send):
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"x-frame-options", b"SAMEORIGIN"),
+                    (b"x-request-id", b"inner-id"),
+                    (b"content-type", b"text/plain"),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    middleware = RequestContextMiddleware(inner)
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def receive():
+        await asyncio.sleep(0)
+        return {"type": "http.request"}
+
+    scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/",
+        "headers": [(b"host", b"127.0.0.1")],
+    }
+    asyncio.run(middleware(scope, receive, send))
+    headers: dict[bytes, list[bytes]] = {}
+    for key, value in sent[0]["headers"]:
+        headers.setdefault(key.lower(), []).append(value)
+    assert headers[b"x-frame-options"] == [b"DENY"]
+    assert len(headers[b"x-request-id"]) == 1
+    assert headers[b"x-request-id"][0] != b"inner-id"
+    assert len(headers[b"content-security-policy"]) == 1
+    print("✓ 受管安全头去重（内层同名头被中间件覆盖）")
 
 
 def test_docs_disabled_by_default():
@@ -16012,6 +16140,8 @@ def test_kb_import_backpressure_rejects_when_busy():
     client = _client()
     state = client.app.state.aligo
     state.kb_import_queue_slots = _threading.BoundedSemaphore(1)
+    original_import_limit = state.import_limiter.limit
+    state.import_limiter.limit = 1
     assert state.kb_import_queue_slots.acquire(blocking=False)
     try:
         response = client.post(
@@ -16019,13 +16149,20 @@ def test_kb_import_backpressure_rejects_when_busy():
         )
         assert response.status_code == 503
         assert "已有知识库导入" in response.json()["detail"]
+        assert state.import_limiter.status("testclient")[0] == 1, (
+            "槽位繁忙的零成本 503 必须归还导入桶额度"
+        )
         preview = client.post(
             "/api/knowledge/import/preview", json={"documents": [{"content": "x"}]}
         )
         assert preview.status_code == 503
+        assert state.import_limiter.status("testclient")[0] == 1, (
+            "预览同样归还导入桶额度"
+        )
     finally:
         state.kb_import_queue_slots.release()
-    print("✓ 知识库导入排队已满返回 503")
+        state.import_limiter.limit = original_import_limit
+    print("✓ 知识库导入排队已满返回 503 且归还导入额度")
 
 
 def test_weather_cache_hit_skips_rate_limit(monkeypatch):
@@ -17038,6 +17175,9 @@ def test_import_same_source_concurrent_guard():
         )
         assert trips.status_code == 503, trips.text[:300]
         assert "该来源已有导入任务在处理" in trips.json()["detail"]
+        assert state.import_limiter.status("testclient")[0] == (
+            state.import_limiter.limit
+        ), "行程导入的同来源并发 503 也必须归还导入额度"
         assert state.import_queue_slots.acquire(blocking=False) is True, (
             "被来源守卫拒绝的请求不能泄漏全局槽位"
         )
@@ -17118,6 +17258,37 @@ def test_trust_proxy_hops_multi_layer(monkeypatch):
         for user in users:
             _cleanup(user)
     print("✓ TRUST_PROXY_HOPS 多跳取址（默认末跳、链长不足回退）")
+
+
+def test_trusted_proxy_cidr_accepts_mapped_ipv4_form(monkeypatch):
+    """TRUSTED_PROXY_CIDRS 写成 IPv4 映射 IPv6 形式也必须命中。
+
+    双栈监听时对端可能是 ``::ffff:172.18.0.1``，运维照日志把这个形式填进
+    配置：原始地址与映射后的 IPv4 都要参与匹配，否则这类 CIDR 永不生效、
+    XFF 被整体忽略、所有客户端共用代理 IP 的限流桶。
+    """
+    from config import RATE_LIMIT_CONFIG
+    from webapp.server import _is_trusted_proxy_peer
+
+    monkeypatch.setitem(
+        RATE_LIMIT_CONFIG, "trusted_proxy_cidrs", "::ffff:203.0.113.0/120"
+    )
+    assert _is_trusted_proxy_peer("::ffff:203.0.113.50") is True
+    assert _is_trusted_proxy_peer("::ffff:203.0.114.50") is False
+
+    monkeypatch.setitem(
+        RATE_LIMIT_CONFIG, "trusted_proxy_cidrs", "::ffff:203.0.113.5"
+    )
+    assert _is_trusted_proxy_peer("::ffff:203.0.113.5") is True
+    assert _is_trusted_proxy_peer("::ffff:203.0.113.6") is False
+
+    # 常规形式与默认配置口径不变
+    monkeypatch.setitem(
+        RATE_LIMIT_CONFIG, "trusted_proxy_cidrs", "127.0.0.1/32,::1/128"
+    )
+    assert _is_trusted_proxy_peer("127.0.0.1") is True
+    assert _is_trusted_proxy_peer("::ffff:172.18.0.1") is False
+    print("✓ TRUSTED_PROXY_CIDRS 支持 IPv4 映射形式")
 
 
 def test_hsts_header_opt_in(monkeypatch):
@@ -17257,6 +17428,194 @@ def test_chat_circuit_open_in_ask_refunds_rate_limit(monkeypatch):
     finally:
         _cleanup(user_id)
     print("✓ ask 层熔断拒绝归还限流额度（非流式 / 流式）")
+
+
+def test_chat_lock_timeout_refunds_rate_limit(monkeypatch):
+    """等待用户锁超时 / 断连发生在任何 LLM 调用之前：必须归还额度。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.rate_limiter = RateLimiter(limit=5, window_sec=60)
+    state.ip_limiter = RateLimiter(limit=5, window_sec=60)
+    client = TestClient(app)
+    user_id = _unique_user("web_test_refund_lock")
+    user_key = f"testclient:{user_id}"
+
+    async def lock_timeout(request, lock, request_id, timeout=50.0):
+        raise server_module.HTTPException(
+            status_code=503, detail="同一用户已有对话正在进行，请稍后再试"
+        )
+
+    monkeypatch.setattr(server_module, "_acquire_chat_lock", lock_timeout)
+    try:
+        response = client.post(
+            "/api/chat", json={"message": "你好", "user_id": user_id}
+        )
+        assert response.status_code == 503, response.text[:300]
+        assert state.rate_limiter.status(user_key)[0] == 5
+        assert state.ip_limiter.status("testclient")[0] == 5
+
+        stream = client.post(
+            "/api/chat/stream", json={"message": "你好", "user_id": user_id}
+        )
+        assert stream.status_code == 503, stream.text[:300]
+        assert state.rate_limiter.status(user_key)[0] == 5, (
+            "流式取锁失败同样归还额度"
+        )
+        assert state.ip_limiter.status("testclient")[0] == 5
+    finally:
+        _cleanup(user_id)
+    print("✓ 取锁失败归还对话限流额度（非流式 / 流式）")
+
+
+def test_chat_session_open_failures_refund_rate_limit(monkeypatch):
+    """会话容量 / 打开会话失败（无 LLM 调用）同样归还额度。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.rate_limiter = RateLimiter(limit=5, window_sec=60)
+    state.ip_limiter = RateLimiter(limit=5, window_sec=60)
+    client = TestClient(app)
+    user_id = _unique_user("web_test_refund_open")
+    user_key = f"testclient:{user_id}"
+
+    async def no_capacity(*args, **kwargs):
+        raise server_module.SessionCapacityError("并发会话过多（上限 1）")
+
+    monkeypatch.setattr(server_module, "_get_session_marked", no_capacity)
+    try:
+        response = client.post(
+            "/api/chat", json={"message": "你好", "user_id": user_id}
+        )
+        assert response.status_code == 503, response.text[:300]
+        assert state.rate_limiter.status(user_key)[0] == 5
+        assert state.ip_limiter.status("testclient")[0] == 5
+
+        stream = client.post(
+            "/api/chat/stream", json={"message": "你好", "user_id": user_id}
+        )
+        assert stream.status_code == 503, stream.text[:300]
+        assert state.rate_limiter.status(user_key)[0] == 5
+    finally:
+        _cleanup(user_id)
+    print("✓ 会话容量拒绝归还对话限流额度")
+
+
+def test_delete_endpoints_lock_timeout_refund_write_bucket(monkeypatch):
+    """删除会话 / 删除最后一轮取锁超时（409）：归还写桶额度。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.write_limiter = RateLimiter(limit=3, window_sec=60)
+    client = TestClient(app)
+    user_id = _unique_user("web_test_delete_refund")
+    session_id = uuid.uuid4().hex[:12]
+    monkeypatch.setattr(server_module, "_DELETE_LOCK_TIMEOUT_SEC", 0.01)
+
+    class _HeldLock:
+        def release(self):
+            pass
+
+        async def acquire(self):
+            await asyncio.sleep(30)
+            return True
+
+    monkeypatch.setattr(state, "lock_for", lambda uid: _HeldLock())
+    response = client.delete(
+        f"/api/sessions/{session_id}", params={"user_id": user_id}
+    )
+    assert response.status_code == 409, response.text[:300]
+    assert state.write_limiter.status("testclient")[0] == 3, (
+        "删除会话取锁超时必须归还写桶额度"
+    )
+    response = client.post(
+        f"/api/sessions/{session_id}/last-turn",
+        json={"user_id": user_id, "expect": "hi"},
+    )
+    assert response.status_code == 409, response.text[:300]
+    assert state.write_limiter.status("testclient")[0] == 3, (
+        "删除最后一轮取锁超时必须归还写桶额度"
+    )
+    print("✓ 删除类接口取锁超时归还写桶额度")
+
+
+def test_trips_dedupe_lock_timeout_refunds_quota(monkeypatch):
+    """去重取锁失败（503）：归还写桶（真实删除）与读桶额度。"""
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.write_limiter = RateLimiter(limit=3, window_sec=60)
+    state.read_limiter = RateLimiter(limit=4, window_sec=60)
+    client = TestClient(app)
+
+    async def lock_timeout(request, lock, request_id, timeout=50.0):
+        raise server_module.HTTPException(
+            status_code=503, detail="同一用户已有对话正在进行，请稍后再试"
+        )
+
+    monkeypatch.setattr(server_module, "_acquire_chat_lock", lock_timeout)
+    rejected = client.post(
+        "/api/trips/dedupe",
+        json={"user_id": "u-dedupe-lock", "dry_run": False},
+    )
+    assert rejected.status_code == 503, rejected.text[:300]
+    assert state.write_limiter.status("testclient")[0] == 3
+    assert state.read_limiter.status("testclient")[0] == 4
+    preview = client.post(
+        "/api/trips/dedupe",
+        json={"user_id": "u-dedupe-lock", "dry_run": True},
+    )
+    assert preview.status_code == 503, preview.text[:300]
+    assert state.write_limiter.status("testclient")[0] == 3
+    assert state.read_limiter.status("testclient")[0] == 4, (
+        "预览取锁失败同样归还读桶额度"
+    )
+    print("✓ 去重取锁失败归还写桶 / 读桶额度")
+
+
+def test_user_bucket_late_rejection_refunds_ip_bucket():
+    """并发下用户桶迟到拒绝：刚记的 IP 桶名额要归还。"""
+    from utils.rate_limit import RateLimiter
+
+    class _LateReject:
+        backend = "memory"
+        limit = 5
+        window_sec = 60.0
+
+        def peek(self, key):
+            return None
+
+        def check(self, key):
+            return 60.0
+
+        def status(self, key):
+            return (0, 60.0)
+
+        def refund(self, key):
+            raise AssertionError("用户桶归还不在本分支调用")
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.rate_limiter = _LateReject()
+    state.ip_limiter = RateLimiter(limit=4, window_sec=60)
+    client = TestClient(app)
+    user_id = _unique_user("web_test_ip_refund")
+    response = client.post(
+        "/api/chat", json={"message": "你好", "user_id": user_id}
+    )
+    assert response.status_code == 429, response.text[:300]
+    assert state.ip_limiter.status("testclient")[0] == 4, (
+        "被用户桶拒绝的请求不能消耗共享 IP 桶额度"
+    )
+    print("✓ 用户桶迟到拒绝归还 IP 桶额度")
 
 
 def test_doctor_reports_open_breaker():

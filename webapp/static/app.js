@@ -7949,7 +7949,8 @@ function bindEvents() {
         const result = await getJSON("/api/trips/dedupe", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ user_id: userId }),
+          // 服务端默认 dry_run=true（只预览）：真实删除必须显式传 false
+          body: JSON.stringify({ user_id: userId, dry_run: false }),
         });
         const removedCount = Number(result.removed || 0);
         toast(`已清理 ${removedCount} 条重复行程`);

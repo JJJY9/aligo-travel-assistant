@@ -267,6 +267,39 @@ def test_describe_backends_degraded_until_first_redis_success(monkeypatch):
     print("✓ 健康页按真实成功判断短期记忆降级")
 
 
+def test_describe_backends_can_skip_waiting_for_redis_creation(monkeypatch):
+    """健康 / 指标视图不等其它线程的 Redis 客户端创建波次。
+
+    创建在途时跟随者最多等 ``_CREATE_WAIT_SEC``：未限流的健康接口洪泛会把
+    共享线程池占满。``wait_for_create=False`` 直接按当前缓存状态返回。
+    """
+    import threading
+    import time as time_module
+
+    from context import storage as storage_module
+
+    url = "redis://health-wait/0"
+    monkeypatch.setitem(storage_module.STORAGE_CONFIG, "redis_url", url)
+    monkeypatch.setitem(storage_module.STORAGE_CONFIG, "postgres_dsn", "")
+    storage_module.reset_failure_cache()
+    event = threading.Event()
+    with storage_module._redis_lock:
+        storage_module._redis_clients.pop(url, None)
+        storage_module._redis_creating[url] = event
+    try:
+        begin = time_module.monotonic()
+        info = storage_module.describe_backends(wait_for_create=False)
+        elapsed = time_module.monotonic() - begin
+        assert elapsed < 0.3, "健康视图不能等待创建事件"
+        assert info["short_term"] == "memory"
+    finally:
+        with storage_module._redis_lock:
+            storage_module._redis_creating.pop(url, None)
+        event.set()
+        storage_module.reset_failure_cache()
+    print("✓ 健康视图不等待 Redis 客户端创建")
+
+
 def test_factory_warns_on_non_positive_ttl(monkeypatch, caplog):
     """存储工厂对非法 REDIS_TTL_SEC 记录 WARNING（构造函数钳制之外）。"""
     import logging

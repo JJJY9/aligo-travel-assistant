@@ -577,6 +577,131 @@ def test_refund_returns_one_slot():
     print("✓ refund 归还一单位限流额度")
 
 
+def test_read_only_blip_does_not_degrade_or_reset_quota(monkeypatch):
+    """只读探测（peek / status）瞬时失败不降级整桶、不清零已用额度。
+
+    单次读超时不能证明写路径不可用：只短暂暂停读探测，权威 check 仍打
+    Redis；若按旧逻辑整桶进入 60 秒进程内回退，空本地桶会让已用满的额度
+    被完全忘记（多实例下按实例数放大）。
+    """
+    import utils.rate_limit as rate_limit_module
+
+    times = {"now": 1000.0}
+    monkeypatch.setattr(
+        rate_limit_module.time, "monotonic", lambda: times["now"]
+    )
+
+    class _BlipRedis:
+        def __init__(self):
+            self.reads = 0
+            self.writes = 0
+            self.fail_reads = True
+
+        def eval(self, script, numkeys, *args):
+            if "ZADD" in script:
+                self.writes += 1
+                return "-1"
+            self.reads += 1
+            if self.fail_reads:
+                raise TimeoutError("read timeout")
+            return "-1"
+
+    client = _BlipRedis()
+    limiter = RedisRateLimiter(client, "unit-read-blip", limit=5, window_sec=60)
+    assert limiter.peek("k") is None, "读超时回退进程内桶放行"
+    assert limiter.degraded is False, "只读失败不能把整桶打进降级"
+    assert limiter._degraded_until == 0.0
+    # 权威 check 仍打 Redis（写成功即恢复正常共享计数）
+    assert limiter.check("k") is None
+    assert client.writes == 1
+    client.fail_reads = False
+    assert limiter.peek("k") is None
+    assert client.reads == 2, "check 成功后读探测立即恢复"
+    print("✓ 只读探测瞬时失败不降级整桶")
+
+
+def test_read_only_failure_cooldown_suppresses_storm(monkeypatch):
+    """读超时风暴：2 秒冷却内的后续 peek 不再逐个付 socket 超时。"""
+    import utils.rate_limit as rate_limit_module
+
+    times = {"now": 1000.0}
+    monkeypatch.setattr(
+        rate_limit_module.time, "monotonic", lambda: times["now"]
+    )
+
+    class _Down:
+        def __init__(self):
+            self.reads = 0
+
+        def eval(self, script, numkeys, *args):
+            self.reads += 1
+            raise TimeoutError("read timeout")
+
+    client = _Down()
+    limiter = RedisRateLimiter(client, "unit-read-storm", limit=5, window_sec=60)
+    assert limiter.peek("k") is None
+    assert client.reads == 1
+    assert limiter.peek("k") is None
+    assert client.reads == 1, "短冷却内的读探测直接走本地桶"
+    times["now"] += rate_limit_module.REDIS_READ_FAILURE_COOLDOWN_SEC + 0.1
+    assert limiter.peek("k") is None
+    assert client.reads == 2, "冷却到期后重新尝试 Redis"
+    print("✓ 只读失败短冷却压制探测风暴")
+
+
+def test_wrongtype_warning_throttled_and_key_visible(monkeypatch):
+    """WRONGTYPE 告警按 60 秒节流，损坏键单独可见且恢复后自动移除。"""
+    import logging
+
+    import utils.rate_limit as rate_limit_module
+
+    times = {"now": 1000.0}
+    monkeypatch.setattr(
+        rate_limit_module.time, "monotonic", lambda: times["now"]
+    )
+
+    class ResponseError(Exception):
+        pass
+
+    class _FakeRedis:
+        def eval(self, script, numkeys, key, *args):
+            if key.endswith(":bad"):
+                raise ResponseError(
+                    "WRONGTYPE Operation against a key holding the wrong "
+                    "kind of value"
+                )
+            return "-1"
+
+    limiter = RedisRateLimiter(_FakeRedis(), "user", 5, 60)
+    records: list[logging.LogRecord] = []
+    handler = logging.Handler()
+    handler.emit = records.append  # type: ignore[method-assign]
+    target = logging.getLogger("utils.rate_limit")
+    target.addHandler(handler)
+    try:
+        for _ in range(5):
+            assert limiter.check("bad") is None
+    finally:
+        target.removeHandler(handler)
+    warnings = [
+        record
+        for record in records
+        if "限流键类型损坏" in record.getMessage()
+    ]
+    assert len(warnings) == 1, "同一损坏键 60 秒内只告警一次"
+    assert limiter.degraded is False
+    assert any(name.endswith(":bad") for name in limiter.corrupt_keys)
+
+    class _Healthy:
+        def eval(self, script, numkeys, key, *args):
+            return "-1"
+
+    limiter._client = _Healthy()
+    assert limiter.check("bad") is None
+    assert limiter.corrupt_keys == (), "成功调用后损坏键自动移除"
+    print("✓ WRONGTYPE 告警限频且损坏键可见")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -628,4 +753,19 @@ if __name__ == "__main__":
     test_wrongtype_key_falls_back_without_degrading_bucket()
     test_create_rate_limiter_passes_max_keys()
     test_refund_returns_one_slot()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_read_only_blip_does_not_degrade_or_reset_quota(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_read_only_failure_cooldown_suppresses_storm(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_wrongtype_warning_throttled_and_key_visible(_mp)
+    finally:
+        _mp.undo()
     print("\n全部通过")
