@@ -345,6 +345,29 @@ def test_editor_round2_preferences_and_guards():
     assert data["addMerges"] == ["汉庭", "如家", "锦江"], data["addMerges"]
     assert data["addScalar"] == "上海", data["addScalar"]
 
+    obj_input = data["prefObjectArrayInput"]
+    assert obj_input["text"] == '[{"name":"汉庭","level":1}]', obj_input
+    assert obj_input["roundtrip"] == [{"name": "汉庭", "level": 2}], obj_input
+    assert obj_input["plainList"] == "汉庭、如家", obj_input
+
+    assert data["addStatusBaseline"] == ["汉庭", "全季", "如家"], (
+        "/api/status 权威快照必须先于旧缓存作为合并基线"
+    )
+    no_base = data["addNoBaseline"]
+    assert no_base["puts"] == 0, "无合并基线不得退化成整值覆盖"
+    assert no_base["refreshes"] == 1, no_base
+    assert any("无法读取现有偏好" in item for item in no_base["toasts"]), no_base
+
+    unknown_add = data["addUnknownOutcome"]
+    assert any("保存结果未知" in item for item in unknown_add["toasts"]), unknown_add
+    assert unknown_add["refreshes"] == 1, unknown_add
+    assert unknown_add["latest"] == ["汉庭", "全季"], unknown_add
+    assert unknown_add["status"] == ["汉庭", "全季"], unknown_add
+
+    finite = data["prefScalarFinite"]
+    assert "infinity" not in finite, "非有限数必须判为格式无效，不能序列化成 null"
+    assert finite["normal"] == 4.5, finite
+
     blur = data["blurPrompt"]
     assert blur["changed"] is True and blur["unchanged"] is False, blur
     assert blur["newline"] is False, "输入框剥离换行后与原文一致时不算修改"
@@ -1412,7 +1435,60 @@ def test_trip_import_partial_failure_reconciles():
     switched = data["switched"]
     assert switched["refreshCalls"] == 0, "切号后不能把旧用户的结果刷进新用户界面"
     assert any("已切换用户" in item for item in switched["toasts"]), switched
-    print("✓ 行程导入部分失败 / 超时后对账刷新")
+
+    preview = data["previewTimeout"]
+    assert preview["refreshCalls"] == 0, "预览超时零写入，无需对账刷新"
+    assert any("导入预览超时" in item for item in preview["toasts"]), preview
+    assert not any(
+        "服务端可能仍在写入" in item for item in preview["toasts"]
+    ), "预览（dry_run）超时不能声称服务端可能正在写入"
+    print("✓ 行程导入部分失败 / 超时后对账刷新（预览超时单独提示）")
+
+
+def test_trip_edit_partial_payload_and_cross_row_draft():
+    """编辑行程只提交改动字段；未改动的跨行切换不弹未提交确认。"""
+    data = _run_harness("tripEditPartial")
+    partial = data["partial"]
+    assert partial == [{"user_id": "u1", "purpose": "客户会议"}], partial
+
+    noop = data["noop"]
+    assert noop["puts"] == 0, "未改任何字段不应发 PUT（服务端会 400）"
+    assert noop["editing"] is None and noop["formHidden"] is True, noop
+
+    cross = data["crossRow"]
+    assert cross["confirmCalls"] == 0, "未改动的跨行切换不应弹未提交确认"
+    assert cross["dest"] == "成都", cross
+    print("✓ 行程编辑只提交改动字段，跨行未改动不弹确认")
+
+
+def test_trip_dedupe_result_respects_request_user():
+    """去重预览返回前已切换用户：不弹确认、不发真实删除、不动新账号表单。"""
+    data = _run_harness("tripDedupeSwitchGuard")
+    assert data["requests"] == 1, "切号后不能发出真实删除请求"
+    assert data["confirmCalls"] == 0, "切号后不能再弹确认框"
+    assert data["toasts"] == [], data
+    assert data["refreshed"] == 0 and data["reset"] == 0, data
+    assert data["editing"] == "trip_9", "不能重置新账号正在编辑的行程表单"
+    assert data["button"] == "清理重复", data
+    print("✓ 去重结果按发起账号守卫")
+
+
+def test_panel_empty_state_export_label_and_conflict_total():
+    """空态文案考虑状态筛选；筛选导出按钮明示子集；重叠徽标带真实总数。"""
+    data = _run_harness("panelRound")
+    empty = data["emptyWithStatus"]
+    assert empty["text"] == "没有匹配的行程", empty
+    assert empty["exportLabel"] == "导出筛选结果日历", empty
+    assert empty["exportTitle"] == "按当前关键词 / 状态筛选导出（与列表同口径）", empty
+
+    plain = data["emptyNoFilter"]
+    assert plain["text"] == "还没有行程记录", plain
+    assert plain["exportLabel"] == "导出全部日历", plain
+
+    badge = data["conflictBadge"]
+    assert badge is not None, "有重叠的行程必须渲染徽标"
+    assert "等 25 条" in badge["title"], badge
+    print("✓ 空态 / 导出按钮文案与重叠徽标总数")
 
 
 def test_user_switch_storage_failure_warns_and_keeps_old_account():
@@ -1685,6 +1761,9 @@ if __name__ == "__main__":
     test_trip_late_response_respects_request_user()
     test_send_blocked_while_current_session_deleting()
     test_trip_import_partial_failure_reconciles()
+    test_trip_edit_partial_payload_and_cross_row_draft()
+    test_trip_dedupe_result_respects_request_user()
+    test_panel_empty_state_export_label_and_conflict_total()
     test_user_switch_storage_failure_warns_and_keeps_old_account()
     test_delete_session_late_response_keeps_new_user_list()
     test_delete_session_unknown_outcome_reconciles()

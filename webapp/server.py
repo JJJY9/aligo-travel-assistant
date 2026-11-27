@@ -111,7 +111,7 @@ from utils.knowledge_stats import knowledge_status
 from utils.log_redact import redact_local_paths, redact_paths, redact_secret
 from utils.metrics import REQUEST_METRICS
 from utils.paths import default_data_root
-from utils.preference_values import has_preference_value
+from utils.preference_values import has_preference_value, is_manageable_pref_type
 from utils.rate_limit import CapacityRetry, create_rate_limiter
 from utils.session_ids import RESERVED_SESSION_IDS
 from utils.session_title import session_title_from_content
@@ -4365,9 +4365,14 @@ def _visible_preferences(preferences: dict[str, Any]) -> dict[str, Any]:
 
     过滤 None / 空白串 / 空容器，列表内逐项剔除 null 与空白项；全空的
     列表整体隐藏（此前 [null] / "   " 会原样返回，面板渲染成「东航、null」）。
+    面板 / CLI 无法寻址的键（含 "/"、控制字符、"."/".."、超长）同样隐藏：
+    PostgreSQL 后端加载时不做这类清洗，脏键经 /api/status 进入面板后既改
+    不掉也删不掉，还会占用偏好类型上限（与 JSON 后端加载即丢弃同口径）。
     """
     visible: dict[str, Any] = {}
     for key, value in preferences.items():
+        if not is_manageable_pref_type(key):
+            continue
         if isinstance(value, list):
             items = [
                 item
@@ -5978,6 +5983,15 @@ def create_app(model: Any = None) -> FastAPI:
         pref_type = pref_type.strip()
         if not pref_type:
             raise HTTPException(status_code=422, detail="偏好类型不能为空白")
+        # 路由 pattern 拦不住的两个特例：PATH 里的 %2E / %2E%2E 解码后就是
+        # "." / ".."——JSON 后端下次加载会把这类键当不可管理丢弃（返回 200
+        # 后偏好「凭空消失」，并生成迁移备份），PG 后端则会留下面板改不掉
+        # 也删不掉的脏键。与 CLI pref-set 同口径直接拒绝
+        if not is_manageable_pref_type(pref_type):
+            raise HTTPException(
+                status_code=422,
+                detail="偏好类型不合法（不能为 . / ..，不能含 / 或控制字符，最长 64 字符）",
+            )
         if pref_type == "preferences":
             # 存储层把该类型视为旧版嵌套偏好容器并在下次加载时展开 / 丢弃：
             # 写入会「保存成功」后立即消失，删除恒为 false
@@ -6000,13 +6014,14 @@ def create_app(model: Any = None) -> FastAPI:
             shadow_type = (
                 raw_type if raw_type != pref_type and raw_type in existing else None
             )
-            # 面板永远看不到的空值条目（旧备份导入 / 旧版本写入）不渲染、
-            # 也无法从面板删除，却占用类型上限名额：写入偏好时顺带释放，
-            # 409 只在真实可见条目达到上限时出现
+            # 面板永远看不到的空值 / 不可寻址条目（旧备份导入 / 旧版本写入 /
+            # PG 存量脏键）不渲染、也无法从面板删除，却占用类型上限名额：
+            # 写入偏好时顺带释放，409 只在真实可见条目达到上限时出现
             for hidden in [
                 key
                 for key, value in existing.items()
-                if not has_preference_value(value)
+                if not is_manageable_pref_type(key)
+                or not has_preference_value(value)
             ]:
                 try:
                     if store.delete_preference(hidden):

@@ -94,10 +94,13 @@ def is_manageable_pref_type(pref_type: object) -> bool:
     """
     if not isinstance(pref_type, str):
         return False
-    text = pref_type.strip()
-    if re.search(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]", text):
+    # 控制字符 / 行分隔符按原始字符串判定：strip 只用于空串 / 纯空白与
+    # 「.」「..」判断；用剥离后的值校验会让 “home\n”（尾随换行）漏过——
+    # 面板 DELETE / CLI 都按原始键校验，永远 422 / 拒绝，落库后成了脏键
+    if re.search(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]", pref_type):
         # 控制字符 / 行分隔符会被写进 INFO 日志（%0A 伪造日志行）与面板路径
         return False
+    text = pref_type.strip()
     if text in (".", ".."):
         # 面板用 /api/preferences/{encodeURIComponent(type)} 编辑 / 删除；
         # "." / ".." 不转义且会被浏览器 URL 解析规范化成别的路径（404），

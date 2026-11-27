@@ -4559,6 +4559,42 @@ def test_preference_put_edits_shadow_key_clears_original():
         _cleanup(user_id)
 
 
+def test_preference_put_rejects_dot_types():
+    """PUT 拒绝 "." / ".."：JSON 后端下次加载会丢弃这类键（200 后偏好消失）。"""
+    client = _client()
+    user_id = _unique_user("web_test_pref_dot")
+    try:
+        for raw in ("%2E", "%2E%2E"):
+            response = client.put(
+                f"/api/preferences/{raw}",
+                json={"user_id": user_id, "value": "x"},
+            )
+            assert response.status_code == 422, (raw, response.text)
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["preferences"] == {}, status["preferences"]
+        print("✓ PUT 拒绝 . / .. 偏好类型")
+    finally:
+        _cleanup(user_id)
+
+
+def test_visible_preferences_hides_unmanageable_keys():
+    """面板可见口径隐藏不可寻址的键（含 /、控制字符、点号、超长）。"""
+    from webapp.server import _visible_preferences
+
+    visible = _visible_preferences(
+        {
+            "home_location": "上海",
+            "a/b": "x",
+            "bad" + chr(0x0A) + "key": "y",
+            ".": "z",
+            "": "w",
+            "k" * 65: "v",
+        }
+    )
+    assert visible == {"home_location": "上海"}, visible
+    print("✓ 面板隐藏不可管理的偏好键")
+
+
 def test_preference_put_cleans_hidden_blank_entries():
     """写入偏好时顺带清理面板不可见的空值条目（释放类型上限名额）。"""
     from context.storage import create_long_term_memory

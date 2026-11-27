@@ -37,6 +37,7 @@ from utils.preference_values import (
 from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_export import _MAX_ICS_X_ATTR_CHARS, normalized_uid_token
 from utils.trip_import import (
+    _MAX_TRIP_FIELD_CHARS,
     _strict_date,
     normalize_identity_date,
     trip_identity,
@@ -1808,6 +1809,26 @@ def parse_user_export_data(
         if problem:
             errors.append(f"跳过第 {index} 条行程：{problem}")
             continue
+        # 面板 / CLI 写接口的行程字段上限 100 字：备份恢复以保真为先，不能
+        # 像 CSV / ICS 导入那样整条跳过（等于静默丢行程），但超限行恢复后
+        # 在面板 / CLI 编辑时必然 422。按同一上限截断并显式提示（与编排
+        # 侧 _trip_field 的口径一致）；日历 UID 走独立的 uid_token 字段，
+        # 不受文本截断影响
+        truncated_labels = []
+        if len(origin.strip()) > _MAX_TRIP_FIELD_CHARS:
+            origin = origin[:_MAX_TRIP_FIELD_CHARS]
+            truncated_labels.append("出发地")
+        if len(destination.strip()) > _MAX_TRIP_FIELD_CHARS:
+            destination = destination[:_MAX_TRIP_FIELD_CHARS]
+            truncated_labels.append("目的地")
+        if len(purpose.strip()) > _MAX_TRIP_FIELD_CHARS:
+            purpose = purpose[:_MAX_TRIP_FIELD_CHARS]
+            truncated_labels.append("目的")
+        if truncated_labels:
+            errors.append(
+                f"第 {index} 条行程：{'、'.join(truncated_labels)}"
+                f"超过 {_MAX_TRIP_FIELD_CHARS} 字，已截断"
+            )
         trip_record: dict[str, Any] = {
             "origin": origin if origin.strip() else "",
             "destination": destination,

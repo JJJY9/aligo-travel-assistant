@@ -1327,6 +1327,35 @@ class LongTermMemory:
                 and _trip_date_is_valid(trip.get("start_date"))
             )
 
+        # 历史行程可能缺 trip_id（旧版本 / 手写数据）：列表里能显示，但
+        # 面板的编辑 / 删除 / 单条日历都按 id 寻址，恒 404——删除提示成功
+        # 后行又「复活」。加载时按记录顺序补发 trip_<n>，水位同时覆盖
+        # 计数器与已有 trip_N 编号；与其它迁移一样只在下次写入时落盘，
+        # 每次加载按同一顺序确定性生成同一 id（GET 拿到的 id 与随后
+        # DELETE / PUT 重新加载后定位的一致）
+        trips_list = data["trip_history"]
+        if any(
+            isinstance(trip, dict) and not trip_id_text(trip.get("trip_id"))
+            for trip in trips_list
+        ):
+            max_number = int(stats.get("last_trip_number") or 0)
+            for trip in trips_list:
+                if not isinstance(trip, dict):
+                    continue
+                match = re.fullmatch(r"trip_(\d+)", str(trip.get("trip_id", "")))
+                if match:
+                    max_number = max(max_number, int(match.group(1)))
+            backfilled = 0
+            for trip in trips_list:
+                if not isinstance(trip, dict) or trip_id_text(trip.get("trip_id")):
+                    continue
+                max_number += 1
+                trip["trip_id"] = f"trip_{max_number}"
+                backfilled += 1
+            stats["last_trip_number"] = max_number
+            destructive = True
+            logger.info("为 %d 条缺编号的历史行程补发 trip_id", backfilled)
+
         if not isinstance(data.get("preferences"), (dict, list)):
             data["preferences"] = []
             destructive = True
@@ -1397,6 +1426,10 @@ class LongTermMemory:
                             # 面板改不掉也删不掉，只能占上限名额
                             and is_manageable_pref_type(nested_pref["type"])
                             and 0 < len(nested_pref["type"]) <= 64
+                            # 空值 = 未设置：展开后会影子覆盖同类型的有效
+                            # 条目（按 type 去重保留最后一条），并在下次写盘
+                            # 被顶层空值清洗整条丢弃——与顶层同口径拒绝
+                            and has_preference_value(nested_pref["value"])
                         ):
                             fixed_prefs.append(
                                 {
