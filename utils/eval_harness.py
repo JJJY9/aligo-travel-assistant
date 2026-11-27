@@ -30,6 +30,32 @@ def _intents(value: object) -> set[str]:
     return set()
 
 
+def _field(case: object, name: str) -> Any:
+    """从用例取字段；用例不是对象时返回 None。"""
+    return case.get(name) if isinstance(case, dict) else None
+
+
+def _case_problem(case: object) -> str | None:
+    """校验用例最小结构；返回问题描述，结构正常返回 None。
+
+    harness 是「调用方传入用例」的骨架，eval-cases 导出的 JSONL 也定位
+    为手工维护入口：缺 ``expected_intents`` 会被当成「期望不调度任何
+    智能体」，空预测即白送通过；keywords 类型错误（int 等）会让整批评测
+    在迭代时抛 TypeError。
+    """
+    if not isinstance(case, dict):
+        return "用例不是对象"
+    expected = case.get("expected_intents")
+    if not isinstance(expected, (str, list, tuple, set)):
+        return "expected_intents 缺失或类型非法"
+    for field in ("required_keywords", "forbidden_keywords"):
+        value = case.get(field)
+        # 关键词按元素迭代：str 会被拆成单字逐一匹配，必须单独拒绝
+        if value is not None and not isinstance(value, (list, tuple, set)):
+            return f"{field} 类型非法"
+    return None
+
+
 def evaluate_case(
     case: dict[str, Any],
     prediction: dict[str, Any],
@@ -37,6 +63,21 @@ def evaluate_case(
 ) -> dict[str, Any]:
     """对单条用例做规则验收（可选 Judge），返回通过与否及原因。"""
     reasons: list[str] = []
+    problem = _case_problem(case)
+    if problem:
+        # 坏用例判失败而不是按空值计分：否则缺字段 + 空预测会白送通过
+        return {
+            "id": _field(case, "id"),
+            "category": _field(case, "category"),
+            "passed": False,
+            "reasons": [f"用例无效：{problem}"],
+            "judge_score": None,
+        }
+    if not isinstance(prediction, dict):
+        # 预测函数返回非对象：按显式报错处理，不能让它抛 AttributeError
+        prediction = {
+            "error": f"预测返回类型非法：{type(prediction).__name__}"
+        }
     # 预测侧显式报错（输出无法解析 / 单条调用失败）：空意图集合与问候类
     # 的期望集合相等，不能按「意图匹配」白送通过
     prediction_error = str(prediction.get("error") or "").strip()
@@ -117,15 +158,27 @@ def run_eval(
             prediction = {}
             results.append(
                 {
-                    "id": case.get("id"),
-                    "category": case.get("category"),
+                    "id": _field(case, "id"),
+                    "category": _field(case, "category"),
                     "passed": False,
                     "reasons": [f"预测异常：{type(exc).__name__}"],
                     "judge_score": None,
                 }
             )
             continue
-        results.append(evaluate_case(case, prediction, judge))
+        try:
+            results.append(evaluate_case(case, prediction, judge))
+        except Exception as exc:  # noqa: BLE001 - 单条用例异常不中止整批
+            # 与预测异常对称：坏用例 / 坏预测只让该条失败，其余照常计分
+            results.append(
+                {
+                    "id": _field(case, "id"),
+                    "category": _field(case, "category"),
+                    "passed": False,
+                    "reasons": [f"用例异常：{type(exc).__name__}"],
+                    "judge_score": None,
+                }
+            )
 
     total = len(results)
     passed = sum(1 for item in results if item["passed"])

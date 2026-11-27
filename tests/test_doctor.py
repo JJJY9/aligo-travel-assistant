@@ -515,10 +515,11 @@ def test_knowledge_base_config_dimension_mismatch_warns(monkeypatch):
 
 
 def test_storage_probe_sets_statement_timeout(monkeypatch):
-    """PostgreSQL 自检探测必须给 DDL / 查询设 statement_timeout。"""
+    """PostgreSQL 自检探测必须只读（SELECT）且给语句设 statement_timeout。"""
+    import psycopg
+
     from config import STORAGE_CONFIG
     from context import storage as storage_module
-    from context import postgres_long_term_memory as pg_module
     from utils import doctor as doctor_module
 
     monkeypatch.setitem(STORAGE_CONFIG, "redis_url", "")
@@ -536,18 +537,40 @@ def test_storage_probe_sets_statement_timeout(monkeypatch):
     )
     captured = {}
 
-    class _Probe:
-        def __init__(self, user_id, dsn, statement_timeout_ms=None):
-            captured["timeout"] = statement_timeout_ms
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql):
+            captured["sql"] = sql
+
+        def fetchone(self):
+            return ("aligo_trips",)
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
 
         def close(self):
-            pass
+            captured["closed"] = True
 
-    monkeypatch.setattr(pg_module, "PostgresLongTermMemory", _Probe)
+    def _connect(dsn, **kwargs):
+        captured["dsn"] = dsn
+        captured["kwargs"] = kwargs
+        return _Conn()
+
+    monkeypatch.setattr(psycopg, "connect", _connect)
     result = doctor_module.check_storage()
-    assert captured.get("timeout") == 3000
+    assert captured["kwargs"].get("connect_timeout") == 3
+    assert "statement_timeout=3000" in captured["kwargs"].get("options", "")
+    # doctor 只做只读探测：不建表 / 不建索引 / 不取 advisory lock
+    assert captured["sql"].lstrip().upper().startswith("SELECT"), captured["sql"]
+    assert captured["closed"] is True
     assert result.status == STATUS_OK, result.detail
-    print("✓ PostgreSQL 探测设置语句超时")
+    print("✓ PostgreSQL 探测只读且设置语句超时")
 
 
 def test_config_and_dependencies_branches(monkeypatch):
@@ -619,7 +642,9 @@ def test_report_and_summary_statuses():
 
     assert has_failures([ok, warn, skip]) is False
     assert has_failures([ok, fail]) is True
-    assert summarize([ok, skip]) == ("✓ 环境检查全部通过", "green")
+    # 有跳过项时不能宣称「全部通过」（--offline 的 LLM 连通性即 SKIP）
+    assert summarize([ok, skip]) == ("✓ 检查通过（1 项跳过，未验证）", "green")
+    assert summarize([ok]) == ("✓ 环境检查全部通过", "green")
     text, style = summarize([ok, warn])
     assert style == "yellow" and "警告" in text
     text, style = summarize([fail, warn])
@@ -826,7 +851,8 @@ def test_storage_redis_ping_failure(monkeypatch):
 
 def test_storage_postgres_probe_failure(monkeypatch):
     """describe_backends 报告 PostgreSQL 后端但连接探测失败 → 警告。"""
-    import context.postgres_long_term_memory as pg_module
+    import psycopg
+
     from config import STORAGE_CONFIG
     from context import storage as storage_module
 
@@ -844,11 +870,10 @@ def test_storage_postgres_probe_failure(monkeypatch):
         },
     )
 
-    class _Boom:
-        def __init__(self, *args, **kwargs):
-            raise RuntimeError("db down")
+    def _boom(*args, **kwargs):
+        raise RuntimeError("db down")
 
-    monkeypatch.setattr(pg_module, "PostgresLongTermMemory", _Boom)
+    monkeypatch.setattr(psycopg, "connect", _boom)
     result = check_storage()
     assert result.status == STATUS_WARN and "PostgreSQL 不可用" in result.detail
     print("✓ PostgreSQL 探测失败 → 警告")
@@ -916,6 +941,97 @@ def test_model_files_alternative_formats_ok():
     assert result.status == STATUS_FAIL and "缺少关键文件" in result.detail
     assert "pytorch_model.bin" in result.detail, result.detail
     print("✓ 缺全部权重变体时才失败，且提示可接受的候选")
+
+
+def test_model_files_sharded_weights_ok():
+    """分片权重（index.json + shards）是合法形态，不能被报成缺少关键文件。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for name in [
+            "config.json",
+            "tokenizer.json",
+            "modules.json",
+            "1_Pooling/config.json",
+        ]:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x", encoding="utf-8")
+        (root / "model.safetensors.index.json").write_text(
+            json.dumps(
+                {
+                    "weight_map": {
+                        "a": "model-00001-of-00002.safetensors",
+                        "b": "model-00002-of-00002.safetensors",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        shards = (
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+        )
+        for shard in shards:
+            (root / shard).write_text("x", encoding="utf-8")
+        result = check_model_files(root)
+        assert result.status == STATUS_OK, result.detail
+
+        (root / shards[1]).unlink()
+        result = check_model_files(root)
+    assert result.status == STATUS_FAIL
+    assert "分片权重" in result.detail, result.detail
+    print("✓ 分片权重形态通过；缺分片时失败")
+
+
+def test_model_files_zero_byte_fails():
+    """0 字节权重 / 配置是下载中断的典型形态，不能判 ok。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for name in [
+            "config.json",
+            "tokenizer.json",
+            "modules.json",
+            "1_Pooling/config.json",
+        ]:
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("x", encoding="utf-8")
+        (root / "model.safetensors").write_bytes(b"")
+        result = check_model_files(root)
+    assert result.status == STATUS_FAIL
+    assert "为空" in result.detail, result.detail
+    print("✓ 0 字节权重文件 → 失败")
+
+
+def test_knowledge_base_hf_model_unverified_warns(monkeypatch):
+    """HuggingFace 模型未缓存时无法校验维度：必须 warn 而不是假绿。"""
+    from config import RAG_CONFIG
+    from utils import embedding_model as embedding_module
+    from utils import knowledge_stats
+    from utils.doctor import check_knowledge_base
+
+    with tempfile.TemporaryDirectory() as tmp:
+        missing = Path(tmp) / "no-model"
+        monkeypatch.setattr(
+            embedding_module, "default_embedding_model_dir", lambda: missing
+        )
+        monkeypatch.setitem(
+            RAG_CONFIG, "embedding_model", "BAAI/bge-small-zh-v1.5"
+        )
+        monkeypatch.setattr(
+            knowledge_stats,
+            "knowledge_status",
+            lambda path=None, **kwargs: {
+                "collection": "c",
+                "available": True,
+                "documents": 5,
+                "dimension": 512,
+            },
+        )
+        result = check_knowledge_base(Path("x"))
+    assert result.status == STATUS_WARN, result
+    assert "无法校验向量维度" in result.detail, result.detail
+    print("✓ HF 模型未缓存 → 维度未校验警告")
 
 
 def test_skills_check_duplicate_frontmatter_names(monkeypatch):
@@ -1063,6 +1179,8 @@ if __name__ == "__main__":
     test_model_files_fast_tokenizer_without_vocab_is_ok()
     test_model_files_missing_required_fail()
     test_model_files_alternative_formats_ok()
+    test_model_files_sharded_weights_ok()
+    test_model_files_zero_byte_fails()
     test_knowledge_base_missing()
     test_redact_secret_masks_passwords()
     test_report_and_summary_statuses()
@@ -1076,6 +1194,7 @@ if __name__ == "__main__":
         test_knowledge_base_dimension_mismatch_warns,
         test_configured_model_dimension_reads_pooling_config,
         test_knowledge_base_config_dimension_mismatch_warns,
+        test_knowledge_base_hf_model_unverified_warns,
         test_skills_check_warns_on_broken_skill_md,
         test_skills_check_duplicate_frontmatter_names,
         test_storage_probe_sets_statement_timeout,

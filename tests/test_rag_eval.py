@@ -15,7 +15,28 @@ import sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from utils.rag_eval import EvalCase, evaluate_retrieval
+from utils.rag_eval import EvalCase, evaluate_retrieval, keyword_hit
+
+
+def test_numeric_keyword_does_not_match_longer_number():
+    """「500元」不能命中「1500元」：数字关键词要求两侧不再是数字。"""
+    cases = (EvalCase("住宿标准", ("500元",)),)
+
+    def search(query, top_k):
+        return [{"content": "超标部分 1500元 自理"}]
+
+    result = evaluate_retrieval(search, cases=cases, top_k=5)
+    assert result["hit1"] == 0.0
+    assert result["rows"][0]["rank"] is None
+
+    def search_exact(query, top_k):
+        return [{"content": "一线城市住宿标准500元"}]
+
+    hit = evaluate_retrieval(search_exact, cases=cases, top_k=5)
+    assert hit["hit1"] == 1.0
+    assert keyword_hit("500元", "标准500元") is True
+    assert keyword_hit("500元", "1500元") is False
+    print("✓ 数字关键词边界：不命中更长数字")
 
 
 def test_all_hits_at_one():
@@ -140,7 +161,8 @@ def test_eval_cases_match_bundled_documents():
         covered.add(case.source)
         text = files[case.source].lower()
         for keyword in case.keywords:
-            assert keyword.lower() in text, (
+            # 与运行期判定同一口径（数字关键词带边界），题库漂移检查才有效
+            assert keyword_hit(keyword, text), (
                 f"关键词未在来源文档中出现：{case.query} -> {keyword}（{case.source}）"
             )
     missing = set(files) - covered
@@ -194,6 +216,7 @@ if __name__ == "__main__":
     test_mixed_ranks_and_misses()
     test_top_k_truncation()
     test_empty_cases()
+    test_numeric_keyword_does_not_match_longer_number()
     test_eval_cases_match_bundled_documents()
     test_discount_figures_consistent_across_documents()
     print("\n全部通过")

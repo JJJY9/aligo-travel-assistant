@@ -29,16 +29,41 @@ def case_message(case: dict[str, Any]) -> Msg:
     return Msg(name="user", content=query, role="user")
 
 
+def _degraded_reasoning_prefix() -> str:
+    """意图智能体降级结果的 reasoning 前缀（延迟导入避免拉起重型依赖）。"""
+    try:
+        from agents.intention_agent import DEFAULT_INTENT_REASONING_PREFIX
+
+        return DEFAULT_INTENT_REASONING_PREFIX
+    except Exception:  # noqa: BLE001 - 导入失败时退回同文案字面量
+        return "意图识别出错，使用默认策略"
+
+
 def prediction_from_intention_content(content: object) -> dict[str, Any]:
     """从意图智能体输出解析预测：标准名去重列表 + 空答案。
 
     解析失败 / 结构非法时带 ``error`` 标记：空意图集合与问候类用例的
     期望集合相等，若继续按「空意图」计分会把模型输出故障误判为通过。
+
+    真实 ``IntentionAgent`` 从不把解析失败抛给调用方：它会把 JSON 解析
+    失败、调度缺失 / 类型非法、调度条目全部未知统一兜底成
+    ``_default_intent_result``（默认 ``information_query``）再返回合法
+    JSON。只看 JSON 形状会把这类降级当成真实预测（模型持续输出垃圾时
+    仍按 information_query 类用例计分），因此按 ``reasoning`` 前缀识别
+    降级并同样标记 ``error``。
     """
     try:
         data = json.loads(str(content or ""))
     except (json.JSONDecodeError, ValueError):
         data = None
+    if isinstance(data, dict):
+        reasoning = str(data.get("reasoning") or "").lstrip()
+        if reasoning.startswith(_degraded_reasoning_prefix()):
+            return {
+                "intents": [],
+                "answer": "",
+                "error": "意图识别降级为默认调度",
+            }
     schedule = data.get("agent_schedule") if isinstance(data, dict) else None
     if not isinstance(schedule, list):
         return {
@@ -79,12 +104,18 @@ async def collect_intent_predictions(
                 "error": f"预测异常：{type(exc).__name__}",
             }
             continue
-        predictions[str(case.get("id"))] = prediction_from_intention_content(
+        prediction = prediction_from_intention_content(
             getattr(response, "content", None)
         )
+        if prediction.get("error"):
+            # 解析失败 / 降级同样计入失败：模型持续输出不可用内容时
+            # 不能被「全部失败」保护看成正常评测（Pass@1 会虚高）
+            failed += 1
+        predictions[str(case.get("id"))] = prediction
     if selected and failed == len(selected):
-        # 全部失败（密钥失效 / 网关整体不可用）不是「模型能力 0 分」：
-        # 交给 CLI 的既有失败分支，避免 min_pass=0.0 时把故障算成达标
+        # 全部失败（密钥失效 / 网关整体不可用 / 模型持续输出不可解析内容
+        # 被兜底成默认调度）不是「模型能力 0 分」：交给 CLI 的既有失败
+        # 分支，避免 min_pass=0.0 时把故障算成达标
         raise RuntimeError(f"全部 {failed} 条评测预测失败")
     return predictions
 
