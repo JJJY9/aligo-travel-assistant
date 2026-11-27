@@ -1713,6 +1713,119 @@ async function scenarioSse(source) {
   );
 }
 
+async function scenarioSseEof(source) {
+  const runCase = async (chunks) => {
+    const env = buildEnv(source);
+    return runIn(
+      env,
+      `(async () => {
+        const chunks = ${JSON.stringify(chunks)};
+        const events = [];
+        const encoded = chunks.map((chunk) => new TextEncoder().encode(chunk));
+        let index = 0;
+        const body = {
+          getReader: () => ({
+            read: async () =>
+              index < encoded.length
+                ? { done: false, value: encoded[index++] }
+                : { done: true, value: undefined },
+          }),
+        };
+        await readEventStream(body, (event) => events.push(event));
+        return events;
+      })()`
+    );
+  };
+  return {
+    // EOF 前缺少终止空行：最后一行是完整 data:，必须补发
+    noBlank: await runCase(['data: {"type":"done","reply":"tail"}']),
+    // JSON 中途截断：补空行后解析失败应被忽略（不误派发半帧）
+    truncated: await runCase(['data: {"type":"done","reply":"']),
+    // 正常带终止空行：行为不变
+    withBlank: await runCase(['data: {"type":"done","reply":"ok"}\n\n']),
+  };
+}
+
+async function scenarioReplayError(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    __reconcileCalls = [];
+    refreshStatus = async () => {};
+    loadSessions = async () => {};
+    reconcileStoppedTurn = async (sessionId, message, token, turnId, reason) => {
+      __reconcileCalls.push({ sessionId, message, turnId, reason });
+      return "done";
+    };
+    state.ready = true;
+    state.userId = "u1";
+    state.sessionId = "s1";
+    state.partialHistory = false;
+    document.querySelector = () => null;
+    els.messages = {
+      children: [],
+      appendChild(node) { this.children.push(node); return node; },
+      insertBefore(node) { this.children.push(node); return node; },
+      querySelectorAll(sel) {
+        if (sel === ".msg.user") return this.children.filter((n) => n.role === "user" && !n.removed);
+        return [];
+      },
+      querySelector() { return null; },
+      set innerHTML(value) { if (value === "") this.children.length = 0; },
+      get innerHTML() { return ""; },
+      get firstChild() { return this.children[0] || null; },
+    };
+    renderUserNode = (text) => ({
+      __msg: true, role: "user", text, dataset: {},
+      remove() { this.removed = true; },
+      querySelector() { return null; },
+      querySelectorAll() { return []; },
+    });
+    renderAssistantNode = (text) => ({ __msg: true, role: "assistant", text });
+    hideWelcome = () => {};
+    trimRegenButtons = () => {};
+    refreshEditButtons = () => {};
+    const frames = [
+      "data: " + JSON.stringify({ type: "session", session_id: "s1" }) + String.fromCharCode(10) + String.fromCharCode(10),
+      "data: " + JSON.stringify({
+        type: "error",
+        message: "上一请求已处理但响应未送达，请刷新会话历史",
+        idempotent_replay: true,
+        persisted: true,
+      }) + String.fromCharCode(10) + String.fromCharCode(10),
+    ];
+    const bytes = new TextEncoder().encode(frames.join(""));
+    fetch = async () => {
+      let sent = false;
+      return {
+        ok: true,
+        status: 200,
+        body: {
+          getReader: () => ({
+            read: async () => {
+              if (sent) return { done: true, value: undefined };
+              sent = true;
+              return { done: false, value: bytes };
+            },
+          }),
+        },
+        json: async () => ({}),
+      };
+    };
+  `);
+  await run('sendMessage("重放提问")');
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  return run(`(() => {
+    const user = els.messages.children.find((n) => n.role === "user");
+    return {
+      transient: user ? (user.dataset.transient || "none") : "missing",
+      reconcileCalls: __reconcileCalls.slice(),
+      toasts: __toasts.slice(),
+      pending: state.pendingStoppedTurns.length,
+    };
+  })()`);
+}
+
 async function scenarioCopy(source) {
   const env = buildEnv(source);
   const removed = [];
@@ -2815,7 +2928,7 @@ async function scenarioUpcomingWeather(source) {
 }
 
 async function scenarioHttpError(source) {
-  const runScenario = async (status, detail) => {
+  const runScenario = async (status, detail, resend = false) => {
     const env = buildEnv(source);
     const run = (code) => runIn(env, code);
     run(`
@@ -2827,6 +2940,17 @@ async function scenarioHttpError(source) {
       state.sessionId = "s1";
       state.partialHistory = false;
       els.input.value = "你好";
+      renderUserNode = (text) => {
+        const node = document.createElement("div");
+        node.className = "msg user";
+        node.textContent = text;
+        node.__removedFlag = false;
+        node.remove = function () {
+          this.removed = true;
+          this.__removedFlag = true;
+        };
+        return node;
+      };
       fetch = async (url) => {
         if (String(url).includes("/api/chat/stream")) {
           return {
@@ -2843,17 +2967,63 @@ async function scenarioHttpError(source) {
     await run(`sendMessage("你好")`);
     // 旧实现会在 600ms 后触发停止对账；等待足够长时间确认没有发生
     await new Promise((resolve) => setTimeout(resolve, 900));
+    let afterResend = null;
+    if (resend) {
+      // 重发成功：HttpError 分支已移除旧气泡，界面只应剩一条提问
+      run(`
+        fetch = async (url) => {
+          if (String(url).includes("/api/chat/stream")) {
+            const line = "data: " + JSON.stringify({
+              type: "done",
+              session_id: "s1",
+              reply: "重发回答",
+              elapsed: 0.1,
+              persisted: true,
+            }) + String.fromCharCode(10) + String.fromCharCode(10);
+            const bytes = new TextEncoder().encode(line);
+            let sent = false;
+            return {
+              ok: true,
+              status: 200,
+              body: {
+                getReader: () => ({
+                  read: async () => {
+                    if (sent) return { done: true, value: undefined };
+                    sent = true;
+                    return { done: false, value: bytes };
+                  },
+                }),
+              },
+              json: async () => ({}),
+            };
+          }
+          return { ok: true, status: 200, json: async () => ({ messages: [] }) };
+        };
+      `);
+      await run(`sendMessage("你好")`);
+      afterResend = run(`({
+        users: els.messages.children.filter(
+          (n) => n && n.__removedFlag === false,
+        ).length,
+        toasts: __toasts.slice(),
+      })`);
+    }
     return run(`({
       toasts: __toasts.slice(),
       healthText: els.healthText.textContent,
       healthClass: els.health.className,
       reconcileCalls: __reconcileCalls.slice(),
       input: els.input.value,
+      users: els.messages.children.filter(
+        (n) => n && n.__removedFlag === false,
+      ).length,
+      afterResend: ${afterResend === null ? "null" : JSON.stringify(afterResend)},
     })`);
   };
   return {
     rateLimited: await runScenario(429, "请求过于频繁，请稍后再试"),
     unavailable: await runScenario(503, "同一用户已有对话正在进行"),
+    resendRateLimited: await runScenario(429, "请求过于频繁，请稍后再试", true),
   };
 }
 
@@ -5753,6 +5923,10 @@ async function main() {
     payload = scenarioRender(source);
   } else if (scenario === "sse") {
     payload = await scenarioSse(source);
+  } else if (scenario === "sseEof") {
+    payload = await scenarioSseEof(source);
+  } else if (scenario === "replayError") {
+    payload = await scenarioReplayError(source);
   } else if (scenario === "copy") {
     payload = await scenarioCopy(source);
   } else if (scenario === "duplicates") {

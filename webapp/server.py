@@ -794,11 +794,17 @@ class RequestContextMiddleware:
                 raise exc from None
         finally:
             # 流式断连（200 头已发出、任一终态未送达）：线上状态保持 200，
-            # 日志 / 指标按 499 记账以便区分「完整送达」与「断连半截流」
+            # 日志 / 指标按 499 记账以便区分「完整送达」与「断连半截流」；
+            # 响应体自身抛错（服务端流内异常）按 500 记账——不能把流内 bug
+            # 伪装成客户端中止，否则 5xx 错误率与告警看不到真实故障
+            state_obj = scope.get("state") or {}
+            stream_failed = status_code == 200 and bool(
+                state_obj.get("aligo_stream_failed")
+            )
             account_status = status_code
-            if status_code == 200 and bool(
-                (scope.get("state") or {}).get("aligo_stream_aborted")
-            ):
+            if stream_failed:
+                account_status = 500
+            elif status_code == 200 and bool(state_obj.get("aligo_stream_aborted")):
                 account_status = 499
             # 被 Host 白名单拒绝的请求无论打哪个路径都要可观测（DNS rebinding
             # 扫描常直接探测 /），其余非 /api 路径保持不记访问日志
@@ -835,6 +841,7 @@ class RequestContextMiddleware:
                     # 只有 2xx 才算真正进入流式输出（3xx 是尾斜杠重定向）
                     streaming=(
                         account_status == 499
+                        or stream_failed
                         or (
                             metric_path == "/api/chat/stream"
                             and account_status < 300
@@ -1650,8 +1657,19 @@ class _LeasedStreamingResponse(StreamingResponse):
         self._stream_state = stream_state
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        # 记录响应体的退出原因：客户端断连 / 服务取消按 499 记账，流内
+        # 服务端异常按 500 记账——只看「终态未送达」会把两者混成客户端
+        # 中止，成片的流内 bug 在指标里永远表现为用户断网
+        stream_failed = False
         try:
             await super().__call__(scope, receive, send)
+        except (asyncio.CancelledError, ClientDisconnect, OSError):
+            # spec 2.3 下客户端断连可表现为裸 OSError；spec 2.4 是
+            # ClientDisconnect。二者与服务取消都不能记成服务端故障
+            raise
+        except BaseException:
+            stream_failed = True
+            raise
         finally:
             # Starlette 不负责关闭 body_iterator：断连取消 / send 抛错时
             # 生成器停在 yield，其 finally（取消心跳、落定 stream_state）
@@ -1667,11 +1685,16 @@ class _LeasedStreamingResponse(StreamingResponse):
             if self._stream_state is not None:
                 # 断连记账：ASGI 2.3（uvicorn 0.54）下 Starlette 会把
                 # http.disconnect 的取消吞掉、正常返回，中间件看不到任何
-                # 异常。任一终态未送达 ⇒ 客户端断连（含幂等回放流与首帧
-                # 发送前的中断）——在 scope 上打标，由中间件按 499 记账
-                # （线上状态保持 200）
+                # 异常。任一终态未送达且响应体自身没有抛错 ⇒ 客户端断连
+                # （含幂等回放流与首帧发送前的中断）——在 scope 上打标，
+                # 由中间件按 499 记账（线上状态保持 200）；流内异常单独
+                # 打 failed 标，按 500 记账并计入错误率
                 if not self._stream_state.get("terminal_delivered"):
-                    scope.setdefault("state", {})["aligo_stream_aborted"] = True
+                    scope_state = scope.setdefault("state", {})
+                    if stream_failed:
+                        scope_state["aligo_stream_failed"] = True
+                    else:
+                        scope_state["aligo_stream_aborted"] = True
             with contextlib.suppress(asyncio.CancelledError):
                 await self._lease.stop_turn()
             # 让落库完成回调（turn_state["persisted"]）先于 after_stop 执行：
@@ -4825,8 +4848,35 @@ async def _cancel_turn_with_budget(runtime: Any, task: "asyncio.Task[Any]") -> N
         if callable(begin):
             begin()
     task.cancel()
-    with contextlib.suppress(asyncio.CancelledError):
+    try:
         await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # noqa: BLE001 - 回合已自行失败，不得顶替断连口径
+        # 回合恰在探测与 cancel 之间以非取消异常结束：cancel() 是 no-op，
+        # await task 会把它重新抛出。该异常不能顶替端点自身的断连 / 取消
+        # 口径（会让已断开的请求按 4xx/5xx 记账并漏写 __incomplete__ 标记）
+        logger.warning("断连收尾时回合异常结束: %s", _redacted_exc_log_text(exc))
+
+
+async def _terminal_frame_delivered(request: Request) -> bool:
+    """SSE 终态帧 yield 恢复后确认客户端仍在线（非阻塞探测）。
+
+    生成器在 ``yield`` 处恢复只说明底层 ``send`` 返回，不代表帧已送达：
+    uvicorn==0.54 的 h11 实现在连接已断时 ``send`` 直接静默 return（不
+    抛错、不写字节），Starlette 随后继续拉取生成器。``Request.is_disconnected``
+    用已取消的 anyio 作用域调 ``receive``：未断连时立即返回 False，断连
+    后 uvicorn 立即返回 ``http.disconnect``，不会阻塞流收尾。
+
+    探测本身失败（非取消异常）按旧口径视为已送达——记账探测不能改变
+    流行为；``CancelledError`` 继续向上传播，由收尾路径统一处理。
+    """
+    try:
+        return not await request.is_disconnected()
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - 探测失败按已送达，不改变流行为
+        return True
 
 
 async def _ask_cancellable_on_disconnect(
@@ -4848,7 +4898,15 @@ async def _ask_cancellable_on_disconnect(
             await asyncio.wait({task}, timeout=poll_interval)
             if task.done():
                 break
-            if await request.is_disconnected():
+            try:
+                disconnected_now = await request.is_disconnected()
+            except BaseException:
+                # 探测自身异常（被取消 / Receive 异常）：先取消并等待回合
+                # 停稳再向外抛，否则在途 ask 任务无人取消也无人等待，
+                # 端点 finally 会先释放用户锁，任务继续在后台执行并迟到落库
+                await _cancel_turn_with_budget(runtime, task)
+                raise
+            if disconnected_now:
                 # 取消前建立共享截止时刻：回合协程的暂存等待 / 回滚等待
                 # 与随后的 drain 用同一预算（约 10 秒口径）
                 await _cancel_turn_with_budget(runtime, task)
@@ -6852,6 +6910,22 @@ def create_app(model: Any = None) -> FastAPI:
                 if idem_key is not None
                 else None
             )
+            if cached is None and idem_key is not None:
+                # 跨端点同键重试：另一端点若已写入「未完成」防重标记，
+                # 说明该轮已落库而响应未送达——不能换端点再执行一遍、
+                # 再追加一份问答。只认 __incomplete__：另一端点成功负载
+                # 形状不同（SSE done 事件），绝不回放
+                cross = state.idempotency.get(
+                    make_key(
+                        payload.user_id,
+                        payload.session_id or "",
+                        payload.idempotency_key or "",
+                        endpoint="chat_stream",
+                        message=payload.message,
+                    )
+                )
+                if cross is not None and cross.get("__incomplete__"):
+                    cached = cross
             if cached is None and state.breaker.denies_new_calls():
                 # 入口预检到锁内之间缓存可能过期 / 被淘汰，熔断也可能已
                 # 打开：无幂等键的请求同样要复核，不能把打开期的请求放回
@@ -7137,6 +7211,20 @@ def create_app(model: Any = None) -> FastAPI:
                 if idem_key is not None
                 else None
             )
+            if cached is None and idem_key is not None:
+                # 跨端点同键重试（见非流式端点同段注释）：只认另一端点
+                # 的「未完成」防重标记，成功负载形状不同绝不回放
+                cross = state.idempotency.get(
+                    make_key(
+                        payload.user_id,
+                        payload.session_id or "",
+                        payload.idempotency_key or "",
+                        endpoint="chat",
+                        message=payload.message,
+                    )
+                )
+                if cross is not None and cross.get("__incomplete__"):
+                    cached = cross
             if cached is None and state.breaker.denies_new_calls():
                 # 入口预检到锁内之间缓存可能过期 / 被淘汰、熔断也可能已
                 # 打开：无幂等键的请求同样复核，不让打开期的请求进入
@@ -7184,7 +7272,9 @@ def create_app(model: Any = None) -> FastAPI:
                         )
                         if cached.get("__incomplete__"):
                             # 上一流式请求已落库但客户端断连：回放错误终态，
-                            # 不重放空答案、也不重新执行
+                            # 不重放空答案、也不重新执行。该标记只在 drain
+                            # 后确认整轮已写入历史时才会写下，必须带
+                            # persisted=true 让前端据此清除临时提问标记
                             yield (
                                 "data: "
                                 + json.dumps(
@@ -7196,6 +7286,7 @@ def create_app(model: Any = None) -> FastAPI:
                                             "请刷新会话历史"
                                         ),
                                         "idempotent_replay": True,
+                                        "persisted": True,
                                     },
                                     ensure_ascii=False,
                                 )
@@ -7253,6 +7344,18 @@ def create_app(model: Any = None) -> FastAPI:
                     detail=f"{exc}（请求 ID：{rid}）",
                 ) from exc
             lease = _SessionTurnLease(lock, session)
+            # 构造会话（PG 连接 / 建表、Redis ping、隔离扫描，可达数秒）
+            # 期间客户端可能已断开：与取锁路径同口径，不再为无人接收的
+            # 请求启动回合；这里发生在任何 LLM / 存储工作之前，入口已扣
+            # 的限流额度要一并归还
+            if await request.is_disconnected():
+                await asyncio.to_thread(
+                    _refund_rate_limit, state, payload.user_id, request
+                )
+                raise HTTPException(
+                    status_code=499,
+                    detail=f"客户端已断开（请求 ID：{rid}）",
+                )
             if idem_key is not None:
 
                 def _mark_stream_incomplete() -> None:
@@ -7327,6 +7430,15 @@ def create_app(model: Any = None) -> FastAPI:
             task: asyncio.Task[None] | None = None
             heartbeat: asyncio.Task[None] | None = None
             completed = False
+            terminal_queued = False
+
+            def _emit_terminal(event: dict[str, Any]) -> None:
+                # 无界队列：put_nowait 不会阻塞，且能在任务完成回调（事件
+                # 循环线程）里安全调用；标志保证 done / error 只入队一次
+                nonlocal terminal_queued
+                terminal_queued = True
+                queue.put_nowait(event)
+
             try:
 
                 async def run() -> None:
@@ -7353,7 +7465,7 @@ def create_app(model: Any = None) -> FastAPI:
                                 message=payload.message,
                                 payload=_json_safe_value(done_event),
                             )
-                        await queue.put(done_event)
+                        _emit_terminal(done_event)
                     except asyncio.CancelledError:
                         raise
                     except CircuitOpenError:
@@ -7363,7 +7475,7 @@ def create_app(model: Any = None) -> FastAPI:
                         await asyncio.to_thread(
                             _refund_rate_limit, state, payload.user_id, request
                         )
-                        await queue.put(
+                        _emit_terminal(
                             {
                                 "type": "error",
                                 "message": f"服务暂时不可用，请稍后再试（请求 ID：{rid}）",
@@ -7375,7 +7487,7 @@ def create_app(model: Any = None) -> FastAPI:
                             rid,
                             redact_paths(exc),
                         )
-                        await queue.put(
+                        _emit_terminal(
                             {
                                 "type": "error",
                                 "message": _persistence_failure_detail(exc, rid),
@@ -7387,7 +7499,7 @@ def create_app(model: Any = None) -> FastAPI:
                         logger.warning(
                             "流式对话失败（%s）: %s", rid, redact_paths(exc)
                         )
-                        await queue.put(
+                        _emit_terminal(
                             {
                                 "type": "error",
                                 "message": f"处理失败：{exc}（请求 ID：{rid}）",
@@ -7403,7 +7515,7 @@ def create_app(model: Any = None) -> FastAPI:
                             rid,
                             _redacted_exc_log_text(exc),
                         )
-                        await queue.put(
+                        _emit_terminal(
                             {
                                 "type": "error",
                                 "message": (
@@ -7426,6 +7538,35 @@ def create_app(model: Any = None) -> FastAPI:
                 stream_state["turn_started"] = True
                 lease.bind_turn(task)
 
+                def _ensure_terminal(finished: asyncio.Task[None]) -> None:
+                    # 生产方必须给消费方一个终态：run() 正常返回或走
+                    # except Exception 都会入队 done / error，但 BaseException
+                    # （或未来处理器自身的 bug）跳出时不会。此时消费循环
+                    # 只等 queue，心跳每 15s 续命又让客户端空闲看门狗永不
+                    # 触发，界面会卡在「生成中」直到用户手动停止
+                    if terminal_queued:
+                        return
+                    if not finished.cancelled():
+                        exc = finished.exception()
+                        logger.error(
+                            "流式回合协程无终态结束（%s）: %s",
+                            rid,
+                            _redacted_exc_log_text(exc)
+                            if exc is not None
+                            else "returned without terminal",
+                        )
+                    _emit_terminal(
+                        {
+                            "type": "error",
+                            "message": (
+                                "处理失败：服务器内部错误，请稍后再试"
+                                f"（请求 ID：{rid}）"
+                            ),
+                        }
+                    )
+
+                task.add_done_callback(_ensure_terminal)
+
                 async def send_heartbeat() -> None:
                     while True:
                         await asyncio.sleep(SSE_HEARTBEAT_SEC)
@@ -7446,8 +7587,12 @@ def create_app(model: Any = None) -> FastAPI:
                         "\n\n"
                     )
                     if event["type"] in ("done", "error"):
-                        # 这行在消费方取下一项时才执行：能走到这里说明终态
-                        # 帧已成功发送（send 失败时生成器在 yield 处被关闭）
+                        # yield 恢复只说明 send 返回，不代表帧已送达
+                        # （uvicorn 断连后 send 静默成功）：补一次非阻塞
+                        # 探测，未送达时不置 terminal_delivered、不记
+                        # sse_error，让响应包装器按断连（499）记账
+                        if not await _terminal_frame_delivered(request):
+                            break
                         if event["type"] == "error":
                             # HTTP 已发出 200 且 error 帧确认送达：对话错误率
                             # 需要独立口径；未送达的 error 帧由 499 单独记录

@@ -908,13 +908,24 @@ class OrchestrationAgent(AgentBase):
         merged["user_preferences"] = preferences
         return merged
 
-    def _session_deleted_now(self) -> bool:
-        """提交检查点前复查共享墓碑（读取失败按未删除处理，保真优先）。"""
+    def _session_deleted_now(self, force: bool = True) -> bool:
+        """提交检查点前复查共享墓碑（读取失败按未删除处理，保真优先）。
+
+        ``force=True`` 跳过墓碑读取的故障冷却：冷却窗口内的删除方清理
+        可能已错过本次落盘，写后复查若同样被冷却按「未删除」返回，含
+        用户数据的检查点会残留到 TTL。低频写路径应真实读取一次。
+        """
         check = getattr(self.memory_manager, "session_deleted", None)
         if not callable(check):
             return False
         try:
-            return bool(check())
+            return bool(check(force=force))
+        except TypeError:
+            # 无 force 参数的测试替身 / 旧实现：退回无参调用
+            try:
+                return bool(check())
+            except Exception:  # noqa: BLE001 - 状态不明按未删除处理
+                return False
         except Exception:  # noqa: BLE001 - 状态不明按未删除处理
             return False
 
@@ -1151,12 +1162,15 @@ class OrchestrationAgent(AgentBase):
         # 注册器两种名称都接受，但事件与结果统一用标准名
         canonical_name = canonical_agent_name(agent_name)
         # 整轮重试缓存的键必须绑定本步骤实际可见的输入（上游批次结果 /
-        # 记忆偏好 / 抽取实体）：同轮回退时上游已由失败重跑为成功，下游
-        # 若只按计划文本命中缓存会复用「基于失败上游」的结果
+        # 记忆偏好 / 抽取实体 / 重写后的查询）：同轮回退时上游已由失败
+        # 重跑为成功，下游若只按计划文本命中缓存会复用「基于失败上游」的
+        # 结果；query-info / memory-query / plan-trip 把 rewritten_query
+        # 当作实际查询输入，计划措辞恰好一致时不能沿用旧查询的结果
         input_extras = {
             "previous_results": previous_results,
             "user_preferences": context.get("user_preferences") or {},
             "key_entities": context.get("key_entities") or {},
+            "rewritten_query": context.get("rewritten_query") or "",
         }
         extras_digest = ""
         effective_key = cache_key
@@ -1297,29 +1311,37 @@ class OrchestrationAgent(AgentBase):
             # 不能再写出新的检查点文件（会残留到 TTL 且含用户数据）。
             # 墓碑复查只在确实要写检查点时执行：失败 / 超时结果不写检查点，
             # 无需为此多付一次 Redis 查询（Redis 变慢时延迟用户可见错误）
-            deleted_now = await asyncio.to_thread(self._session_deleted_now)
-            if not deleted_now:
+            scope = getattr(self, "_checkpoint_scope", None)
+
+            def _persist_step_and_recheck() -> None:
+                """写前复查 + 落盘 + 写后复查补删，全部在同一个线程里完成。
+
+                写后复查若留在协程里，断连取消会整段跳过补删（与
+                「两种时序都不会留到 TTL」的承诺不符）；放进同一同步函数
+                后，取消只可能发生在写之前（不落盘）或线程整体完成之后
+                （补删已执行）。
+                """
+                if self._session_deleted_now():
+                    return
                 try:
-                    await asyncio.to_thread(
-                        checkpoint_store.update_step,
+                    checkpoint_store.update_step(
                         checkpoint_key,
                         canonical_name,
                         result,
-                        scope=getattr(self, "_checkpoint_scope", None),
+                        scope=scope,
                         task_digest=task_digest or None,
                     )
                 except Exception as exc:  # noqa: BLE001 - 检查点失败不阻断对话
                     logger.warning("保存执行检查点失败: %s", exc)
-                else:
-                    # 落盘期间可能刚被跨实例删除：删除方的按作用域清理扫描
-                    # 早于本次落盘时不会包含该文件。落盘后再复查一次——
-                    # 墓碑已写 ⇒ 这里补删刚写出的键；墓碑在本复查之后才写
-                    # ⇒ 删除方的扫描必能看到已存在的文件并清掉。两种时序都
-                    # 不会把含用户提问 / 行程的检查点留到 TTL
-                    if await asyncio.to_thread(self._session_deleted_now):
-                        await asyncio.to_thread(
-                            self.clear_checkpoint_key, checkpoint_key
-                        )
+                    return
+                # 落盘期间可能刚被跨实例删除：删除方的按作用域清理扫描
+                # 早于本次落盘时不会包含该文件。落盘后再复查一次——
+                # 墓碑已写 ⇒ 这里补删刚写出的键；墓碑在本复查之后才写
+                # ⇒ 删除方的扫描必能看到已存在的文件并清掉。
+                if self._session_deleted_now():
+                    self.clear_checkpoint_key(checkpoint_key)
+
+            await asyncio.to_thread(_persist_step_and_recheck)
         return result
 
     async def _run_agent(

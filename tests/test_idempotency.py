@@ -152,6 +152,24 @@ def test_eviction_purges_expired_before_fair(monkeypatch):
     print("✓ 幂等缓存先清过期再按用户公平淘汰")
 
 
+def test_eviction_tie_targets_most_entries_owner():
+    """条目数并列时的实际淘汰口径（尽力而为，文档已按此修正）。
+
+    多用户各占一条、新用户写入时 counts 全为 1：victim 是全局最旧条目
+    的归属，新写入会淘汰另一用户仍在 TTL 内的条目——行为用用例钉死，
+    避免实现与文档承诺再次漂移。
+    """
+    cache = IdempotencyCache(max_entries=3, ttl_sec=600)
+    keys = [make_key(user, "s", "k") for user in ("alice", "bob", "carol")]
+    for key in keys:
+        cache.put(key, {"ok": True})
+    cache.put(make_key("dave", "s", "k"), {"ok": True})
+    assert len(cache) == 3
+    assert cache.get(keys[0]) is None, "并列时淘汰全局最旧条目的归属"
+    assert cache.get(make_key("dave", "s", "k")) is not None
+    print("✓ 幂等缓存条目并列时按全局最旧淘汰（尽力而为）")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -174,4 +192,5 @@ if __name__ == "__main__":
     test_key_normalization_and_clear()
     test_key_binds_endpoint_and_message()
     test_discard_session_clears_all_forms()
+    test_eviction_tie_targets_most_entries_owner()
     print("\n全部通过")

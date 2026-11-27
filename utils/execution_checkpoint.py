@@ -9,10 +9,11 @@
   带用户 / 会话标识，落盘原始值等于把个人数据写进运行期文件；
 - 原子写：同目录临时文件 → fsync → ``os.replace``；
 - TTL + 最大条目数：读取过期文件视为不存在并清理，写入后超限按用户
-  公平淘汰——只淘汰条目最多的用户自己最旧的一条，任一用户的流量不能
-  把另一用户仍在 TTL 内的检查点挤出（被挤出的检查点会让重试重复执行
-  子智能体、重复调用模型）。归属按 key / scope 首段（用户）计，只存
-  哈希；无法解析归属的旧文件归入共享桶，仍按全局最旧淘汰；
+  公平淘汰——优先只淘汰条目最多的归属自己最旧的一条；当最大条目数在
+  多个归属间并列且写入者不在其中时，退回淘汰全局最旧条目（尽力而为：
+  活跃归属数达到上限时没有「任一用户都不挤掉他人」的绝对保证）。归属
+  按 key / scope 首段（用户）计，只存哈希；无法解析归属的旧文件归入
+  共享桶，仍按全局最旧淘汰；
 - 损坏文件按不存在处理并移出（不阻断调用方）；
 - 进程内互斥保证同进程并发写同一键不互相覆盖；跨进程写同一键不在本层
   承诺（多实例部署应按用户 / 请求分片或换 Redis 实现）。
@@ -44,6 +45,18 @@ DEFAULT_MAX_ENTRIES = 256
 # :meth:`CheckpointStore._cleanup_legacy_roots`）。
 _CHECKPOINT_NAME_RE = re.compile(r"^[0-9a-f]{64}\.json$")
 _CHECKPOINT_TEMP_RE = re.compile(r"^\.[0-9a-f]{64}\.json\..+\.tmp$")
+
+
+class _Unreadable:
+    """哨兵：文件存在但暂时不可读（与「不存在 / 已损坏」区分）。
+
+    瞬时读失败（Windows 共享冲突 / 杀软 / I/O 抖动）时保留文件是对的，
+    但调用方不能把「读不到」当成「没有状态」：``update_step`` 据此跳过
+    本次写入，避免整份覆盖并清空此前已保存的步骤。
+    """
+
+
+_UNREADABLE = _Unreadable()
 
 
 class CheckpointStore:
@@ -86,18 +99,19 @@ class CheckpointStore:
     def _path(self, key: str) -> Path:
         return self.root / f"{self._digest(key)}.json"
 
-    def _read(self, path: Path) -> dict[str, Any] | None:
+    def _read(self, path: Path) -> dict[str, Any] | _Unreadable | None:
         try:
             raw = path.read_text(encoding="utf-8")
         except FileNotFoundError:
             return None
         except OSError as exc:
             # 暂时不可读（Windows 共享冲突 / 句柄耗尽 / I/O 抖动）：内容
-            # 未证实损坏，保留文件，否则重试会重复执行子智能体
+            # 未证实损坏，保留文件，否则重试会重复执行子智能体；用哨兵
+            # 与「不存在」区分，写路径不得在未知状态上整份覆盖
             logger.debug(
                 "读取检查点暂时失败，保留文件：%s（%s）", path.name, exc
             )
-            return None
+            return _UNREADABLE
         try:
             data = json.loads(raw)
         except ValueError:  # JSONDecodeError / UnicodeDecodeError：确实损坏
@@ -342,12 +356,16 @@ class CheckpointStore:
         if removed:
             logger.info("已清理旧版检查点目录过期文件 %s 个", removed)
 
-    def _load_unlocked(self, key: str) -> dict[str, Any] | None:
+    def _load_unlocked(self, key: str) -> dict[str, Any] | _Unreadable | None:
         """调用方已持有 ``self._lock`` 时使用。"""
         path = self._path(key)
-        stat_result = self._stat_or_none(path)
-        if stat_result is None:
+        try:
+            stat_result = path.stat()
+        except FileNotFoundError:
             return None
+        except OSError:
+            # 暂时 stat 不到不等于不存在：保留哨兵让写路径放弃覆盖
+            return _UNREADABLE
         if self.ttl_sec > 0 and (
             time.time() - stat_result.st_mtime
         ) > self.ttl_sec:
@@ -359,9 +377,10 @@ class CheckpointStore:
     # ---------- 公共接口 ----------
 
     def load(self, key: str) -> dict[str, Any] | None:
-        """读取检查点；不存在 / 过期 / 损坏返回 None。"""
+        """读取检查点；不存在 / 过期 / 损坏 / 暂时不可读均返回 None。"""
         with self._lock:
-            return self._load_unlocked(key)
+            state = self._load_unlocked(key)
+            return None if isinstance(state, _Unreadable) else state
 
     def save(
         self, key: str, state: dict[str, Any], *, scope: str | None = None
@@ -385,7 +404,17 @@ class CheckpointStore:
         复用方据此确认「同键重试的计划没有变化」；不传时保持旧行为。
         """
         with self._lock:
-            state = self._load_unlocked(key) or {}
+            state = self._load_unlocked(key)
+            if isinstance(state, _Unreadable):
+                # 状态未知时整份覆盖会清空此前已保存的步骤（随后重试把
+                # 已成功的子智能体全部重跑）：跳过本次写入，等下一次成功
+                # 读取后再合并。丢一步结果比丢整份安全
+                logger.warning(
+                    "读取检查点暂时失败，跳过本次写入以免覆盖已保存步骤：%s",
+                    step,
+                )
+                return
+            state = state or {}
             steps = state.get("steps")
             if not isinstance(steps, dict):
                 steps = {}

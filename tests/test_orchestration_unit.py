@@ -86,6 +86,30 @@ def _intent(schedule: list[dict]) -> Msg:
     )
 
 
+def _checkpoint_digest(plan: bytes, rewritten_query: str = "测试查询") -> str:
+    """与 _execute_agent 同口径的任务摘要（计划摘要 | 实际可见输入摘要）。
+
+    检查点复用绑定 rewritten_query 后，手工构造旧检查点的用例必须按同一
+    口径计算，否则摘要不匹配会让步骤重跑。
+    """
+    plan_digest = hashlib.sha256(plan).hexdigest()
+    extras = json.dumps(
+        {
+            "previous_results": [],
+            "user_preferences": {},
+            "key_entities": {},
+            "rewritten_query": rewritten_query,
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    extras_digest = hashlib.sha256(extras).hexdigest()
+    return hashlib.sha256(
+        f"{plan_digest}|{extras_digest}".encode("utf-8")
+    ).hexdigest()
+
+
 def test_priority_parallel_and_sequential():
     """同优先级并行、下一个优先级必须等整批完成"""
     order: list[str] = []
@@ -226,8 +250,6 @@ def test_checkpoint_store_init_is_single_flight(monkeypatch):
 
 def test_checkpoint_reuse_emits_progress_events(tmp_path):
     """复用的已完成步骤也要补发 start/done，新流执行路线不能一直 pending。"""
-    import hashlib
-
     from utils.execution_checkpoint import CheckpointStore
 
     store = CheckpointStore(tmp_path, ttl_sec=3600)
@@ -239,7 +261,7 @@ def test_checkpoint_reuse_emits_progress_events(tmp_path):
             "expected_output": "e",
         }
     ]
-    digest = hashlib.sha256(b"a|1|r|e").hexdigest()
+    digest = _checkpoint_digest(b"a|1|r|e")
     store.update_step(
         "u:s:reuse",
         "a",
@@ -333,6 +355,93 @@ def test_checkpoint_cleared_when_session_deleted_between_probe_and_write(tmp_pat
     asyncio.run(probe.reply(_intent(schedule), checkpoint_key="u:s:gone"))
     assert store.load("u:s:gone") is None, "落盘后复查到删除必须补删检查点"
     print("✓ 跨实例删除落在复查与落盘之间时检查点被补删")
+
+
+def test_checkpoint_tombstone_probe_forces_shared_read(tmp_path):
+    """检查点墓碑复查跳过失败冷却：低频写路径应真实读取一次墓碑。"""
+    from utils.execution_checkpoint import CheckpointStore
+
+    calls: list[bool] = []
+
+    class _Memory(_StubMemory):
+        def session_deleted(self, force: bool = False) -> bool:
+            calls.append(force)
+            return False
+
+    orch = OrchestrationAgent(
+        agent_registry={"a": _StubAgent("a", {"ok": True})},
+        memory_manager=_Memory(),
+    )
+    orch._checkpoint_store = CheckpointStore(tmp_path, ttl_sec=3600)
+    asyncio.run(orch.reply(_intent([{"agent_name": "a", "priority": 1}]),
+                           checkpoint_key="u:s:force"))
+    assert calls == [True, True], "写前 / 写后复查都必须 force 读取"
+    print("✓ 检查点墓碑复查使用 force 读取")
+
+
+def test_checkpoint_tombstone_probe_tolerates_legacy_memory(tmp_path):
+    """无 force 参数的记忆替身（旧实现）退回无参调用，不阻断写检查点。"""
+    from utils.execution_checkpoint import CheckpointStore
+
+    class _LegacyMemory(_StubMemory):
+        def session_deleted(self) -> bool:
+            return False
+
+    store = CheckpointStore(tmp_path, ttl_sec=3600)
+    orch = OrchestrationAgent(
+        agent_registry={"a": _StubAgent("a", {"ok": True})},
+        memory_manager=_LegacyMemory(),
+    )
+    orch._checkpoint_store = store
+    asyncio.run(orch.reply(_intent([{"agent_name": "a", "priority": 1}]),
+                           checkpoint_key="u:s:legacy"))
+    state = store.load("u:s:legacy")
+    assert isinstance(state, dict) and state.get("steps", {}).get("a")
+    print("✓ 旧记忆替身不支持 force 时回退无参调用")
+
+
+def test_checkpoint_reuse_requires_same_rewritten_query(tmp_path):
+    """检查点复用绑定 rewritten_query：查询改写变化必须按未命中重跑。"""
+    from utils.execution_checkpoint import CheckpointStore
+
+    store = CheckpointStore(tmp_path, ttl_sec=3600)
+    schedule = [{"agent_name": "a", "priority": 1}]
+
+    def _intent_with_query(query: str) -> Msg:
+        return Msg(
+            name="IntentionAgent",
+            content=json.dumps(
+                {
+                    "reasoning": "unit test",
+                    "intents": [],
+                    "key_entities": {},
+                    "rewritten_query": query,
+                    "agent_schedule": schedule,
+                },
+                ensure_ascii=False,
+            ),
+            role="assistant",
+        )
+
+    first = OrchestrationAgent(agent_registry={"a": _StubAgent("a", {"ok": True})})
+    first._checkpoint_store = store
+    asyncio.run(first.reply(_intent_with_query("北京天气"),
+                            checkpoint_key="u:s:q"))
+
+    changed_agent = _StubAgent("a", {"ok": True})
+    changed = OrchestrationAgent(agent_registry={"a": changed_agent})
+    changed._checkpoint_store = store
+    asyncio.run(changed.reply(_intent_with_query("上海天气"),
+                              checkpoint_key="u:s:q"))
+    assert changed_agent.calls == 1, "rewritten_query 变化必须重跑，不能复用旧查询结果"
+
+    same_agent = _StubAgent("a", {"ok": True})
+    same = OrchestrationAgent(agent_registry={"a": same_agent})
+    same._checkpoint_store = store
+    asyncio.run(same.reply(_intent_with_query("上海天气"),
+                           checkpoint_key="u:s:q"))
+    assert same_agent.calls == 0, "查询一致时应复用检查点"
+    print("✓ 检查点复用绑定 rewritten_query")
 
 
 def test_checkpoint_store_failure_does_not_block_turn(monkeypatch):
@@ -4414,15 +4523,13 @@ def test_update_memory_key_entities_overrides_unparseable_event_date():
 
 def test_checkpoint_reuse_registers_retry_cache(tmp_path):
     """检查点命中后登记 retry_cache，同一轮整轮重试不再重复发进度事件。"""
-    import hashlib
-
     from utils.execution_checkpoint import CheckpointStore
 
     store = CheckpointStore(tmp_path, ttl_sec=3600)
     schedule = [
         {"agent_name": "a", "priority": 1, "reason": "r", "expected_output": "e"}
     ]
-    digest = hashlib.sha256(b"a|1|r|e").hexdigest()
+    digest = _checkpoint_digest(b"a|1|r|e")
     store.update_step(
         "u:s:rc",
         "a",
