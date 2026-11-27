@@ -272,6 +272,10 @@ class IntentionAgent(AgentBase):
             if skill_dir in self._available_skill_dirs:
                 valid_names.extend((skill_dir, standard_name))
         valid_names.extend(str(name) for name in skill_names)
+        # 目录名同样可调度（LazyAgentRegistry._resolve_agent_name 第一步就按
+        # 目录名解析）：自定义技能 name != 目录名 / 缺 SKILL.md 时，优先级
+        # 分组按目录名宣传，过滤层若只认 frontmatter 名会把整轮调度降级
+        valid_names.extend(sorted(self._available_skill_dirs))
         self._valid_agent_names = {
             str(skill_name).strip().casefold()
             for skill_name in valid_names

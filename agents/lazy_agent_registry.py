@@ -97,12 +97,14 @@ class LazyAgentRegistry:
             from utils.skill_loader import SkillLoader
 
             loader = SkillLoader(str(self.skills_root))
-            for directory, script_path in self._skill_map.items():
+            # 排序 + 首个胜出：重名技能的别名解析必须确定，与
+            # SkillLoader.load_skills 的「排序后保留首个」同向
+            for directory, script_path in sorted(self._skill_map.items()):
                 skill_md = Path(script_path).parent.parent / "SKILL.md"
                 info = loader._parse_skill_md(str(skill_md)) or {}
                 name = info.get("name")
                 if isinstance(name, str) and name and name != directory:
-                    self._name_aliases[name] = directory
+                    self._name_aliases.setdefault(name, directory)
         except Exception as exc:  # noqa: BLE001 - 别名只是加分项，失败不影响发现
             self._say(f"[dim]读取技能 frontmatter 名称失败: {exc}[/dim]")
 

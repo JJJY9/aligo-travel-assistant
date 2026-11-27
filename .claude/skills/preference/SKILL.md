@@ -123,21 +123,21 @@ data = asyncio.run(save_preference("我还喜欢如家"))
 （支持自定义新的偏好类型）
 
 【输出格式】(严格JSON)
-{{
+{
     "preferences": [
-        {{
+        {
             "type": "hotel_brands",
             "value": "汉庭",
             "action": "append"
-        }},
-        {{
+        },
+        {
             "type": "home_location",
             "value": "上海浦东新区",
             "action": "replace"
-        }}
+        }
     ],
     "has_preferences": true
-}}
+}
 
 【重要规则】
 1. action 只能是 "append" 或 "replace"
@@ -145,4 +145,4 @@ data = asyncio.run(save_preference("我还喜欢如家"))
 3. 如果用户使用「还」、「也」等词，使用 append
 4. 如果用户使用「搬家」、「改成」等词，使用 replace
 5. 如果是首次提及，使用 replace
-6. 如果用户未提及任何偏好，返回 {{"preferences": [], "has_preferences": false}}
+6. 如果用户未提及任何偏好，返回 {"preferences": [], "has_preferences": false}

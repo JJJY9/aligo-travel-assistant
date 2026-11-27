@@ -18,6 +18,35 @@ from utils.preference_values import (
 
 logger = logging.getLogger(__name__)
 
+
+def normalize_missing_items(items: Any) -> list[str]:
+    """把 missing_info 归一为非空字符串列表。
+
+    模型偶发返回单个字符串 / null / 数字 / 包装对象；直接 str() 会把
+    ``None`` / ``123`` 当「还需要补充」展示给用户。dict 条目取
+    field / name / description，其余非字符串条目丢弃。
+    """
+    if isinstance(items, str):
+        items = [items]
+    if not isinstance(items, (list, tuple)):
+        return []
+    normalized: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            text = str(
+                item.get("field")
+                or item.get("name")
+                or item.get("description")
+                or ""
+            ).strip()
+        elif isinstance(item, str):
+            text = item.strip()
+        else:
+            continue
+        if text:
+            normalized.append(text)
+    return normalized
+
 _DISPLAY_NAMES = {
     "event_collection": "事项收集",
     "preference": "偏好管理",
@@ -331,21 +360,14 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
             value = data.get(key) or nested.get(key)
             if value:
                 parts.append(f"- {label}：{_pref_value_text(value)}")
-        missing = data.get("missing_info") or []
-        # 模型可能返回单个字符串：直接迭代会被拆成单字
-        if isinstance(missing, str):
-            missing = [missing]
-        if not isinstance(missing, list):
-            missing = []
+        missing = normalize_missing_items(data.get("missing_info") or [])
         if parts:
             text = "### ✅ 已收集行程信息\n" + "\n".join(parts)
             if missing:
-                text += "\n\n💡 还需要补充：" + "、".join(
-                    str(item) for item in missing
-                )
+                text += "\n\n💡 还需要补充：" + "、".join(missing)
             return text
         if missing:
-            return "💡 还需要补充：" + "、".join(str(item) for item in missing)
+            return "💡 还需要补充：" + "、".join(missing)
         return ""
 
     if agent_name == "information_query":

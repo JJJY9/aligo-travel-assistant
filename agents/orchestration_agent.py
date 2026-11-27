@@ -45,6 +45,7 @@ from utils.preference_values import (
     merge_preference_value,
     preference_value_problem,
 )
+from utils.result_formatter import normalize_missing_items
 
 logger = logging.getLogger(__name__)
 
@@ -1075,11 +1076,35 @@ class OrchestrationAgent(AgentBase):
         """执行单个智能体，并在开始 / 结束时发出进度事件。"""
         # 注册器两种名称都接受，但事件与结果统一用标准名
         canonical_name = canonical_agent_name(agent_name)
-        if retry_cache is not None and cache_key and cache_key in retry_cache:
+        # 整轮重试缓存的键必须绑定本步骤实际可见的输入（上游批次结果 /
+        # 记忆偏好 / 抽取实体）：同轮回退时上游已由失败重跑为成功，下游
+        # 若只按计划文本命中缓存会复用「基于失败上游」的结果
+        input_extras = {
+            "previous_results": previous_results,
+            "user_preferences": context.get("user_preferences") or {},
+            "key_entities": context.get("key_entities") or {},
+        }
+        extras_digest = ""
+        effective_key = cache_key
+        if cache_key and any(input_extras.values()):
+            extras_digest = hashlib.sha256(
+                json.dumps(
+                    input_extras,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            effective_key = f"{cache_key}|{extras_digest}"
+        if (
+            retry_cache is not None
+            and effective_key
+            and effective_key in retry_cache
+        ):
             # 外层整轮回退重试：复用首轮已完成的智能体结果，不重复调用
             # 模型（一次 429/5xx 曾让同批已成功的智能体整体重发），也不再
             # 重发进度事件（首轮已经展示过）
-            return retry_cache[cache_key]
+            return retry_cache[effective_key]
         checkpoint_store = await self._checkpoint_store_for_turn()
         checkpoint_key = getattr(self, "_checkpoint_key", None)
         # 检查点复用必须绑定「本轮计划里的这份任务」：只按智能体名取回
@@ -1091,26 +1116,10 @@ class OrchestrationAgent(AgentBase):
             if cache_key
             else ""
         )
-        # 判定还必须绑定该步骤实际可见的输入：上游批次结果
-        # （previous_results）以及记忆偏好 / 抽取实体都不在计划文本里。
-        # 同键重试时上游重跑（计划漂移触发）而下游计划措辞恰好不变时，
-        # 只看计划摘要会复用「基于旧上游 / 旧偏好」的下游结果，拼出
-        # 自相矛盾的回复。结构化输入全为空时回退纯计划摘要，兼容旧格式
-        # 检查点与既有单步骤用例（安全方向：不命中就重跑）。
-        input_extras = {
-            "previous_results": previous_results,
-            "user_preferences": context.get("user_preferences") or {},
-            "key_entities": context.get("key_entities") or {},
-        }
-        if plan_digest and any(input_extras.values()):
-            extras_digest = hashlib.sha256(
-                json.dumps(
-                    input_extras,
-                    sort_keys=True,
-                    ensure_ascii=False,
-                    default=str,
-                ).encode("utf-8")
-            ).hexdigest()
+        # 判定还必须绑定该步骤实际可见的输入（见上方 input_extras）：
+        # 结构化输入全为空时回退纯计划摘要，兼容旧格式检查点与既有
+        # 单步骤用例（安全方向：不命中就重跑）。
+        if plan_digest and extras_digest:
             task_digest = hashlib.sha256(
                 f"{plan_digest}|{extras_digest}".encode("utf-8")
             ).hexdigest()
@@ -1176,13 +1185,13 @@ class OrchestrationAgent(AgentBase):
         )
         duration = round(time.perf_counter() - started, 2)
         result["duration"] = duration
-        if result.pop("_timed_out", False) and cache_key:
+        if result.pop("_timed_out", False) and effective_key:
             if retry_cache is not None:
                 # 超时结果按整轮缓存键记录：同一轮的回退重试（同一个
                 # retry_cache 对象）直接复用、不再跑满 300 秒；下一轮由
                 # 调用方新建的空 dict 自然失效。不能挂在编排器实例上——
                 # 那会把一次瞬时超时永久毒化同键任务（跨轮跳过执行）
-                retry_cache[cache_key] = dict(result)
+                retry_cache[effective_key] = dict(result)
         self._emit(
             on_event,
             {
@@ -1195,12 +1204,12 @@ class OrchestrationAgent(AgentBase):
         )
         if (
             retry_cache is not None
-            and cache_key
+            and effective_key
             and result.get("status") == "success"
         ):
             # 只复用首轮已成功的结果：status=error（模型格式错误 / 超时）
             # 在整轮回退重试时应当重新执行，否则瞬时失败被缓存成永久失败
-            retry_cache[cache_key] = result
+            retry_cache[effective_key] = result
         if (
             checkpoint_store is not None
             and checkpoint_key
@@ -1509,22 +1518,10 @@ class OrchestrationAgent(AgentBase):
                     **{key: value for key, value in data.items() if key != "data"},
                 }
             info = data.get("missing_info") if isinstance(data, dict) else None
-            # 模型偶发返回单个字符串（展示层已兼容），聚合层同样归一
-            if isinstance(info, str):
-                info = [info]
-            if not isinstance(info, list):
-                continue
-            for item in info:
-                if isinstance(item, dict):
-                    text = str(
-                        item.get("field")
-                        or item.get("name")
-                        or item.get("description")
-                        or ""
-                    ).strip()
-                else:
-                    text = str(item).strip()
-                if text and text not in missing:
+            # 模型偶发返回 null / 数字 / 包装对象：与展示层同一归一
+            # （直接 str() 会把 "None" / "123" 当「还需要补充」）
+            for text in normalize_missing_items(info):
+                if text not in missing:
                     missing.append(text)
         if missing:
             aggregated["missing_info"] = missing[:8]

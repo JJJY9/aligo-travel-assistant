@@ -62,7 +62,9 @@ try:
     import pymilvus  # noqa: F401 - 仅用于检测依赖是否安装
     from sentence_transformers import SentenceTransformer  # noqa: F401 - 依赖检测
     DEPENDENCIES_AVAILABLE = True
-except ImportError as e:
+except (ImportError, OSError) as e:
+    # Windows 缺 VC++ 运行库 / ABI 不匹配时 torch 导入抛 OSError(WinError 126)
+    # 而不是 ImportError：漏掉会让整个技能模块加载失败，初始化降级提示不可达
     logger.warning(f"RAG dependencies not available: {e}")
     logger.warning("Install with: pip install pymilvus sentence-transformers")
     DEPENDENCIES_AVAILABLE = False

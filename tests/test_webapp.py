@@ -13769,6 +13769,39 @@ def test_knowledge_eval_rejects_dimension_mismatch(monkeypatch):
     print("✓ 冷进程维度不一致时评测入口 503 并给出重建指引")
 
 
+def test_knowledge_dimension_hint_follows_install_mode(monkeypatch):
+    """维度不一致的重建指引随安装形态切换：wheel 下必须是可执行的 aligo 命令。"""
+    from webapp import server as server_module
+    import utils.paths as paths_module
+
+    monkeypatch.setattr(
+        server_module,
+        "knowledge_status",
+        lambda **kwargs: {
+            "available": True,
+            "documents": 3,
+            "dimension": 512,
+            "dimension_mismatch": True,
+        },
+    )
+    monkeypatch.setattr(
+        paths_module, "is_source_checkout", lambda *args, **kwargs: False
+    )
+    body = _client().get("/api/knowledge").json()
+    assert "aligo kb-init --documents" in body["reason"], body
+    assert ".claude/skills" not in body["reason"], body
+    detail = _client().get("/api/knowledge/eval").json()["detail"]
+    assert "aligo kb-init --documents" in detail, detail
+    assert ".claude/skills" not in detail, detail
+
+    monkeypatch.setattr(
+        paths_module, "is_source_checkout", lambda *args, **kwargs: True
+    )
+    body = _client().get("/api/knowledge").json()
+    assert "init_knowledge_base.py" in body["reason"], body
+    print("✓ 维度重建指引随安装形态切换（wheel / 源码）")
+
+
 def test_knowledge_export_strips_nul(monkeypatch):
     """专用导出剥离 NUL：否则导入端把该条目标为无效、导出→导入丢片段。"""
     from webapp import server as server_module

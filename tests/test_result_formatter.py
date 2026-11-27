@@ -790,6 +790,27 @@ def test_event_collection_missing_non_list():
     print("✓ event_collection missing_info 非列表容错")
 
 
+def test_event_collection_missing_items_drop_non_strings():
+    """missing_info 里的 null / 数字条目不能被 str() 成 None / 123 展示。"""
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "event_collection",
+                    "status": "success",
+                    "data": {
+                        "origin": "北京",
+                        "missing_info": ["出发日期", None, 123, {"field": "预算"}],
+                    },
+                }
+            ]
+        )
+    )
+    assert "出发日期" in md and "预算" in md, md
+    assert "None" not in md and "123" not in md, md
+    print("✓ event_collection missing_info 非字符串条目被丢弃")
+
+
 def test_preference_single_object_renders_one_preference():
     """模型单对象偏差 {"type","value","action"} 按落库口径渲染为一条偏好。"""
     data = _wrap(
@@ -979,6 +1000,7 @@ if __name__ == "__main__":
     test_preference_legacy_explanatory_keys_not_rendered()
     test_itinerary_tolerant_shapes_extra()
     test_event_collection_missing_non_list()
+    test_event_collection_missing_items_drop_non_strings()
     test_object_results_are_normalized()
     test_itinerary_validation_warning_rendered()
     test_extra_skills_have_chinese_display_names()

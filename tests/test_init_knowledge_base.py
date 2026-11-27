@@ -901,6 +901,119 @@ def test_cli_kb_init_missing_script_returns_1(monkeypatch):
     print("✓ kb-init 脚本缺失退出 1")
 
 
+def test_documents_env_with_quotes_and_bom_is_cleaned(monkeypatch):
+    """ALIGO_KB_DOCS_DIR 带成对引号 / BOM 时按清洗后的路径判断。"""
+    module = _load_init_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "skill" / "script"
+        script.mkdir(parents=True)
+        module.current_dir = script
+        missing = Path(tmp) / "no-docs"
+        for noisy in ('"' + str(missing) + '"', "﻿" + str(missing) + "\n"):
+            monkeypatch.setenv("ALIGO_KB_DOCS_DIR", noisy)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                code = module.main()
+            assert code == 1, out.getvalue()
+            printed = out.getvalue()
+            assert "文档目录不存在" in printed
+            assert "﻿" not in printed, printed
+            assert '"' not in printed.split("文档目录不存在", 1)[1], printed
+            assert str(missing) in printed, printed
+    print("✓ ALIGO_KB_DOCS_DIR 去引号 / BOM 后判断目录")
+
+
+def test_load_documents_strips_utf8_bom(monkeypatch):
+    """带 UTF-8 BOM 的自备文档：正文与标题都不能带不可见字符。"""
+    module = _load_init_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        documents = Path(tmp) / "docs"
+        documents.mkdir()
+        (documents / "01_travel_standards.txt").write_text(
+            "差旅住宿标准\n\n一线城市：800元/晚。", encoding="utf-8-sig"
+        )
+        docs, failures = module.load_documents_from_directory(str(documents))
+        assert not failures, failures
+        assert docs
+        assert all(not doc["content"].startswith("﻿") for doc in docs)
+        assert docs[0]["metadata"]["title"] == "差旅住宿标准 (Part 1)"
+    print("✓ 文档读取剥离 UTF-8 BOM")
+
+
+def test_preserved_backup_write_failure_aborts_cleanly(monkeypatch):
+    """备份写入失败（磁盘满等）：中止且不删旧集合、不留 tmp。"""
+    module = _load_init_module()
+    import utils.knowledge_admin as admin_module
+
+    monkeypatch.setattr(
+        admin_module,
+        "export_documents",
+        lambda directory=None: [
+            {"content": "面板加的片段", "metadata": {"category": "住宿"}}
+        ],
+    )
+    dropped: list[str] = []
+
+    class _MismatchAgent(_RebuildAgent):
+        def __init__(self, **kwargs):
+            raise RuntimeError(
+                "知识库向量维度 1024 与嵌入模型 512 不一致，请重新运行 "
+                "python init_knowledge_base.py 重建知识库"
+            )
+
+    class _Client:
+        def drop_collection(self, name):
+            dropped.append(name)
+
+    def boom(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dirs(module, tmp)
+        monkeypatch.setattr(module, "create_chat_model", lambda: None)
+        monkeypatch.setattr(module, "RAGKnowledgeAgent", _MismatchAgent)
+        monkeypatch.setattr(module, "write_text_atomic", boom)
+        import utils.milvus_client as milvus_module
+
+        monkeypatch.setattr(
+            milvus_module, "get_milvus_client", lambda path: _Client()
+        )
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.main()
+        printed = out.getvalue()
+        assert code == 1, printed
+        assert "备份写入失败" in printed and "已中止（知识库保持原样）" in printed
+        assert dropped == [], "备份失败不得删除旧集合"
+        base = module.current_dir.parent / "data" / "rag_knowledge"
+        assert not list(base.glob("*.tmp")), "不能留下临时文件"
+        assert not module._preserved_backup_path(base).exists()
+    print("✓ 保留片段备份写入失败中止且不删库 / 不留 tmp")
+
+
+def test_write_preserved_backup_uses_atomic_write(monkeypatch):
+    """备份走原子写：写入失败抛 OSError 且不残留固定名 tmp。"""
+    module = _load_init_module()
+
+    def boom(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp) / "rag" / "data"
+        base.mkdir(parents=True)
+        monkeypatch.setattr(module, "write_text_atomic", boom)
+        try:
+            module._write_preserved_backup(
+                base.parent, [{"content": "x", "metadata": {}}]
+            )
+        except OSError as exc:
+            assert "No space" in str(exc)
+        else:
+            raise AssertionError("备份写入失败必须抛 OSError")
+        assert not list(base.parent.glob("*.tmp")), "原子写失败必须清理临时文件"
+    print("✓ 保留片段备份走原子写")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_target_follows_runtime_when_skills_dir_overridden": "需要 tmp_path 夹具",
 }
@@ -1041,6 +1154,26 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_cli_kb_init_missing_script_returns_1(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_documents_env_with_quotes_and_bom_is_cleaned(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_load_documents_strips_utf8_bom(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_preserved_backup_write_failure_aborts_cleanly(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_write_preserved_backup_uses_atomic_write(_mp)
     finally:
         _mp.undo()
     if _DIRECT_RUN_SKIP:

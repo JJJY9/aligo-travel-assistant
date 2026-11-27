@@ -462,6 +462,52 @@ def test_registry_discovers_extra_skills():
     print("✓ 注册器发现扩展技能")
 
 
+def test_extra_skill_prefers_last_envelope_over_echoed_template():
+    """模型先回显 SKILL.md 示例再给出正式结果时，不能把占位文案当答案。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    agent = agent_class(model=None)
+    echo = json.dumps(
+        {"status": "success", "budget_advice": "建议正文", "answer": "建议正文"},
+        ensure_ascii=False,
+    )
+    real = json.dumps(
+        {"status": "success", "budget_advice": "北京三日游总预算约 2500 元"},
+        ensure_ascii=False,
+    )
+    echoed_then_real = (
+        "以下是输出示例：\n```json\n" + echo + "\n```\n正式：\n```json\n" + real + "\n```"
+    )
+    assert agent._unwrap_answer(echoed_then_real) == "北京三日游总预算约 2500 元"
+    # 只回显了模板：原样返回整段（正式建议跟在其后，不能被占位文案顶替）
+    placeholder_only = (
+        "以下是输出示例：\n```json\n" + echo + "\n```\n"
+        "正式建议：北京三日游总预算约 2500 元"
+    )
+    assert agent._unwrap_answer(placeholder_only) == placeholder_only
+    assert agent._unwrap_answer(real) == "北京三日游总预算约 2500 元"
+    print("✓ 回显示例优先取最后的正式信封")
+
+
+def test_extra_skill_prompt_substitutes_result_key():
+    """SKILL.md 的通用 <result_key> 占位符替换为本技能真实结果键。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    model = _Model()
+    agent = agent_class(model=model)
+    asyncio.run(
+        agent.reply(
+            Msg(
+                name="orchestrator",
+                content=json.dumps({"context": {"rewritten_query": "预算"}}),
+                role="user",
+            )
+        )
+    )
+    prompt = model.prompts[0]
+    assert "<result_key>" not in prompt
+    assert "budget_advice" in prompt
+    print("✓ 技能 prompt 替换 <result_key> 占位符")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -480,5 +526,7 @@ if __name__ == "__main__":
     test_extra_skill_long_context_keeps_json_structure()
     test_extra_skill_long_dialogue_keeps_previous_results()
     test_extra_skill_single_oversized_previous_result_is_kept()
+    test_extra_skill_prefers_last_envelope_over_echoed_template()
+    test_extra_skill_prompt_substitutes_result_key()
     test_registry_discovers_extra_skills()
     print("\n全部通过")

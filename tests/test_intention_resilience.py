@@ -697,6 +697,60 @@ def test_priority_prompt_only_lists_dispatchable_skills():
     print("✓ 优先级块只列出可调度技能")
 
 
+def test_custom_skill_directory_names_are_schedulable(monkeypatch):
+    """自定义技能 name != 目录名 / 缺 SKILL.md：按目录名宣传的条目必须可调度。"""
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    root = tempfile.mkdtemp(prefix="chailv_custom_skills_")
+    try:
+        custom = Path(root) / "my-info"
+        (custom / "script").mkdir(parents=True)
+        (custom / "script" / "agent.py").write_text("", encoding="utf-8")
+        (custom / "SKILL.md").write_text(
+            "---\nname: My Info\ndescription: 自定义\n---\n正文",
+            encoding="utf-8",
+        )
+        no_md = Path(root) / "no-md-skill"
+        (no_md / "script").mkdir(parents=True)
+        (no_md / "script" / "agent.py").write_text("", encoding="utf-8")
+
+        monkeypatch.setenv("ALIGO_SKILLS_DIR", root)
+
+        class _DirNameModel:
+            async def __call__(self, messages):
+                return json.dumps(
+                    {
+                        "reasoning": "x",
+                        "intents": [],
+                        "key_entities": {},
+                        "rewritten_query": "查一下",
+                        "agent_schedule": [
+                            {"agent_name": "no-md-skill", "priority": 1}
+                        ],
+                    },
+                    ensure_ascii=False,
+                )
+
+        agent = IntentionAgent(name="IntentionAgent", model=_DirNameModel())
+        kept = agent._valid_schedule(
+            [
+                {"agent_name": "my-info", "priority": 1},
+                {"agent_name": "no-md-skill", "priority": 1},
+                {"agent_name": "My Info", "priority": 1},
+            ]
+        )
+        names = {task["agent_name"] for task in kept}
+        assert {"my-info", "no-md-skill", "My Info"} <= names, names
+        data = json.loads(asyncio.run(agent.reply([_user_msg()])).content)
+        names = [task["agent_name"] for task in data["agent_schedule"]]
+        assert names == ["no-md-skill"], names
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    print("✓ 自定义技能目录名可调度（name != 目录名 / 缺 SKILL.md）")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -731,4 +785,9 @@ if __name__ == "__main__":
     test_trailing_template_example_does_not_override_real_result()
     test_underscore_skill_variants_are_accepted()
     test_priority_prompt_only_lists_dispatchable_skills()
+    _mp = __import__("pytest").MonkeyPatch()
+    try:
+        test_custom_skill_directory_names_are_schedulable(_mp)
+    finally:
+        _mp.undo()
     print("\n全部通过")
