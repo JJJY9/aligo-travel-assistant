@@ -1043,7 +1043,12 @@ def test_skills_check_duplicate_frontmatter_names(monkeypatch):
         for directory in ("skill-a", "skill-b"):
             script = root / directory / "script" / "agent.py"
             script.parent.mkdir(parents=True)
-            script.write_text("", encoding="utf-8")
+            script.write_text(
+                "from agentscope.agent import AgentBase\n"
+                "class DuplicateAgent(AgentBase):\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
             (root / directory / "SKILL.md").write_text(
                 "---\nname: 同名技能\ndescription: d\n---\n",
                 encoding="utf-8",
@@ -1133,7 +1138,12 @@ def test_skills_check_warns_on_broken_skill_md(monkeypatch):
         def add_skill(name, skill_md):
             script_dir = root / name / "script"
             script_dir.mkdir(parents=True)
-            (script_dir / "agent.py").write_text("x", encoding="utf-8")
+            (script_dir / "agent.py").write_text(
+                "from agentscope.agent import AgentBase\n"
+                f"class {name.title()}Agent(AgentBase):\n"
+                "    pass\n",
+                encoding="utf-8",
+            )
             if skill_md is not None:
                 (root / name / "SKILL.md").write_text(skill_md, encoding="utf-8")
 
@@ -1153,6 +1163,67 @@ def test_skills_check_warns_on_broken_skill_md(monkeypatch):
     assert "good" not in result.detail
     assert "nameonly" not in result.detail
     print("✓ 技能 SKILL.md 校验（缺失 / 空 / 非法 frontmatter）")
+
+
+def test_skills_check_warns_on_broken_agent_script(monkeypatch):
+    """agent.py 语法错误 / 缺少 Agent 子类时 doctor 必须警告。
+
+    运行期 LazyAgentRegistry 才会 exec_module 并要求 AgentBase 子类，
+    doctor 只数文件会让这类技能通过自检、故障推迟到首次调度。
+    """
+    from utils import skill_paths
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+
+        def add_skill(name, source):
+            script_dir = root / name / "script"
+            script_dir.mkdir(parents=True)
+            (script_dir / "agent.py").write_text(source, encoding="utf-8")
+            (root / name / "SKILL.md").write_text(
+                f"---\nname: {name}\ndescription: d\n---\n", encoding="utf-8"
+            )
+
+        add_skill(
+            "good",
+            "from agentscope.agent import AgentBase\n"
+            "class A(AgentBase):\n    pass\n",
+        )
+        # import 别名同样要能识别
+        add_skill(
+            "aliased",
+            "from utils.simple_skill import SimplePromptSkill as Base\n"
+            "class B(Base):\n    pass\n",
+        )
+        add_skill("syntax", "class Broken(AgentBase:\n")
+        add_skill("noclass", "VALUE = 1\n")
+        add_skill("wrongbase", "class C(object):\n    pass\n")
+        monkeypatch.setattr(skill_paths, "resolve_skills_root", lambda: root)
+        result = check_skills()
+    assert result.status == STATUS_WARN, result.detail
+    assert "syntax（agent.py 语法错误" in result.detail, result.detail
+    assert "noclass（agent.py 未定义任何类" in result.detail, result.detail
+    assert "wrongbase（agent.py 未找到 AgentBase" in result.detail, result.detail
+    assert "good（" not in result.detail and "aliased（" not in result.detail
+    print("✓ agent.py 语法 / 子类校验")
+
+
+def test_dependencies_include_web_stack(monkeypatch):
+    """fastapi / uvicorn 是 Web 硬依赖，装坏时 doctor 不能报核心依赖 ok。"""
+    from utils import doctor as doctor_module
+
+    real_import = doctor_module.importlib.import_module
+
+    def fake_import(name, *args, **kwargs):
+        if name == "uvicorn":
+            raise ImportError("broken uvicorn")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(doctor_module.importlib, "import_module", fake_import)
+    results = doctor_module.check_dependencies()
+    core = next(item for item in results if item.name == "核心依赖")
+    assert core.status == STATUS_FAIL and "uvicorn" in core.detail
+    print("✓ 核心依赖包含 fastapi / uvicorn")
 
 
 _DIRECT_RUN_SKIP: dict[str, str] = {
@@ -1196,6 +1267,8 @@ if __name__ == "__main__":
         test_knowledge_base_config_dimension_mismatch_warns,
         test_knowledge_base_hf_model_unverified_warns,
         test_skills_check_warns_on_broken_skill_md,
+        test_skills_check_warns_on_broken_agent_script,
+        test_dependencies_include_web_stack,
         test_skills_check_duplicate_frontmatter_names,
         test_storage_probe_sets_statement_timeout,
         test_llm_connectivity_branches,

@@ -438,6 +438,9 @@ let sessionsRequestId = 0;
 // 刷新按已加载条数一次取回整窗，避免为展开过的列表逐页串行重扫全量历史
 const SESSION_REFRESH_LIMIT_MAX = 1000;
 let statusRequestId = 0;
+// 健康检查也存在并发（启动 / 回合结束 / 页面重新可见）：只应用最新一次
+// 结果，切换用户后旧响应不能覆盖新用户的服务状态
+let healthRequestId = 0;
 // 行程列表（展开全部 / 状态刷新时的二次请求）共用序号：只应用最新一次结果，
 // 防止切换用户后旧用户的数据被渲染（行内删除按当前用户执行，会误删同名 trip_id）
 let tripsRequestId = 0;
@@ -4645,17 +4648,39 @@ function handleStreamEvent(assistant, event, userText) {
 
 /* ---------- 状态与用户 ---------- */
 
+function storageFallback(storage) {
+  return Boolean(
+    storage &&
+      ((storage.short_term_configured &&
+        (storage.short_term !== "redis" ||
+          Boolean(storage.short_term_degraded))) ||
+        (storage.long_term_configured &&
+          (storage.long_term !== "postgres" ||
+            Boolean(storage.long_term_degraded)))),
+  );
+}
+
 function storageParts(storage) {
-  if (!storage) return ["本地存储"];
+  if (!storage) return ["存储状态未知"];
   const parts = [];
   const shortTerm =
     storage.short_term === "redis"
       ? storage.short_term_degraded
         ? "Redis（降级中）"
         : "Redis"
-      : "本地内存";
+      : storage.short_term_configured
+        ? "Redis（已回退）"
+        : "本地内存";
   parts.push(shortTerm);
-  parts.push(storage.long_term === "postgres" ? "PostgreSQL" : "JSON");
+  parts.push(
+    storage.long_term === "postgres"
+      ? storage.long_term_degraded
+        ? "PostgreSQL（降级中）"
+        : "PostgreSQL"
+      : storage.long_term_configured
+        ? "PostgreSQL（已回退）"
+        : "JSON",
+  );
   // 技能数量放在用户卡片上：安装后技能缺失（如 wheel 未打包）能直接看到
   const skills = state.health && state.health.skills;
   if (skills && typeof skills.count === "number") {
@@ -5254,10 +5279,7 @@ function renderOverview() {
     chip.textContent = text;
     els.storageChips.appendChild(chip);
   });
-  const fallback =
-    (storage.short_term_configured &&
-      (storage.short_term !== "redis" || Boolean(storage.short_term_degraded))) ||
-    (storage.long_term_configured && storage.long_term !== "postgres");
+  const fallback = storageFallback(storage);
   if (fallback) {
     const warn = document.createElement("span");
     warn.className = "badge err";
@@ -6004,8 +6026,11 @@ async function deletePreference(type, label, row) {
 }
 
 async function refreshHealth() {
+  const requestId = (healthRequestId += 1);
+  const userId = state.userId;
   try {
     const data = await getJSON("/api/health", undefined, 30000);
+    if (requestId !== healthRequestId || userId !== state.userId) return;
     state.health = data;
     const breaker = String(data.circuit_breaker || "closed");
     if (data.status === "degraded" || breaker === "open" || breaker === "half_open") {
@@ -6025,6 +6050,7 @@ async function refreshHealth() {
     }
     if (data.model) els.modelChip.textContent = data.model;
   } catch {
+    if (requestId !== healthRequestId || userId !== state.userId) return;
     state.health = null;
     els.health.className = "health err";
     els.healthText.textContent = "服务未连接";
@@ -7877,6 +7903,13 @@ function resizeInput() {
 /* ---------- 事件绑定 ---------- */
 
 function bindEvents() {
+  // 无轮询的轻量刷新：页面重新可见 / 网络恢复时纠正顶栏陈旧状态
+  // （启动后熔断或后端重启时不能一直显示「在线」）
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") refreshHealth();
+  });
+  window.addEventListener("online", () => refreshHealth());
+
   els.composer.addEventListener("submit", (event) => {
     event.preventDefault();
     sendMessage(els.input.value);

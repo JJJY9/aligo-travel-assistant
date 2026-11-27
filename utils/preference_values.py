@@ -39,6 +39,11 @@ def _is_blank_item(value: Any) -> bool:
     return False
 
 
+def is_blank_pref_item(value: Any) -> bool:
+    """单条偏好值是否为空的公开口径（合并、面板与 CLI 展示共用）。"""
+    return _is_blank_item(value)
+
+
 def has_preference_value(value: Any) -> bool:
     """偏好是否有实际值。
 

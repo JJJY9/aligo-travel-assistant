@@ -88,6 +88,12 @@ _PG_CONNECT_BACKOFF_SEC = (0.25, 0.5)
 # 最近一次实际返回的后端（describe_backends 用真实状态而不是仅凭时间戳
 # 推断：冷却过期后、下一次成功创建之前，实际仍在使用回退后端）
 _ACTUAL_BACKEND: dict[str, str] = {}
+# 本进程还没创建过长期记忆时的一次只读连通性探测（/api/health 与
+# /api/metrics 用）：只凭「配置了 DSN 且未进入冷却」推断 postgres 会让
+# 数据库不可达的新实例一直报绿，与 doctor 的真实连通性检查结论相反。
+# 单飞 + 失败冷却：探测成功写入 _ACTUAL_BACKEND 后不再重复连接。
+_pg_probe_lock = threading.Lock()
+_PG_PROBE_TIMEOUT_SEC = 2.0
 
 
 def _failed_recently(key: str) -> bool:
@@ -432,6 +438,36 @@ def reset_failure_cache() -> None:
     reset_pref_version_failure()
 
 
+def _probe_postgres_backend(dsn: str) -> bool:
+    """只读探测 PostgreSQL 连通性（不建表），供从未创建过长期记忆时上报。
+
+    与 ``create_long_term_memory`` 共用失败冷却：探测失败后 60 秒内健康 /
+    指标请求直接按回退上报，不再重复连接；探测成功写入 ``_ACTUAL_BACKEND``。
+    """
+    key = f"postgres:{dsn}"
+    with _pg_probe_lock:
+        if _failed_recently(key):
+            return False
+        try:
+            import psycopg
+
+            conn = psycopg.connect(
+                dsn,
+                connect_timeout=int(_PG_PROBE_TIMEOUT_SEC),
+                options="-c statement_timeout=2000",
+            )
+            conn.close()
+        except Exception as exc:  # noqa: BLE001 - 探测失败按回退处理
+            _mark_failed(key)
+            logger.warning(
+                "PostgreSQL 健康探测失败（%s），长期记忆按 JSON 上报",
+                redact_secret(exc),
+            )
+            return False
+        _ACTUAL_BACKEND["long_term"] = "postgres"
+        return True
+
+
 def describe_backends(wait_for_create: bool = True) -> dict[str, Any]:
     """返回当前实际使用的后端名称（供 /api/health 与界面展示）。
 
@@ -439,6 +475,10 @@ def describe_backends(wait_for_create: bool = True) -> dict[str, Any]:
     界面可提示「已配置后端暂不可用」。``wait_for_create=False`` 供健康 /
     指标路径：Redis 客户端正在别的线程创建时不等待其完成（见
     :func:`_get_redis_client`），最坏在极短窗口内显示回退后端。
+
+    长期后端在「本进程尚未创建过」时会做一次有界（≤2 秒）只读连通性
+    探测并缓存结果，不再只凭配置推断 ``postgres``——否则数据库不可达的
+    新实例会一直上报「未降级」，与 doctor 的实时检查口径相反。
     """
     url = STORAGE_CONFIG.get("redis_url") or ""
     dsn = STORAGE_CONFIG.get("postgres_dsn") or ""
@@ -450,12 +490,15 @@ def describe_backends(wait_for_create: bool = True) -> dict[str, Any]:
     short_term = "redis" if url and redis_client is not None else "memory"
     long_term = _ACTUAL_BACKEND.get("long_term")
     if long_term is None:
-        # 本进程还没创建过长期记忆：只能按配置与失败冷却推断
-        long_term = (
-            "postgres"
-            if dsn and not _failed_recently(f"postgres:{dsn}")
-            else "json"
-        )
+        # 本进程还没创建过长期记忆：不能只凭配置推断 postgres——数据库
+        # 不可达的新实例会一直报「已降级=false」，与 doctor 的连通性检查
+        # 相反。做一次有界只读探测，失败进入冷却并按回退上报。
+        if not dsn or _failed_recently(f"postgres:{dsn}"):
+            long_term = "json"
+        elif _probe_postgres_backend(dsn):
+            long_term = "postgres"
+        else:
+            long_term = "json"
     return {
         "short_term": short_term,
         "long_term": long_term,

@@ -340,8 +340,40 @@ def test_describe_backends_reports_long_term_degraded(monkeypatch):
     assert backends["long_term_degraded"] is True
 
     monkeypatch.setattr(storage, "_failed_recently", lambda key: False)
-    assert storage.describe_backends()["long_term_degraded"] is False
+    monkeypatch.setattr(storage, "_probe_postgres_backend", lambda dsn: True)
+    info = storage.describe_backends()
+    assert info["long_term"] == "postgres"
+    assert info["long_term_degraded"] is False
+    _set("postgres_dsn", "")
     print("✓ describe_backends 标记长期记忆回退")
+
+
+def test_describe_backends_probes_dead_pg_before_first_create(monkeypatch):
+    """新进程尚未创建过长期记忆：死 DSN 不能上报 postgres 且不降级。
+
+    /api/health 与 doctor 对同一故障必须同口径；探测失败进入冷却后，
+    后续描述请求不再重复连接。
+    """
+    _set("redis_url", "")
+    dsn = "postgresql://user:pass@127.0.0.1:1/db"
+    _set("postgres_dsn", dsn)
+    storage.reset_failure_cache()
+    try:
+        backends = storage.describe_backends(wait_for_create=False)
+        assert backends["long_term"] == "json", backends
+        assert backends["long_term_configured"] is True
+        assert backends["long_term_degraded"] is True, backends
+        assert storage._failed_recently(f"postgres:{dsn}")
+        # 冷却期内不再发起连接：再次描述直接按回退上报
+        monkeypatch.setattr(
+            storage,
+            "_probe_postgres_backend",
+            lambda _dsn: (_ for _ in ()).throw(AssertionError("冷却期内不应探测")),
+        )
+        assert storage.describe_backends(wait_for_create=False)["long_term"] == "json"
+    finally:
+        _set("postgres_dsn", "")
+    print("✓ 首次创建前按真实连通性上报长期后端")
 
 
 def test_bad_postgres_falls_back(monkeypatch):

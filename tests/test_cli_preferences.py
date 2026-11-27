@@ -130,7 +130,7 @@ def test_preferences_hides_blank_and_null_items(monkeypatch):
     """文本与 --json 口径同面板：null / 空白串 / 全空列表不列出，列表内空项剔除。"""
     store = _FakeStore(
         {
-            "hotel_brands": ["东航", None, "  "],
+            "hotel_brands": ["东航", None, "  ", {}, []],
             "home_location": "   ",
             "airlines": [""],
             "budget_level": 0,
@@ -140,6 +140,7 @@ def test_preferences_hides_blank_and_null_items(monkeypatch):
     assert code == 0
     assert "2 条偏好" in out, out
     assert "东航" in out and "None" not in out
+    assert "{}" not in out and "[]" not in out, "空容器条目不能显示"
     assert "home_location" not in out and "airlines" not in out
     assert "0" in out, "0 是合法偏好值"
 
@@ -150,6 +151,7 @@ def test_preferences_hides_blank_and_null_items(monkeypatch):
     payload = json.loads(buf.getvalue())
     assert payload["count"] == 2
     assert set(payload["preferences"]) == {"hotel_brands", "budget_level"}
+    assert payload["preferences"]["hotel_brands"] == ["东航"]
     assert payload["preferences"]["budget_level"] == 0
     print("✓ preferences 隐藏空白 / null 项（文本与 JSON 同口径）")
 

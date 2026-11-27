@@ -112,7 +112,11 @@ from utils.knowledge_stats import knowledge_status
 from utils.log_redact import redact_local_paths, redact_paths, redact_secret
 from utils.metrics import REQUEST_METRICS
 from utils.paths import default_data_root
-from utils.preference_values import has_preference_value, is_manageable_pref_type
+from utils.preference_values import (
+    has_preference_value,
+    is_blank_pref_item,
+    is_manageable_pref_type,
+)
 from utils.rate_limit import CapacityRetry, create_rate_limiter
 from utils.session_ids import RESERVED_SESSION_IDS
 from utils.session_title import session_title_from_content
@@ -326,7 +330,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # wheel 安装后 PROJECT_ROOT 是 site-packages：数据目录按运行形态选择
 # （ALIGO_DATA_DIR / 用户数据目录），重建 venv 不会丢用户记忆
 MEMORY_DIR = default_data_root() / "memory"
-# 未匹配路由（404 / 405）的指标路径统一取值，避免任意路径撑爆指标基数
+# 未匹配路由（404）的指标路径统一取值，避免任意路径撑爆指标基数；
+# 方法不符（405）是 partial match，按注册路由模板计标签（端点未执行，
+# 只计请求数、不进耗时窗口）
 _UNMATCHED_METRIC_PATH = "__unmatched__"
 # 路由前即被拒绝的请求（Content-Length 预检 413、尾斜杠 307/308 重定向）
 # 没有 route：已知接口按接口名归一标签（与 chunked 超限记录到路由模板的
@@ -848,11 +854,14 @@ class RequestContextMiddleware:
                             and account_status < 300
                         )
                     ),
-                    # Host 拒绝与未匹配路径的 404 不受限流、可被扫描无限次
-                    # 触发：只计请求数，不能替换延迟样本窗口（否则 P95 被
-                    # 亚毫秒探测稀释到近 0）
+                    # 不受限流、可被扫描无限次触发的协议级响应只计请求数，
+                    # 不能替换延迟样本窗口（否则 P95 被亚毫秒探测稀释到
+                    # 近 0）：Host 拒绝、未匹配 404、路由前 307/308/413
+                    # （route 为 None）以及部分匹配的 405（端点未执行）
                     count_only=(
-                        metric_path == "__host_rejected__"
+                        route is None
+                        or account_status == 405
+                        or metric_path == "__host_rejected__"
                         or metric_path == _UNMATCHED_METRIC_PATH
                     ),
                 )
@@ -3046,6 +3055,14 @@ RATE_LIMIT_PROBE_BUDGET_SEC = 2.0
 RATE_LIMIT_PROBE_MAX_LATENCY_SEC = 1.5
 
 
+def _skills_status() -> tuple[bool, int, bool]:
+    """技能目录健康口径（/api/health 与 Prometheus 指标共用）。"""
+    root = resolve_skills_root()
+    scripts = skill_scripts(root)
+    found = root.is_dir()
+    return (found and bool(scripts), len(scripts), found)
+
+
 def _rate_limit_info(state: AligoWebApp) -> dict[str, Any]:
     """限流后端与状态（健康检查与指标接口共用）。
 
@@ -4411,11 +4428,13 @@ def _safe_usage_int(value: Any) -> int:
 def _visible_preferences(preferences: dict[str, Any]) -> dict[str, Any]:
     """面板 / 导出的偏好可见口径：与 CLI 的 has_preference_value 一致。
 
-    过滤 None / 空白串 / 空容器，列表内逐项剔除 null 与空白项；全空的
-    列表整体隐藏（此前 [null] / "   " 会原样返回，面板渲染成「东航、null」）。
-    面板 / CLI 无法寻址的键（含 "/"、控制字符、"."/".."、超长）同样隐藏：
-    PostgreSQL 后端加载时不做这类清洗，脏键经 /api/status 进入面板后既改
-    不掉也删不掉，还会占用偏好类型上限（与 JSON 后端加载即丢弃同口径）。
+    过滤 None / 空白串 / 空容器，列表内逐项剔除 null、空白项与 {} / []；
+    全空的列表整体隐藏（此前 [null] / "   " 会原样返回，面板渲染成
+    「东航、null」；空容器会让面板显示「汉庭、{}」且下一次追加时被合并层
+    静默丢弃）。面板 / CLI 无法寻址的键（含 "/"、控制字符、"."/".."、超长）
+    同样隐藏：PostgreSQL 后端加载时不做这类清洗，脏键经 /api/status 进入
+    面板后既改不掉也删不掉，还会占用偏好类型上限（与 JSON 后端加载即丢弃
+    同口径）。
     """
     visible: dict[str, Any] = {}
     for key, value in preferences.items():
@@ -4423,9 +4442,7 @@ def _visible_preferences(preferences: dict[str, Any]) -> dict[str, Any]:
             continue
         if isinstance(value, list):
             items = [
-                item
-                for item in value
-                if not (item is None or (isinstance(item, str) and not item.strip()))
+                item for item in value if not is_blank_pref_item(item)
             ]
             if items:
                 visible[key] = items
@@ -4604,8 +4621,13 @@ def _usage_summary(
 # 操作（保存行程 / 偏好 / 切换用户）都会触发。按用户缓存，指纹只取 O(1)
 # 的首尾消息信息——任何追加、删除、编辑末条或导入都会改变长度 / 时间戳 /
 # 内容长度，命中即直接复用上次的汇总结果。
-_USAGE_SUMMARY_CACHE: dict[str, tuple[tuple[Any, ...], dict[str, Any]]] = {}
+# 每个用户在缓存里按 tz 分槽（有界）：同一账号在两个时区的浏览器交替刷新
+# 时，单槽位会让两条指纹互相顶掉、每次都全量重放历史。
+_USAGE_SUMMARY_CACHE: dict[
+    str, dict[str, tuple[tuple[Any, ...], dict[str, Any]]]
+] = {}
 _USAGE_SUMMARY_CACHE_MAX = 64
+_USAGE_SUMMARY_TZ_PER_USER = 4
 _usage_summary_cache_lock = threading.Lock()
 
 
@@ -4641,19 +4663,25 @@ def _usage_summary_for_user(
 ) -> dict[str, Any]:
     """带缓存的用量汇总（/api/status 专用；导出路径仍走实时计算）。"""
     fingerprint = _usage_history_fingerprint(history, tz)
+    tz_key = tz or ""
     with _usage_summary_cache_lock:
-        cached = _USAGE_SUMMARY_CACHE.get(user_id)
+        per_user = _USAGE_SUMMARY_CACHE.get(user_id)
+        cached = per_user.get(tz_key) if per_user else None
         if cached is not None and cached[0] == fingerprint:
             return cached[1]
     summary = _usage_summary(history, tz)
     with _usage_summary_cache_lock:
-        if (
-            user_id not in _USAGE_SUMMARY_CACHE
-            and len(_USAGE_SUMMARY_CACHE) >= _USAGE_SUMMARY_CACHE_MAX
-        ):
-            # 用户 ID 来自请求参数：缓存必须封顶，不能随访问过的用户增长
-            _USAGE_SUMMARY_CACHE.pop(next(iter(_USAGE_SUMMARY_CACHE)), None)
-        _USAGE_SUMMARY_CACHE[user_id] = (fingerprint, summary)
+        per_user = _USAGE_SUMMARY_CACHE.get(user_id)
+        if per_user is None:
+            if len(_USAGE_SUMMARY_CACHE) >= _USAGE_SUMMARY_CACHE_MAX:
+                # 用户 ID 来自请求参数：缓存必须封顶，不能随访问过的用户增长
+                _USAGE_SUMMARY_CACHE.pop(next(iter(_USAGE_SUMMARY_CACHE)), None)
+            per_user = {}
+            _USAGE_SUMMARY_CACHE[user_id] = per_user
+        if tz_key not in per_user and len(per_user) >= _USAGE_SUMMARY_TZ_PER_USER:
+            # 时区别名切换 / 多设备使用：每个用户只保留最近几个时区槽位
+            per_user.pop(next(iter(per_user)), None)
+        per_user[tz_key] = (fingerprint, summary)
     return summary
 
 
@@ -5312,12 +5340,10 @@ def create_app(model: Any = None) -> FastAPI:
     @app.get("/api/health")
     def health() -> dict[str, Any]:
         rate = _rate_limit_info(state)
-        skills_root = resolve_skills_root()
         breaker_state = state.breaker.get_status()["state"]
-        scripts = skill_scripts(skills_root)
         # 技能缺失时对话链路只剩空结果（doctor 的「技能目录」同为 fail）：
         # 健康检查不能继续报 ok，否则监控全绿而线上无法对话
-        skills_ok = skills_root.is_dir() and bool(scripts)
+        skills_ok, skills_count, skills_found = _skills_status()
         return {
             # 熔断打开 / 半开说明服务已无法正常对话（半开期只有单个试探
             # 回合放行、其余对话请求 503）：健康检查不能继续报 ok
@@ -5343,8 +5369,8 @@ def create_app(model: Any = None) -> FastAPI:
                 "max": state.max_sessions,
             },
             "skills": {
-                "count": len(scripts),
-                "dir_found": skills_root.is_dir(),
+                "count": skills_count,
+                "dir_found": skills_found,
                 "ok": skills_ok,
             },
             "time": datetime.now().isoformat(timespec="seconds"),
@@ -5452,6 +5478,16 @@ def create_app(model: Any = None) -> FastAPI:
             "# TYPE aligo_sessions_max gauge\n"
             f"aligo_sessions_max {state.max_sessions}\n"
         )
+        skills_ok, skills_count, _skills_found = _skills_status()
+        body += (
+            "# HELP aligo_skills_ok 1 if the skills directory is present "
+            "and has agent scripts (same check as /api/health).\n"
+            "# TYPE aligo_skills_ok gauge\n"
+            f"aligo_skills_ok {1 if skills_ok else 0}\n"
+            "# HELP aligo_skills_count Number of skill agent scripts discovered.\n"
+            "# TYPE aligo_skills_count gauge\n"
+            f"aligo_skills_count {skills_count}\n"
+        )
         backends = describe_backends(wait_for_create=False)
         body += (
             "# HELP aligo_storage_backend Current storage backend (one-hot).\n"
@@ -5480,7 +5516,8 @@ def create_app(model: Any = None) -> FastAPI:
         response: Response,
         network: bool = Query(default=False),
     ) -> dict[str, Any]:
-        """环境自检（默认不做网络请求；network=true 时检查 LLM 连通性）。"""
+        """环境自检（默认跳过 LLM 连通性检查；配置了 Redis / PostgreSQL
+        时仍会做短超时存储连通性探测）。"""
         # network=true 每次都会真实调用一次 LLM（离线检查也会探测数据库）：
         # 未鉴权的自检接口同样需要限流，并拒绝浏览器跨站简单 GET
         _reject_cross_site_side_effect(request)
@@ -5515,6 +5552,10 @@ def create_app(model: Any = None) -> FastAPI:
             results = [*results, CheckResult("熔断器", STATUS_OK, breaker_state or "closed")]
         return {
             "status": "fail" if any(item.status == "fail" for item in results) else "ok",
+            # /api/health 在熔断 open / half_open 时都判 degraded；doctor 的
+            # status 只有 ok/fail 且 warn 不计入，这里补一个同口径布尔，
+            # 供只看 status 的门禁 / 告警识别半开（多数对话仍 503）
+            "degraded": breaker_state in ("open", "half_open"),
             "checks": [
                 {
                     "name": item.name,
@@ -6103,9 +6144,15 @@ def create_app(model: Any = None) -> FastAPI:
         data = _load_user_data(user_id, strict=True)
         preferences = _visible_preferences(data["preferences"])
         # today 由面板传浏览器本地日期：next_trip / 概览与徽标同口径，
-        # 缺省（CLI / 旧客户端）仍是服务器本地日期
+        # 缺省（CLI / 旧客户端）按 tz 推断——只传文档化的 tz 时，行程状态
+        # 与用量窗口必须用同一个「今天」，否则同一响应里两套日期口径
         if today is None:
-            today = datetime.now().date()
+            zone = _usage_zone(tz)
+            today = (
+                datetime.now(zone).date()
+                if zone is not None
+                else datetime.now().date()
+            )
         # 每条行程的日期区间在本请求内被统计 / 状态判断 / 冲突视图各用一遍
         # （上限 5000 条时重复解析是可观开销）：先算一次，各处复用
         trip_intervals: dict[int, tuple[datetime, datetime] | None] = {
@@ -6157,7 +6204,7 @@ def create_app(model: Any = None) -> FastAPI:
                 "chat_count": len(data["chat_history"]),
                 "archived_count": _archived_count(data),
                 "statistics": data["statistics"],
-                "storage": describe_backends(),
+                "storage": describe_backends(wait_for_create=False),
                 "usage": _usage_summary_for_user(user_id, data["chat_history"], tz),
             }
         )

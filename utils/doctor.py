@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import asyncio
+import ast
 import importlib
 import importlib.util
 import json
@@ -61,6 +62,10 @@ def check_dependencies() -> list[CheckResult]:
         "rich": "rich",
         "yaml": "PyYAML",
         "ddgs": "ddgs",
+        # Web 组件的硬依赖：装坏时 `python -m webapp.server` 直接 ImportError，
+        # doctor 不能再报「核心依赖 ok」
+        "fastapi": "fastapi",
+        "uvicorn": "uvicorn",
     }
     rag = {
         "pymilvus": "pymilvus",
@@ -83,7 +88,11 @@ def check_dependencies() -> list[CheckResult]:
             "无法导入: " + "、".join(broken_core) + "（pip install -r requirements.txt）",
         )
     else:
-        core_result = CheckResult("核心依赖", STATUS_OK, "agentscope / rich / PyYAML / ddgs 已安装")
+        core_result = CheckResult(
+            "核心依赖",
+            STATUS_OK,
+            "agentscope / rich / PyYAML / ddgs / fastapi / uvicorn 已安装",
+        )
 
     missing_rag = [pkg for mod, pkg in rag.items() if importlib.util.find_spec(mod) is None]
     if missing_rag:
@@ -297,6 +306,52 @@ def _skill_md_name(script_path: Path) -> str:
     return fallback
 
 
+def _agent_script_problem(script_path: Path) -> str | None:
+    """静态校验技能脚本：可编译且定义了运行期必需的 Agent 子类。
+
+    LazyAgentRegistry 会 exec_module 并要求模块内定义 AgentBase 子类；
+    doctor 只数 ``script/agent.py`` 会让语法错误、空文件、缺少子类的技能
+    通过自检，故障推迟到首次调度。这里只做 AST 解析（不执行、不导入重型
+    依赖），并解析 import 别名以识别 ``AgentBase`` / ``SimplePromptSkill``。
+    """
+    try:
+        source = script_path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        return f"agent.py 无法读取（{str(exc)[:60]}）"
+    try:
+        tree = ast.parse(source, filename=str(script_path))
+    except SyntaxError as exc:
+        return f"agent.py 语法错误（{exc.msg}，第 {exc.lineno} 行）"
+    # 本地名 -> 原始类名：兼容 ``from agentscope.agent import AgentBase as Base``
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                aliases[alias.asname or alias.name] = alias.name
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                tail = alias.name.rsplit(".", 1)[-1]
+                aliases[alias.asname or tail] = tail
+
+    def _base_name(expr: ast.expr) -> str:
+        if isinstance(expr, ast.Name):
+            return aliases.get(expr.id, expr.id)
+        if isinstance(expr, ast.Attribute):
+            return expr.attr
+        return ""
+
+    classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
+    if not classes:
+        return "agent.py 未定义任何类（缺少 AgentBase 子类）"
+    for cls in classes:
+        if any(
+            _base_name(base) in ("AgentBase", "SimplePromptSkill")
+            for base in cls.bases
+        ):
+            return None
+    return "agent.py 未找到 AgentBase / SimplePromptSkill 子类"
+
+
 def check_skills() -> CheckResult:
     """检查技能目录：源码运行 / wheel 安装后都应能发现技能脚本。"""
     from utils.skill_paths import resolve_skills_root, skill_scripts
@@ -306,7 +361,10 @@ def check_skills() -> CheckResult:
     if scripts:
         problems = []
         for name in sorted(scripts):
-            problem = _skill_md_problem(Path(scripts[name]))
+            script_path = Path(scripts[name])
+            problem = _skill_md_problem(script_path) or _agent_script_problem(
+                script_path
+            )
             if problem:
                 problems.append(f"{name}（{problem}）")
         # frontmatter name 是 SkillLoader 的字典键：两个技能写同名时后
@@ -702,7 +760,12 @@ async def check_llm_connectivity() -> CheckResult:
 
 
 def run_doctor_offline() -> list[CheckResult]:
-    """执行不依赖网络的同步检查项（供线程池调用，避免阻塞事件循环）。"""
+    """执行同步检查项（供线程池调用，避免阻塞事件循环）。
+
+    配置了 Redis / PostgreSQL 时，``check_storage`` 仍会做短超时连通性
+    探测——本函数名中的 offline 指「不请求 LLM」，不是完全无网络 I/O；
+    ``--offline`` 同样只跳过 LLM 连通性检查。
+    """
     results: list[CheckResult] = [check_python()]
     results.extend(check_dependencies())
     results.append(check_config())

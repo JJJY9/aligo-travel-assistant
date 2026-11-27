@@ -40,6 +40,7 @@ from utils.llm_resilience import RetryBudgetExhausted, retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
 from utils.preference_values import (
     has_preference_value,
+    is_blank_pref_item,
     is_manageable_pref_type,
     preference_prompt_lines,
     preference_value_problem,
@@ -7420,22 +7421,17 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
         return [
             _pref_display_item(item)
             for item in value
-            if not (
-                item is None or (isinstance(item, str) and not item.strip())
-            )
+            if not is_blank_pref_item(item)
         ]
 
-    # --json 与文本同口径：列表里的 null / 空白项逐项剔除（机器消费方
-    # 不应拿到空项，模型 prompt 也不会把 None 拼进偏好值）
+    # --json 与文本同口径：列表里的 null / 空白项 / 空容器逐项剔除（机器
+    # 消费方不应拿到空项，模型 prompt 也不会把 None 拼进偏好值）
     payload_preferences = {
         key: (
             [
                 item
                 for item in visible[key]
-                if not (
-                    item is None
-                    or (isinstance(item, str) and not item.strip())
-                )
+                if not is_blank_pref_item(item)
             ]
             if isinstance(visible[key], list)
             else visible[key]
