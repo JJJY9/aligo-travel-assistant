@@ -243,11 +243,17 @@ _MAX_CONFLICT_ENTRIES = 20
 
 
 def trips_with_conflicts(
-    trips: list[dict[str, Any]], pool: list[dict[str, Any]] | None = None
+    trips: list[dict[str, Any]],
+    pool: list[dict[str, Any]] | None = None,
+    *,
+    intervals: dict[int, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """为每条行程附上与之日期重叠的其它行程（不会修改传入的字典）。
 
     ``pool`` 用于在一页行程之外计算重叠（如 Web 列表分页时以完整历史为基准）。
+    ``intervals`` 可选传入按 ``id(trip)`` 预计算的日期区间表：调用方在同一
+    请求内已解析过这些行程的日期时（如 /api/status）直接复用，避免对上限
+    5000 条行程再全量解析一遍。
 
     返回的每条视图含 ``conflicts``（重叠行程，至多 ``_MAX_CONFLICT_ENTRIES``
     条，按出发日期排序）与 ``conflict_count``（真实重叠总数）。按开始日期
@@ -259,7 +265,10 @@ def trips_with_conflicts(
     context = pool if pool is not None else trips
     entries: list[tuple[datetime, datetime, dict[str, Any]]] = []
     for trip in context:
-        interval = trip_interval(trip)
+        if isinstance(trip, dict) and intervals is not None and id(trip) in intervals:
+            interval = intervals[id(trip)]
+        else:
+            interval = trip_interval(trip)
         if interval is not None:
             entries.append((interval[0], interval[1], trip))
     entries.sort(key=lambda item: item[0])

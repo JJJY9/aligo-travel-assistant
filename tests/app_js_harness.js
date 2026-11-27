@@ -5032,6 +5032,168 @@ async function scenarioEditDeleteOutcome(source) {
   };
 }
 
+async function scenarioPerfRound(source) {
+  // 性能热路径一轮的回归：
+  // 1) 侧栏搜索的归档匹配探针不阻塞主结果：主列表先渲染，探针晚到只在
+  //    列表仍是同一查询 / 视图时补提示，旧查询的迟到结果丢弃；
+  // 2) 面板打开 + 行程展开：一次 refreshStatus 只整块渲染一次、只查一次
+  //    天气（loadExpandedTrips 已渲染时不再重复 renderOverview）；
+  // 3) 记忆面板隐藏时：只更新侧栏「即将出行 / 归档」，不重建面板内容。
+  const results = {};
+
+  // ---- 1) 归档探针不阻塞主结果 ----
+  {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      state.userId = "u1";
+      state.searchQuery = "";
+      state.showArchived = false;
+      state.sessions = [];
+      state.sessionTotal = 0;
+      state.archivedMatches = 0;
+      globalThis.__renders = 0;
+      renderHistory = () => { __renders += 1; };
+      updateArchivedToggle = () => {};
+    `);
+    const first = run('loadSessions("北京", { reset: true })');
+    const mainReq = await waitRequest(env);
+    mainReq.resolve({
+      sessions: [{ session_id: "s1" }],
+      total: 1,
+      archived_count: 3,
+    });
+    await tick();
+    results.beforeProbe = run(
+      "({ renders: __renders, loading: state.sessionsLoading, matches: state.archivedMatches, sessions: state.sessions.length })",
+    );
+    const staleProbe = await waitRequest(env);
+    results.probeUrl = staleProbe.args[0];
+    // 探针返回前发起新搜索：旧探针结果必须丢弃
+    const second = run('loadSessions("上海", { reset: true })');
+    const mainReq2 = await waitRequest(env);
+    mainReq2.resolve({
+      sessions: [{ session_id: "s2" }],
+      total: 1,
+      archived_count: 3,
+    });
+    await tick();
+    const freshProbe = await waitRequest(env);
+    staleProbe.resolve({ total: 7 });
+    await tick();
+    results.afterStaleProbe = run(
+      "({ matches: state.archivedMatches, query: state.sessionsLoadedQuery })",
+    );
+    freshProbe.resolve({ total: 2 });
+    await second;
+    await first;
+    await tick();
+    results.afterFreshProbe = run(
+      "({ matches: state.archivedMatches, query: state.sessionsLoadedQuery })",
+    );
+  }
+
+  // ---- 2) 展开 + 打开面板：一次刷新只渲染一块、只查一次天气 ----
+  {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      state.userId = "u1";
+      state.tripsExpanded = true;
+      state.tripsAll = [{ trip_id: "t1", origin: "北京", destination: "上海", start_date: "2026-12-01", end_date: "2026-12-02" }];
+      state.tripsAllTotal = 1;
+      els.memorySheet.hidden = false;
+      document.querySelector = () => null;
+      globalThis.__renderCount = 0;
+      const __origRender = renderOverview;
+      renderOverview = () => { __renderCount += 1; return __origRender(); };
+      globalThis.__weather = 0;
+      loadUpcomingWeather = async () => { __weather += 1; };
+    `);
+    const pending = run("refreshStatus({})");
+    const statusReq = await waitRequest(env);
+    statusReq.resolve({
+      trip_count: 1,
+      trips: [{ trip_id: "t1", origin: "北京", destination: "上海", start_date: "2026-12-01", end_date: "2026-12-02" }],
+      next_trip: { trip_id: "t1", origin: "北京", destination: "上海", start_date: "2026-12-01", end_date: "2026-12-02" },
+      preferences: {},
+      archived_count: 0,
+      chat_count: 3,
+      statistics: {},
+      usage: { by_day: {}, top_agents: [] },
+      travel_summary: {},
+      storage: {},
+    });
+    const tripsReq = await waitRequest(env);
+    tripsReq.resolve({ trips: [], total: 1 });
+    await pending;
+    results.expandedRefresh = run(
+      "({ renders: __renderCount, weather: __weather })",
+    );
+  }
+
+  // ---- 3) 面板隐藏：只更新侧栏，不重建面板内容 ----
+  {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      state.userId = "u1";
+      state.tripsExpanded = true;
+      state.tripsAll = Array.from({ length: 200 }, (_, i) => ({
+        trip_id: "t" + i,
+        origin: "北京",
+        destination: "上海",
+        start_date: "2026-12-01",
+        end_date: "2026-12-02",
+      }));
+      state.tripsAllTotal = 200;
+      els.memorySheet.hidden = true;
+      els.trips = {
+        children: [],
+        innerHTML: "",
+        appendChild(node) { this.children.push(node); return node; },
+      };
+      els.overview = { innerHTML: "", appendChild() {} };
+      globalThis.__created = 0;
+      const __origCreate = document.createElement.bind(document);
+      document.createElement = (tag) => { __created += 1; return __origCreate(tag); };
+      globalThis.__weather = 0;
+      globalThis.__upcoming = 0;
+      globalThis.__archived = null;
+      const __origUpcoming = renderUpcoming;
+      renderUpcoming = (trip) => { __upcoming += 1; return __origUpcoming(trip); };
+      loadUpcomingWeather = async () => { __weather += 1; };
+      updateArchivedToggle = (count) => { __archived = count; };
+      document.querySelector = () => null;
+      state.status = {
+        preferences: { home_location: "北京" },
+        trips: [],
+        trip_count: 200,
+        archived_count: 4,
+        next_trip: {
+          trip_id: "t0",
+          origin: "北京",
+          destination: "上海",
+          start_date: "2026-12-01",
+          end_date: "2026-12-02",
+        },
+        statistics: {},
+        usage: { by_day: {}, top_agents: [] },
+        travel_summary: {},
+      };
+    `);
+    run("renderOverview()");
+    results.hiddenPanel = run(
+      "({ created: __created, trips: els.trips.children.length, upcoming: __upcoming, weather: __weather, archived: __archived, tripsText: els.trips.innerHTML })",
+    );
+    // 切换用户（status=null）仍要清空隐藏面板：清空分支在早退之前
+    run("state.status = null; renderOverview();");
+    results.hiddenCleared = run("els.overview.innerHTML");
+  }
+
+  return results;
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -5188,6 +5350,8 @@ async function main() {
     payload = await scenarioTripFilterFailureStale(source);
   } else if (scenario === "editDeleteOutcome") {
     payload = await scenarioEditDeleteOutcome(source);
+  } else if (scenario === "perfRound") {
+    payload = await scenarioPerfRound(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }

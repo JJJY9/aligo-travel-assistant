@@ -1,7 +1,7 @@
 """行程统计（utils/travel_stats.py）测试（无需 API Key）。"""
 import os
 import sys
-from datetime import date
+from datetime import date, datetime
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
@@ -90,6 +90,20 @@ def test_summarize_tolerates_date_max_end():
     print("✓ date.max 终点的区间合并不再溢出")
 
 
+def test_summarize_reuses_precomputed_intervals():
+    """/api/status 在同一请求内复用按 id(trip) 预计算的日期区间表。"""
+    trip = {"destination": "上海", "start_date": "2026-01-01", "end_date": "2026-01-03"}
+    pinned = {id(trip): (datetime(2026, 1, 1), datetime(2026, 1, 5))}
+    summary = summarize_travel([trip], today=date(2026, 1, 4), intervals=pinned)
+    assert summary["active"] == 1, "应使用外部传入的区间（原始区间已结束）"
+    assert summary["total_days"] == 5
+    # 不传区间表时按行程原始日期计算（既有语义不变）
+    original = summarize_travel([trip], today=date(2026, 1, 4))
+    assert original["active"] == 0
+    assert original["total_days"] == 3
+    print("✓ 统计复用单请求内的预计算区间")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -101,4 +115,5 @@ if __name__ == "__main__":
     test_summarize_overlapping_days_counted_once()
     test_summarize_empty_and_invalid()
     test_summarize_tolerates_date_max_end()
+    test_summarize_reuses_precomputed_intervals()
     print("\n全部通过")

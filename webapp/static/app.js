@@ -3055,7 +3055,6 @@ async function loadSessions(query = state.searchQuery, options = {}) {
   });
   if (state.searchQuery) params.set("q", state.searchQuery);
   if (state.showArchived) params.set("archived", "1");
-  let archivedMatches = 0;
   try {
     const data = await getJSON(`/api/sessions?${params}`, undefined, 30000);
     if (requestId !== sessionsRequestId) return;
@@ -3099,26 +3098,34 @@ async function loadSessions(query = state.searchQuery, options = {}) {
     }
     // 普通视图搜索时提示归档会话中的匹配数量（不把归档内容混进主列表）。
     // 没有归档会话时该子请求的 total 必为 0（归档列表是 archived∩live
-    // 的子集），白跑一次全量搜索没有意义
+    // 的子集），白跑一次全量搜索没有意义。探针不阻塞主结果上屏：它要再
+    // 扫一遍全量归组（大账号近 200ms），等它对「加载更多」还持有锁；
+    // 返回后仅在列表仍是同一查询 / 视图时补提示
     if (state.searchQuery && !state.showArchived && archivedCount > 0) {
+      const probedQuery = state.searchQuery;
+      const probedArchived = state.showArchived;
+      const probedUser = state.userId;
       const archivedParams = new URLSearchParams({
-        user_id: state.userId,
+        user_id: probedUser,
         limit: "1",
         offset: "0",
         archived: "1",
-        q: state.searchQuery,
+        q: probedQuery,
       });
-      try {
-        const archivedData = await getJSON(
-          `/api/sessions?${archivedParams}`,
-          undefined,
-          30000,
-        );
-        if (requestId !== sessionsRequestId) return;
-        archivedMatches = Number(archivedData.total || 0);
-      } catch {
-        archivedMatches = 0;
-      }
+      getJSON(`/api/sessions?${archivedParams}`, undefined, 30000)
+        .then((archivedData) => {
+          if (
+            state.userId !== probedUser ||
+            state.showArchived !== probedArchived ||
+            state.sessionsLoadedQuery !== probedQuery ||
+            state.sessionsLoadedArchived !== probedArchived
+          ) {
+            return;
+          }
+          state.archivedMatches = Number(archivedData.total || 0);
+          renderHistory();
+        })
+        .catch(() => {});
     }
   } catch (error) {
     if (requestId !== sessionsRequestId) return;
@@ -3170,7 +3177,7 @@ async function loadSessions(query = state.searchQuery, options = {}) {
   }
   if (requestId !== sessionsRequestId) return;
   state.sessionsLoading = false;
-  state.archivedMatches = archivedMatches;
+  state.archivedMatches = 0;
   renderHistory();
   return true;
 }
@@ -4592,7 +4599,9 @@ async function refreshMetrics() {
 
 async function loadExpandedTrips(options = {}) {
   // 展开视图按服务端 q 过滤完整历史（此前只过滤最近 200 条的本地缓存，
-  // 更早的行程会被误报为无匹配）；limit 仍是最近 200 条匹配
+  // 更早的行程会被误报为无匹配）；limit 仍是最近 200 条匹配。
+  // 返回是否已渲染：refreshStatus 据此避免随后再整块渲染一遍（面板打开且
+  // 展开时一次刷新会把整块面板建两次、天气请求发两次）
   const userId = state.userId;
   const requestId = (tripsRequestId += 1);
   const query = state.tripsFilter.trim();
@@ -4607,13 +4616,13 @@ async function loadExpandedTrips(options = {}) {
     const tripsData = await getJSON(
       `/api/trips?user_id=${encodeURIComponent(userId)}&limit=200&order=desc${suffix}`,
     );
-    if (requestId !== tripsRequestId || userId !== state.userId) return;
+    if (requestId !== tripsRequestId || userId !== state.userId) return false;
     state.tripsAll = tripsData.trips || [];
     state.tripsAllTotal = Number(tripsData.total || state.tripsAll.length);
     state.tripsLoadedFilter = query;
     state.tripsLoadedStatus = status;
   } catch (error) {
-    if (requestId !== tripsRequestId || userId !== state.userId) return;
+    if (requestId !== tripsRequestId || userId !== state.userId) return false;
     // 保留旧列表：接口短暂失败不应把已展示的行程清空
     if (!options.silentFailure) {
       toast(`加载行程列表失败：${error.message || error}`);
@@ -4622,14 +4631,17 @@ async function loadExpandedTrips(options = {}) {
   if (preferenceEditActive()) {
     // 记忆面板里正在编辑偏好：整体重渲染会销毁输入框，等保存 / 取消后的刷新补齐
     state.statusStale = true;
-  } else {
-    renderOverview();
+    return false;
   }
+  renderOverview();
+  return true;
 }
 
 async function refreshStatus(options = {}) {
   const requestId = (statusRequestId += 1);
   const userId = state.userId;
+  // 展开行程的列表已由 loadExpandedTrips 渲染过时，收尾不再重复整块渲染
+  let tripsRendered = false;
   // tz：用量按浏览器时区分桶与取「近 7 天」窗口（服务端可能是 UTC，
   // 否则今天 0-8 点 / 跨时区时「今天」高亮与合计窗口整体偏移）
   let zone = "";
@@ -4653,7 +4665,7 @@ async function refreshStatus(options = {}) {
     // 行程并重建两次列表纯属浪费；重新打开面板时 openMemorySheet 会再刷新
     const sheetOpen = els.memorySheet && !els.memorySheet.hidden;
     if (state.tripsExpanded && Number(data.trip_count || 0) > 0 && sheetOpen) {
-      await loadExpandedTrips(options);
+      tripsRendered = await loadExpandedTrips(options);
     } else if (!data.trip_count) {
       tripsRequestId += 1;
       state.tripsExpanded = false;
@@ -4679,7 +4691,7 @@ async function refreshStatus(options = {}) {
   // 在真正渲染前（异步请求返回后）再检查一次，编辑期间保留旧视图，
   // 编辑结束的保存 / 取消路径会各补一次刷新
   if (!preferenceEditActive()) {
-    renderOverview();
+    if (!tripsRendered) renderOverview();
     state.statusStale = false;
   } else {
     // 本次刷新被跳过：数据已写入 state.status 但未渲染，标记过期，
@@ -4720,6 +4732,21 @@ function renderOverview() {
     els.usageAgents.innerHTML = "";
     els.usageTrend.hidden = true;
     els.storageChips.innerHTML = "";
+    return;
+  }
+
+  // 记忆面板关闭时，每回合结束的状态刷新只需更新侧栏可见的「即将出行」
+  // 卡片与归档入口：面板里的偏好 / 行程 / 统计 / 用量都不可见，重建它们
+  // （展开 200 条行程约 2000 个元素 + 700 多个监听器）纯属浪费。
+  // 打开面板时 openMemorySheet 会再刷新一次，内容不会停留在旧数据
+  if (els.memorySheet && els.memorySheet.hidden) {
+    const sidebarTrips = state.tripsExpanded
+      ? state.tripsAll
+      : Array.isArray(status.trips)
+        ? status.trips
+        : [];
+    renderUpcoming(status.next_trip || pickUpcomingTrip(sidebarTrips));
+    updateArchivedToggle(Number(status.archived_count || 0));
     return;
   }
 

@@ -908,6 +908,10 @@ def test_transient_reload_failure_is_not_reported_as_damage(monkeypatch):
     storage_dir = tempfile.mkdtemp()
     memory = LongTermMemory("u-transient", storage_dir)
     memory.save_preference("home_location", "北京")
+    # 写路径现在按磁盘指纹跳过「磁盘未变」时的重载：要让保存真正去读文件，
+    # 先制造一次外部写入（另一实例原子替换文件），指纹变化后必须完整重载
+    other = LongTermMemory("u-transient", storage_dir)
+    other.save_preference("airline", "东航")
 
     def flaky_loads(raw):
         raise PermissionError("[Errno 13] Permission denied")
@@ -5659,12 +5663,19 @@ def test_export_snapshot_skips_reload_when_disk_unchanged(monkeypatch):
     assert calls == [1], "第二个实例写入后必须重载"
     assert len(refreshed["chat_history"]) == 2
 
-    # 本实例写盘后指纹已刷新：随后的快照读取只需承受写前那一次重载
+    # 本实例写盘后指纹已刷新、磁盘未变：写操作自身也不再整份重载
     memory.add_chat_message("user", "Q3", "s")
-    assert len(calls) == 2, "写操作自身的重载照旧"
+    assert len(calls) == 1, "磁盘未变时写操作跳过重载"
     memory.export_snapshot()
-    assert len(calls) == 2, "本实例写盘后不必再重载"
-    print("✓ 导出快照按磁盘指纹跳过重复解析（外部写入仍可见）")
+    assert len(calls) == 1, "本实例写盘后不必再重载"
+
+    # 外部写入（另一实例）后，写路径必须先完整重载再修改：不能覆盖他人
+    # 刚写入的偏好（旧快照直接写回会把如家 / 东航的更新抹掉）
+    other.save_preference("hotel_brand", ["如家"])
+    memory.save_preference("airline", "东航")
+    assert len(calls) == 2, "外部写入后写路径必须重载"
+    assert memory.get_preference()["hotel_brand"] == ["如家"], "外部写入不能被覆盖"
+    print("✓ 导出快照与写路径按磁盘指纹跳过重复解析（外部写入仍可见）")
 
 
 def test_memory_file_is_compact_and_reloadable():
@@ -6668,9 +6679,22 @@ def test_pg_schema_drops_invalid_message_index_before_recreate():
             and "idx_aligo_chat_user_created" in text
             for text in statements
         ), statements
+        # 会话级操作（详情 / 删除 / 改名 / 置顶 / 归档）按 user_id+session_id
+        # 过滤：同口径创建 / 清理会话索引，缺它时每次操作都扫用户全部消息
+        assert any(
+            text.startswith("DROP INDEX CONCURRENTLY IF EXISTS")
+            and "idx_aligo_chat_user_session" in text
+            for text in statements
+        ), statements
+        assert any(
+            text.startswith("CREATE INDEX CONCURRENTLY IF NOT EXISTS")
+            and "idx_aligo_chat_user_session" in text
+            and "(user_id, session_id, created_at, id)" in text
+            for text in statements
+        ), statements
     finally:
         pg_module._SCHEMA_READY.discard(dsn)
-    print("✓ 无效的消息时间索引被清理后重建")
+    print("✓ 无效的消息时间 / 会话索引被清理后重建")
 
 
 def test_pg_update_trip_aborts_when_connection_reconnects():

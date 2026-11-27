@@ -1724,6 +1724,13 @@ class AligoWebApp:
         self.import_executor = _DaemonImportExecutor(
             max_workers=1, thread_name_prefix="aligo-import"
         )
+        # 会话构造要整份解析用户快照 / 建立 PG-Redis 连接（大账号可达数百
+        # 毫秒、PG 不可达时连接超时数秒）：突发新会话若占满 asyncio 默认
+        # 线程池，在途回合的记忆读写 to_thread 会排队数百毫秒到数秒。
+        # 放独立有界守护线程池，默认池只跑短任务
+        self.session_build_executor = _DaemonImportExecutor(
+            max_workers=6, thread_name_prefix="aligo-session-build"
+        )
         # 导入排队上限（1 执行 + 1 等待）：执行器队列无界，并发大备份
         # （各可达 64MB）会在排队期间常驻内存直到 OOM，排队已满时按 503 背压
         self.import_queue_slots = threading.BoundedSemaphore(2)
@@ -4014,9 +4021,15 @@ def _ci_find(haystack: str, needle: str) -> int:
     ``lower()`` 可能改变字符串长度（如土耳其语 ``İ`` 小写后是两个码点），
     用 lower 串里的下标去切原文会让窗口整体错位；长度变化时改用正则
     在原文上定位（re.IGNORECASE 返回的就是原文下标）。
+
+    无大小写区分的关键字（中文 / 数字 / 符号）忽略大小写等价于精确查找：
+    直接走 C 层 ``str.find``，不再对每条未命中的消息做 re.escape+re.search
+    （会话搜索逐条扫描时这是主要开销）。
     """
     if not needle:
         return -1
+    if needle == needle.lower() == needle.upper():
+        return haystack.find(needle)
     lowered = haystack.lower()
     index = lowered.find(needle.lower())
     if index >= 0 and len(lowered) == len(haystack):
@@ -4576,7 +4589,13 @@ async def _get_session_marked(
     并发上限后新会话全部 503。这里 shield 内层任务，取消时挂完成回调。
     """
     future = asyncio.ensure_future(
-        asyncio.to_thread(state.get_session, user_id, session_id, True)
+        asyncio.get_running_loop().run_in_executor(
+            getattr(state, "session_build_executor", None),
+            state.get_session,
+            user_id,
+            session_id,
+            True,
+        )
     )
     try:
         return await asyncio.shield(future)
@@ -4719,6 +4738,7 @@ def create_app(model: Any = None) -> FastAPI:
         # 取消排队未执行的导入；正在执行的线程是 daemon，不阻塞进程退出
         state.import_executor.shutdown(wait=False, cancel_futures=True)
         state.kb_import_executor.shutdown(wait=False, cancel_futures=True)
+        state.session_build_executor.shutdown(wait=False, cancel_futures=True)
 
     # 交互式 API 文档默认关闭：/docs 加载 CDN 资源、/openapi.json 暴露完整
     # 端点与参数结构，是内网服务最常见的信息泄露面。需要时显式设置
@@ -5733,11 +5753,22 @@ def create_app(model: Any = None) -> FastAPI:
         # 缺省（CLI / 旧客户端）仍是服务器本地日期
         if today is None:
             today = datetime.now().date()
-        travel_summary = summarize_travel(data["trip_history"], today=today)
+        # 每条行程的日期区间在本请求内被统计 / 状态判断 / 冲突视图各用一遍
+        # （上限 5000 条时重复解析是可观开销）：先算一次，各处复用
+        trip_intervals: dict[int, tuple[datetime, datetime] | None] = {
+            id(trip): _trip_interval(trip)
+            for trip in data["trip_history"]
+            if isinstance(trip, dict)
+        }
+        travel_summary = summarize_travel(
+            data["trip_history"], today=today, intervals=trip_intervals
+        )
         active_trips: list[tuple[datetime, dict[str, Any]]] = []
         upcoming_trips: list[tuple[datetime, dict[str, Any]]] = []
         for trip in data["trip_history"]:
-            interval = _trip_interval(trip)
+            interval = (
+                trip_intervals.get(id(trip)) if isinstance(trip, dict) else None
+            )
             if interval is None:
                 continue
             start_dt, end_dt = interval
@@ -5758,7 +5789,7 @@ def create_app(model: Any = None) -> FastAPI:
             featured_trip = None
         # 最近 5 条行程附带与其它行程的日期重叠信息（列表用徽标提示）
         trips_view = _trips_with_conflicts(
-            data["trip_history"][-5:], data["trip_history"]
+            data["trip_history"][-5:], data["trip_history"], intervals=trip_intervals
         )
         # 历史 / 手写数据可能含孤立代理项：不清洗会让响应 UTF-8 编码
         # 失败（该接口对用户永久 500），与会话接口统一出口清洗
@@ -7208,9 +7239,17 @@ def create_app(model: Any = None) -> FastAPI:
         total = len(trips)
         ordered = trips[::-1] if order == "desc" else trips
         page = ordered[offset : offset + limit]
+        # 页面冲突要按完整历史计算：区间表按完整历史建一次，当前页复用
+        trip_intervals = {
+            id(trip): _trip_interval(trip)
+            for trip in all_trips
+            if isinstance(trip, dict)
+        }
         return _json_safe_value(
             {
-                "trips": _trips_with_conflicts(page, all_trips),
+                "trips": _trips_with_conflicts(
+                    page, all_trips, intervals=trip_intervals
+                ),
                 "total": total,
                 "offset": offset,
                 "limit": limit,
@@ -8078,8 +8117,9 @@ def create_app(model: Any = None) -> FastAPI:
         import_client = _rate_identity(_client_host(request))
         if not state.try_begin_import(import_client):
             # 准入失败没有任何恢复工作：归还刚扣的知识库额度，并按可重试
-            # 口径给出 Retry-After（与对话忙 503 一致）
-            _refund_kb_rate_limit(state, request)
+            # 口径给出 Retry-After（与对话忙 503 一致）。Redis 归还是一次
+            # 同步网络往返，不能在事件循环线程上执行
+            await asyncio.to_thread(_refund_kb_rate_limit, state, request)
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -8090,7 +8130,7 @@ def create_app(model: Any = None) -> FastAPI:
             )
         if not state.import_queue_slots.acquire(blocking=False):
             state.end_import(import_client)
-            _refund_kb_rate_limit(state, request)
+            await asyncio.to_thread(_refund_kb_rate_limit, state, request)
             raise HTTPException(
                 status_code=503,
                 detail=(

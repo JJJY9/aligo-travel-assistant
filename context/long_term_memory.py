@@ -238,7 +238,12 @@ def _locked_mutation(func):
                     # 加载时没能确认的损坏文件在这里补复核：否则空快照会把
                     # 磁盘上的损坏文件直接覆盖且不产生 .corrupt-* 备份
                     self._ensure_corrupt_backed_up()
-                    self._reload_latest()
+                    # 磁盘自上次加载 / 保存后未变（本进程刚写过且无外部写者）
+                    # 时跳过整份重读解析；脏快照 / 损坏待复核 / 文件已被其它
+                    # 进程原子替换时 reload_if_changed 返回 False，回退完整
+                    # 重载，语义与无条件重载一致
+                    if not self.reload_if_changed():
+                        self._reload_latest()
                     # 修改开始：成功写盘由 _save 复位；中途异常 / 未落盘的
                     # 修改保持 dirty，下一次重载会把它们丢弃（现行语义）
                     self._dirty = True
@@ -1061,7 +1066,10 @@ class LongTermMemory:
             try:
                 with file_lock(self.db_path):
                     self._ensure_corrupt_backed_up()
-                    self._reload_latest()
+                    # 与 _locked_mutation 同口径：磁盘未变时跳过整份重载，
+                    # 空批次 / 本实例刚写完的连续批量写不再白付一次解析
+                    if not self.reload_if_changed():
+                        self._reload_latest()
                     self._batch_owner = tid
                     self._batch_depth = 1
                     self._batch_dirty = False

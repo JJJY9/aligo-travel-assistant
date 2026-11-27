@@ -12132,6 +12132,45 @@ def test_cancelled_session_open_releases_late_turn():
     print("✓ 取消会话构造后迟到占用被释放")
 
 
+def test_session_open_prefers_dedicated_build_executor():
+    """会话构造走独立有界线程池：构造会整份解析快照 / 建 PG-Redis 连接，
+    突发新会话不能占满 asyncio 默认池、把在途回合的记忆 to_thread 拖成排队。"""
+    import asyncio
+    import threading
+
+    from utils.daemon_executor import DaemonThreadPoolExecutor
+    from webapp.server import _get_session_marked
+
+    class _Session:
+        def end_turn(self):
+            pass
+
+    class _State:
+        def __init__(self):
+            self.session = _Session()
+            self.threads = []
+            self.session_build_executor = DaemonThreadPoolExecutor(
+                max_workers=1, thread_name_prefix="aligo-session-build"
+            )
+
+        def get_session(self, user_id, session_id, mark_in_use=False):
+            self.threads.append(threading.current_thread().name)
+            return self.session
+
+    async def scenario():
+        state = _State()
+        try:
+            session = await _get_session_marked(state, "u1", "s1")
+        finally:
+            state.session_build_executor.shutdown(wait=True)
+        assert session is state.session
+        assert state.threads, "会话构造没有被执行"
+        assert state.threads[0].startswith("aligo-session-build"), state.threads
+
+    asyncio.run(scenario())
+    print("✓ 会话构造走专用线程池")
+
+
 def test_session_lru_skips_in_use_sessions():
     """LRU 淘汰不能关闭正在对话的会话；全部在用时不新建（容量拒绝）。"""
     from webapp.server import SessionCapacityError
@@ -15875,6 +15914,32 @@ def test_match_snippet_handles_casefold_length_changes():
     assert "needle" in snippet
     # 常规大小写不敏感匹配不回归（片段保留原文大小写）
     assert "needle" in server_module._match_snippet("Some NEEDLE here", "needle").lower()
+
+
+def test_ci_find_caseless_fast_path_skips_regex(monkeypatch):
+    """无大小写区分的关键字（中文 / 数字 / 符号）直接精确查找，不走正则回退。
+
+    会话搜索逐条扫描时，每条未命中消息的 re.escape+re.search 是主要开销
+    （2 万条无命中搜索实测约 100ms）：无大小写关键字的忽略大小写语义与
+    精确查找等价，必须走 C 层 str.find；有大小写差异的关键字保持原路径。
+    """
+    from webapp import server as server_module
+
+    assert server_module._ci_find("这里有问题在这里", "问题") == 3
+    assert server_module._ci_find("完全没有匹配", "英文") == -1
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("无大小写关键字不应走 re.search")
+
+    monkeypatch.setattr(server_module.re, "search", _boom)
+    assert server_module._ci_find("大段中文没有关键字", "关键词") == -1
+    assert server_module._ci_find("abc123", "--") == -1
+    monkeypatch.undo()
+
+    # 大小写不敏感路径不回归（英文 / 土耳其语 İ 长度变化仍按原文定位）
+    assert server_module._ci_find("Some NEEDLE here", "needle") == 5
+    assert server_module._ci_find("İstanbul", "istanbul") == 0
+    assert server_module._ci_find("Hello", "") == -1
 
 
 def test_session_detail_sanitizes_surrogate_meta():

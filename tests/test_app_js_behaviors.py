@@ -1492,6 +1492,33 @@ def test_edit_delete_unknown_outcome_message():
     print("✓ 编辑重发删除结果未知的提示")
 
 
+def test_perf_round_probe_and_render_budget():
+    """性能热路径：归档探针不阻塞主结果、展开刷新只渲染一次、
+    记忆面板隐藏时不重建面板内容。"""
+    data = _run_harness("perfRound")
+    before = data["beforeProbe"]
+    assert before["renders"] >= 1, before
+    assert before["loading"] is False, before
+    assert before["sessions"] == 1, before
+    assert "archived=1" in data["probeUrl"], data["probeUrl"]
+    stale = data["afterStaleProbe"]
+    assert stale["matches"] == 0, "旧查询的迟到探针结果必须丢弃"
+    assert stale["query"] == "上海", stale
+    fresh = data["afterFreshProbe"]
+    assert fresh["matches"] == 2, "当前查询的探针结果要补到提示上"
+    expanded = data["expandedRefresh"]
+    assert expanded["renders"] == 1, "展开 + 打开面板一次刷新只整块渲染一次"
+    assert expanded["weather"] == 1, "同一刷新只查一次天气"
+    hidden = data["hiddenPanel"]
+    assert hidden["created"] < 100, hidden
+    assert hidden["trips"] == 0, "隐藏面板不应重建行程列表"
+    assert hidden["upcoming"] == 1, "侧栏「即将出行」仍要更新"
+    assert hidden["weather"] == 1, "侧栏天气仍要刷新"
+    assert hidden["archived"] == 4, hidden
+    assert "无法获取数据概览" in data["hiddenCleared"], data["hiddenCleared"]
+    print("✓ 性能热路径（探针不阻塞 / 单次渲染 / 隐藏面板早退）")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -1591,4 +1618,5 @@ if __name__ == "__main__":
     test_delete_session_unknown_outcome_reconciles()
     test_trip_filter_failure_does_not_claim_match_count()
     test_edit_delete_unknown_outcome_message()
+    test_perf_round_probe_and_render_budget()
     print("\n全部通过")
