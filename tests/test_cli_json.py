@@ -125,6 +125,11 @@ def test_kb_status_flags_configured_dimension_mismatch(monkeypatch):
     payload = json.loads(out)
     assert code == 1 and payload["dimension_mismatch"] is True
     assert payload["configured_dimension"] == 1024
+    # 集合维度不一致时检索必然 503：JSON 的 available / reason 必须与退出码、
+    # 文本输出和 Web /api/knowledge 同口径
+    assert payload["available"] is False
+    assert "不一致" in payload["reason"]
+    assert "init_knowledge_base.py" in payload["reason"]
     print("✓ kb 冷进程按配置维度判失败（文本 / JSON）")
 
 

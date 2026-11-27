@@ -214,6 +214,19 @@ def test_main_dispatch_rejects_html_and_bad_args(monkeypatch):
     print("✓ trip-calendar 非法参数返回用法错误")
 
 
+def test_stdout_failure_uses_stderr(monkeypatch):
+    """--stdout 失败：错误走 stderr，stdout 不能混入中文报错污染 ICS 产物。"""
+    store = _FakeStore([])
+    monkeypatch.setattr(cli, "_open_cli_store", lambda uid: store)
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cli.run_trip_calendar_standalone("u1", "trip_x", to_stdout=True)
+    assert code == 1
+    assert out.getvalue() == ""
+    assert "不存在" in err.getvalue()
+    print("✓ trip-calendar --stdout 失败不污染数据通道")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -233,6 +246,11 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_trip_without_start_date_rejected(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_stdout_failure_uses_stderr(mp)
     finally:
         mp.undo()
     mp = pytest.MonkeyPatch()

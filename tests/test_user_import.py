@@ -1063,6 +1063,39 @@ def test_runner_errors(monkeypatch):
     print("✓ 非法用户 / 文件不存在 / 空备份失败")
 
 
+def test_runner_reports_partial_commit_when_late_section_fails(monkeypatch):
+    """后段（消息）写入失败时，已提交的偏好 / 行程必须如实报告。"""
+    path = _write_json(_export_payload())
+    store = _real_store("u-partial")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("模拟消息批量写盘失败：磁盘已满")
+
+    monkeypatch.setattr(store, "add_chat_messages", boom)
+    code, out = _run_import(monkeypatch, "u-partial", path, store)
+    assert code == 1
+    assert "已提交" in out and "可安全重跑" in out, out
+    # 偏好 / 行程确实已落库（部分提交口径与实际一致）
+    assert store.get_preference()["home_location"] == "北京"
+    trips = store.get_trip_history(limit=None)
+    assert {trip["destination"] for trip in trips} == {"上海", "成都"}
+
+    # 未提交任何数据的失败不制造「已提交 0 条」噪音
+    cold = _real_store("u-cold")
+
+    def no_write(*args, **kwargs):
+        raise RuntimeError("任何写入之前失败")
+
+    monkeypatch.setattr(cold, "save_trip_histories", no_write)
+    # 备份只有行程段：行程段失败于任何写入之前
+    trips_only = {"trip_history": _export_payload()["trip_history"]}
+    code, out = _run_import(
+        monkeypatch, "u-cold", _write_json(trips_only), cold
+    )
+    assert code == 1 and "已提交" not in out, out
+    print("✓ user-import 后段失败如实报告已提交部分")
+
+
 def test_runner_all_sessions_skipped_reports_failure(monkeypatch):
     """备份条目全部落在保留字会话：不能报「已恢复」+ 退出 0。"""
     payload = {

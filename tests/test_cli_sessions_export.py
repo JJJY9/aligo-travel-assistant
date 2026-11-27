@@ -141,6 +141,71 @@ def test_export_write_failure_reports(monkeypatch):
     print("✓ sessions-export 写入失败友好报错")
 
 
+def test_stdout_failure_writes_stderr(monkeypatch):
+    """--stdout 是数据通道：失败时 stdout 必须为空、错误走 stderr。"""
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *a, **k: _FakeStore([])
+    )
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cli.run_sessions_export_standalone("u-x", None, True)
+    assert code == 1
+    assert out.getvalue() == "", "stdout 混入错误文本会污染 Markdown 产物"
+    assert "没有可导出的会话" in err.getvalue()
+    print("✓ sessions-export --stdout 失败不污染数据通道")
+
+
+def test_export_cleans_placeholder_on_interrupt(monkeypatch):
+    """Ctrl-C 中断写入不能把 0 字节占位留在正式导出名上。"""
+    import tempfile
+
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *a, **k: _store()
+    )
+    target = Path(tempfile.mkdtemp(prefix="chailv_export_")) / "out.md"
+    real_writer = cli.write_text_atomic
+
+    def interrupted(path, text):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "write_text_atomic", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        cli.run_sessions_export_standalone("u-export", str(target))
+    assert not target.exists(), "中断后占位文件残留，后续导出会永远报已存在"
+
+    # 真实写入随后可以成功（占位已被清理）
+    monkeypatch.setattr(cli, "write_text_atomic", real_writer)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_sessions_export_standalone("u-export", str(target))
+    assert code == 0 and target.exists()
+    print("✓ 导出中断清理占位文件")
+
+
+def test_export_keeps_concurrent_force_snapshot(monkeypatch):
+    """写入失败前名字已被并发 --force 的完整快照替换：不能删别人的文件。"""
+    import tempfile
+
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *a, **k: _store()
+    )
+    target = Path(tempfile.mkdtemp(prefix="chailv_export_")) / "out.md"
+
+    def replace_then_fail(path, text):
+        path.unlink()
+        path.write_text("完整快照", encoding="utf-8")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli, "write_text_atomic", replace_then_fail)
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_sessions_export_standalone("u-export", str(target))
+    assert code == 1 and "写入失败" in buf.getvalue()
+    assert target.exists()
+    assert target.read_text(encoding="utf-8") == "完整快照"
+    print("✓ 导出失败不误删并发写入的完整快照")
+
+
 def test_export_without_sessions(monkeypatch):
     code, out = _run(monkeypatch, _FakeStore([]), "u-export")
     assert code == 1 and "没有可导出的会话" in out
@@ -259,6 +324,9 @@ if __name__ == "__main__":
         test_dispatch_strict,
         test_dispatch_option_before_positional,
         test_export_write_failure_reports,
+        test_stdout_failure_writes_stderr,
+        test_export_cleans_placeholder_on_interrupt,
+        test_export_keeps_concurrent_force_snapshot,
     ):
         mp = pytest.MonkeyPatch()
         try:

@@ -274,6 +274,27 @@ def test_markup_safe_strips_controls_before_escaping():
 
     field = _field_safe("上海\n  • 目的地: 杭州")
     assert "\n" not in field and "目的地" in field, field
+
+    # 双向覆盖 / 零宽 / BOM 等不可见格式符不能进入终端（可伪造显示顺序）
+    from cli import _plain_safe, _single_line_safe
+
+    spoof = "\u202eBAN\u200b\u200f\ufeff\u00ad"
+    bads = (
+        "\u202e",
+        "\u200b",
+        "\u200f",
+        "\ufeff",
+        "\u00ad",
+    )
+    for helper in (_markup_safe, _plain_safe, _single_line_safe, _field_safe):
+        cleaned = helper(spoof)
+        for bad in bads:
+            assert bad not in cleaned, (helper, cleaned)
+    assert _plain_safe("BAN") == "BAN"
+    # ZWJ / ZWNJ 是 emoji 组合与文字整形的一部分：必须保留
+    family = "\U0001F468\u200d\U0001F469\u200d\U0001F467"
+    assert _plain_safe(family) == family
+    assert _plain_safe("a\u200cb") == "a\u200cb"
     print("✓ 剥控制符先于 markup 转义 + 单行字段")
 
 
@@ -322,6 +343,11 @@ def test_display_tolerates_non_list_results():
         agent3, _ = _capture_console()
         # 无结果时按既有文案输出，不抛异常
         agent3._display_results(malformed)
+    # 合法 JSON 但不是对象（[] / "ok" / 123）：兜底分支不能抛 AttributeError
+    for non_dict in ([], "ok", 123, None):
+        agent4, buffer4 = _capture_console()
+        agent4._display_results(non_dict)
+        assert "未能获取有效结果" in buffer4.getvalue(), buffer4.getvalue()
     print("✓ 展示预检容忍 results 对象 / 标量")
 
 

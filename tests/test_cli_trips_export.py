@@ -523,6 +523,19 @@ def test_export_ics_stdout_reports_skipped(monkeypatch):
     print("✓ trips-export --ics --stdout 跳过提示走 stderr")
 
 
+def test_export_stdout_failure_uses_stderr(monkeypatch):
+    """--stdout 失败：错误走 stderr，stdout 不能混入中文报错污染 CSV/ICS。"""
+    fake = _FakeStore([_trip()], fail=True)
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: fake)
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = cli.run_trips_export_standalone("u1", to_stdout=True)
+    assert code == 1
+    assert out.getvalue() == ""
+    assert "读取行程失败" in err.getvalue()
+    print("✓ trips-export --stdout 失败不污染数据通道")
+
+
 def test_export_stdout_strips_terminal_controls(monkeypatch):
     """--stdout 导出剥离终端控制序列（ESC / OSC 不送达终端）。"""
     fake = _FakeStore([_trip("上海\x1b]52;c;QUJD\x07")])
@@ -643,6 +656,7 @@ if __name__ == "__main__":
         test_export_csv_warns_about_unimportable_rows,
         test_export_ics_stdout_reports_skipped,
         test_export_stdout_strips_terminal_controls,
+        test_export_stdout_failure_uses_stderr,
         test_export_csv_over_import_row_limit,
         test_export_write_failure_reports,
         test_export_ics_stdout_writes_utf8_bytes,

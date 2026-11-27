@@ -271,6 +271,8 @@ def test_archive_missing_session(monkeypatch):
 
 def test_sessions_updated_at_uses_max_timestamp(monkeypatch):
     """updated_at 取转录最大时间戳：恢复备份把旧消息追加到末尾后不回拨。"""
+    from utils.timestamps import to_aware
+
     store = _FakeStore(
         [
             _message("user", "新问题", "s-max", "2026-11-04T12:00:00"),
@@ -284,8 +286,39 @@ def test_sessions_updated_at_uses_max_timestamp(monkeypatch):
     entry = next(
         item for item in payload["sessions"] if item["session_id"] == "s-max"
     )
-    assert entry["updated_at"] == "2026-11-04T12:01:00"
+    # --json 输出统一为带偏移的 ISO（与 Web 列表同口径）：时刻不变
+    assert entry["updated_at"].startswith("2026-11-04T12:01:00")
+    stamped = to_aware(entry["updated_at"])
+    assert stamped is not None and stamped.utcoffset() is not None
+    assert stamped == to_aware("2026-11-04T12:01:00")
     print("✓ sessions updated_at 取最大时间戳")
+
+
+def test_sessions_json_updated_at_normalized(monkeypatch):
+    """混合 naive（JSON 后端）/ aware（PG）时间戳：--json 一律带偏移。"""
+    from utils.timestamps import to_aware
+
+    store = _FakeStore(
+        [
+            _message("user", "甲", "s-naive", "2026-03-02T01:05:00"),
+            _message("user", "乙", "s-aware", "2026-03-01T23:40:00+00:00"),
+            _message("user", "丙", "s-bad", "不是时间"),
+        ]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: store)
+    code, out = _run_list("u1", as_json=True)
+    assert code == 0
+    payload = json.loads(out)
+    by_id = {item["session_id"]: item["updated_at"] for item in payload["sessions"]}
+    naive = to_aware(by_id["s-naive"])
+    aware = to_aware(by_id["s-aware"])
+    assert naive is not None and naive.utcoffset() is not None
+    assert aware is not None and aware.utcoffset() is not None
+    # 两种后端的时间戳都带偏移（isoformat 的偏移段必然含 '+'）
+    assert "+" in by_id["s-naive"] and "+" in by_id["s-aware"]
+    # 非法时间戳原样保留，不因归一化丢数据
+    assert by_id["s-bad"] == "不是时间"
+    print("✓ sessions --json 时间戳统一带偏移")
 
 
 def test_archive_json_output(monkeypatch):
@@ -1058,6 +1091,13 @@ def test_main_rejects_bad_usage(monkeypatch):
         ["cli.py", "sessions", "u1", "--archived", "--all"],
         ["cli.py", "session-archive", "u1", "s1", "--restore=1"],
         ["cli.py", "session-archive", "u1", "--restore"],
+        # 非法 user / session ID 统一按用法错误（exit 2），与 stats / trips 同口径
+        ["cli.py", "sessions", "bad!"],
+        ["cli.py", "session-archive", "bad!", "s1"],
+        ["cli.py", "session-delete", "u1", "bad!"],
+        ["cli.py", "session-title", "bad!", "s1", "标题"],
+        ["cli.py", "session-pin", "u1", "bad!"],
+        ["cli.py", "session-show", "bad!", "s1"],
     ):
         monkeypatch.setattr(sys, "argv", argv)
         buf = io.StringIO()
@@ -1065,6 +1105,15 @@ def test_main_rejects_bad_usage(monkeypatch):
             cli.main()
         assert exc.value.code == 2, argv
         assert "用法" in buf.getvalue(), argv
+
+    # --json 契约：用法错误同样是合法 JSON（脚本 jq .error 不解析失败）
+    monkeypatch.setattr(sys, "argv", ["cli.py", "sessions", "bad!", "--json"])
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf), pytest.raises(SystemExit) as exc:
+        cli.main()
+    assert exc.value.code == 2
+    payload = json.loads(buf.getvalue())
+    assert payload["ok"] is False and "用法" in payload["error"]
     print("✓ dispatch 层拒绝错误用法（退出码 2）")
 
 
@@ -1177,6 +1226,11 @@ def test_session_export_flag_parsing():
     assert cli._parse_export_args(["--status", "past"]) is None, (
         "会话导出不接受 --status"
     )
+    # 显式空路径（脚本变量未设置）不是「未提供」：静默写默认 exports/ 会
+    # 让脚本误以为写到了指定备份目录
+    assert cli._parse_export_args([""]) is None
+    assert cli._parse_session_export_args([""]) is None
+    assert cli._parse_kb_export_args([""]) is None
     print("✓ session-export 参数解析（--stdout / --ics / --query 与路径冲突被拒绝）")
 
 
@@ -1837,6 +1891,61 @@ def test_option_before_positional_dispatch(monkeypatch):
             assert got[:3] == ("archive", "u1", "s1")
             assert got[3]["archived"] is False
     print("✓ sessions / session-archive 支持选项在位置参数之前")
+
+
+def test_sessions_excludes_reserved_session(monkeypatch):
+    """保留字会话（export）与 Web 面板同口径：列表 / 总数不计入。"""
+    store = _sessions_store()
+    store.messages.append(_message("user", "导出页遗留", "export"))
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: store)
+    code, out = _run_list("u1", as_json=True)
+    assert code == 0
+    payload = json.loads(out)
+    ids = {item["session_id"] for item in payload["sessions"]}
+    assert "export" not in ids
+    assert payload["total"] == 2  # 默认视图只看未归档（s-active / s-pinned）
+    code, out = _run_list("u1", include_all=True)
+    assert "export" not in out
+    # 直接寻址仍是清理 / 打捞入口
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        assert cli.run_session_show_standalone("u1", "export") == 0
+    print("✓ sessions 跳过保留字会话")
+
+
+def test_sessions_width_uses_grapheme_cells(monkeypatch):
+    """emoji 序列按字素簇计宽，会话 ID 列不截断且列对齐。"""
+    from rich.cells import cell_len
+
+    family = "\U0001F468‍\U0001F469‍\U0001F467"
+    assert cli._display_width(family) == 2
+    assert cli._display_width("❤️") == 2
+    assert cli._display_width("1️⃣") == 2
+    truncated = cli._truncate_display("x" * 28 + family, 30)
+    assert truncated.endswith(family)
+    assert "‍" not in truncated[: -len(family)]
+
+    long_id = "会" * 40
+    store = _FakeStore(
+        [
+            _message("user", "标题一 " + family, "s-short"),
+            _message("user", "标题二", long_id),
+        ]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *a, **k: store)
+    code, out = _run_list("u1")
+    assert code == 0
+    assert long_id in out
+    lines = [line for line in out.splitlines() if line.startswith("  [")]
+    assert len(lines) == 2
+    # 消息列（「条」）在每一行的显示列必须一致：标题 / 会话 ID 的填充按
+    # 字素簇宽度计算，emoji 序列与 40 个汉字的会话 ID 都不能把列推歪
+    columns = []
+    for line in lines:
+        marker = line.rindex(" 条")
+        columns.append(cell_len(line[:marker]))
+    assert len(set(columns)) == 1
+    print("✓ sessions 宽字符 / 长会话 ID 对齐")
 
 
 if __name__ == "__main__":

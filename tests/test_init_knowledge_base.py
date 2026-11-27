@@ -1018,6 +1018,40 @@ _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_target_follows_runtime_when_skills_dir_overridden": "需要 tmp_path 夹具",
 }
 
+def test_cli_kb_init_dispatch_rejects_empty_documents(monkeypatch):
+    """--documents ""（脚本变量为空）按用法错误拒绝，不能静默用内置文档初始化。"""
+    import cli
+
+    calls: list = []
+
+    def fake_run(documents=None):
+        calls.append(documents)
+        return 0
+
+    monkeypatch.setattr(cli, "run_knowledge_init_standalone", fake_run)
+    for argv in (
+        ["cli.py", "kb-init", "--documents", ""],
+        ["cli.py", "kb-init", "--documents="],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert calls == [], argv
+        assert "用法：python cli.py kb-init" in out.getvalue()
+
+    monkeypatch.setattr(
+        sys, "argv", ["cli.py", "kb-init", "--documents", "D:/docs"]
+    )
+    with contextlib.redirect_stdout(io.StringIO()), pytest.raises(
+        SystemExit
+    ) as exc:
+        cli.main()
+    assert exc.value.code == 0 and calls == ["D:/docs"]
+    print("✓ kb-init 空 --documents 按用法错误拒绝")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -1154,6 +1188,11 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_cli_kb_init_missing_script_returns_1(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_cli_kb_init_dispatch_rejects_empty_documents(_mp)
     finally:
         _mp.undo()
     _mp = pytest.MonkeyPatch()

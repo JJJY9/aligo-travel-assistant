@@ -23,7 +23,11 @@ from pathlib import Path
 from typing import Any
 
 from utils.chat_import import filter_import_messages, prepare_import_messages
-from utils.errors import ImportVolumeError, MemoryPersistenceError
+from utils.errors import (
+    ImportVolumeError,
+    MemoryPersistenceError,
+    PartialImportError,
+)
 from utils.identifiers import is_valid_web_session_id
 from utils.json_safe import MAX_JSON_DEPTH
 from utils.preference_values import (
@@ -2612,6 +2616,33 @@ def import_user_data(
         )
 
 
+def _partial_commit_error(
+    exc: Exception, result: dict[str, Any]
+) -> Exception:
+    """写入中途失败且已有部分提交时，转成 PartialImportError 如实上报。
+
+    备份恢复按段多次独立写入（偏好 → 行程 → 消息 → 标题 / 置顶 / 归档）：
+    后段失败时前段已落库，若只报「写入失败」，用户会以为整份没导入而换
+    文件 / 丢弃备份，数据永久停留在半份状态。未提交任何数据时原样返回
+    原异常（不制造「已提交 0 条」的噪音）。
+    """
+    created = sum(
+        int(result.get(key) or 0)
+        for key in (
+            "preferences",
+            "trips_created",
+            "messages_added",
+            "titles",
+            "pinned",
+            "archived",
+        )
+    )
+    updated = int(result.get("trips_updated") or 0)
+    if created or updated:
+        return PartialImportError(str(exc), created, updated)
+    return exc
+
+
 def _import_user_data_locked(
     store: Any,
     sections: dict[str, Any],
@@ -2667,64 +2698,87 @@ def _import_user_data_locked(
         batch_ctx = (
             batch_factory() if callable(batch_factory) else contextlib.nullcontext()
         )
-        with batch_ctx:
-            for key, value in preferences.items():
-                store.save_preference(key, value)
-                result["preferences"] += 1
+        try:
+            with batch_ctx:
+                for key, value in preferences.items():
+                    store.save_preference(key, value)
+                    result["preferences"] += 1
+        except PartialImportError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 统一转部分提交口径
+            if callable(batch_factory):
+                # 批内异常整体回滚：本次一条偏好都没有真正提交
+                result["preferences"] = 0
+            converted = _partial_commit_error(exc, result)
+            if converted is exc:
+                raise
+            raise converted from exc
     trips = sections.get("trips", [])
-    if trips:
-        # 被删除 / 保留字会话的行程关联：只清除目标库确实指向该会话的记录，
-        # 另一条存活会话的既有链接必须保留（见 _resolve_dropped_trip_links）
-        _resolve_dropped_trip_links(store, trips)
-        # 批量保存：JSON 后端一次重载 + 一次原子写回（逐条写是 O(n²)，
-        # 几千条行程会把恢复拖成分钟级）
-        created, updated = store.save_trip_histories(trips)
-        result["trips_created"] = int(created)
-        result["trips_updated"] = int(updated)
+    try:
+        if trips:
+            # 被删除 / 保留字会话的行程关联：只清除目标库确实指向该会话的记录，
+            # 另一条存活会话的既有链接必须保留（见 _resolve_dropped_trip_links）
+            _resolve_dropped_trip_links(store, trips)
+            # 批量保存：JSON 后端一次重载 + 一次原子写回（逐条写是 O(n²)，
+            # 几千条行程会把恢复拖成分钟级）
+            created, updated = store.save_trip_histories(trips)
+            result["trips_created"] = int(created)
+            result["trips_updated"] = int(updated)
 
-    messages = sections.get("messages", [])
-    if messages:
-        # 批量写入 + 存储层写锁内去重：JSON 后端一次重载一次原子写回
-        # （逐条写是 O(n²)，大备份会跑几分钟到数小时）；去重放在写锁内
-        # 使并发导入也不会因锁外快照过期而重复插入
-        if applied_out is not None:
-            added = store.add_chat_messages(
-                messages, dedupe=True, added_by_session=msg_by_session
-            )
-        else:
-            added = store.add_chat_messages(messages, dedupe=True)
-        added = int(added if added is not None else len(messages))
-        result["messages_added"] = added
-        result["messages_skipped"] = len(messages) - added
+        messages = sections.get("messages", [])
+        if messages:
+            # 批量写入 + 存储层写锁内去重：JSON 后端一次重载一次原子写回
+            # （逐条写是 O(n²)，大备份会跑几分钟到数小时）；去重放在写锁内
+            # 使并发导入也不会因锁外快照过期而重复插入
+            if applied_out is not None:
+                added = store.add_chat_messages(
+                    messages, dedupe=True, added_by_session=msg_by_session
+                )
+            else:
+                added = store.add_chat_messages(messages, dedupe=True)
+            added = int(added if added is not None else len(messages))
+            result["messages_added"] = added
+            result["messages_skipped"] = len(messages) - added
 
-    titles = sections.get("titles", {})
-    if titles:
-        if applied_out is not None:
-            result["titles"] = int(
-                store.set_session_titles(titles, applied_out=applied_titles)
-            )
-        else:
-            result["titles"] = int(store.set_session_titles(titles))
-    pinned = sections.get("pinned", [])
-    if pinned:
-        if applied_out is not None:
-            result["pinned"] = int(
-                store.set_sessions_pinned(
-                    pinned, True, applied_out=applied_pinned
+        titles = sections.get("titles", {})
+        if titles:
+            if applied_out is not None:
+                result["titles"] = int(
+                    store.set_session_titles(titles, applied_out=applied_titles)
                 )
-            )
-        else:
-            result["pinned"] = int(store.set_sessions_pinned(pinned, True))
-    archived = sections.get("archived", [])
-    if archived:
-        if applied_out is not None:
-            result["archived"] = int(
-                store.set_sessions_archived(
-                    archived, True, applied_out=applied_archived
+            else:
+                result["titles"] = int(store.set_session_titles(titles))
+        pinned = sections.get("pinned", [])
+        if pinned:
+            if applied_out is not None:
+                result["pinned"] = int(
+                    store.set_sessions_pinned(
+                        pinned, True, applied_out=applied_pinned
+                    )
                 )
-            )
-        else:
-            result["archived"] = int(store.set_sessions_archived(archived, True))
+            else:
+                result["pinned"] = int(store.set_sessions_pinned(pinned, True))
+        archived = sections.get("archived", [])
+        if archived:
+            if applied_out is not None:
+                result["archived"] = int(
+                    store.set_sessions_archived(
+                        archived, True, applied_out=applied_archived
+                    )
+                )
+            else:
+                result["archived"] = int(
+                    store.set_sessions_archived(archived, True)
+                )
+    except PartialImportError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 统一转部分提交口径
+        # 后段失败时前段（偏好 / 行程 / 消息…）已经落库：必须如实报告已
+        # 提交条数，否则用户以为整份没导入而换文件 / 丢弃备份
+        converted = _partial_commit_error(exc, result)
+        if converted is exc:
+            raise
+        raise converted from exc
     knowledge = sections.get("knowledge", [])
     if knowledge and knowledge_unverified:
         # 合并复核无法核对知识体积：跳过写入并如实上报（用户数据已恢复，

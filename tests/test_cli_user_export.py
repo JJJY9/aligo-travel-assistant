@@ -204,6 +204,8 @@ def test_user_export_dispatch(monkeypatch):
         ["cli.py", "user-export", "-u1"],
         ["cli.py", "user-export", "u1", "a", "b"],
         ["cli.py", "user-export", "u1", "--x"],
+        # 显式空目录（脚本变量未设置）不能静默回退到默认 exports/
+        ["cli.py", "user-export", "u1", ""],
     ):
         monkeypatch.setattr(sys, "argv", argv)
         buf = io.StringIO()

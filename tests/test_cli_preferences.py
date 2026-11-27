@@ -836,6 +836,33 @@ def test_pref_set_strips_type_and_rejects_blank(monkeypatch):
     print("✓ pref-set 类型 strip 后落库，纯空白拒绝")
 
 
+def test_preferences_objects_render_as_json(monkeypatch):
+    """对象项按 JSON 显示（与 Web 面板一致），不再是 Python repr。"""
+    store = _FakeStore({"home_candidates": [{"city": "北京"}, "东航"]})
+    code, out = _run_list(monkeypatch, store)
+    assert code == 0
+    assert '{"city": "北京"}、东航' in out, out
+    assert "{'city'" not in out
+    assert (
+        cli.AligoCLI._format_result_value([{"a": 1}, "东航"])
+        == '{"a": 1}、东航'
+    )
+
+    write_store = _WriteStore({"tags": []})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: write_store
+    )
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_preference_set_standalone(
+            "u1", "tags", '[{"city": "北京"}, null]', json_value=True
+        )
+    assert code == 0
+    echo = buf.getvalue()
+    assert '{"city": "北京"}' in echo and "None" not in echo, echo
+    print("✓ 偏好对象项按 JSON 显示")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -879,6 +906,7 @@ if __name__ == "__main__":
         test_pref_type_allows_web_charset,
         test_pref_set_strips_type_and_rejects_blank,
         test_preferences_list_json,
+        test_preferences_objects_render_as_json,
         test_preferences_dispatch_json_and_bad_args,
         test_preferences_hides_blank_and_null_items,
     ):

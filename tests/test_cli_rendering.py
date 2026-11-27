@@ -264,6 +264,48 @@ def test_status_renders_assistant_plaintext():
     print("✓ status 最近对话渲染助手正文")
 
 
+def test_status_table_single_lines_multiline_message():
+    """status 最近对话表格：多行消息必须单行化，不能拆行错位后续列。"""
+
+    class _ShortTerm:
+        def get_recent_context(self, n_turns=5):
+            return [
+                {"role": "user", "content": "第一行\n第二行", "timestamp": ""},
+                {"role": "assistant", "content": "回答\n也换行", "timestamp": ""},
+            ]
+
+    class _Memory:
+        short_term = _ShortTerm()
+
+        def reload_long_term(self):
+            pass
+
+        def get_full_context(self):
+            return {
+                "short_term": {"statistics": {"total_messages": 2}},
+                "long_term": {"statistics": {"total_trips": 0}},
+            }
+
+        @property
+        def long_term(self):
+            raise AssertionError("status 不应读取长期记忆")
+
+    instance = _new_cli()
+    instance.memory_manager = _Memory()
+    instance.user_id = "u1"
+    instance.session_id = "s1"
+    instance._agent_cache = {}
+    instance.model = None
+    instance.show_status()
+    output = instance._buffer.getvalue()
+    assert "第一行 第二行" in output, output
+    assert "回答 也换行" in output, output
+    # 角色列每行只出现一次：多行内容没有把表格拆成续行
+    assert output.count("👤 用户") == 1
+    assert output.count("🤖 助手") == 1
+    print("✓ status 多行消息单行化")
+
+
 def test_preferences_table_keeps_zero_and_lists():
     class _LongTerm:
         def get_preference(self):
@@ -528,6 +570,7 @@ if __name__ == "__main__":
     test_local_timestamp_text_tolerates_extreme_years()
     test_agent_error_message_fallback()
     test_status_renders_assistant_plaintext()
+    test_status_table_single_lines_multiline_message()
     test_preferences_table_keeps_zero_and_lists()
     test_result_formatter_generic_output_field()
     test_cli_realtime_renders_itinerary_validation_warning()
