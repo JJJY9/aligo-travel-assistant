@@ -248,8 +248,8 @@ def test_orchestration_checkpoint_store_cleans_legacy():
     base = tempfile.mkdtemp(prefix="chailv_ckpt_orch_")
     legacy = Path(base) / "data" / "runtime" / "checkpoints"
     legacy.mkdir(parents=True)
-    stale = legacy / "stale.json"
-    stale.write_text("{}", encoding="utf-8")
+    stale = legacy / f"{hashlib.sha256(b'k').hexdigest()}.json"
+    stale.write_text('{"key": "u:s:t:d"}', encoding="utf-8")
     old_ts = time.time() - 7200
     os.utime(stale, (old_ts, old_ts))
     old_package_root = checkpoint_module.package_root
@@ -286,11 +286,23 @@ def test_default_store_cleans_stale_legacy_checkpoints():
     base = tempfile.mkdtemp(prefix="chailv_ckpt_legacy_")
     legacy = Path(base) / "data" / "runtime" / "checkpoints"
     legacy.mkdir(parents=True)
-    stale = legacy / "stale.json"
-    fresh = legacy / "fresh.json"
-    stale.write_text("{}", encoding="utf-8")
-    fresh.write_text("{}", encoding="utf-8")
+    stale = legacy / f"{hashlib.sha256(b'old').hexdigest()}.json"
+    fresh = legacy / f"{hashlib.sha256(b'fresh').hexdigest()}.json"
+    stale.write_text('{"key": "u:s:t:d"}', encoding="utf-8")
+    fresh.write_text('{"key_hash": "abc"}', encoding="utf-8")
+    # 非本模块形态的文件（普通名 / 内容缺键 / 非 dict / 宽匹配的 .tmp）
+    # 不能因为「旧目录」这个理由被顺手删掉
+    foreign_json = legacy / "notes.json"
+    foreign_json.write_text('{"note": "用户自己的文件"}', encoding="utf-8")
+    keyless = legacy / f"{hashlib.sha256(b'keyless').hexdigest()}.json"
+    keyless.write_text('{"other": 1}', encoding="utf-8")
+    non_object = legacy / f"{hashlib.sha256(b'list').hexdigest()}.json"
+    non_object.write_text('["not-a-dict"]', encoding="utf-8")
+    foreign_tmp = legacy / ".user-notes.txt.tmp"
+    foreign_tmp.write_text("user scratch", encoding="utf-8")
     old_ts = time.time() - 7200
+    for path in (foreign_json, keyless, non_object, foreign_tmp):
+        os.utime(path, (old_ts, old_ts))
     os.utime(stale, (old_ts, old_ts))
     old_package_root = checkpoint_module.package_root
     try:
@@ -300,6 +312,8 @@ def test_default_store_cleans_stale_legacy_checkpoints():
         CheckpointStore()
         assert not stale.exists(), "过期的旧目录检查点应被清理"
         assert fresh.exists(), "TTL 内的旧目录文件不能误删"
+        for path in (foreign_json, keyless, non_object, foreign_tmp):
+            assert path.exists(), f"非检查点形态的旧目录文件不能误删：{path.name}"
     finally:
         checkpoint_module.package_root = old_package_root
         os.chdir(old_cwd)
@@ -331,6 +345,78 @@ def test_explicit_root_does_not_clean_legacy_checkpoints():
     print("✓ 显式 root 不清理旧目录")
 
 
+def test_transient_read_error_keeps_checkpoint(monkeypatch):
+    """瞬时不可读（Windows 共享冲突）不能当损坏删除：重试应能复用。"""
+    from pathlib import Path as _Path
+
+    store, root = _store()
+    try:
+        store.save("u1:s1:t1:d", {"steps": {"a": 1}})
+        path = next(_Path(root).glob("*.json"))
+        real_read_text = _Path.read_text
+
+        def flaky_read_text(self, *args, **kwargs):
+            if self == path:
+                raise PermissionError(13, "被其它进程短暂占用")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(_Path, "read_text", flaky_read_text)
+        assert store.load("u1:s1:t1:d") is None
+        assert path.exists(), "瞬时读失败不能删除有效检查点"
+        monkeypatch.setattr(_Path, "read_text", real_read_text)
+        assert store.load("u1:s1:t1:d")["steps"] == {"a": 1}
+        print("✓ 瞬时读失败保留检查点，恢复后可复用")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_clear_scope_transient_read_error_keeps_other_scope(monkeypatch):
+    """会话删除批量读取时，其它作用域文件瞬时不可读不能被顺手删掉。"""
+    from pathlib import Path as _Path
+
+    store, root = _store()
+    try:
+        store.save("u1:s1:t1:d", {"status": "ok"}, scope="u1:s1")
+        store.save("u1:s2:t1:d", {"status": "ok"}, scope="u1:s2")
+        other = store._path("u1:s2:t1:d")
+        real_read_text = _Path.read_text
+
+        def flaky_read_text(self, *args, **kwargs):
+            if self == other:
+                raise PermissionError(13, "被其它进程短暂占用")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(_Path, "read_text", flaky_read_text)
+        assert store.clear_scope("u1:s1") == 1
+        assert other.exists(), "其它作用域的检查点不能因读失败被删"
+        monkeypatch.setattr(_Path, "read_text", real_read_text)
+        assert store.load("u1:s2:t1:d")["status"] == "ok"
+        print("✓ 按作用域清理不误删瞬时不可读的其它检查点")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def test_unlink_if_unchanged_respects_replaced_file():
+    """stat 与 unlink 之间被另一实例 os.replace 的新文件不能被删。"""
+    store, root = _store()
+    try:
+        store.save("u1:s1:t1:d", {"status": "old"})
+        path = store._path("u1:s1:t1:d")
+        stat_result = path.stat()
+        # 模拟另一实例在 stat 之后提交了新检查点
+        path.write_text('{"status": "new"}', encoding="utf-8")
+        os.utime(path, (time.time() - 5, time.time() - 5))
+        assert store._unlink_if_unchanged(path, stat_result) is False
+        assert path.exists() and "new" in path.read_text(encoding="utf-8")
+        # 未变化时照常删除
+        stat_result = path.stat()
+        assert store._unlink_if_unchanged(path, stat_result) is True
+        assert not path.exists()
+        print("✓ 复核身份后才删除检查点")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -350,4 +436,17 @@ if __name__ == "__main__":
     test_orchestration_checkpoint_store_cleans_legacy()
     test_default_store_cleans_stale_legacy_checkpoints()
     test_explicit_root_does_not_clean_legacy_checkpoints()
+    test_unlink_if_unchanged_respects_replaced_file()
+    import pytest as _pytest
+
+    mp = _pytest.MonkeyPatch()
+    try:
+        test_transient_read_error_keeps_checkpoint(mp)
+    finally:
+        mp.undo()
+    mp = _pytest.MonkeyPatch()
+    try:
+        test_clear_scope_transient_read_error_keeps_other_scope(mp)
+    finally:
+        mp.undo()
     print("\n全部通过")

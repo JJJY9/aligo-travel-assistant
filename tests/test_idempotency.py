@@ -130,6 +130,28 @@ def test_discard_session_clears_all_forms():
     print("✓ 幂等缓存按会话失效（含首条消息的空键）")
 
 
+def test_eviction_purges_expired_before_fair(monkeypatch):
+    """超限时先清过期条目：活跃用户仍在 TTL 内的新鲜条目不能被挤出。"""
+    cache = IdempotencyCache(max_entries=4, ttl_sec=600)
+    stale_bob = make_key("bob", "s", "mark")
+    stale_carol = make_key("carol", "s", "mark")
+    monkeypatch.setattr(idempotency.time, "monotonic", lambda: 1_000.0)
+    cache.put(stale_bob, {"__incomplete__": True})
+    cache.put(stale_carol, {"__incomplete__": True})
+    monkeypatch.setattr(idempotency.time, "monotonic", lambda: 1_601.0)
+    fresh = [make_key("alice", "s", f"k{index}") for index in range(4)]
+    for index, key in enumerate(fresh):
+        cache.put(key, {"v": index})
+    assert len(cache) == 4, "超限后仍应裁到上限"
+    for index, key in enumerate(fresh):
+        assert cache.get(key) == {"v": index}, (
+            "活跃用户的新鲜条目被过期条目挤掉了"
+        )
+    assert cache.get(stale_bob) is None
+    assert cache.get(stale_carol) is None
+    print("✓ 幂等缓存先清过期再按用户公平淘汰")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -140,6 +162,11 @@ if __name__ == "__main__":
     try:
         test_put_get_returns_deep_copy()
         test_ttl_expiry(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_eviction_purges_expired_before_fair(mp)
     finally:
         mp.undo()
     test_lru_eviction()

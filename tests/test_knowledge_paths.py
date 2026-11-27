@@ -122,7 +122,10 @@ def test_knowledge_path_encoding_hint_detects_windows_ansi_paths():
     from utils.knowledge_paths import knowledge_path_encoding_hint
 
     hint = knowledge_path_encoding_hint(
-        r"C:\Users\张三\aligo\rag_knowledge", windows=True, acp=936
+        r"C:\Users\张三\aligo\rag_knowledge",
+        windows=True,
+        acp=936,
+        source_checkout=False,
     )
     assert hint and "ALIGO_DATA_DIR" in hint, hint
     assert knowledge_path_encoding_hint(
@@ -136,6 +139,26 @@ def test_knowledge_path_encoding_hint_detects_windows_ansi_paths():
         r"/home/张三/aligo", windows=False
     ) is None
     print("✓ 非 ASCII 知识库路径提示按平台 / 代码页判定")
+
+
+def test_knowledge_path_encoding_hint_source_checkout_wording():
+    """源码 checkout 下不能建议 ALIGO_DATA_DIR（它不会移动知识库目录）。"""
+    from utils.knowledge_paths import knowledge_path_encoding_hint
+
+    hint = knowledge_path_encoding_hint(
+        r"D:\Code\张三\chailv",
+        windows=True,
+        acp=936,
+        source_checkout=True,
+    )
+    assert hint is not None
+    assert "纯英文路径" in hint
+    assert "ALIGO_SKILLS_DIR" in hint
+    assert "ALIGO_DATA_DIR 不会移动知识库" in hint
+    assert knowledge_path_encoding_hint(
+        r"D:\Code\张三\chailv", windows=True, acp=65001, source_checkout=True
+    ) is None
+    print("✓ 源码 checkout 的知识库路径提示给出可执行规避方式")
 
 
 _DIRECT_RUN_SKIP: dict[str, str] = {
@@ -153,6 +176,7 @@ if __name__ == "__main__":
     _stdio.ensure_utf8()
     _tmp_registry.install()
     test_knowledge_path_encoding_hint_detects_windows_ansi_paths()
+    test_knowledge_path_encoding_hint_source_checkout_wording()
     print("monkeypatch 用例需 pytest 运行")
     if _DIRECT_RUN_SKIP:
         print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")

@@ -100,6 +100,7 @@ def knowledge_path_encoding_hint(
     *,
     windows: bool | None = None,
     acp: int | None = None,
+    source_checkout: bool | None = None,
 ) -> str | None:
     """知识库路径在 Windows 下含非 ASCII 字符时的修正提示（其余情况 None）。
 
@@ -108,6 +109,10 @@ def knowledge_path_encoding_hint(
     索引、初始化脚本自检全部通过；进程重启后集合加载必然失败。写入端没有
     办法提前感知，只能在这里统一给出可操作的规避指引（init 提前失败、
     状态接口把「重新运行初始化脚本」换成真实原因）。
+
+    提示按部署形态给可执行文案：源码 checkout 下知识库目录固定在
+    ``.claude/skills``（``ALIGO_DATA_DIR`` 不会移动它），让用户设置该变量
+    是无效指引；只有 wheel 安装才跟随用户数据目录。
     """
     is_windows = os.name == "nt" if windows is None else bool(windows)
     if not is_windows:
@@ -119,6 +124,18 @@ def knowledge_path_encoding_hint(
         # 已启用「Beta: 使用 Unicode UTF-8 提供全球语言支持」：ANSI 代码页
         # 就是 UTF-8，faiss 按 ANSI 解释也能得到正确路径
         return None
+    if source_checkout is None:
+        try:
+            source_checkout = is_source_checkout()
+        except Exception:  # noqa: BLE001 - 路径解析失败按安装形态给通用文案
+            source_checkout = False
+    if source_checkout:
+        return (
+            "知识库路径含非 ASCII 字符，Windows 下 Milvus Lite 无法把索引写入磁盘"
+            "（重启后集合加载失败）；请把仓库放到纯英文路径（如 D:\\Code\\chailv），"
+            "或把 .claude/skills 复制到纯英文目录并用 ALIGO_SKILLS_DIR 指向它后"
+            "重建知识库（源码运行时 ALIGO_DATA_DIR 不会移动知识库）"
+        )
     return (
         "知识库路径含非 ASCII 字符，Windows 下 Milvus Lite 无法把索引写入磁盘"
         "（重启后集合加载失败）；请把 ALIGO_DATA_DIR（或 ALIGO_SKILLS_DIR）"
