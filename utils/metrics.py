@@ -4,8 +4,10 @@
 分布只统计真实经过路由的请求——Host 拒绝与未匹配路径的 404 不受限流、
 可被扫描无限次触发，只计请求数，避免稀释 P50 / P95。首页、静态资源与
 ``/metrics`` 抓取本身不计入（``GET /api/metrics`` 返回快照），便于本地
-观测与压测。耗时 P50 / P95 基于最近 ``MAX_DURATION_SAMPLES`` 个请求
-（内存有界）。多进程 / 多实例部署时各进程独立统计（见 README 已知限制）。
+观测与压测。平均 / 最大耗时为进程启动以来全部计时请求的累计口径；耗时
+P50 / P95 基于最近 ``MAX_DURATION_SAMPLES`` 个请求（内存有界），两者的
+统计窗口不同（长历史下平均值可能高于最近窗口的 P95）。多进程 / 多实例
+部署时各进程独立统计（见 README 已知限制）。
 """
 import math
 import re
@@ -196,24 +198,30 @@ class RequestMetrics:
             f"aligo_requests_total {total}",
             "# HELP aligo_requests_by_status_total Requests grouped by HTTP status.",
             "# TYPE aligo_requests_by_status_total counter",
-            "# HELP aligo_sse_errors_total Streaming turns that ended with an error event.",
-            "# TYPE aligo_sse_errors_total counter",
-            f"aligo_sse_errors_total {sse_errors}",
-            "# HELP aligo_preference_cache_hits_total Preference snapshot cache hits (process).",
-            "# TYPE aligo_preference_cache_hits_total counter",
-            f"aligo_preference_cache_hits_total {pref_hits}",
-            "# HELP aligo_preference_cache_misses_total Preference snapshot cache misses (process).",
-            "# TYPE aligo_preference_cache_misses_total counter",
-            f"aligo_preference_cache_misses_total {pref_misses}",
-            "# HELP aligo_preference_cache_version_invalidations_total Misses a shared preference version change caused while the snapshot was still fresh (subset of misses).",
-            "# TYPE aligo_preference_cache_version_invalidations_total counter",
-            "aligo_preference_cache_version_invalidations_total "
-            f"{pref_version_invalidations}",
         ]
+        # 同一 metric family 的样本必须紧跟其 HELP / TYPE（文本格式 0.0.4），
+        # 中间插入其它族会让解析器把它当成新的 untyped 族
         for status, value in statuses:
             lines.append(
                 f'aligo_requests_by_status_total{{status="{_escape_label(str(status))}"}} {value}'
             )
+        lines.extend(
+            [
+                "# HELP aligo_sse_errors_total Streaming turns that ended with an error event.",
+                "# TYPE aligo_sse_errors_total counter",
+                f"aligo_sse_errors_total {sse_errors}",
+                "# HELP aligo_preference_cache_hits_total Preference snapshot cache hits (process).",
+                "# TYPE aligo_preference_cache_hits_total counter",
+                f"aligo_preference_cache_hits_total {pref_hits}",
+                "# HELP aligo_preference_cache_misses_total Preference snapshot cache misses (process).",
+                "# TYPE aligo_preference_cache_misses_total counter",
+                f"aligo_preference_cache_misses_total {pref_misses}",
+                "# HELP aligo_preference_cache_version_invalidations_total Misses a shared preference version change caused while the snapshot was still fresh (subset of misses).",
+                "# TYPE aligo_preference_cache_version_invalidations_total counter",
+                "aligo_preference_cache_version_invalidations_total "
+                f"{pref_version_invalidations}",
+            ]
+        )
         lines.extend(
             [
                 "# HELP aligo_requests_by_method_total Requests grouped by HTTP method.",
@@ -236,7 +244,9 @@ class RequestMetrics:
             )
         lines.extend(
             [
-                "# HELP aligo_request_duration_seconds Request duration statistics.",
+                "# HELP aligo_request_duration_seconds Process-local request duration gauge "
+                "(not a Prometheus summary): avg/max over all timed requests since start, "
+                "p50/p95 over the most recent duration samples.",
                 "# TYPE aligo_request_duration_seconds gauge",
             ]
         )

@@ -1108,6 +1108,28 @@ def test_status_endpoint():
     print("✓ /api/status 正常")
 
 
+def test_status_storage_description_does_not_wait_for_redis(monkeypatch):
+    """/api/status 只为展示后端名：不能等 Redis 客户端创建波次（占线程池）。"""
+    from webapp import server as server_module
+
+    calls: list[bool] = []
+
+    def fake_describe(wait_for_create: bool = True) -> dict:
+        calls.append(wait_for_create)
+        return {
+            "short_term": "memory",
+            "long_term": "json",
+            "short_term_degraded": False,
+            "long_term_degraded": False,
+        }
+
+    monkeypatch.setattr(server_module, "describe_backends", fake_describe)
+    response = _client().get("/api/status", params={"user_id": "web_test_status_wait"})
+    assert response.status_code == 200, response.text
+    assert calls == [False], calls
+    print("✓ /api/status 不等 Redis 创建波次")
+
+
 def test_reserved_device_user_id_rejected():
     """Windows 设备保留名不能作 user_id：会拼成记忆库文件名并指向设备。"""
     client = _client()
@@ -5016,7 +5038,15 @@ def test_visible_preferences_hides_unmanageable_keys():
         }
     )
     assert visible == {"home_location": "上海"}, visible
-    print("✓ 面板隐藏不可管理的偏好键")
+    # 列表内的空容器与 null / 空白项同口径（下一步追加时会被合并层丢弃）
+    lists = _visible_preferences(
+        {
+            "hotel_brands": ["汉庭", None, "", {}, []],
+            "empty_only": [None, {}, []],
+        }
+    )
+    assert lists == {"hotel_brands": ["汉庭"]}, lists
+    print("✓ 面板隐藏不可管理的偏好键与空值条目")
 
 
 def test_preference_put_cleans_hidden_blank_entries():
@@ -10469,9 +10499,16 @@ def test_host_rejection_is_secured_and_counted():
         assert root.status_code == 400
         missing = client.get("/api/definitely-not-a-route")
         assert missing.status_code == 404
+        # 方法不符（partial match，端点未执行）与尾斜杠重定向同样不受限流、
+        # 可被无限触发：计入请求数，但不能进入延迟分位
+        mismatch = client.post("/api/health")
+        assert mismatch.status_code == 405
+        redirect = client.get("/api/health/", follow_redirects=False)
+        assert redirect.status_code in (307, 308)
         snapshot = REQUEST_METRICS.snapshot()
         assert snapshot["by_status"].get("400") == 2, snapshot
         assert snapshot["by_status"].get("404") == 1, snapshot
+        assert snapshot["by_status"].get("405") == 1, snapshot
         assert snapshot["by_path"].get("__host_rejected__") == 2, snapshot
         assert snapshot["by_path"].get("__unmatched__") == 1, snapshot
         assert snapshot["duration_samples"] == 0, "探测流量不进入延迟分位"
@@ -10818,6 +10855,10 @@ def test_prometheus_metrics_endpoint():
         assert "aligo_circuit_breaker_state" in text
         assert "aligo_sessions_cached" in text
         assert "aligo_sessions_max" in text
+        assert "aligo_skills_ok 1" in text, "源码目录应有可加载技能"
+        import re
+
+        assert re.search(r"aligo_skills_count [1-9]\d*", text), text
         assert "aligo_rate_limit_degraded 0" in text
         assert 'aligo_rate_limit_backend{backend="memory"} 1' in text
         assert 'aligo_storage_backend{short_term="memory",long_term="json"} 1' in text
@@ -14927,6 +14968,42 @@ def test_usage_summary_naive_timestamp_uses_browser_zone():
     print("✓ 用量 by_day 对 naive 时间戳同样按浏览器时区分桶")
 
 
+def test_status_today_defaults_to_tz_when_only_tz_given():
+    """只传文档化的 tz 时，行程状态与用量窗口共用同一个「今天」。"""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    zone = ZoneInfo("Pacific/Midway")
+    zone_today = datetime.now(zone).date()
+    if zone_today == datetime.now().date():
+        pytest.skip("本机时区与 UTC-11 同一天，无法构造跨日用例")
+    client = _client()
+    user = _unique_user("web_status_tz_today")
+    day = zone_today.isoformat()
+    try:
+        created = client.post(
+            "/api/trips",
+            json={
+                "user_id": user,
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": day,
+                "end_date": day,
+            },
+        )
+        assert created.status_code == 201, created.text
+        data = client.get(
+            "/api/status", params={"user_id": user, "tz": "Pacific/Midway"}
+        ).json()
+        assert data["travel_summary"]["active"] == 1, data["travel_summary"]
+        assert (data["next_trip"] or {}).get("destination") == "杭州", data["next_trip"]
+        # 用量窗口同口径：最后一格就是该时区的今天
+        assert data["usage"]["by_day"][-1]["date"] == day, data["usage"]["by_day"]
+    finally:
+        _cleanup(user)
+    print("✓ /api/status 只传 tz 时 today 按同时区推断")
+
+
 def test_cached_chronological_key_invalidates_on_tz_change():
     """chronological_key 缓存必须带时区世代：进程内切 TZ 后不得命中旧结果。"""
     import time as time_module
@@ -15228,6 +15305,10 @@ def test_usage_summary_cached_per_user(monkeypatch):
         # 时区进入指纹：同一历史按不同时区取窗口不能命中旧缓存
         server_module._usage_summary_for_user("u-cache", grown, "Asia/Shanghai")
         assert calls["n"] == 3, "换时区（窗口口径变化）必须重新汇总"
+        # 多时区客户端交替刷新：每个时区各自命中槽位，不能互相顶掉
+        server_module._usage_summary_for_user("u-cache", grown)
+        server_module._usage_summary_for_user("u-cache", grown, "Asia/Shanghai")
+        assert calls["n"] == 3, "时区交替请求必须命中各自缓存槽位"
         # 缓存封顶：不同用户不会无限写入
         for index in range(server_module._USAGE_SUMMARY_CACHE_MAX + 5):
             server_module._usage_summary_for_user(f"u-{index}", [])
@@ -18340,6 +18421,21 @@ def test_doctor_reports_open_breaker():
     assert item["status"] == "fail", item
     assert data["status"] == "fail"
     print("✓ /api/doctor 反映熔断状态")
+
+
+def test_doctor_flags_half_open_degraded():
+    """半开期多数对话仍 503：/api/doctor 的 status 是 ok，但 degraded 必须为真。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.breaker.recovery_timeout_sec = 0
+    for _ in range(state.breaker.failure_threshold):
+        state.breaker.record_failure()
+    data = TestClient(app).get("/api/doctor").json()
+    item = next(check for check in data["checks"] if check["name"] == "熔断器")
+    assert item["status"] == "warn", item
+    # 其它检查项在 CI（无 API Key / 无模型）可能为 fail：只验证半开口径
+    assert data["degraded"] is True, data
+    print("✓ /api/doctor 半开期标记 degraded")
 
 
 def test_session_detail_normalizes_usage():

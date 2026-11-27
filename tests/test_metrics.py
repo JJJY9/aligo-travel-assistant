@@ -44,7 +44,9 @@ def test_percentiles_use_bounded_recent_samples():
     assert snapshot["p50_duration_ms"] == 1.0
     assert snapshot["p95_duration_ms"] == 1.0, "早期慢请求应已滑出样本窗口"
     assert snapshot["max_duration_ms"] == 1000.0, "最大值仍保留全量历史"
-    print("✓ P50 / P95 使用有界近期样本，max 保留历史")
+    # 平均耗时为全生命周期口径（与百分位窗口不同），显式固化契约
+    assert snapshot["avg_duration_ms"] == 167.5
+    print("✓ P50 / P95 使用有界近期样本，max / avg 保留历史")
 
 
 def test_average_duration_excludes_streaming_requests():
@@ -130,6 +132,32 @@ def test_prometheus_render():
     print("✓ Prometheus 文本指标（标签转义 / 百分位）")
 
 
+def test_prometheus_families_stay_grouped():
+    """同一 metric family 的样本必须紧跟 HELP / TYPE（文本格式 0.0.4）。
+
+    中间插入其它族时，解析器会把后半段样本当成新的 untyped 族。
+    """
+    metrics = RequestMetrics()
+    metrics.record("GET", "/api/health", 200, 1.0)
+    metrics.record("POST", "/api/chat", 500, 2.0)
+    metrics.record("GET", "/api/health", 200, 1.0)
+    lines = metrics.render_prometheus().splitlines()
+
+    def family(line: str) -> str:
+        if line.startswith("# HELP ") or line.startswith("# TYPE "):
+            return line.split()[2]
+        return line.split("{")[0].split()[0]
+
+    seen: list[str] = []
+    for line in lines:
+        name = family(line)
+        if seen and seen[-1] == name:
+            continue
+        assert name not in seen, f"metric family {name} 被拆成多段"
+        seen.append(name)
+    print("✓ Prometheus 指标族连续输出")
+
+
 def test_prometheus_omits_duration_stats_without_samples():
     metrics = RequestMetrics()
     text = metrics.render_prometheus()
@@ -198,6 +226,7 @@ if __name__ == "__main__":
     test_method_cardinality_is_bounded()
     test_control_characters_are_sanitized()
     test_prometheus_render()
+    test_prometheus_families_stay_grouped()
     test_prometheus_omits_duration_stats_without_samples()
     test_uptime_uses_monotonic_clock()
     test_reset()

@@ -565,7 +565,7 @@ python cli.py
 
 全部会话导出（不进入交互）：`python cli.py sessions-export <user_id> [path] [--stdout] [--force] [--html]` 把全部会话导出为单个 Markdown（默认 `exports/aligo_sessions_<user>.md`），`--html` 导出独立 HTML 合集（单文件内嵌样式、全部内容转义，默认 `.html` 后缀，与单会话 `session-export --html` 同一渲染口径）；中文或超长用户名会追加短哈希避免重名；按最近更新排序并含归档会话；已存在时需 `--force` 覆盖，无会话返回 1。所有导出命令（`kb-export` / `session-export` / `sessions-export` / `trips-export` / `trip-calendar` / `user-export`）传显式空路径（如脚本变量未设置）按用法错误处理，不会静默回退到默认 `exports/`；`--stdout` 模式下 stdout 只包含导出内容，失败提示一律走 stderr（重定向产物不会混入中文报错）；非 `--force` 导出在写入中断（Ctrl-C 等）时会清理占位文件，同名导出不会被 0 字节残留永久挡住。
 
-环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）；`python cli.py doctor --json` 输出机器可读的 `status` / `checks`，便于监控脚本解析，退出码不变；`--offline`（或 `--no-network`）跳过 LLM 连通性检查，适合网络不可达或 CI 环境。
+环境自检（不进入交互）：`python cli.py doctor`，逐项检查运行环境并给出修复提示，退出码 0/1（存在必须处理的问题时为 1）；`python cli.py doctor --json` 输出机器可读的 `status` / `checks`，便于监控脚本解析，退出码不变；`--offline`（或 `--no-network`）跳过 LLM 连通性检查，适合网络不可达或 CI 环境——该开关**只**跳过 LLM 检查；配置了 `REDIS_URL` / `DATABASE_URL` 时仍会以 1.5s / 3s 超时探测存储（失败只记警告、不影响退出码 0，网络隔离 CI 若无需存储自检可不配置这两个变量）。
 
 技能目录（不进入交互）：`python cli.py skills`，输出当前技能目录与已发现的技能名，退出码 0/1；`--json` 输出 `root` / `skills` / `ok`，便于脚本读取。安装 wheel 或设置 `ALIGO_SKILLS_DIR` 后可用它确认技能是否生效。
 
@@ -628,7 +628,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 - 访问日志默认输出单行文本（方法 / 路径 / 状态 / 耗时 / 请求 ID）；设置 `LOG_FORMAT=json` 后，应用日志（含访问日志）每行输出为**合法 JSON**（`time` / `level` / `logger` + `event=http_request` 等字段），便于日志采集与检索；uvicorn 自身的启动 / access 日志保持原格式。
 - 静态资源与 JSON 响应启用 gzip（≥1KB）；`/api/chat/stream` 的 SSE 事件流保持不压缩，避免缓冲破坏实时进度。
 - 系统自检：记忆面板「运行自检」调用 `/api/doctor`，展示 Python 版本、核心 / RAG 依赖、大模型配置、版本一致性（`pyproject.toml` / wheel 元数据 / `index.html` 静态资源 `?v=` / `utils/version.py`）、技能目录（发现数量）、记忆存储后端（配置 Redis / PostgreSQL 时检查连通性）、嵌入模型文件、知识库状态；勾选「检查 LLM 连通性」时额外发起一次真实健康检查（默认不请求网络）。
-- 请求指标：`GET /api/metrics` 返回进程内 `/api` 请求计数（仅统计 `/api` 路由与 Host 白名单拒绝的探测；首页、`/static` 资源与 `/metrics` 抓取本身不计）、状态 / 方法分布、Top 路径（按路由模板聚合，如 `/api/sessions/{session_id}`；未匹配路径记为 `__unmatched__`，Host 白名单拒绝记为 `__host_rejected__`，路由前 413 与尾斜杠重定向按已知接口归一）、平均 / 最大 / P50 / P95 耗时（百分位基于最近 1000 个请求样本；流式与取消 / 客户端断开的 499 不计耗时；Host 拒绝探测与未匹配路径的 404 不受限流、可被扫描无限次触发，只计请求数、不进延迟分位；无计时样本时面板显示「—」）、熔断器状态（`opened_at` / `last_failure_time` 为本地墙钟秒，字段同锁读取）、缓存会话数，以及当前限流后端（Redis 共享 / 进程内）、是否降级与用户 / IP / 知识库 / 天气额度配置（请求指标多进程各自统计）；同时提供 Prometheus 文本端点 `GET /metrics`，便于接入 Prometheus / Grafana，多实例需分别采集。
+- 请求指标：`GET /api/metrics` 返回进程内 `/api` 请求计数（仅统计 `/api` 路由与 Host 白名单拒绝的探测；首页、`/static` 资源与 `/metrics` 抓取本身不计）、状态 / 方法分布、Top 路径（按路由模板聚合，如 `/api/sessions/{session_id}`；未匹配路径记为 `__unmatched__`，Host 白名单拒绝记为 `__host_rejected__`，路由前 413 与尾斜杠重定向按已知接口归一）、平均 / 最大 / P50 / P95 耗时（平均与最大为进程启动以来全部计时请求的累计口径，百分位基于最近 1000 个请求样本，两者窗口不同；流式与取消 / 客户端断开的 499 不计耗时；Host 拒绝探测、未匹配路径的 404、方法不符的 405 与尾斜杠 307/308 不受限流、可被扫描无限次触发，只计请求数、不进延迟分位；无计时样本时面板显示「—」）、熔断器状态（`opened_at` / `last_failure_time` 为本地墙钟秒，字段同锁读取）、缓存会话数、技能可用性与数量（`aligo_skills_ok` / `aligo_skills_count`，与 `/api/health` 的 `skills.ok` 同口径），以及当前限流后端（Redis 共享 / 进程内）、是否降级与用户 / IP / 知识库 / 天气额度配置（请求指标多进程各自统计）；同时提供 Prometheus 文本端点 `GET /metrics`，便于接入 Prometheus / Grafana，多实例需分别采集。
 
   Prometheus 抓取示例：
 
@@ -649,9 +649,9 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果；`done` 事件同样携带 `persisted`；可选 `idempotency_key`，重复提交只回放 `session` + `done` 并标记 `idempotent_replay`） |
 | GET | `/api/health` | 服务版本 / 模型 / 技能数 / 存储与限流后端状态；熔断器打开或技能目录不可用（`skills.ok` 为 `false`）时 `status` 为 `degraded` 并附 `circuit_breaker` / `skills` |
 | GET | `/api/metrics` | 进程内 `/api` 请求指标（计数 / 状态分布 / Top 路径 / 平均、最大、P50、P95 耗时 / 熔断器状态 / SSE error 收尾计数 `sse_errors` / 偏好快照缓存 hits、misses、version_invalidations）与限流后端信息；Prometheus 文本端点（`/metrics`）另暴露 `aligo_preference_cache_hits_total` / `aligo_preference_cache_misses_total` / `aligo_preference_cache_version_invalidations_total`；SSE 长连接只计请求数、不计入延迟分位；首页、静态资源与抓取自身不计入 |
-| GET | `/metrics` | Prometheus 文本指标（请求计数 / 状态 / 方法 / 路径 / 耗时 / 熔断器 / 缓存会话 / 限流与存储后端降级 / 共享墓碑状态；多实例分别采集） |
+| GET | `/metrics` | Prometheus 文本指标（请求计数 / 状态 / 方法 / 路径 / 耗时 / 熔断器 / 缓存会话 / 技能可用性（`aligo_skills_ok` / `aligo_skills_count`）/ 限流与存储后端降级 / 共享墓碑状态；多实例分别采集） |
 | GET | `/api/knowledge` | 知识库状态（集合名 / 片段数 / 是否可用 / 向量维度；已加载嵌入模型时按实际维度、冷进程按模型目录配置维度附带 `dimension_mismatch` 标记换模型后的维度不一致） |
-| GET | `/api/doctor` | 环境自检（`network=true` 时包含 LLM 连通性检查）；熔断器打开 / 半开时附加「熔断器」检查项并让自检不再全绿 |
+| GET | `/api/doctor` | 环境自检（`network=true` 时包含 LLM 连通性检查）；熔断器打开 / 半开时附加「熔断器」检查项并让自检不再全绿；顶层 `degraded` 布尔与 `/api/health` 的 `status=degraded` 同口径（`status` 仍只有 `ok` / `fail`，半开期 `status=ok` 且 `degraded=true`） |
 | GET | `/api/knowledge/documents` | 知识片段列表（`limit` / `offset` / `q` / `category`，按 id 倒序） |
 | POST | `/api/knowledge/documents` | 新增知识片段（`content` / `metadata`；首次调用加载嵌入模型） |
 | PUT | `/api/knowledge/documents/{id}` | 更新知识片段（内容重新向量化后覆盖原片段，不存在返回 404；带 `group` 的多分片记录按整组替换，内容上限 20000 字；可选 `expect` / `expect_parts` / `expect_group` / `expect_metadata` 传入编辑时载入的快照（元数据轴同样 409，另一会话只改分类 / 标题也不会被旧快照改回）；整组编辑保留逐片元数据，只把真正改动的字段应用到全组） |
@@ -665,7 +665,7 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 | GET | `/api/knowledge/export` | 导出全部知识片段为 JSON 文件（备份 / 迁移）；导出前按逐条紧凑序列化估算体积，超过 50 MB 面板导入上限时返回 413（该文件本也无法经面板 / `/api/import` 导回，提示先删除部分片段或改用 CLI `kb-export`） |
 | POST | `/api/knowledge/import` | 批量导入知识片段（`documents` 数组，单次最多 20000 条；`dry_run=1` 只返回 `would_import` 不写库） |
 | POST | `/api/knowledge/import/preview` | 预览整个备份（一次最多 20000 条）：校验 / 去重后返回将导入 / 跳过的数量（`skipped_invalid` 无效内容 / `skipped_duplicate` 已存在分别统计），不写库 |
-| GET | `/api/status` | 用户数据概览（偏好 / 最近行程 / 行程统计（总数 / 出行天数 / 到访城市 / 进行中 / 即将出行）/ 对话数 / 统计 / 存储后端 / 模型用量与近 7 天趋势（可按浏览器时区 `tz` 参数分桶）；`user_id` 必填，缺省 422——不再回退固定账号 `web_user`，避免省略字段的不同调用方读到同一份数据） |
+| GET | `/api/status` | 用户数据概览（偏好 / 最近行程 / 行程统计（总数 / 出行天数 / 到访城市 / 进行中 / 即将出行）/ 对话数 / 统计 / 存储后端 / 模型用量与近 7 天趋势（可按浏览器时区 `tz` 参数分桶）；可选 `today=YYYY-MM-DD` 指定行程状态的「今天」，缺省时若 `tz` 有效按该时区取当天（与用量窗口同口径）、否则按服务器本地日期；`user_id` 必填，缺省 422——不再回退固定账号 `web_user`，避免省略字段的不同调用方读到同一份数据） |
 | GET | `/api/weather` | 目的地天气（Open-Meteo，无 API Key；实时 + 未来 3 天，成功结果 10 分钟进程内缓存（配置 `REDIS_URL` 时同时写入共享缓存 `aligo:weather:<城市>`，其它实例直接复用）、失败结果 60 秒；上游故障时沿用最近一次成功数据并标记 `stale`，窗口按最近一次成功计时、1 小时封顶，不会被反复降级刷新；按客户端 IP 限流，默认 30 次 / 分钟，10 分钟缓存命中不消耗额度（缓存命中的成功响应同样附带 `X-RateLimit-*` 额度头，与未命中的 200 形状一致） |
 | PUT | `/api/preferences/{type}` | 新增或覆盖一条偏好（JSON 值，记忆面板编辑入口） |
 | DELETE | `/api/preferences/{type}` | 删除一条偏好 |
@@ -910,7 +910,7 @@ python -m webapp.server --port 8002   # 另一个进程 / 机器
 - **请求幂等**：幂等缓存（进程内 TTL 10 分钟 + 上限 256 条，超限时先清理过期条目、再按用户公平淘汰——只淘汰当前条目数最多的用户自己最旧的一条：单一用户的突发流量不会把另一用户仍在 TTL 内的缓存条目 / 断连未完成标记挤出；多个用户共同占满上限时仍会淘汰某个用户的最旧条目，没有每用户配额时无法避免）与按用户串行的 asyncio 锁都是进程内状态。响应丢失后重试若被负载均衡分到另一实例，仍会重新执行整轮并重复落库；请配合会话粘滞（session affinity），或把 `IdempotencyCache` 替换为 Redis 实现。
 - **PostgreSQL 连接**：生产连接默认 `lock_timeout=3000ms`（等表锁超过 3 秒按「存储暂时不可用」返回，而不是无限挂起）和 TCP keepalive（30s/10s/3，半开连接约一分钟内被发现）；`statement_timeout` 只在自检探测等显式场景设置，大备份导入等合法长事务不受默认语句上限影响。表结构在进程内每个 DSN 只初始化一次（首次持跨进程 advisory lock；另一实例正在建索引时最多等 5 秒即跳过本次 DDL，并在 30 秒内不再重试，表结构由其推进、幂等稍后补齐）。
 - **反向代理**：前面有 Nginx / 负载均衡时设置 `TRUST_PROXY_HEADERS=1`，并让最靠近应用的代理以追加模式写入 `X-Forwarded-For`（应用默认取最后一项）；多层代理（CDN→nginx→应用）把 `TRUST_PROXY_HOPS` 设为实际代理层数（如 `2`），否则所有客户端会共用上游出口地址的 IP 桶、一个客户端即可打满全站额度。默认不信任该头是为了防止客户端伪造。
-- **观测**：请求指标（`/api/metrics`）是进程内统计（只统计 `/api` 路由请求与 Host 白名单拒绝的探测，首页 / 静态资源 / 抓取自身不计），需要分别采集每个实例；SSE 长连接只统计请求数与状态码、不计入延迟分位（整段会话时长没有可比性），以 error 事件收尾（且终态帧已送达）的流单独计入 `sse_errors`（HTTP 已发出 200，按状态码看不到失败）；Host 拒绝探测与未匹配路径的 404 不受限流、只计请求数、不计入延迟分位；PostgreSQL 后端的偏好快照缓存命中 / 未命中 / 版本失效计数见 `preference_cache`（同样按实例统计，`version_invalidations` 是 misses 的子集：只统计快照仍在 TTL 内、因跨进程版本变化被迫回源），Prometheus 暴露对应计数；`/api/health` 在熔断打开或技能目录不可用（`skills.ok` 为 `false`）时 body 的 `status` 为 `degraded`（HTTP 仍返回 200，K8s / 负载均衡的就绪探针需要解析 body 或改用 `storage.*_degraded` 等指标），可用于实例级就绪检查。
+- **观测**：请求指标（`/api/metrics`）是进程内统计（只统计 `/api` 路由请求与 Host 白名单拒绝的探测，首页 / 静态资源 / 抓取自身不计），需要分别采集每个实例；SSE 长连接只统计请求数与状态码、不计入延迟分位（整段会话时长没有可比性），以 error 事件收尾（且终态帧已送达）的流单独计入 `sse_errors`（HTTP 已发出 200，按状态码看不到失败）；Host 拒绝探测、未匹配路径的 404、方法不符的 405 与尾斜杠 307/308 不受限流、只计请求数、不计入延迟分位；PostgreSQL 后端的偏好快照缓存命中 / 未命中 / 版本失效计数见 `preference_cache`（同样按实例统计，`version_invalidations` 是 misses 的子集：只统计快照仍在 TTL 内、因跨进程版本变化被迫回源），Prometheus 暴露对应计数，并新增 `aligo_skills_ok` / `aligo_skills_count`（与 `/api/health` 的 `skills.ok` / `skills.count` 同口径）；`/api/health` 在熔断打开或技能目录不可用（`skills.ok` 为 `false`）时 body 的 `status` 为 `degraded`（HTTP 仍返回 200，K8s / 负载均衡的就绪探针需要解析 body 或改用 `storage.*_degraded` 等指标），可用于实例级就绪检查。
 - **知识库**：Milvus Lite 是本地单进程文件锁，多个实例无法共享同一个向量库文件；这里的多实例共享适用于无 RAG 或各实例独立知识库的场景，需要共享向量库时请替换为 Milvus 服务端部署。
 
 ### 知识库初始化
@@ -952,7 +952,7 @@ python -m webapp.server --port 8002   # 另一个进程 / 机器
 - **整组替换与检索并发**：面板编辑多分片文档按「写新分片 → 覆盖首片 → 删除旧分片」多步提交，每步单独写库；与针对该组的检索并发时，可能读到新旧混合的窗口期内容（几秒内）。检索侧已按 `group` / `part` 拼回整篇并对重复分片去重；BM25 索引的全量扫描与写入共用知识库读写锁（写忙时本次混合检索退回纯向量），仍建议在低峰期维护多分片文档。
 - **存储后端故障回退**：配置的 PostgreSQL 连接失败时自动回退本地 JSON；故障期间新会话写入 JSON 的消息 / 偏好不会在恢复后自动合并到 PostgreSQL（文件保留在 `data/memory/`，恢复时日志会给出警告），需要时请手动迁移。**删除、元数据读写与偏好 / 行程写入例外**：删除会话、删除最后一轮、删除行程、删除偏好，以及行程新增 / 编辑（Web 接口与导入端点）、偏好设置（PUT）、会话标题 / 置顶 / 归档、**会话详情读取（`GET /api/sessions/{id}`，避免把回退库里的「空会话」误当成已删除）与会话列表 / 状态概览读取（`GET /api/sessions`、`/api/status`，避免列表展示回退库的陈旧会话、点开详情却 503 的口径分叉），以及交互模式的 `status` / `history` / `preferences` 读命令（同样不把回退 JSON 当账号现状展示）**在 PostgreSQL 不可用（连接失败 / 60 秒冷却期）时返回 503，而不是作用在回退的 JSON 库上——否则恢复后数据会「复活」或「凭空消失」；恢复后再执行即可。
 - **本地 JSON 损坏文件的保护**：加载时发现记忆文件无法解析会先备份为 `<data>.corrupt-<时间戳>-<pid>` 再以空数据启动；若加载时等锁超时或备份失败（Windows 上文件被其它进程占用），下一次写操作会在持锁状态下补做复核 / 备份，备份仍失败则拒绝写入并提示手动处理文件路径，绝不会用空快照直接覆盖损坏文件。
-- **`/api/health` 的存储描述**：`storage.short_term` / `storage.long_term` 与 `*_degraded` 反映**最近一次实际创建**的后端；PostgreSQL 冷却刚过期、下一次会话创建之前不会乐观误报 `postgres`。运行中 Redis 故障回退进程内缓存时 `short_term_degraded` 为 `true`；该标记按**最近一次真实 Redis 操作**判断——冷却到期但期间没有任何成功操作时仍为 `true`，不会因「冷却结束」误报恢复。
+- **`/api/health` 的存储描述**：`storage.short_term` / `storage.long_term` 与 `*_degraded` 反映**最近一次实际创建或健康探测**的后端；本进程尚未创建过长期记忆时，`/api/health`、`/api/metrics` 与 `/api/status` 会对 PostgreSQL 做一次有界（≤2 秒）只读连通性探测并缓存结果（失败进入 60 秒冷却），数据库不可达的新实例不会乐观误报 `postgres`。运行中 Redis 故障回退进程内缓存时 `short_term_degraded` 为 `true`；该标记按**最近一次真实 Redis 操作**判断——冷却到期但期间没有任何成功操作时仍为 `true`，不会因「冷却结束」误报恢复。
 - **Redis 短期记忆的故障重放**：运行中 Redis 故障时短期记忆回退进程内影子缓存，故障期的消息与删除操作记入**进程内**日志，恢复后由同一进程的下一次访问按顺序重放（多进程部署下各进程各自补写；限流与删除墓碑仍跨实例共享）。截断 / 清空与回填去重按消息时间戳判断新旧，前提是同一部署内各实例**时钟基本同步且进程时区一致**（建议全部 `TZ=UTC`；仅时钟同步不够——跨时区实例会把同一时刻归一成不同字符串，指纹去重、有序插入与截断守卫都会失效）。故障期日志只存在于当前进程：进程重启、或一次性命令（如 `cli.py session-delete`）在 Redis 恢复前退出后，未重放的删除不再执行，该会话键会按 TTL（默认 1 小时）自然过期；删除墓碑的共享检查在 Redis 抖动后有 60 秒失败冷却——删除会话（Web / CLI）与故障重放前的墓碑检查属于低频关键路径，会**绕过冷却强制真实读取一次**（避免冷却期静默放行已删除会话），其余高频枚举（如备份恢复逐会话检查）在冷却期内按 fail-open 跳过（与存储回退同一口径）。
 - **Redis 配置热更新**：修改 `REDIS_URL` 后调用 `reset_failure_cache()` 只影响之后的创建调用（客户端缓存按 URL 区分、reset 与在途创建互斥）；限流器实例、已建会话的短期记忆与 Web 状态已直接缓存的客户端仍指向旧实例，需要重启进程才能全部切换。
 - **交互模式首次加载技能**：首次触发知识库问答等技能会在后台线程加载嵌入模型（torch / BGE，可能数十秒），加载期间按 Ctrl-C 只取消本轮等待，进程仍会等加载线程结束后退出；技能加载完成后再按 Ctrl-C 可在提示符处立即返回。

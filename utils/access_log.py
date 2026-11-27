@@ -29,6 +29,17 @@ def _safe_log_text(value: object) -> str:
     return text.replace("\u2028", "?").replace("\u2029", "?")
 
 
+# 文本格式以空格 / "->" / "(ms)" / "[id]" 分词：path 是唯一可被请求方
+# 控制且未转义的字段（method 来自请求行、request_id 由中间件生成），
+# 其中出现同名分隔符时用 percent-encoding 转义，避免路径伪造出额外的
+# 状态码 / 请求 ID。JSON 模式字段相互独立，不受影响。
+_TEXT_DELIMITERS = re.compile(r"[ \[\]()>]")
+
+
+def _escape_text_delimiters(value: str) -> str:
+    return _TEXT_DELIMITERS.sub(lambda m: f"%{ord(m.group()):02X}", value)
+
+
 def access_log_format() -> str:
     """当前访问日志格式：``text``（默认）或 ``json``。
 
@@ -75,7 +86,7 @@ def format_access_log(
             ensure_ascii=False,
         )
     return (
-        f"{safe_method} {safe_path} -> {status} "
+        f"{safe_method} {_escape_text_delimiters(safe_path)} -> {status} "
         f"({float(elapsed_ms):.0f}ms) [{_safe_log_text(request_id)}]"
     )
 

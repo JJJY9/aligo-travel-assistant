@@ -33,6 +33,20 @@ def test_json_format():
     print("✓ JSON 格式字段完整")
 
 
+def test_text_format_escapes_path_delimiters():
+    """文本格式按空格 / 箭头 / 括号分词：路径里的同名分隔符必须转义。
+
+    uvicorn 会 percent-decode 路径，未转义时可伪造出完整伪访问记录。
+    """
+    path = "/api/a b(c)[d]>"
+    line = format_access_log("GET", path, 200, 1.0, "rid", fmt="text")
+    assert line == "GET /api/a%20b%28c%29%5Bd%5D%3E -> 200 (1ms) [rid]"
+    # JSON 模式字段独立，路径原样保留（不改变机器消费方契约）
+    data = json.loads(format_access_log("GET", path, 200, 1.0, "rid", fmt="json"))
+    assert data["path"] == path
+    print("✓ 文本访问日志转义路径分隔符")
+
+
 def test_env_switch(monkeypatch):
     monkeypatch.setenv("LOG_FORMAT", "JSON")
     assert access_log_format() == "json"
@@ -108,6 +122,7 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_text_format_default()
+        test_text_format_escapes_path_delimiters()
         test_json_format()
         test_env_switch(mp)
         test_json_formatter_merges_access_fields()

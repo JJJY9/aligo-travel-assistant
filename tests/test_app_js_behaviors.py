@@ -1378,6 +1378,26 @@ def test_metrics_panel_uses_duration_samples():
     print("✓ 运行指标面板按计时样本数判断耗时")
 
 
+def test_storage_labels_show_fallback():
+    """用户卡片：配置了但回退的后端要显示「已回退」，未知状态不能冒充本地存储。"""
+    data = _run_harness("storageLabels")
+    assert data["fallback"] == ["Redis（已回退）", "PostgreSQL（已回退）"], data
+    assert data["redis"] == ["Redis", "PostgreSQL"], data
+    assert data["unknown"] == ["存储状态未知"], data
+    print("✓ 用户卡片显示存储回退状态")
+
+
+def test_health_refreshes_on_visibility_and_online():
+    """页面重新可见 / 网络恢复时刷新健康状态（无轮询的陈旧指示纠正）。"""
+    data = _run_harness("healthRefresh")
+    assert data["hidden_requested"] == 0, "不可见时不应请求"
+    assert data["url"] == "/api/health", data
+    assert data["degraded_text"] == "降级", data
+    assert data["online_text"] == "在线", data
+    assert data["status"] == "ok", data
+    print("✓ 健康状态在可见 / 上线时刷新")
+
+
 def test_stop_reconcile_preserves_registration_across_switch():
     """停止后切走会话：待对账登记保留，回到该会话时再对账。"""
     data = _run_harness("stopReconcileParked")
@@ -1802,6 +1822,8 @@ if __name__ == "__main__":
     test_webapp_round_interaction_fixes()
     test_webapp_round_semantic_stash_and_truncation()
     test_metrics_panel_uses_duration_samples()
+    test_storage_labels_show_fallback()
+    test_health_refreshes_on_visibility_and_online()
     test_stop_reconcile_preserves_registration_across_switch()
     test_stop_reconcile_single_flight()
     test_delete_inflight_session_restores_edit_entry()

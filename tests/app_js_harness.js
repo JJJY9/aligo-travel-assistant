@@ -1900,6 +1900,72 @@ async function scenarioMetricsPanel(source) {
   return results;
 }
 
+async function scenarioStorageLabels(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  return {
+    fallback: JSON.parse(
+      run(`JSON.stringify(storageParts({
+        short_term: "memory", short_term_configured: true, short_term_degraded: true,
+        long_term: "json", long_term_configured: true, long_term_degraded: true,
+      }))`)
+    ),
+    redis: JSON.parse(
+      run(`JSON.stringify(storageParts({
+        short_term: "redis", short_term_configured: true, short_term_degraded: false,
+        long_term: "postgres", long_term_configured: true, long_term_degraded: false,
+      }))`)
+    ),
+    unknown: JSON.parse(run("JSON.stringify(storageParts(null))")),
+  };
+}
+
+async function scenarioHealthRefresh(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    globalThis.__docHandlers = {};
+    globalThis.__winHandlers = {};
+    document.addEventListener = (type, fn) => { __docHandlers[type] = fn; };
+    window.addEventListener = (type, fn) => { __winHandlers[type] = fn; };
+    bindEvents();
+  `);
+  const results = {};
+  results.hidden_requested = run(`
+    document.visibilityState = "hidden";
+    __docHandlers.visibilitychange();
+    __requests.length;
+  `);
+  run(`
+    document.visibilityState = "visible";
+    __docHandlers.visibilitychange();
+  `);
+  const request = await waitRequest(env);
+  results.url = request.args[0];
+  request.resolve({
+    status: "degraded",
+    circuit_breaker: "open",
+    model: "m",
+    version: "1",
+    skills: { count: 12 },
+  });
+  await tick();
+  results.degraded_text = run("els.healthText.textContent");
+  run("__winHandlers.online();");
+  const online = await waitRequest(env);
+  online.resolve({
+    status: "ok",
+    circuit_breaker: "closed",
+    model: "m",
+    version: "1",
+    skills: { count: 12 },
+  });
+  await tick();
+  results.online_text = run("els.healthText.textContent");
+  results.status = run("state.health && state.health.status");
+  return results;
+}
+
 async function scenarioDeleteTurn(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
@@ -6070,6 +6136,10 @@ async function main() {
     payload = await scenarioOpenSessionGuards(source);
   } else if (scenario === "metricsPanel") {
     payload = await scenarioMetricsPanel(source);
+  } else if (scenario === "storageLabels") {
+    payload = await scenarioStorageLabels(source);
+  } else if (scenario === "healthRefresh") {
+    payload = await scenarioHealthRefresh(source);
   } else if (scenario === "webappRound") {
     payload = await scenarioWebappRound(source);
   } else if (scenario === "stopReconcileParked") {
