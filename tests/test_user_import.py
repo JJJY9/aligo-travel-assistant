@@ -96,6 +96,42 @@ def test_parse_export_sections():
     print("✓ 解析备份：偏好 / 行程 / 消息 / 会话元数据")
 
 
+def test_parse_drops_trip_links_to_sessions_with_no_surviving_messages():
+    payload = {
+        "user_id": "u-src",
+        "trip_history": [
+            {
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-03",
+                "session_id": "s-lost",
+            },
+            {
+                "origin": "北京",
+                "destination": "广州",
+                "start_date": "2026-12-10",
+                "end_date": "2026-12-11",
+                "session_id": "s-keep",
+            },
+        ],
+        "chat_history": [
+            {"role": "system", "content": "非法角色", "session_id": "s-lost"},
+        ],
+    }
+    sections, errors = parse_user_export(
+        json.dumps(payload, ensure_ascii=False)
+    )
+    trips = {trip["destination"]: trip for trip in sections["trips"]}
+    # 备份里确有消息、但全部被解析层丢弃的会话：恢复后不存在，行程不再
+    # 带指向它的死链
+    assert "session_id" not in trips["上海"], trips["上海"]
+    # 仅行程引用、备份里本无消息的会话保留关联（同账号重导不误清）
+    assert trips["广州"]["session_id"] == "s-keep"
+    assert any("会话关联" in error for error in errors), errors
+    print("✓ 解析备份：只清「有消息但零存活」会话的行程关联")
+
+
 def test_backup_limit_problem_checks_counts_and_size(monkeypatch):
     """导出上限检查：条数与体积超出导入侧上限时给出具体原因。"""
     from utils import user_import as module

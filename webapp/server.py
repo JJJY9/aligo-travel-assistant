@@ -5943,6 +5943,27 @@ def create_app(model: Any = None) -> FastAPI:
         # 专用导出是「备份 / 换机」用途，必须与用户备份的 knowledge 段
         # 一样剥离 NUL，否则导出→导入会静默丢片段
         documents = strip_nul(_json_safe_value(documents))
+        # 知识库合法上限约 5 万行 ×（400 字正文 + 10×200 字元数据）：整库
+        # indent=2 序列化会在内存里同时驻留整串 str 与完整 bytes（实测
+        # 5000 行峰值 ~66MB，线性外推单请求 ~0.9GB），两个导出槽并发即可
+        # 把 1-2GB 进程 OOM。先按逐条紧凑序列化估算下界（只产生单条小
+        # 字符串，不物化整份大对象）：超过面板导入上限（50MB，导出后本来
+        # 也无法经 /api/knowledge/import 或备份恢复导回）直接 413。
+        from utils.user_import import MAX_BACKUP_BYTES
+
+        estimated_bytes = sum(
+            len(json.dumps(document, ensure_ascii=False))
+            for document in documents
+        )
+        if estimated_bytes > MAX_BACKUP_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    f"知识库导出超过 {MAX_BACKUP_BYTES // (1024 * 1024)} MB"
+                    " 的面板导入上限，导出后无法再导回；请先删除部分知识"
+                    "片段，或改用 CLI kb-export 迁移"
+                ),
+            )
         payload = {
             "version": 1,
             "exported_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -8414,6 +8435,26 @@ def create_app(model: Any = None) -> FastAPI:
             backup["knowledge"] = sanitize_backup_data(
                 {"knowledge": backup["knowledge"]}
             )["knowledge"]
+        knowledge_omitted = ""
+        if backup.get("knowledge"):
+            # 知识段单独已超过面板导入上限时（知识库可被 CLI kb-import /
+            # 知识管理导入推到远超上限），不必先把整份超限备份 indent=2
+            # 序列化一遍再发现超限：整串 str + bytes 同时驻留会让单请求
+            # 内存逼近 1GB。按逐条紧凑序列化估算下界（不物化大对象），
+            # 直接走下面「省略知识段」的同一下游分支
+            from utils.user_import import MAX_BACKUP_BYTES
+
+            estimated_knowledge = sum(
+                len(json.dumps(document, ensure_ascii=False))
+                for document in backup["knowledge"]
+            )
+            if estimated_knowledge > MAX_BACKUP_BYTES:
+                backup = {
+                    key: value
+                    for key, value in backup.items()
+                    if key != "knowledge"
+                }
+                knowledge_omitted = "over-limit"
         # 超出导入上限的备份「看起来成功、永远无法恢复」：宁可明确拒绝，
         # 让用户先清理数据（消息 / 行程 / 偏好 / 知识片段的条数与 50 MB 上限）
         from utils.user_import import export_backup_limit_problem
@@ -8434,7 +8475,6 @@ def create_app(model: Any = None) -> FastAPI:
             reason_out=knowledge_reasons,
             precomputed_size=len(payload_bytes),
         )
-        knowledge_omitted = ""
         if limit_problem and "knowledge" in backup:
             # 知识库是全局存量：知识管理导入 / CLI kb-import 不受导出上限
             # 约束，可被推到超出上限，之后所有 with_knowledge 导出都会 413，
@@ -8689,9 +8729,18 @@ def create_app(model: Any = None) -> FastAPI:
 
             # 有界等待用户锁：同一用户有在途长回合时不能在持有全局导入
             # 槽位的情况下无上限等待（两个请求即可让所有用户的导入 503），
-            # 超时明确 503 并释放槽位
+            # 超时明确 503 并释放槽位。取锁失败（超时 / 断连）时归还
+            # 已扣的知识库额度：与 trips-dedupe 的 _refund_on_lock_failure
+            # 同口径，重试风暴不能把额度留在滑动窗口里
+            async def _refund_kb_on_lock_failure() -> None:
+                await asyncio.to_thread(_refund_kb_rate_limit, state, request)
+
             async with _bounded_user_lock(
-                request, state.lock_for(user_id), _request_id(request), timeout=10.0
+                request,
+                state.lock_for(user_id),
+                _request_id(request),
+                timeout=10.0,
+                on_acquire_failure=_refund_kb_on_lock_failure,
             ):
                 sessions_dropped_in_queue: set[str] = set()
 
@@ -8916,6 +8965,7 @@ def create_app(model: Any = None) -> FastAPI:
                     finally:
                         _close_long_term(store)
 
+                emptied_after_skip = False
                 try:
                     counts = await loop.run_in_executor(state.import_executor, _run_import)
                     dropped_knowledge = int(
@@ -8925,6 +8975,30 @@ def create_app(model: Any = None) -> FastAPI:
                         counts["knowledge_skipped"] = (
                             int(counts.get("knowledge_skipped") or 0)
                             + dropped_knowledge
+                        )
+                    # 与 CLI user-import 同口径：备份条目全部落在墓碑期 /
+                    # 保留字会话（drop_sessions 之后已无可恢复内容）时本次
+                    # 什么都没恢复，不能报 ok=true 让灾难恢复被误认为成功
+                    emptied_after_skip = bool(
+                        deleted_sessions
+                        | reserved_sessions
+                        | sessions_dropped_in_queue
+                    ) and not any(
+                        sections.get(key)
+                        for key in (
+                            "preferences",
+                            "trips",
+                            "messages",
+                            "titles",
+                            "pinned",
+                            "archived",
+                            "knowledge",
+                        )
+                    )
+                    if emptied_after_skip:
+                        errors.append(
+                            "没有可恢复的数据（备份中的会话均处于墓碑期或使用了"
+                            "保留字，已全部跳过）"
                         )
                 except HTTPException:
                     # 存储打开失败的 503（_open_long_term strict）原样上抛，
@@ -8992,9 +9066,11 @@ def create_app(model: Any = None) -> FastAPI:
                         status_code=503, detail="恢复失败，请稍后重试"
                     ) from exc
             # 知识片段恢复失败 / 隔离账号未写回任何用户数据（主文件未
-            # 重建）都视为恢复未完成（与 CLI ok=false/退出码 1 同口径）
+            # 重建）/ 备份条目全部被墓碑期或保留字会话跳过都视为恢复未
+            # 完成（与 CLI ok=false/退出码 1 同口径）
             return {
-                "ok": not counts.get("knowledge_error")
+                "ok": not emptied_after_skip
+                and not counts.get("knowledge_error")
                 and not counts.get("recovery_incomplete"),
                 "dry_run": dry_run,
                 **counts,

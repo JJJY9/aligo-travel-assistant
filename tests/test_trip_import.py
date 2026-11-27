@@ -829,6 +829,30 @@ def test_ics_calendar_dtend_only_edit_is_honored():
     print("✓ 日历端只改 DTEND 的编辑被尊重（机器段不再回滚）")
 
 
+def test_ics_x_attribute_does_not_override_external_dtend_edit():
+    """X-ALIGO-TRIP-END 只在 DTEND 仍是导出端单日占位时采用：外部日历把
+    「返程待定」事件改长（DTEND 变多日）后回导，改期不能被旧脏值回滚。"""
+    trip = {
+        "trip_id": "t-x-edit",
+        "origin": "北京",
+        "destination": "上海",
+        "start_date": "2026-12-05",
+        "end_date": "待定",
+        "purpose": "出差",
+    }
+    text = render_trips_ics([trip], "u1")
+    assert "X-ALIGO-TRIP-END:待定" in text, text
+    rows, errors = parse_trips_ics(text)
+    assert errors == [] and rows[0]["end_date"] == "待定", rows
+    extended = text.replace(
+        "DTEND;VALUE=DATE:20261206", "DTEND;VALUE=DATE:20261211"
+    )
+    assert extended != text, "测试载荷必须真的改到 DTEND"
+    rows, errors = parse_trips_ics(extended)
+    assert errors == [] and rows[0]["end_date"] == "2026-12-10", rows
+    print("✓ X 属性不覆盖外部日历对 DTEND 的改期")
+
+
 def test_ics_dirty_dates_use_x_attribute_only_when_needed():
     """X 属性仅承载真正无法解析的日期；旧式脏 end<start 仍由机器段闭合。"""
     slash = {
@@ -1780,6 +1804,7 @@ if __name__ == "__main__":
     test_ics_long_unparsable_end_keeps_identity()
     test_ics_old_file_without_x_attr_falls_back()
     test_ics_calendar_dtend_only_edit_is_honored()
+    test_ics_x_attribute_does_not_override_external_dtend_edit()
     test_ics_dirty_dates_use_x_attribute_only_when_needed()
     test_ics_empty_origin_roundtrip()
     test_ics_datetime_offset_converts_local_date()

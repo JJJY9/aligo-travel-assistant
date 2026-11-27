@@ -1191,6 +1191,12 @@ def test_user_backup_restore_reports_recovery_incomplete():
         "知识片段未恢复" in toast and "用户数据未恢复" in toast
         for toast in data["combo_toasts"]
     ), data
+    # ok=false（备份条目全部被墓碑期 / 保留字会话跳过）：与 CLI 同口径，
+    # toast 以「未恢复：」开头并展示服务端给出的原因，不能谎报已恢复
+    emptied = data["emptied_toasts"]
+    assert emptied and emptied[-1].startswith("未恢复："), emptied
+    assert all("已恢复" not in toast for toast in emptied), emptied
+    assert "没有可恢复的数据" in emptied[-1], emptied
 
     # 408 = 请求体读取超时（服务端零写入）：不能提示「服务端可能仍在写入」
     timeouts = data["upload_timeout_toasts"]

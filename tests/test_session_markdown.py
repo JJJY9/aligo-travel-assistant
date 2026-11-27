@@ -397,6 +397,23 @@ def test_list_scoped_fence_restores_escaping_after_container():
     print("✓ 列表容器内的围栏结束后恢复转义")
 
 
+def test_container_fence_close_reparse_does_not_leak_html():
+    """列表容器内的开围栏 + 缩进更小的合法关围栏：渲染器会随容器结束先
+    关闭围栏、再把该行重解析为新开围栏，与 sanitizer 的状态错位一位；
+    随后一条裸 ``` 让 sanitizer 进入围栏而渲染器恰好关闭围栏——余下
+    原始 HTML 若按围栏内容原样透传，导出文件即可执行脚本。降级转义后
+    原始标签不得以未转义形式落盘，且开围栏由本条消息末尾补齐。"""
+    from utils.session_markdown import sanitize_body
+
+    text = sanitize_body(
+        "1. 步骤\n   ```\n   code\n```\n```\n<img src=x onerror=alert(1)>\n```"
+    )
+    assert "<img" not in text, text
+    assert "&lt;img" in text, text
+    assert "onerror" in text, text
+    print("✓ 容器内开围栏的关围栏重解析不落原始 HTML")
+
+
 def test_fence_ambiguity_degrades_to_escaping():
     """围栏状态无法判定时余下内容全部转义（渲染器可能已关闭围栏）。
 
@@ -603,6 +620,7 @@ if __name__ == "__main__":
     test_block_start_line_cannot_close_code_span()
     test_heading_line_cannot_open_cross_line_code_span()
     test_list_scoped_fence_restores_escaping_after_container()
+    test_container_fence_close_reparse_does_not_leak_html()
     test_fence_ambiguity_degrades_to_escaping()
     test_table_row_escapes_html_without_cross_cell_code_span()
     test_latest_timestamp_keeps_first_on_ties_and_invalid()
