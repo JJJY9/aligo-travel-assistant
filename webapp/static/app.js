@@ -2378,8 +2378,16 @@ async function _runUserBackupImport(file, targetUser) {
         ? `，知识片段新增 ${result.knowledge_imported} / 跳过 ${result.knowledge_skipped} 条`
         : "";
     // 与 CLI 同口径：隔离账号 + 无写回数据（recovery_incomplete）时
-    // 不能以「已恢复」开头，否则同一条 toast 先声称恢复成功再追加警告
-    const restorePrefix = result.recovery_incomplete ? "已写入：" : "已恢复：";
+    // 不能以「已恢复」开头，否则同一条 toast 先声称恢复成功再追加警告；
+    // ok=false 且非知识片段失败 = 备份条目全部被墓碑期 / 保留字会话
+    // 跳过（什么都没恢复），同样不能用「已恢复」开头
+    const emptied =
+      result.ok === false && !result.recovery_incomplete && !result.knowledge_error;
+    const restorePrefix = result.recovery_incomplete
+      ? "已写入："
+      : emptied
+        ? "未恢复："
+        : "已恢复：";
     let restoreMessage =
       `${restorePrefix}偏好 ${result.preferences} 项，行程新增 ${result.trips_created} / ` +
       `更新 ${result.trips_updated} 条，消息 ${result.messages_added} 条` +
@@ -2394,6 +2402,19 @@ async function _runUserBackupImport(file, targetUser) {
       // 隔离账号 + 备份无可写回的用户数据：不能显示为恢复成功
       restoreMessage +=
         "；⚠ 用户数据未恢复：备份中没有可写回的用户数据，账号仍处于记忆隔离状态，请使用含偏好 / 行程 / 消息的备份重试";
+    }
+    if (emptied) {
+      // 服务端已把「没有可恢复的数据」写进 skipped：原样展示第一条
+      // 命中原因（含会话处于墓碑期 / 保留字），否则用固定文案兜底
+      const reasons = Array.isArray(result.skipped) ? result.skipped : [];
+      const reason = reasons.find(
+        (item) =>
+          typeof item === "string" && item.includes("没有可恢复的数据"),
+      );
+      restoreMessage +=
+        "；" +
+        (reason ||
+          "没有可恢复的数据（备份中的会话均处于墓碑期或使用了保留字，已全部跳过）");
     }
     if (state.userId !== targetUser) {
       // 合并成一条：同一 tick 的第二次 toast 会覆盖计数摘要

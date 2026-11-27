@@ -209,12 +209,15 @@ def sanitize_body(text: str) -> str:
                 and _leading_spaces(line) < fence_indent
             ):
                 if _fence_close(line, fence):
-                    # 缩进更小的合法关围栏：渲染器在这里关闭围栏，必须
-                    # 先按关闭处理（否则会被当成容器结束，再被重新解析
-                    # 为新开围栏，后续行被当作围栏内容原样输出）
-                    rendered.append(_quote_line(line))
-                    fence = ""
-                    fence_indent = 0
+                    # 缩进更小的合法关围栏：若开围栏在列表容器内，渲染器
+                    # 会随容器结束先关闭围栏、再把同一行重解析为新开围栏，
+                    # sanitize 与渲染器的围栏状态从此错位一位，后续行会被
+                    # 当作围栏内容原样输出（放行原始 HTML）。不能假定两边
+                    # 同口径，与下方歧义分支一样：本行转义、进入降级，并
+                    # 保留 fence 由函数末尾补关围栏，保证两边都不留未配对
+                    # 裸围栏
+                    degraded = True
+                    rendered.append(_escaped_line(line))
                     continue
                 # 缩进变小且非合法关围栏：无法判定渲染器是随容器结束退出
                 # 了围栏（列表项），还是仍在围栏内（顶层 1-3 空格缩进的

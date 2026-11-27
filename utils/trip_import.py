@@ -577,8 +577,11 @@ def _ics_event_row(
             end_date = machine_end
         # X-ALIGO-TRIP-END 是导出端为「无法解析的返程日期」保留原值的专用
         # 属性（DESCRIPTION 机器段只能写 YYYY-MM-DD）：只在 DTSTART 与机器段
-        # 一致时信任，回导后 identity 的 end 与原行闭合，不会重复新增
-        if machine_start == start_date:
+        # 一致时信任，回导后 identity 的 end 与原行闭合，不会重复新增。
+        # 导出端写该属性时 DTEND 恒为单日占位（end_date == start_date）或
+        # 缺失：DTEND 已给出不同的多日区间说明外部日历改过日期，与上面
+        # 机器段的「只改 DTEND 的编辑必须尊重」同一口径，以 DTEND 为准
+        if machine_start == start_date and end_date in {"", start_date}:
             restored_end = _restored_end_from_props(props)
             if restored_end is not None:
                 end_date = restored_end

@@ -382,6 +382,25 @@ def test_import_large_file_not_capped(monkeypatch):
     print("✓ kb-import 不受接口 200 条上限限制")
 
 
+def test_import_prechecks_file_size(monkeypatch):
+    """读取前体积预检：误选多 GB 文件不能先整份读入内存（与 user-import
+    50MB / trips-import 25MB 同口径；阈值 1 GiB 不拒绝合法备份）。"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = _write_json(tmp, {"documents": [{"content": "x"}]})
+        real_getsize = os.path.getsize
+
+        def huge_getsize(target):
+            if os.fspath(target) == os.fspath(path):
+                return 2 * 1024 * 1024 * 1024
+            return real_getsize(target)
+
+        monkeypatch.setattr(os.path, "getsize", huge_getsize)
+        code, out = _capture(cli.run_knowledge_import_standalone, str(path))
+    assert code == 1, out
+    assert "文件过大" in out
+    print("✓ kb-import 读取前体积预检")
+
+
 def test_import_dry_run(monkeypatch):
     calls = {}
 
@@ -686,6 +705,7 @@ if __name__ == "__main__":
         test_import_errors,
         test_import_rejects_non_utf8_file,
         test_import_large_file_not_capped,
+        test_import_prechecks_file_size,
         test_import_dry_run,
         test_import_dry_run_surfaces_export_limit_problem,
         test_import_reports_skip_reasons,

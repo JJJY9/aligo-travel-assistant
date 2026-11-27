@@ -3954,6 +3954,54 @@ def test_knowledge_export_sanitizes_non_finite(monkeypatch):
     print("✓ 知识导出清洗非有限数（标准 JSON 可回读）")
 
 
+def test_knowledge_export_rejects_over_panel_import_limit(monkeypatch):
+    """整库序列化前的体积闸门：超 50MB 面板导入上限直接 413。"""
+    from utils import user_import as user_import_module
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "export_documents",
+        lambda: [{"id": 1, "content": "x" * 200, "metadata": {}}],
+    )
+    monkeypatch.setattr(user_import_module, "MAX_BACKUP_BYTES", 64)
+    client = _client()
+    response = client.get("/api/knowledge/export")
+    assert response.status_code == 413, response.text[:300]
+    assert "面板导入上限" in response.json()["detail"]
+    print("✓ 知识导出超面板导入上限 413（不先序列化整库）")
+
+
+def test_export_omits_oversized_knowledge_segment(monkeypatch):
+    """with_knowledge 导出的知识段单独超限：直接省略并带响应头，避免先
+    序列化整份超限备份。"""
+    from utils import user_import as user_import_module
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "export_documents",
+        lambda: [
+            {"id": index, "content": "x" * 200, "metadata": {}}
+            for index in range(10)
+        ],
+    )
+    monkeypatch.setattr(user_import_module, "MAX_BACKUP_BYTES", 1024)
+    client = _client()
+    user_id = _unique_user("web_export_omit_kb")
+    try:
+        response = client.get(
+            "/api/export",
+            params={"user_id": user_id, "with_knowledge": 1},
+        )
+        assert response.status_code == 200, response.text[:300]
+        assert response.headers.get("x-knowledge-omitted") == "over-limit"
+        assert "knowledge" not in response.json()
+    finally:
+        _cleanup(user_id)
+    print("✓ 知识段超限时导出省略并提示 over-limit")
+
+
 def test_export_refuses_while_restore_in_progress():
     """恢复写入期间同账号导出返回 409：不会产出半截快照。"""
     client = _client()
@@ -7221,6 +7269,39 @@ def test_import_skips_recently_deleted_sessions(monkeypatch):
         # 必须清理，否则每次运行遗留一对测试用户文件与锁文件
         _cleanup(user_id)
     print("✓ /api/import 跳过墓碑期内的已删除会话")
+
+
+def test_import_all_sessions_skipped_reports_not_ok(monkeypatch):
+    """备份条目全部落在墓碑期会话：什么都没恢复，ok 必须为 false（与
+    CLI「没有可恢复的数据」退出码 1 同口径）。"""
+    client = _client()
+    user_id = _unique_user("web_test_import_all_skipped")
+    state = client.app.state.aligo
+    monkeypatch.setattr(
+        state,
+        "is_recently_deleted",
+        lambda uid, sid: uid == user_id and sid == "s-del",
+    )
+    backup = {
+        "chat_history": [
+            {"role": "user", "content": "已删会话", "session_id": "s-del"},
+        ],
+        "session_titles": {"s-del": "旧标题"},
+    }
+    try:
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json={"backup": backup}
+        )
+        assert response.status_code == 200, response.text[:300]
+        payload = response.json()
+        assert payload["ok"] is False, payload
+        assert payload["messages_added"] == 0
+        assert any(
+            "没有可恢复的数据" in item for item in payload["skipped"]
+        ), payload["skipped"]
+    finally:
+        _cleanup(user_id)
+    print("✓ /api/import 全部跳过时 ok=false 并说明原因")
 
 
 def test_import_rolls_back_sessions_deleted_during_write(monkeypatch):
@@ -17794,6 +17875,50 @@ def test_import_same_source_concurrent_guard():
     finally:
         _cleanup(user_id)
     print("✓ 同来源并发导入被 503 拒绝且不泄漏槽位")
+
+
+def test_import_lock_timeout_refunds_kb_rate_limit(monkeypatch):
+    """等待用户锁超时（导入尚未做任何工作）：必须归还已扣的知识库额度。"""
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+    user_id = _unique_user("web_import_lock_refund")
+
+    async def lock_timeout(request, lock, request_id, timeout=10.0):
+        raise server_module.HTTPException(
+            status_code=503, detail="同一用户已有操作正在进行，请稍后再试"
+        )
+
+    monkeypatch.setattr(server_module, "_acquire_chat_lock", lock_timeout)
+    original_kb_limit = state.kb_limiter.limit
+    state.kb_limiter.limit = 1
+    try:
+        try:
+            response = client.post(
+                "/api/import",
+                params={"user_id": user_id},
+                json={
+                    "backup": {
+                        "chat_history": [
+                            {
+                                "role": "user",
+                                "content": "取锁失败测试",
+                                "timestamp": "2026-11-01T09:00:00",
+                                "session_id": "s-lock",
+                            }
+                        ]
+                    }
+                },
+            )
+            remaining = state.kb_limiter.status("testclient")[0]
+        finally:
+            state.kb_limiter.limit = original_kb_limit
+        assert response.status_code == 503, response.text[:300]
+        assert remaining == 1, "取锁失败必须归还已扣的知识库额度"
+    finally:
+        _cleanup(user_id)
+    print("✓ /api/import 取锁失败归还知识库限流额度")
 
 
 def test_trust_proxy_hops_multi_layer(monkeypatch):

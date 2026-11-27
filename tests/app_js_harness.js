@@ -2835,6 +2835,20 @@ async function scenarioUserBackupRestore(source) {
   run("__toasts.length = 0;");
   await run("importUserBackup()");
   results.combo_toasts = run("__toasts.slice()");
+  // ok=false（备份条目全部被墓碑期 / 保留字会话跳过）：不能以「已恢复」
+  // 开头，原因取服务端 skipped 里的说明
+  run(
+    `__importResult = ${JSON.stringify({
+      ...base,
+      ok: false,
+      skipped: [
+        "没有可恢复的数据（备份中的会话均处于墓碑期或使用了保留字，已全部跳过）",
+      ],
+    })};`,
+  );
+  run("__toasts.length = 0;");
+  await run("importUserBackup()");
+  results.emptied_toasts = run("__toasts.slice()");
 
   // 错误分支：408（上传超时，零写入）/ 部分完成 503 / 普通失败 / 静默刷新
   run(`

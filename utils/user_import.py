@@ -1865,6 +1865,15 @@ def parse_user_export_data(
 
     messages: list[dict[str, Any]] = []
     raw_messages = _raw_list("chat_history")
+    # 在截断前按完整列表统计「备份里确实出现过消息」的会话：之后某会话
+    # 的全部消息都被校验 / 截断丢弃时，行程关联要按删除会话同口径清掉
+    raw_message_sessions: set[str] = set()
+    for row in raw_messages:
+        if not isinstance(row, dict):
+            continue
+        raw_session_id, raw_ok = _clean_session_id(row.get("session_id"))
+        if raw_ok and raw_session_id:
+            raw_message_sessions.add(raw_session_id)
     if len(raw_messages) > _MAX_MESSAGES:
         errors.append(f"聊天消息超过 {_MAX_MESSAGES} 条，多余条目已跳过")
         raw_messages = raw_messages[:_MAX_MESSAGES]
@@ -1905,6 +1914,21 @@ def parse_user_export_data(
     # 消息的先后。
     sections["messages"] = messages
     session_ids = {m["session_id"] for m in messages if m["session_id"]}
+
+    # 悬空行程会话链接：某会话在备份里确有消息、却全部因非法 / 截断被丢弃
+    # 时，恢复后该会话不存在，行程再带 session_id 就是面板里一条永远打不开
+    # 的行（删除会话的路径同样会清链接，恢复要同口径）。只处理「出现过消息
+    # 却零存活」的会话——不能按 session_ids 过滤：仅行程引用、备份里本无
+    # 消息的会话（同账号重导）必须保留链接。
+    dropped_message_sessions = raw_message_sessions - session_ids
+    if dropped_message_sessions:
+        for trip in trips:
+            if trip.get("session_id") in dropped_message_sessions:
+                trip.pop("session_id", None)
+        errors.append(
+            f"部分行程关联的会话（{len(dropped_message_sessions)} 个）"
+            "消息均无法恢复，已忽略其会话关联"
+        )
 
     titles: dict[str, str] = {}
     raw_titles = data.get("session_titles")

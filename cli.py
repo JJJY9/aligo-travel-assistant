@@ -3162,6 +3162,17 @@ def run_knowledge_import_standalone(
     path = Path(source)
     if not path.exists():
         return _fail(f"文件不存在：{path}")
+    # 读取前预检（与 user-import 的 50MB / trips-import 的 25MB 同口径）：
+    # 误把多 GB 的备份 / 数据库文件传进来时不能先整份读入内存。5 万行
+    # 导出的最坏合法体积约 550-600MB，1 GiB 不会拒绝合法备份
+    try:
+        file_size = os.path.getsize(path)
+    except OSError:
+        file_size = 0
+    if file_size > 1024 * 1024 * 1024:
+        return _fail(
+            f"导入文件过大（{file_size} 字节，超过 1 GiB），请拆分后再导入"
+        )
     try:
         data = json.loads(path.read_text(encoding="utf-8-sig"))
     except MemoryError:
