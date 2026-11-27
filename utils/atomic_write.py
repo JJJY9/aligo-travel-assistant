@@ -5,6 +5,8 @@
 旧备份被清成 0 字节并留下半截新文件。这里在目标目录写临时文件、fsync
 后原子替换；失败时清理临时文件，原文件保持不变。
 """
+import errno
+import hashlib
 import os
 import tempfile
 import time
@@ -16,6 +18,22 @@ _REPLACE_RETRY_WINDOW_SEC = 1.5
 # 崩溃 / 断电可能在 mkstemp 与 replace 之间留下临时文件：只清理超过该
 # 年龄的条目，避免误删并发写者的活跃临时文件
 _STALE_TEMP_AGE_SEC = 600.0
+# 只有「目标被短暂占用」类 errno 值得重试：EACCES / WinError 5（读者 /
+# 杀软 / 同步盘，与只读目标同一形态无法再细分）、EBUSY / ENOTEMPTY。
+# ENOENT（临时文件被并发清理清走）、ENOSPC / EDQUOT（磁盘满）、EISDIR、
+# ENAMETOOLONG、EROFS 等重试不会自愈，继续轮询只会让每次失败多付 1.5 秒。
+# errno 为 None 的裸 OSError 仍按可重试处理（与 utils/llm_resilience.py 同口径）。
+_REPLACE_RETRY_ERRNOS = frozenset(
+    {errno.EACCES, errno.EBUSY, getattr(errno, "ENOTEMPTY", errno.EACCES)}
+)
+
+
+def _temp_prefix(target: Path) -> str:
+    """临时文件名前缀与目标名解耦：``.<目标名>.`` + 随机 + ``.tmp`` 比目标名
+    长 14 字节，目标名接近 NAME_MAX（255）时 mkstemp 会 ENAMETOOLONG——
+    原名本身合法、占名（claim_export_path）也已成功，写盘时才失败。"""
+    digest = hashlib.sha1(os.fsencode(target.name)).hexdigest()[:16]
+    return f".tmp-{digest}."
 
 
 def fsync_parent_dir(path: str | os.PathLike[str]) -> None:
@@ -51,23 +69,29 @@ def replace_with_retry(
         try:
             os.replace(src, dst)
             return
-        except OSError:
-            if time.monotonic() >= deadline:
+        except OSError as exc:
+            if (
+                exc.errno is not None and exc.errno not in _REPLACE_RETRY_ERRNOS
+            ) or time.monotonic() >= deadline:
                 raise
             time.sleep(0.03)
 
 
 def cleanup_stale_temp_files(
     directory: str | os.PathLike[str],
-    name_prefix: str,
+    name_prefix: str | tuple[str, ...],
     older_than_sec: float = _STALE_TEMP_AGE_SEC,
 ) -> int:
-    """清理目录下 ``name_prefix`` 开头、超过年龄阈值的遗留临时文件。
+    """清理目录下 ``name_prefix`` 开头且以 ``.tmp`` 结尾、超过年龄阈值的
+    遗留临时文件。
 
-    原子写崩溃残留的 ``.<目标名>.<随机>.tmp`` 可能含完整用户数据（记忆
+    原子写崩溃残留的 ``.tmp-<哈希>.<随机>.tmp`` 可能含完整用户数据（记忆
     快照 / 导出内容），不能永久累积。只删超过阈值的条目：并发写者的
-    临时文件刚创建，mtime 新鲜，不会被误删。返回删除条数，失败静默。
+    临时文件刚创建，mtime 新鲜，不会被误删。必须带 ``.tmp`` 后缀守卫：
+    前缀匹配还会命中用户自建的同名隐藏文件（如 ``.backup.json.keep``），
+    那些不是本模块的临时文件。返回删除条数，失败静默。
     """
+    prefixes = (name_prefix,) if isinstance(name_prefix, str) else name_prefix
     cutoff = time.time() - max(0.0, older_than_sec)
     removed = 0
     try:
@@ -75,7 +99,9 @@ def cleanup_stale_temp_files(
     except OSError:
         return 0
     for entry in entries:
-        if not entry.name.startswith(name_prefix):
+        if not entry.name.endswith(".tmp"):
+            continue
+        if not any(entry.name.startswith(prefix) for prefix in prefixes):
             continue
         try:
             if entry.stat().st_mtime >= cutoff:
@@ -96,9 +122,11 @@ def write_text_atomic(
     """原子写入文本文件（``newline`` 语义同 ``open``）。"""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    cleanup_stale_temp_files(target.parent, f".{target.name}.")
+    prefix = _temp_prefix(target)
+    # 旧版本的临时前缀含完整目标名，升级后仍需清理其遗留
+    cleanup_stale_temp_files(target.parent, (prefix, f".{target.name}."))
     fd, temp_path = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+        prefix=prefix, suffix=".tmp", dir=str(target.parent)
     )
     try:
         with os.fdopen(fd, "w", encoding=encoding, newline=newline) as handle:
@@ -122,9 +150,11 @@ def write_bytes_atomic(
     """原子写入二进制文件（iCalendar 等固定行尾的输出）。"""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    cleanup_stale_temp_files(target.parent, f".{target.name}.")
+    prefix = _temp_prefix(target)
+    # 旧版本的临时前缀含完整目标名，升级后仍需清理其遗留
+    cleanup_stale_temp_files(target.parent, (prefix, f".{target.name}."))
     fd, temp_path = tempfile.mkstemp(
-        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+        prefix=prefix, suffix=".tmp", dir=str(target.parent)
     )
     try:
         with os.fdopen(fd, "wb") as handle:

@@ -9,21 +9,55 @@ naive 时间戳按「该时刻」的本机时区解释（含夏令时）：不�
 ``datetime.now().astimezone().tzinfo``——那是一个定值偏移，夏令时地区在
 7 月运行时会用 +02:00 解释 1 月的墙钟时间，排序相差一小时。
 """
+import re
 from datetime import datetime, timezone
 from typing import Any
+
+# ISO 8601 基本格式（``+0800`` / ``+08``）与逗号小数只在 3.11 起被
+# ``datetime.fromisoformat`` 接受；项目支持 3.10，同一份备份在 3.10 上
+# 解析失败（排序键为空、导入丢时间），3.12 上却正常。这里在解析前做一次
+# 受控归一：偏移统一成 ``±HH:MM``、小数统一成点号且补齐 6 位，
+# 只改写「整串是带时分秒的本地时间 + 偏移」/「小数后紧跟偏移或结尾」的形态，
+# date-only 与 naive 时间戳不受影响。
+_OFFSET_DT = re.compile(
+    r"^(?P<base>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:[.,]\d*)?)?)"
+    r"(?P<off>[+-]\d{2}(?::?\d{2})?)$"
+)
+_FRACTION = re.compile(r"\.(\d+)(?=[+-]\d{2}|$)")
+
+
+def _normalize_iso(text: str) -> str:
+    """把 3.11+ 才接受的 ISO 8601 写法归一到 3.10 也能解析的形式。"""
+    # 逗号小数 → 点小数（只替换数字之间的逗号，避免误伤任意文本）
+    text = re.sub(r"(?<=\d),(?=\d)", ".", text)
+    match = _OFFSET_DT.match(text)
+    if match is not None:
+        offset = match.group("off")
+        sign, digits = offset[0], offset[1:].replace(":", "")
+        hours = digits[:2]
+        minutes = digits[2:4] if len(digits) >= 4 else "00"
+        text = f"{match.group('base')}{sign}{hours}:{minutes}"
+    # 3.10 的 fromisoformat 只接受 3 或 6 位小数：高位截断到 6 位后再补齐
+    text = _FRACTION.sub(
+        lambda found: "." + found.group(1)[:6].ljust(6, "0"), text
+    )
+    return text
 
 
 def parse_iso_datetime(value: Any) -> "datetime | None":
     """解析 ISO 8601 时间戳；非法 / 缺失返回 None。
 
-    Python 3.10 的 ``datetime.fromisoformat`` 不接受 ``Z`` 后缀（3.11 起
-    才支持），而 ``Z`` 是合法的 UTC 写法，先归一成 ``+00:00``。
+    Python 3.10 的 ``datetime.fromisoformat`` 不接受 ``Z`` 后缀、
+    ``+0800`` / ``+08`` 偏移与逗号小数（3.11 起才支持），而它们都是
+    合法的 ISO 8601 写法。先归一（见 :func:`_normalize_iso`）再解析，
+    保证同一份数据在受支持的 3.10–3.12 上结果一致。
     """
     if not isinstance(value, str) or not value.strip():
         return None
     text = value.strip()
     if text.endswith(("Z", "z")):
         text = text[:-1] + "+00:00"
+    text = _normalize_iso(text)
     try:
         return datetime.fromisoformat(text)
     except ValueError:

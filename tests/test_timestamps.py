@@ -93,6 +93,41 @@ def test_chronological_key_extreme_years_do_not_raise():
     print("✓ 极端年份的排序键安全返回")
 
 
+def test_iso8601_basic_formats_parse_cross_version():
+    """+0800 / +08 偏移与逗号小数（3.11 起才接受）在 3.10 上也应解析。"""
+    expected = datetime(2026, 11, 2, 2, 0, tzinfo=timezone.utc)
+    assert to_aware("2026-11-02T10:00:00+0800") == expected
+    assert to_aware("2026-11-02T10:00:00+08") == expected
+    assert to_aware("2026-11-02T10:00:00,5") is not None
+    assert to_aware("2026-11-02T10:00:00,5").microsecond == 500000
+    assert to_aware("2026-11-02T10:00:00.5") == to_aware(
+        "2026-11-02T10:00:00.500000"
+    )
+    assert chronological_key("2026-11-02T10:00:00+0800") == chronological_key(
+        "2026-11-02T10:00:00+08:00"
+    )
+    assert chronological_key("2026-11-02T10:00:00,5") != ""
+    assert chronological_key("2026-11-02T10:00:00,5") == chronological_key(
+        "2026-11-02T10:00:00.500000"
+    )
+    print("✓ 基本格式偏移 / 逗号小数跨运行时一致解析")
+
+
+def test_date_only_and_naive_unchanged_by_normalization():
+    """归一不误伤 date-only（当日 00:00 本地）与普通 naive 时间戳。"""
+    date_only = to_aware("2026-11-08")
+    assert date_only is not None
+    assert (date_only.year, date_only.month, date_only.day) == (2026, 11, 8)
+    assert date_only.hour == 0 and date_only.minute == 0
+    assert to_aware("2026-11-02T10:00:00") == datetime(
+        2026, 11, 2, 10, 0, tzinfo=to_aware("2026-11-02T10:00:00").tzinfo
+    )
+    assert to_aware("2026-11-02T10:00:00+08:00") == datetime(
+        2026, 11, 2, 2, 0, tzinfo=timezone.utc
+    )
+    print("✓ date-only / naive / 冒号偏移语义不变")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -103,6 +138,8 @@ if __name__ == "__main__":
     test_chronological_key_compares_by_instant()
     test_naive_and_aware_same_instant_share_key()
     test_z_suffix_accepted()
+    test_iso8601_basic_formats_parse_cross_version()
+    test_date_only_and_naive_unchanged_by_normalization()
     test_naive_uses_dst_offset_of_that_moment()
     test_chronological_key_extreme_years_do_not_raise()
     print("\n全部通过")

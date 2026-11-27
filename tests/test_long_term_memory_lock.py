@@ -516,6 +516,148 @@ def test_file_lock_empty_lock_file_concurrent_first_open(tmp_path):
     assert sorted(acquired) == [0, 1, 2, 3], acquired
 
 
+def test_load_retries_transient_read_permission_error(monkeypatch, tmp_path):
+    """读路径与写路径同口径：瞬时 PermissionError 有界重试后成功加载。"""
+    import builtins
+
+    memory = LongTermMemory("read-retry", str(tmp_path))
+    memory.save_preference("home_location", "北京")
+    db_path = memory.db_path
+    real_open = builtins.open
+    calls = {"n": 0}
+
+    def flaky_open(file, *args, **kwargs):
+        if str(file) == db_path:
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if "r" in str(mode):
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    raise PermissionError(13, "sync client holds the file")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", flaky_open)
+    reopened = LongTermMemory("read-retry", str(tmp_path))
+    assert calls["n"] == 3, calls
+    assert any(
+        pref["type"] == "home_location"
+        for pref in reopened.data["preferences"]
+    ), reopened.data["preferences"]
+    print("✓ 读路径瞬时占用有界重试")
+
+
+def test_load_read_retry_budget_exhausted_is_persistence_error(
+    monkeypatch, tmp_path
+):
+    """持续不可读最终按 MemoryPersistenceError 上报，不能触发损坏隔离。"""
+    import builtins
+
+    memory = LongTermMemory("read-blocked", str(tmp_path))
+    memory.save_preference("home_location", "上海")
+    db_path = memory.db_path
+    real_open = builtins.open
+
+    def blocked_open(file, *args, **kwargs):
+        if str(file) == db_path:
+            raise PermissionError(13, "exclusive holder")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", blocked_open)
+    monkeypatch.setattr(
+        "context.long_term_memory._READ_RETRY_WINDOW_SEC", 0.05
+    )
+    with pytest.raises(MemoryPersistenceError):
+        LongTermMemory("read-blocked", str(tmp_path))
+    assert Path(db_path).exists(), "读不了不等于损坏，文件不能被移走"
+    assert not list(Path(tmp_path).glob("*.corrupt-*"))
+    print("✓ 读重试预算耗尽按持久化失败处理")
+
+
+def test_reload_latest_retries_transient_read_permission_error(
+    monkeypatch, tmp_path
+):
+    """写入前的重载同样重试瞬时占用，不把整条写请求打成 503。"""
+    import builtins
+    import time as _time
+
+    memory = LongTermMemory("reload-retry", str(tmp_path))
+    memory.save_preference("home_location", "上海")
+    db_path = memory.db_path
+    # 模拟其它进程刚改写：指纹变化强制走 _reload_latest
+    future = _time.time() + 5
+    os.utime(db_path, (future, future))
+    real_open = builtins.open
+    calls = {"n": 0}
+
+    def flaky_open(file, *args, **kwargs):
+        if str(file) == db_path:
+            mode = args[0] if args else kwargs.get("mode", "r")
+            if "r" in str(mode):
+                calls["n"] += 1
+                if calls["n"] <= 2:
+                    raise PermissionError(13, "sync client holds the file")
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", flaky_open)
+    memory.save_preference("seat_preference", "靠窗")
+    assert calls["n"] >= 3, calls
+    print("✓ 写前重载瞬时占用有界重试")
+
+
+def test_migration_backup_uses_source_snapshot_under_lock(
+    monkeypatch, tmp_path
+):
+    """迁移备份取触发迁移的原始快照，并在跨进程文件锁内写出。"""
+    import json
+
+    from context import long_term_memory as module
+
+    memory = LongTermMemory("mig-source", str(tmp_path))
+    db_path = memory.db_path
+    original = {
+        "user_id": "mig-source",
+        "session_titles": ["broken-type"],
+        "preferences": [{"type": "home_location", "value": "天津"}],
+    }
+    Path(db_path).write_text(json.dumps(original), encoding="utf-8")
+    calls: list[str] = []
+    real_lock = module.file_lock
+
+    @contextlib.contextmanager
+    def spying_lock(path, timeout=6.0):
+        calls.append(str(path))
+        with real_lock(path, timeout):
+            yield
+
+    monkeypatch.setattr(module, "file_lock", spying_lock)
+    reopened = LongTermMemory("mig-source", str(tmp_path))
+    backup = Path(db_path + ".migrate-backup")
+    assert backup.exists(), "破坏性迁移前必须生成备份"
+    assert json.loads(backup.read_text(encoding="utf-8")) == original
+    assert calls, "迁移备份必须持有跨进程文件锁"
+    assert reopened.data["session_titles"] == {}
+    print("✓ 迁移备份绑定原始快照并持跨进程锁")
+
+
+def test_migration_backup_lock_is_reentrant_in_write_path(tmp_path):
+    """写路径已持文件锁时，内部迁移备份再取锁必须直接放行（不能 6 秒超时）。"""
+    import json
+
+    memory = LongTermMemory("mig-reentrant", str(tmp_path))
+    db_path = memory.db_path
+    original = {"user_id": "mig-reentrant", "session_titles": ["broken-type"]}
+    Path(db_path).write_text(json.dumps(original), encoding="utf-8")
+    backup = Path(db_path + ".migrate-backup")
+    reopened = LongTermMemory("mig-reentrant", str(tmp_path))
+    assert backup.exists()
+    backup.unlink()
+    # 指纹变化强制写路径重载 → 再次触发破坏性迁移备份（此时已持文件锁）
+    os.utime(db_path, (1_000_000.0, 1_000_000.0))
+    reopened.save_preference("seat_preference", "靠窗")
+    assert backup.exists(), "写路径内嵌套备份锁必须可重入"
+    assert json.loads(backup.read_text(encoding="utf-8")) == original
+    print("✓ 写路径内迁移备份锁可重入")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_case_collision_user_id_is_refused": "需要 tmp_path 夹具",
     "test_canonically_equivalent_user_ids_are_refused": "需要 tmp_path 夹具",
@@ -534,6 +676,11 @@ _DIRECT_RUN_SKIP: dict[str, str] = {
     "test_in_process_lock_wait_is_bounded": "需要 tmp_path / monkeypatch 夹具",
     "test_orphan_atomic_temp_files_cleaned_on_write": "需要 tmp_path 夹具",
     "test_file_lock_empty_lock_file_concurrent_first_open": "需要 tmp_path 夹具",
+    "test_load_retries_transient_read_permission_error": "需要 tmp_path / monkeypatch 夹具",
+    "test_load_read_retry_budget_exhausted_is_persistence_error": "需要 tmp_path / monkeypatch 夹具",
+    "test_reload_latest_retries_transient_read_permission_error": "需要 tmp_path / monkeypatch 夹具",
+    "test_migration_backup_uses_source_snapshot_under_lock": "需要 tmp_path / monkeypatch 夹具",
+    "test_migration_backup_lock_is_reentrant_in_write_path": "需要 tmp_path 夹具",
 }
 
 if __name__ == "__main__":

@@ -21,9 +21,27 @@ from pathlib import Path
 
 # 添加项目根目录到路径 (假设脚本在 .claude/skills/ask-question/script/)
 current_dir = Path(__file__).parent
-project_root = current_dir.parent.parent.parent.parent
-if str(project_root) not in sys.path:
-    sys.path.insert(0, str(project_root))
+
+
+def _aligo_source_root(script_dir: Path) -> Path | None:
+    """脚本位于 aligo 源码树内时返回仓库根，外部技能树返回 None。
+
+    ``ALIGO_SKILLS_DIR`` 可指向仓库外的技能目录：盲目把第 4 层父目录
+    插到 ``sys.path[0]`` 会把宿主项目的 utils / config 放到导入路径
+    最前，遮蔽 aligo 自己的模块。
+    """
+    root = script_dir.parent.parent.parent.parent
+    if (
+        (root / "utils" / "paths.py").is_file()
+        and (root / "config_agentscope.py").is_file()
+    ):
+        return root
+    return None
+
+
+_aligo_root = _aligo_source_root(current_dir)
+if _aligo_root is not None and str(_aligo_root) not in sys.path:
+    sys.path.insert(0, str(_aligo_root))
 
 from config_agentscope import create_chat_model
 from utils.atomic_write import write_text_atomic
@@ -320,6 +338,24 @@ def _dedupe_preserved(docs: list[dict]) -> list[dict]:
     return merged
 
 
+def _quarantine_unreadable_backup(path: Path) -> Path | None:
+    """把不可读的保留片段备份原样另存，避免随后的新备份覆盖掉它。
+
+    备份要保住的是「当前集合已不含、只在旧备份里的片段」；直接跳过再
+    写新备份等于把它永久覆盖。命名与重试风格对齐 :func:`_rename_unreadable_db`。
+    """
+    target = path.with_name(
+        path.name + ".unreadable-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+    )
+    for _ in range(3):
+        try:
+            os.replace(path, target)
+            return target
+        except OSError:
+            time.sleep(0.3)
+    return None
+
+
 def _merge_preserved_backup(
     knowledge_base_path: Path, preserved: list[dict]
 ) -> tuple[list[dict], list[str]]:
@@ -330,10 +366,24 @@ def _merge_preserved_backup(
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        return preserved, [f"上次重建的保留片段备份不可读（{exc}）：{path}"]
+        kept = _quarantine_unreadable_backup(path)
+        note = f"上次重建的保留片段备份不可读（{exc}）：{path}"
+        note += (
+            f"；已原样另存为 {kept}"
+            if kept is not None
+            else "；未能另存，重跑前请手动备份该文件"
+        )
+        return preserved, [note]
     docs = payload.get("documents") if isinstance(payload, dict) else None
     if not isinstance(docs, list):
-        return preserved, [f"上次重建的保留片段备份格式异常：{path}"]
+        kept = _quarantine_unreadable_backup(path)
+        note = f"上次重建的保留片段备份格式异常：{path}"
+        note += (
+            f"；已原样另存为 {kept}"
+            if kept is not None
+            else "；未能另存，重跑前请手动备份该文件"
+        )
+        return preserved, [note]
     previous = [
         {
             "content": str(item.get("content") or ""),

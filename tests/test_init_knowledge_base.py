@@ -674,6 +674,12 @@ def test_preserved_backup_helpers_roundtrip(monkeypatch):
         merged, notes = module._merge_preserved_backup(base, docs)
         assert notes and "不可读" in notes[0]
         assert merged == docs
+        # 不可读的备份必须原样另存：否则随后的新备份会覆盖它，
+        # 只存在于旧备份里的片段永久丢失
+        quarantined = list(path.parent.glob(path.name + ".unreadable-*"))
+        assert len(quarantined) == 1, list(path.parent.iterdir())
+        assert quarantined[0].read_text(encoding="utf-8") == "not-json"
+        assert "已原样另存为" in notes[0]
     print("✓ 保留片段备份写读与容错")
 
 
@@ -991,6 +997,66 @@ def test_preserved_backup_write_failure_aborts_cleanly(monkeypatch):
     print("✓ 保留片段备份写入失败中止且不删库 / 不留 tmp")
 
 
+def test_preserved_backup_format_error_is_quarantined():
+    """格式异常（documents 非 list）的备份同样先另存再继续重建。"""
+    module = _load_init_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp) / "data" / "rag_knowledge"
+        base.mkdir(parents=True)
+        path = module._preserved_backup_path(base)
+        path.write_text('{"documents": "oops"}', encoding="utf-8")
+        merged, notes = module._merge_preserved_backup(
+            base, [{"content": "当前片段", "metadata": {}}]
+        )
+        assert notes and "格式异常" in notes[0]
+        assert [doc["content"] for doc in merged] == ["当前片段"]
+        quarantined = list(path.parent.glob(path.name + ".unreadable-*"))
+        assert len(quarantined) == 1
+        assert "oops" in quarantined[0].read_text(encoding="utf-8")
+    print("✓ 格式异常的保留片段备份先另存再继续")
+
+
+def test_preserved_backup_quarantine_failure_is_reported(monkeypatch):
+    """隔离失败（路径被占用）不抛异常：按无备份继续，但告警要求手动备份。"""
+    module = _load_init_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp) / "data" / "rag_knowledge"
+        base.mkdir(parents=True)
+        path = module._preserved_backup_path(base)
+        path.write_text("not-json", encoding="utf-8")
+        monkeypatch.setattr(module.time, "sleep", lambda _seconds: None)
+
+        def locked(*args, **kwargs):
+            raise PermissionError("locked")
+
+        monkeypatch.setattr(module.os, "replace", locked)
+        merged, notes = module._merge_preserved_backup(
+            base, [{"content": "x", "metadata": {}}]
+        )
+        assert merged == [{"content": "x", "metadata": {}}]
+        assert notes and "未能另存" in notes[0]
+        assert path.exists(), "隔离失败时原备份文件保持不动"
+    print("✓ 备份隔离失败给出可操作告警")
+
+
+def test_aligo_source_root_guard_skips_foreign_skill_trees(tmp_path):
+    """外部技能树（无 aligo 标记）不返回仓库根，避免遮蔽宿主模块。"""
+    module = _load_init_module()
+    assert module._aligo_source_root(module.current_dir) == Path(project_root)
+
+    foreign_script = (
+        tmp_path / "host" / ".claude" / "skills" / "ask-question" / "script"
+    )
+    foreign_script.mkdir(parents=True)
+    (tmp_path / "host" / "utils").mkdir()
+    (tmp_path / "host" / "utils" / "paths.py").write_text("", encoding="utf-8")
+    assert module._aligo_source_root(foreign_script) is None
+
+    (tmp_path / "host" / "config_agentscope.py").write_text("", encoding="utf-8")
+    assert module._aligo_source_root(foreign_script) == tmp_path / "host"
+    print("✓ 源码根判定按 aligo 标记，外部技能树不插 sys.path")
+
+
 def test_write_preserved_backup_uses_atomic_write(monkeypatch):
     """备份走原子写：写入失败抛 OSError 且不残留固定名 tmp。"""
     module = _load_init_module()
@@ -1215,6 +1281,15 @@ if __name__ == "__main__":
         test_write_preserved_backup_uses_atomic_write(_mp)
     finally:
         _mp.undo()
+    test_preserved_backup_format_error_is_quarantined()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_preserved_backup_quarantine_failure_is_reported(_mp)
+    finally:
+        _mp.undo()
+    test_aligo_source_root_guard_skips_foreign_skill_trees(
+        Path(tempfile.mkdtemp(prefix="chailv_skill_guard_"))
+    )
     if _DIRECT_RUN_SKIP:
         print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
     print("\n全部通过")

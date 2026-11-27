@@ -104,6 +104,35 @@ def test_wheel_fallback_strips_quoted_base_dir(monkeypatch, tmp_path=None):
     print("✓ wheel 回退基目录去成对引号 / BOM")
 
 
+def test_is_source_checkout_uses_pyproject_marker_only(monkeypatch, tmp_path):
+    """只用 pyproject.toml 判定源码 checkout：裁剪 webapp 的部署不能误切数据根。"""
+    from pathlib import Path
+
+    from utils import paths
+
+    repo = Path(tmp_path) / "repo-cli-only"
+    repo.mkdir()
+    (repo / "pyproject.toml").write_text("[project]\n", encoding="utf-8")
+    assert paths.is_source_checkout(repo) is True
+    monkeypatch.setattr(paths, "package_root", lambda: repo)
+    monkeypatch.delenv("ALIGO_DATA_DIR", raising=False)
+    assert paths.default_data_root() == repo / "data"
+
+    build_lib = Path(tmp_path) / "build-lib"
+    (build_lib / "webapp").mkdir(parents=True)
+    assert paths.is_source_checkout(build_lib) is False
+
+    empty = Path(tmp_path) / "empty"
+    empty.mkdir()
+    assert paths.is_source_checkout(empty) is False
+    print("✓ 源码 checkout 判定只看 pyproject.toml")
+
+
+_DIRECT_RUN_SKIP: dict[str, str] = {
+    "test_is_source_checkout_uses_pyproject_marker_only": "需要 tmp_path 夹具",
+}
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -126,3 +155,6 @@ if __name__ == "__main__":
         finally:
             mp.undo()
     print("\n全部通过")
+    print(
+        f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具）"
+    )

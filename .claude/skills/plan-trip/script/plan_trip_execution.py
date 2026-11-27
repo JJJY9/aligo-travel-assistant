@@ -9,9 +9,15 @@ from pathlib import Path
 
 # Add project root to sys.path：脚本位于 .claude/skills/plan-trip/script/，
 # 仓库根是第 5 层父目录（parents[0] 是 script 目录）；此前后退 4 层得到的是
-# .claude，直接运行脚本会在 import config 处 ModuleNotFoundError
+# .claude，直接运行脚本会在 import config 处 ModuleNotFoundError。
+# 只有确认祖先目录是 aligo 源码根才插入：ALIGO_SKILLS_DIR 可指向仓库外
+# 的技能树，盲目 insert(0) 会把宿主项目的模块放到导入路径最前。
 project_root = Path(__file__).resolve().parents[4]
-if str(project_root) not in sys.path:
+if (
+    (project_root / "utils" / "paths.py").is_file()
+    and (project_root / "config_agentscope.py").is_file()
+    and str(project_root) not in sys.path
+):
     sys.path.insert(0, str(project_root))
 
 # Windows 中文 locale 下重定向 / 管道时 stdout 是 GBK：脚本里的 ✓ / ❌

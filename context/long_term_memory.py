@@ -3,6 +3,7 @@
 持久化存储用户信息，支持跨会话访问
 """
 import contextlib
+import errno
 import functools
 import json
 import logging
@@ -49,6 +50,47 @@ _IN_PROCESS_LOCK_TIMEOUT_SEC = 6.0
 # 崩溃遗留的原子写临时文件最小年龄：活跃写者的临时文件刚创建，靠 mtime
 # 阈值避免误删；600 秒覆盖 dump + fsync + 迁移拷贝的最坏耗时
 _ORPHAN_TEMP_MIN_AGE_SEC = 600.0
+# 读路径的瞬时占用重试：写路径（_save 的 os.replace）已有 1.5 秒有界
+# 重试，读路径此前单次 open——Windows 上同步盘 / 杀软短暂以受限共享打开
+# 文件时，所有接口成片 503。只重试共享冲突 / 权限抖动类 errno：
+# FileNotFoundError（ENOENT）等必须立即上抛，墓碑 / 删除分支依赖它。
+_READ_RETRY_WINDOW_SEC = 1.5
+_READ_RETRY_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EBUSY})
+
+# 本线程已持有的跨进程文件锁路径：Windows 字节锁在另一个句柄上重复
+# 锁同一区段会失败（6 秒超时），同线程的嵌套获取必须直接放行
+_FILE_LOCK_HELD = threading.local()
+
+
+def _file_lock_held_paths() -> set[str]:
+    held = getattr(_FILE_LOCK_HELD, "paths", None)
+    if held is None:
+        held = set()
+        _FILE_LOCK_HELD.paths = held
+    return held
+
+
+def _read_text_with_retry(path: str) -> tuple[os.stat_result, str]:
+    """读取文本并返回 (读取前指纹, 内容)；瞬时权限冲突有界重试。
+
+    指纹在 read 之前 fstat：若存在原地写者，得到的是不晚于所读字节的
+    指纹，只会多一次重载、不会假命中。读句柄尽早关闭：Windows 上任何
+    打开中的句柄都会让其它进程的 os.replace 失败（WinError 5）。
+    """
+    deadline = time.monotonic() + _READ_RETRY_WINDOW_SEC
+    while True:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                stat_info = os.fstat(handle.fileno())
+                raw = handle.read()
+            return stat_info, raw
+        except OSError as exc:
+            if (
+                exc.errno not in _READ_RETRY_ERRNOS
+                or time.monotonic() >= deadline
+            ):
+                raise
+            time.sleep(0.03)
 
 
 def _trip_date_is_valid(value: object) -> bool:
@@ -285,7 +327,7 @@ def _locked_mutation(func):
                 raise
         with self._hold_write_lock():
             try:
-                with file_lock(self.db_path):
+                with self._cross_process_lock():
                     self._cleanup_orphan_temp_files()
                     # 加载时没能确认的损坏文件在这里补复核：否则空快照会把
                     # 磁盘上的损坏文件直接覆盖且不产生 .corrupt-* 备份
@@ -447,6 +489,26 @@ class LongTermMemory:
         finally:
             self._write_lock.release()
 
+    @contextlib.contextmanager
+    def _cross_process_lock(self) -> Iterator[None]:
+        """跨进程文件锁（同线程可重入）。
+
+        ``_locked_mutation`` / ``write_batch`` 已持锁时，内部迁移备份再取
+        同一文件锁会在 Windows 上与自己冲突（同进程不同句柄、同一字节
+        区段），直接嵌套会 6 秒超时。按线程记录已持路径，重入直接放行。
+        """
+        key = os.path.abspath(self.db_path)
+        held = _file_lock_held_paths()
+        if key in held:
+            yield
+            return
+        with file_lock(self.db_path):
+            held.add(key)
+            try:
+                yield
+            finally:
+                held.discard(key)
+
     def _cleanup_orphan_temp_files(self) -> None:
         """清理崩溃 / 断电遗留的原子写临时文件（调用方已持有进程内写锁）。
 
@@ -491,10 +553,8 @@ class LongTermMemory:
                     # 读取耗时的大头，先读完再解析可把阻塞写者的窗口压到最短。
                     # 指纹在 read 之前 fstat：若存在原地写者，得到的是不晚于
                     # 所读字节的指纹，只会多一次重载、不会假命中
-                    with open(self.db_path, "r", encoding="utf-8") as f:
-                        stat_info = os.fstat(f.fileno())
-                        raw = f.read()
-                    data = self._migrate_data(json.loads(raw))
+                    stat_info, raw = _read_text_with_retry(self.db_path)
+                    data = self._migrate_data(json.loads(raw), raw)
                     # 大小写不敏感文件系统上另一账号可能映射到同一文件：
                     # 这是身份冲突而不是文件损坏，不能走隔离分支
                     self._check_owner_case(data)
@@ -510,7 +570,7 @@ class LongTermMemory:
                     # 同一把锁内用原子替换提交，不持锁的 os.replace 可能把
                     # 对方刚写入的有效文件当作损坏文件移走
                     try:
-                        with file_lock(self.db_path):
+                        with self._cross_process_lock():
                             try:
                                 with open(self.db_path, "r", encoding="utf-8") as f:
                                     recheck_stat = os.fstat(f.fileno())
@@ -520,7 +580,7 @@ class LongTermMemory:
                                 # 字段结构异常同样视为损坏，不能逃逸
                                 if not isinstance(latest, dict):
                                     raise ValueError("记忆文件内容不是 JSON 对象")
-                                latest = self._migrate_data(latest)
+                                latest = self._migrate_data(latest, latest_raw)
                             except FileNotFoundError:
                                 return self._init_data()
                             except OSError as load_error:
@@ -998,9 +1058,7 @@ class LongTermMemory:
         try:
             # 与 _load 同一原因：句柄尽早关闭，解析在句柄关闭后进行；
             # 指纹在 read 之前取，只会多一次重载、不会假命中
-            with open(self.db_path, encoding="utf-8") as f:
-                reload_stat = os.fstat(f.fileno())
-                raw = f.read()
+            reload_stat, raw = _read_text_with_retry(self.db_path)
             data = json.loads(raw)
         except FileNotFoundError:
             backups = self._corrupt_siblings()
@@ -1097,7 +1155,7 @@ class LongTermMemory:
             raise MemoryPersistenceError(
                 f"长期记忆重载失败（{self.db_path}）：内容不是 JSON 对象"
             )
-        migrated = self._migrate_data(data)
+        migrated = self._migrate_data(data, raw)
         self._check_owner_case(migrated)
         self.data = migrated
         self._loaded_stat = _stat_fingerprint(reload_stat)
@@ -1124,7 +1182,7 @@ class LongTermMemory:
             return
         with self._hold_write_lock():
             try:
-                with file_lock(self.db_path):
+                with self._cross_process_lock():
                     self._ensure_corrupt_backed_up()
                     # 与 _locked_mutation 同口径：磁盘未变时跳过整份重载，
                     # 空批次 / 本实例刚写完的连续批量写不再白付一次解析
@@ -1198,11 +1256,14 @@ class LongTermMemory:
             return False
         return _stat_fingerprint(stat_info) == fingerprint
 
-    def _backup_before_migration(self) -> None:
-        """迁移会丢弃 / 重置坏数据前把原始文件另存一份（每个文件只留首份）。
+    def _backup_before_migration(self, source: str | None = None) -> None:
+        """迁移会丢弃 / 重置坏数据前把原始内容另存一份（每个文件只留首份）。
 
         这些修正是破坏性的（非对象消息被丢弃、非数字计数器归零），直接把
         清理后的快照写回磁盘会让原始内容不可恢复；保留原始副本便于排查。
+        ``source`` 是触发迁移的原始文本（构造 / 只读路径只有进程内锁，
+        备份必须在跨进程文件锁内完成，且内容取触发迁移的那份快照——备份
+        时刻回读磁盘可能拿到其它进程刚写回的已迁移内容）。
         备份含完整用户数据：文件按同目录 mkstemp + fsync + os.replace
         原子落盘（最终路径收紧到 0600，避免与协作目录共享时被同组 / 其他
         用户读取）。已有备份若不可解析（崩溃 / 磁盘满留下的半截文件），
@@ -1210,10 +1271,24 @@ class LongTermMemory:
         原子替换也避免两个进程同时首次加载时交错出混合内容的备份。
         """
         backup = f"{self.db_path}.migrate-backup"
-        if os.path.exists(backup):
-            if _backup_parsed_valid(backup):
-                return
-            logger.warning("迁移备份不完整，重新生成：%s", backup)
+        try:
+            with self._cross_process_lock():
+                if os.path.exists(backup):
+                    if _backup_parsed_valid(backup):
+                        return
+                    logger.warning("迁移备份不完整，重新生成：%s", backup)
+                self._write_migration_backup(backup, source)
+        except TimeoutError as lock_error:
+            # 备份是 best-effort：拿不到跨进程锁时按现有 OSError 口径告警
+            logger.warning(
+                "无法获取迁移备份文件锁：%s（%s）", self.db_path, lock_error
+            )
+            return
+
+    def _write_migration_backup(
+        self, backup: str, source: str | None
+    ) -> None:
+        """在持有跨进程文件锁时写出迁移备份（见 :meth:`_backup_before_migration`）。"""
         tmp_path: str | None = None
         try:
             fd, tmp_path = tempfile.mkstemp(
@@ -1221,10 +1296,17 @@ class LongTermMemory:
                 suffix=".tmp",
                 dir=os.path.dirname(backup) or ".",
             )
-            with os.fdopen(fd, "wb") as out, open(self.db_path, "rb") as src:
-                shutil.copyfileobj(src, out)
-                out.flush()
-                os.fsync(out.fileno())
+            if source is not None:
+                # 触发迁移的原始快照：与备份时刻的磁盘状态解耦
+                with os.fdopen(fd, "wb") as out:
+                    out.write(source.encode("utf-8"))
+                    out.flush()
+                    os.fsync(out.fileno())
+            else:
+                with os.fdopen(fd, "wb") as out, open(self.db_path, "rb") as src:
+                    shutil.copyfileobj(src, out)
+                    out.flush()
+                    os.fsync(out.fileno())
             os.replace(tmp_path, backup)
             fsync_parent_dir(backup)
             tmp_path = None
@@ -1251,9 +1333,15 @@ class LongTermMemory:
             _BACKUP_VALID_CACHE[(backup, fingerprint)] = None
         logger.warning("迁移修复前已备份原始记忆文件到 %s", backup)
 
-    def _migrate_data(self, data: dict[str, Any]) -> dict[str, Any]:
+    def _migrate_data(
+        self, data: dict[str, Any], source: str | None = None
+    ) -> dict[str, Any]:
         """
         迁移旧数据格式到新格式
+
+        ``source`` 是触发本次迁移的原始文件文本：破坏性修正前的备份直接
+        写这份快照，而不是在备份时刻回读磁盘——读盘与迁移判定之间其它
+        进程可能已把已迁移（已重置）的内容写回，回读会得到错误的「原始」。
 
         Args:
             data: 原始数据
@@ -1572,7 +1660,7 @@ class LongTermMemory:
         if destructive:
             # 所有破坏性修正（含最后的偏好去重）都完成后才备份：此前在
             # 去重之前就备份，唯一破坏性修正是去重时不会生成 .migrate-backup
-            self._backup_before_migration()
+            self._backup_before_migration(source)
 
         return data
 
@@ -1690,7 +1778,7 @@ class LongTermMemory:
             return
         with self._hold_write_lock():
             try:
-                with file_lock(self.db_path):
+                with self._cross_process_lock():
                     # 与 _locked_mutation 同口径的写前损坏复核：_corrupt_pending
                     # 状态下补隔离备份，恢复入口不再因重载失败无法自愈
                     self._ensure_corrupt_backed_up()
@@ -3111,7 +3199,7 @@ class LongTermMemory:
         """
         with self._hold_write_lock():
             try:
-                with file_lock(self.db_path):
+                with self._cross_process_lock():
                     # 归属复核：陈旧实例（大小写变体）不能删掉另一账号的
                     # 记忆文件与隔离备份；损坏文件仍允许删除
                     self._check_owner_case_on_disk()

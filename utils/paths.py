@@ -46,9 +46,16 @@ def package_root() -> Path:
 
 
 def is_source_checkout(root: Path | None = None) -> bool:
-    """包目录是否位于源码仓库（pyproject.toml 不会随 wheel 安装）。"""
+    """包目录是否位于源码仓库。
+
+    ``pyproject.toml`` 不随 wheel 安装，是唯一可靠标记；不能用 ``webapp/``
+    辅助判定——wheel 与 ``build/lib`` 都带 webapp 目录，而裁剪掉 webapp 的
+    CLI-only 源码部署会把 ``<仓库>/data`` 静默切到用户数据目录（既有账号
+    与知识库在面板里「消失」）。非标准部署（例如源码 COPY 进镜像后再
+    pip 安装）请用 ``ALIGO_DATA_DIR`` 钉住数据根。
+    """
     base = root if root is not None else package_root()
-    return (base / "pyproject.toml").is_file() and (base / "webapp").is_dir()
+    return (base / "pyproject.toml").is_file()
 
 
 def default_data_root() -> Path:

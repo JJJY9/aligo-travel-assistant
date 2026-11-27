@@ -549,6 +549,16 @@ def test_session_detail_fails_closed_when_store_unavailable(monkeypatch):
     print("✓ 会话详情严格打开存储（不可用时 503）")
 
 
+def test_status_requires_user_id():
+    """数据接口必填口径：/api/status 缺省 user_id 返回 422，不回退 web_user。"""
+    client = _client()
+    response = client.get("/api/status")
+    assert response.status_code == 422, response.text
+    response = client.get("/api/status", params={"user_id": "web_user"})
+    assert response.status_code == 200, response.text
+    print("✓ /api/status 缺省 user_id 返回 422")
+
+
 def test_sessions_and_status_fail_closed_when_store_unavailable(monkeypatch):
     """PG 故障冷却期：会话列表与状态同样 503（与详情 / 写接口同口径）。"""
     from utils.errors import MemoryPersistenceError
@@ -5582,7 +5592,8 @@ def test_streaming_releases_user_lock():
             ]
         assert events and events[0]["type"] == "session"
         assert events[-1]["type"] in ("done", "error")
-        assert state.locks[user_id].locked() is False, "流结束后必须释放用户锁"
+        lock = state.locks.get(user_id)
+        assert lock is None or lock.locked() is False, "流结束后必须释放用户锁"
         deleted = client.delete(
             "/api/sessions/stream-lock", params={"user_id": user_id}
         )
@@ -12172,17 +12183,20 @@ def test_lock_table_overflow_uses_shared_lock():
     state = app.state.aligo
     original = state.max_locks
     state.max_locks = 2
+    held = []  # 弱引用锁表：测试必须自己持有强引用模拟「在用」
     try:
         for index in range(2):
             lock = asyncio.Lock()
             # 模拟锁正在被持有：同步测试里没有可直接 acquire 的事件循环
             setattr(lock, "_locked", True)
+            held.append(lock)
             state.locks[f"held-{index}"] = lock
         assert state.lock_for("brand-new-user") is state.overflow_lock
         assert len(state.locks) == 2, "锁表占满时不能再为每个新用户建锁"
         assert state.lock_for("yet-another-user") is state.overflow_lock
-        # 有锁释放后可以重新入表
-        setattr(state.locks["held-0"], "_locked", False)
+        # 有锁释放（且不再被任何请求引用）后可以重新入表
+        setattr(held[0], "_locked", False)
+        held.pop(0)
         fresh = state.lock_for("recovered-user")
         assert fresh is not state.overflow_lock
         assert "recovered-user" in state.locks
@@ -12215,6 +12229,30 @@ def test_lock_eviction_skips_waiting_lock():
     print("✓ 用户锁淘汰跳过有等待者的锁")
 
 
+def test_lock_for_borrowed_lock_not_evicted():
+    """已借出但尚未 acquire 的锁不能被表满淘汰：否则同一用户会分裂出两把锁。"""
+    import asyncio
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    original = state.max_locks
+    state.max_locks = 1
+    try:
+        borrowed = state.lock_for("borrower")
+        filler = asyncio.Lock()
+        setattr(filler, "_locked", True)
+        state.locks["filler"] = filler
+        state.lock_for("newcomer")  # 表满：不能让这里淘汰已借出的 borrowed
+        assert state.lock_for("borrower") is borrowed, (
+            "已借出的锁被淘汰后同一用户会拿到另一把锁并行执行"
+        )
+        assert "borrower" in state.locks
+    finally:
+        state.max_locks = original
+        state.locks.clear()
+    print("✓ 已借出的用户锁不被表满淘汰")
+
+
 def test_lock_for_overflow_user_keeps_shared_lock_while_held():
     """兜底锁被占用期间，同一用户的新请求必须继续共用它，不能新建私有锁并行。"""
     import asyncio
@@ -12229,6 +12267,7 @@ def test_lock_for_overflow_user_keeps_shared_lock_while_held():
         assert overflow is state.overflow_lock, "锁表满时应使用兜底锁"
         await overflow.acquire()  # 模拟该用户的 R1 正持有兜底锁
         blocker.release()  # 锁表腾出空位
+        del blocker  # 弱引用锁表：不再被请求引用后自动回收
         again = state.lock_for("u-overflow")
         assert again is state.overflow_lock, "兜底锁仍被占用时不能给同一用户新建私有锁"
         overflow.release()

@@ -76,13 +76,19 @@ class IdempotencyCache:
             return copy.deepcopy(payload)
 
     def _evict_fair_locked(self) -> None:
-        """超上限时按用户公平淘汰（调用方已持有 ``self._lock``）。
+        """超上限时先清过期、再按用户公平淘汰（调用方已持有 ``self._lock``）。
 
-        全局 FIFO 会让任一用户的流量把另一用户仍在 TTL 内的条目挤出：
-        断连回合的 ``__incomplete__`` 标记被挤出后，重试会重复执行、
-        重复落库。这里只淘汰条目最多的用户自己最旧的一条；同条目数时
-        按全局最旧条目的用户决胜，单用户场景仍是标准 LRU。
+        过期条目不会再被回放却仍占名额：直接按条目数选 victim 会把活跃
+        用户仍在 TTL 内的新鲜条目（可能是断连回合的 ``__incomplete__``
+        标记）挤出，公平性承诺在过期条目堆积时不成立。先弹一条已过期
+        的最旧条目；调用方在仍超限时会再次进入，循环必然收敛。
         """
+        if self.ttl_sec:
+            now = time.monotonic()
+            for key, (created_at, _) in self._entries.items():
+                if now - created_at > self.ttl_sec:
+                    self._entries.pop(key)
+                    return
         counts: dict[str, int] = {}
         for key in self._entries:
             counts[key[0]] = counts.get(key[0], 0) + 1

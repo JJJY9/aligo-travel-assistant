@@ -33,6 +33,7 @@ import threading
 import time
 import traceback
 import uuid
+import weakref
 from urllib.parse import urlsplit
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -1742,7 +1743,13 @@ class AligoWebApp:
         # 结转表最多保留的用户桶数：大量一次性用户 ID 各留一笔账目也不
         # 能让进程内表无界增长，超过时淘汰最早建桶的用户
         self.max_pending_usage_users = 1000
-        self.locks: dict[str, asyncio.Lock] = {}
+        # 用户锁表：弱引用容器——真正空闲（无持有者 / 无等待者 / 无调用方
+        # 局部引用）的锁在引用计数归零时自动移除，内存自然有界；不能手工
+        # 淘汰「看起来空闲」的锁：调用方从 lock_for 返回到 await acquire
+        # 之间有一个事件循环让出点，此间淘汰会让同一用户分裂出两把锁
+        self.locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self._deleted_sessions: OrderedDict[str, tuple[float, str]] = OrderedDict()
         # mark/unmark/is_recently_deleted 会被 asyncio.to_thread 在线程池里执行，
         # 不同 user_id 的请求互不串行：OrderedDict 的迭代 + 删除必须加锁
@@ -2617,7 +2624,14 @@ class AligoWebApp:
             session.close()
 
     def lock_for(self, user_id: str) -> asyncio.Lock:
-        """同一用户的请求串行处理，避免长期记忆并发写覆盖。"""
+        """同一用户的请求串行处理，避免长期记忆并发写覆盖。
+
+        锁表是弱引用容器：锁只在「被某处强引用」（请求协程 / 等待者）时
+        留在表中，空闲后自动回收，因此不需要（也不能）手工淘汰——调用方
+        从本方法返回到真正 ``await lock.acquire()`` 之间有一个事件循环
+        让出点，此刻手工淘汰会让同一用户的两个请求各拿一把锁并行执行。
+        表满（并发度超过上限）时新用户共享兜底锁，内存仍有界。
+        """
         lock = self.locks.get(user_id)
         overflow_busy = self.overflow_lock.locked() or bool(
             getattr(self.overflow_lock, "_waiters", None)
@@ -2628,16 +2642,6 @@ class AligoWebApp:
             # 私有锁与之并行，按用户串行失效
             return self.overflow_lock
         if lock is None:
-            if len(self.locks) >= self.max_locks:
-                for key, candidate in list(self.locks.items()):
-                    # 除「已持有」外还要排除「有等待者」：持有者刚 release、
-                    # 等待者尚未恢复执行时 locked() 为 False，此时淘汰会让
-                    # 等待者拿到已脱离锁表的锁，与新请求的锁并行
-                    if not candidate.locked() and not getattr(
-                        candidate, "_waiters", None
-                    ):
-                        del self.locks[key]
-                        break
             if len(self.locks) >= self.max_locks:
                 # 所有锁都在使用中：共享兜底锁（并发高峰下新用户串行，但内存有界）
                 return self.overflow_lock
@@ -5982,7 +5986,7 @@ def create_app(model: Any = None) -> FastAPI:
     def status(
         request: Request,
         response: Response,
-        user_id: str = Query(default="web_user", pattern=_ID_PATTERN),
+        user_id: str = Query(..., pattern=_ID_PATTERN),
         today: date | None = Query(default=None),
         tz: str | None = Query(default=None, max_length=64),
     ) -> dict[str, Any]:
