@@ -40,6 +40,82 @@ _EXAMPLE_MARKERS = ("示例", "样例", "例如", "输出格式", "模板")
 _PREVIOUS_RESULTS_MAX_DEPTH = 9
 
 
+def unwrap_answer_envelope(text: str, result_key: str = "answer") -> str:
+    """模型按提示返回 JSON 信封时取正文，不把整个 JSON 当答案。
+
+    模型常把信封包在 ```json 围栏里，并在前后加「好的，以下是建议：」
+    这类串词：只在文本恰为裸 JSON / 首尾行恰为围栏时解包会把围栏 +
+    JSON 原样展示给用户。这里对文本里出现的每个围栏块与首个 ``{`` 到
+    末个 ``}`` 的片段都尝试解包。
+
+    SKILL.md 的输出示例也含 ``answer`` 等键：模型先回显示例再给出正式
+    结果时，首个命中会把占位文案当答案（与 json_parser 的「最后对象
+    优先」口径不一致）。因此收集全部命中，优先取非「示例 / 模板」
+    标签前导、非占位文案的最后一个信封。
+
+    简单技能与 RAG 技能共用同一解包实现；``result_key`` 为技能专属的
+    结果键（排在最前，``_ENVELOPE_KEYS`` 作兜底）。
+    """
+    stripped = text.strip()
+    # 候选按在原文中的起点排序：围栏块、首个 { 到末个 } 的片段、整段
+    candidates: list[tuple[int, str]] = [
+        (match.start(), match.group(1).strip())
+        for match in re.finditer(r"```[^\n`]*\n?(.*?)```", stripped, re.S)
+    ]
+    if "{" in stripped and "}" in stripped:
+        first = stripped.index("{")
+        candidates.append(
+            (first, stripped[first: stripped.rfind("}") + 1])
+        )
+    candidates.append((0, stripped))
+    candidates.sort(key=lambda item: item[0])
+
+    matched: list[tuple[int, str]] = []
+    for start, candidate in candidates:
+        if not (candidate.startswith("{") and candidate.endswith("}")):
+            continue
+        try:
+            data = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        value = ""
+        for source in (data, data.get("data")):
+            if not isinstance(source, dict):
+                continue
+            for key in (result_key, *_ENVELOPE_KEYS):
+                candidate_value = source.get(key)
+                if isinstance(candidate_value, str) and candidate_value.strip():
+                    value = candidate_value.strip()
+                    break
+            if value:
+                break
+        if value:
+            matched.append((start, value))
+
+    if not matched:
+        return text
+
+    def _example_labeled(start: int) -> bool:
+        prefix = stripped[max(0, start - 40): start]
+        return any(marker in prefix for marker in _EXAMPLE_MARKERS)
+
+    real = [value for start, value in matched if not _example_labeled(start)]
+    if real:
+        pool = real
+    elif all(
+        value in _PLACEHOLDER_ANSWERS and _example_labeled(start)
+        for start, value in matched
+    ):
+        # 只回显了模板：原样返回整段文本（正式建议通常跟在其后）
+        return text
+    else:
+        pool = [value for _, value in matched]
+    non_placeholder = [value for value in pool if value not in _PLACEHOLDER_ANSWERS]
+    return (non_placeholder or pool)[-1]
+
+
 class SimplePromptSkill(AgentBase):
     """单 prompt 技能基类；子类只需覆盖三个类属性。"""
 
@@ -230,76 +306,7 @@ class SimplePromptSkill(AgentBase):
         return text
 
     def _unwrap_answer(self, text: str) -> str:
-        """模型按提示返回 JSON 信封时取正文，不把整个 JSON 当答案。
-
-        模型常把信封包在 ```json 围栏里，并在前后加「好的，以下是建议：」
-        这类串词：只在文本恰为裸 JSON / 首尾行恰为围栏时解包会把围栏 +
-        JSON 原样展示给用户。这里对文本里出现的每个围栏块与首个 ``{`` 到
-        末个 ``}`` 的片段都尝试解包。
-
-        SKILL.md 的输出示例也含 ``answer`` 等键：模型先回显示例再给出正式
-        结果时，首个命中会把占位文案当答案（与 json_parser 的「最后对象
-        优先」口径不一致）。因此收集全部命中，优先取非「示例 / 模板」
-        标签前导、非占位文案的最后一个信封。
-        """
-        stripped = text.strip()
-        # 候选按在原文中的起点排序：围栏块、首个 { 到末个 } 的片段、整段
-        candidates: list[tuple[int, str]] = [
-            (match.start(), match.group(1).strip())
-            for match in re.finditer(r"```[^\n`]*\n?(.*?)```", stripped, re.S)
-        ]
-        if "{" in stripped and "}" in stripped:
-            first = stripped.index("{")
-            candidates.append(
-                (first, stripped[first: stripped.rfind("}") + 1])
-            )
-        candidates.append((0, stripped))
-        candidates.sort(key=lambda item: item[0])
-
-        matched: list[tuple[int, str]] = []
-        for start, candidate in candidates:
-            if not (candidate.startswith("{") and candidate.endswith("}")):
-                continue
-            try:
-                data = json.loads(candidate)
-            except (json.JSONDecodeError, ValueError):
-                continue
-            if not isinstance(data, dict):
-                continue
-            value = ""
-            for source in (data, data.get("data")):
-                if not isinstance(source, dict):
-                    continue
-                for key in (self.result_key, *_ENVELOPE_KEYS):
-                    candidate_value = source.get(key)
-                    if isinstance(candidate_value, str) and candidate_value.strip():
-                        value = candidate_value.strip()
-                        break
-                if value:
-                    break
-            if value:
-                matched.append((start, value))
-
-        if not matched:
-            return text
-
-        def _example_labeled(start: int) -> bool:
-            prefix = stripped[max(0, start - 40): start]
-            return any(marker in prefix for marker in _EXAMPLE_MARKERS)
-
-        real = [value for start, value in matched if not _example_labeled(start)]
-        if real:
-            pool = real
-        elif all(
-            value in _PLACEHOLDER_ANSWERS and _example_labeled(start)
-            for start, value in matched
-        ):
-            # 只回显了模板：原样返回整段文本（正式建议通常跟在其后）
-            return text
-        else:
-            pool = [value for _, value in matched]
-        non_placeholder = [value for value in pool if value not in _PLACEHOLDER_ANSWERS]
-        return (non_placeholder or pool)[-1]
+        return unwrap_answer_envelope(text, self.result_key)
 
     def _build_prompt(self, x: Msg | list[Msg]) -> str:
         data, user_query = self._payload(x)

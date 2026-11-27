@@ -50,6 +50,15 @@ _GROUP_PARTS_MAX = 100000
 # 每组一条 reason 会让响应与内存随组数线性放大；超出后只保留汇总（片数
 # 仍准确累计），明细过多本身也无法逐条阅读
 _PROBLEMS_MAX = 100
+
+
+class _GroupOrderConflict(ValueError):
+    """备份组内容齐全但 part 顺序与库内组不同：可修复的布局冲突。
+
+    与结构坏组（声明异常 / 重复 part / 缺片）区分：默认输出要把这类
+    组计入 ``skipped_conflict`` 并提示「整份编辑后重新导入」，而不是
+    笼统的「N 条无效」。
+    """
 # 导入时单条内容上限（用户输入 / 任意备份的安全边界）；从导出备份还原的
 # 多分片记录是完整文档，用上面的拼接上限避免备份恢复被截断
 _IMPORT_CONTENT_MAX_CHARS = 2000
@@ -920,10 +929,19 @@ def _apply_per_part_metadata(
     }
     removed = [key for key in base_reference if key not in wanted]
     total = len(documents)
+    # 整份编辑把多分片文档缩成单片：changed/removed 是相对被点击片计算的，
+    # 余下唯一一片不能再以旧第 1 片元数据为底（用户从第 2..N 片进入编辑
+    # 时会被静默改回第 1 片的分类/标题），应以被点击片为底。
+    shrinking = total == 1 and len(per_part_metas) > 1
     for index, document in enumerate(documents):
-        base = dict(
-            per_part_metas[index] if index < len(per_part_metas) else base_reference
-        )
+        if shrinking:
+            base = dict(base_reference)
+        else:
+            base = dict(
+                per_part_metas[index]
+                if index < len(per_part_metas)
+                else base_reference
+            )
         for key in removed:
             base.pop(key, None)
         base.update(changed)
@@ -934,6 +952,12 @@ def _apply_per_part_metadata(
                 base["title"] = (
                     f"{match.group(1)}{match.group(2)}(Part {index + 1})"
                 )
+        elif isinstance(title, str) and shrinking and "title" not in changed:
+            # 缩成单片后不再有分片：剥掉旧标题的「(Part N)」后缀（用户
+            # 显式改过标题时按 changed 的值保留）
+            match = _PART_TITLE_RE.match(title)
+            if match:
+                base["title"] = match.group(1)
         # 派生键（group/part/parts 等）与编辑标记沿用本次重建的值
         preserved = {
             key: value
@@ -1003,6 +1027,12 @@ def update_document(
     try:
         with _read_lock():
             parts, pre_group = _document_info(client, int(doc_id))
+            if parts == 0:
+                # 死 id（另一标签页 / CLI / 清理重复已删除）：在加载嵌入
+                # 模型前就按不存在返回——否则冷进程先卡在模型加载，离线 /
+                # 下载失败时还会把 404 盖成 503，面板无法按「已删除」收尾。
+                # 写锁内仍以权威快照复核
+                raise LookupError("知识片段不存在")
             if parts == 1 or (parts > 1 and pre_group):
                 pre_snapshot = _locked_user_snapshot(
                     client, int(doc_id), pre_group
@@ -1013,6 +1043,8 @@ def update_document(
                         "id": int(doc_id),
                         "unchanged": True,
                     }
+    except LookupError:
+        raise
     except Exception:  # noqa: BLE001 - 预检失败走完整流程
         logger.debug("原样保存预检失败，按完整流程处理", exc_info=True)
 
@@ -1359,7 +1391,7 @@ def _merge_exported_group(
                 if grouped is None or any(
                     content in grouped for content in stripped_contents
                 ):
-                    raise ValueError(
+                    raise _GroupOrderConflict(
                         f"备份中的文档组内容与库内分片相同但顺序不同（group={key}）："
                         "请整份编辑后重新导入"
                     )
@@ -1393,6 +1425,7 @@ def _regroup_exported_documents(
     problems: "list[dict[str, Any]] | None" = None,
     existing_group_texts: "Callable[[], set[str] | None] | None" = None,
     existing_grouped_contents: "Callable[[], set[str] | None] | None" = None,
+    conflict_out: list[int] | None = None,
 ) -> tuple[list[Any], int]:
     """把导出备份里同一 group 的分片按 part 顺序拼回整篇文档。
 
@@ -1458,6 +1491,13 @@ def _regroup_exported_documents(
         except ValueError as exc:
             if problems is None:
                 raise
+            # 顺序冲突是「可修复的布局问题」而非坏数据：单独计数，调用方
+            # 计入 skipped_conflict（在 problems 上限判断之前累计，溢出
+            # 组也要计入，保证与 problems 汇总的 parts 对齐）
+            if conflict_out is not None and isinstance(
+                exc, _GroupOrderConflict
+            ):
+                conflict_out.append(len(pieces))
             if len(problems) < _PROBLEMS_MAX:
                 problems.append(
                     {"group": key, "reason": str(exc), "parts": len(pieces)}
@@ -2299,19 +2339,28 @@ def import_documents(
                         _existing_grouped_contents(),
                     )
             model_needed = not (fully_existing and order_ok)
+        order_conflict_parts: list[int] = []
         merged_items, group_skipped = _regroup_exported_documents(
             valid,
             existing,
             problems=problems,
             existing_group_texts=_existing_group_texts,
             existing_grouped_contents=_existing_grouped_contents,
+            conflict_out=order_conflict_parts,
         )
-        # 结构非法的组整组跳过：片数计入 skipped_invalid，明细给到调用方
-        invalid += sum(_meta_int(item.get("parts"), 0) for item in problems)
+        # 结构非法的组整组跳过：片数计入 skipped_invalid，明细给到调用方。
+        # 顺序冲突（内容齐全、part 顺序与库内任何组不同）不是坏数据而是
+        # 可修复的布局冲突：计入 skipped_conflict，默认文案给出修复指引
+        order_conflict_total = sum(order_conflict_parts)
+        invalid += (
+            sum(_meta_int(item.get("parts"), 0) for item in problems)
+            - order_conflict_total
+        )
         duplicate = group_skipped
-        # 布局冲突（缺失分片的 part 号被旧内容占用 / 布局校验失败）：内容
-        # 没有导入，不能计成「已存在」——否则用户会把备份当作已恢复
-        conflict = 0
+        # 布局冲突（缺失分片的 part 号被旧内容占用 / 布局校验失败 / 备份
+        # 组顺序与库内不同）：内容没有导入，不能计成「已存在」——否则
+        # 用户会把备份当作已恢复
+        conflict = order_conflict_total
         document_chunks: list[list[dict[str, Any]]] = []
         # 与 document_chunks 平行的还原组号（非还原文档为空串），用于识别
         # 「备份组与库内片段部分重合」的布局冲突

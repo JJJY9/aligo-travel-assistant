@@ -258,6 +258,47 @@ def _render_plan_validation_warning(validation: object) -> str:
     return "\n".join(lines)
 
 
+def rag_source_extracts(data: Any) -> tuple[list[str], list[str]]:
+    """RAG 结果的参考来源 / 参考片段，按文档序号一一对应。
+
+    来源名回退顺序 parent_doc → title → category → ``#id``：面板新增的
+    知识只有内容与可选分类，没有文件名/标题；不回退会让来源列表缺项、
+    与片段错位。CLI 实时问答与 Markdown（Web / 历史 / 导出）共用，
+    保证同一结果在两处展示的来源与片段集合一致。
+    """
+    documents = data.get("retrieved_documents") if isinstance(data, dict) else None
+    if not isinstance(documents, list):
+        return [], []
+    doc_names: list[str] = []
+    snippets: list[str] = []
+    seen_names: set[str] = set()
+    for index, document in enumerate(documents[:3], 1):
+        if not isinstance(document, dict):
+            continue
+        metadata = document.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        doc_name = (
+            metadata.get("parent_doc")
+            or metadata.get("title")
+            or metadata.get("category")
+        )
+        if not doc_name and document.get("id") is not None:
+            doc_name = f"#{document['id']}"
+        if doc_name:
+            name_text = str(doc_name)
+            # 多分片文档的多条片段可能共享同一来源：只列一次（序号保留
+            # 文档序号，片段段按同一序号对齐）
+            if name_text not in seen_names:
+                seen_names.add(name_text)
+                doc_names.append(f"{index}. {name_text}")
+        excerpt = " ".join(str(document.get("content") or "").split())
+        if excerpt:
+            if len(excerpt) > 140:
+                excerpt = excerpt[:140] + "…"
+            snippets.append(f"{index}. {excerpt}")
+    return doc_names, snippets
+
+
 def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
     if agent_name == "itinerary_planning":
         nested_payload = data.get("data")
@@ -392,30 +433,11 @@ def _render_agent(agent_name: str, data: dict[str, Any]) -> str:
         if not answer:
             return ""
         text = str(answer)
-        documents = data.get("retrieved_documents") or []
-        if not isinstance(documents, list):
-            documents = []
-        doc_names: list[str] = []
-        for document in documents:
-            if not isinstance(document, dict):
-                continue
-            metadata = document.get("metadata") or {}
-            doc_name = metadata.get("parent_doc") or metadata.get("title")
-            if doc_name and doc_name not in doc_names:
-                doc_names.append(str(doc_name))
+        doc_names, snippets = rag_source_extracts(data)
         if doc_names:
-            text += "\n\n**参考来源**：" + "、".join(doc_names[:3])
-
-        snippets: list[str] = []
-        for document in documents[:3]:
-            if not isinstance(document, dict):
-                continue
-            excerpt = " ".join(str(document.get("content") or "").split())
-            if not excerpt:
-                continue
-            if len(excerpt) > 140:
-                excerpt = excerpt[:140] + "…"
-            snippets.append(excerpt)
+            text += "\n\n**参考来源**"
+            for doc_name in doc_names:
+                text += f"\n{doc_name}"
         if snippets:
             text += "\n\n**参考片段**"
             for snippet in snippets:

@@ -1546,7 +1546,9 @@ def test_import_reordered_group_is_conflict_not_duplicate(monkeypatch):
         result = knowledge_admin.import_documents(documents, dry_run=dry_run)
         assert result["imported"] == 0, result
         assert result["skipped_duplicate"] == 0, result
-        assert result["skipped_invalid"] == 2, result
+        # 顺序冲突是可修复的布局冲突，不计成坏数据（N 条无效）
+        assert result["skipped_invalid"] == 0, result
+        assert result["skipped_conflict"] == 2, result
         assert any(
             "顺序不同" in str(item.get("reason", ""))
             for item in result.get("skipped_groups", [])
@@ -3960,6 +3962,98 @@ def test_apply_per_part_metadata_reference_parameter():
     assert [meta["category"] for meta in metas] == ["A", "A"], metas
 
 
+def test_apply_per_part_metadata_shrink_uses_reference():
+    """多分片缩成单片：以被点击片元数据为底并剥掉 Part 后缀。"""
+    documents = [{"content": "a", "metadata": {}}]
+    per_part = [
+        {"title": "住宿标准 (Part 1)", "category": "住宿"},
+        {"title": "住宿标准 (Part 2)", "category": "交通"},
+    ]
+    knowledge_admin._apply_per_part_metadata(
+        documents,
+        {"title": "住宿标准 (Part 2)", "category": "交通"},
+        per_part,
+        per_part[1],
+    )
+    meta = documents[0]["metadata"]
+    assert meta["category"] == "交通", "不能静默改回旧第 1 片的分类"
+    assert meta["title"] == "住宿标准", meta
+
+
+def test_update_document_shrink_to_single_keeps_clicked_part(monkeypatch):
+    """从第 2 片进入编辑并把整篇改短成单片：保留被点击片的分类与标题。"""
+    from pathlib import Path
+
+    def _meta(part, category):
+        return json.dumps(
+            {
+                "part": str(part),
+                "parts": "2",
+                "group": "g-old",
+                "title": f"住宿标准 (Part {part})",
+                "category": category,
+            },
+            ensure_ascii=False,
+        )
+
+    rows = [
+        {"id": 1, "content": "甲" * 400, "metadata": _meta(1, "住宿")},
+        {"id": 2, "content": "乙" * 100, "metadata": _meta(2, "交通")},
+    ]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _Agent:
+        def __init__(self):
+            self.updated = None
+            self.added = []
+
+        def update_document(self, doc_id, content, metadata):
+            self.updated = (doc_id, content, metadata)
+            return {"status": "success", "id": doc_id}
+
+        def add_documents(self, documents):
+            self.added = documents
+            return {
+                "status": "success",
+                "ids": list(range(100, 100 + len(documents))),
+                "total_count": len(documents),
+            }
+
+    agent = _Agent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    result = knowledge_admin.update_document(
+        2,
+        "乙" * 100,
+        {"title": "住宿标准 (Part 2)", "category": "交通"},
+        expect_parts=2,
+        expect_group="g-old",
+    )
+    assert result["status"] == "success", result
+    meta = agent.updated[2]
+    assert meta["category"] == "交通", meta
+    assert meta["title"] == "住宿标准", meta
+    print("✓ 缩成单片保留被点击片元数据")
+
+
+def test_update_document_missing_id_skips_agent_load(monkeypatch):
+    """更新已删除片段：在加载嵌入模型前就按不存在返回（离线不再 503）。"""
+    from pathlib import Path
+
+    fake_client = _FakeMilvusClient([])
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    def _fail_agent():
+        raise AssertionError("死 id 不应触发嵌入模型加载")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", _fail_agent)
+    with pytest.raises(LookupError):
+        knowledge_admin.update_document(12345, "新内容", {"category": "交通"})
+    print("✓ 更新不存在的片段在加载模型前返回 404")
+
+
 def test_metadata_key_cap_and_internal_keys():
     """10 键上限在写入层同样执行；内部键（user_edited 等）不占额度。"""
     ten = {f"k{index}": "v" for index in range(10)}
@@ -4193,6 +4287,7 @@ if __name__ == "__main__":
     test_read_lock_times_out_when_write_in_progress()
     test_document_info_parses_parts_and_group()
     test_apply_per_part_metadata_reference_parameter()
+    test_apply_per_part_metadata_shrink_uses_reference()
     test_metadata_key_cap_and_internal_keys()
     test_bounded_metadata_keeps_internal_keys()
     for case in (
@@ -4212,6 +4307,8 @@ if __name__ == "__main__":
         test_update_document_rejects_stale_expect_metadata,
         test_update_document_preserves_per_part_metadata,
         test_update_document_uses_clicked_part_reference,
+        test_update_document_shrink_to_single_keeps_clicked_part,
+        test_update_document_missing_id_skips_agent_load,
         test_update_document_legacy_whitespace_saved_as_unchanged,
         test_import_problem_details_are_bounded,
         test_import_group_existing_as_ungrouped_pieces_is_duplicate,

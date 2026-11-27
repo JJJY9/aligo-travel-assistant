@@ -105,6 +105,83 @@ def test_rag_malformed_documents():
     print("✓ RAG 非列表检索结果安全兜底")
 
 
+def test_rag_sources_align_with_snippets_per_document():
+    """来源与片段按文档序号一一对应；面板知识（仅分类）也有来源标识。"""
+    # 面板新增形态：只有内容与分类，没有文件名 / 标题
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "rag_knowledge",
+                    "status": "success",
+                    "data": {
+                        "answer": "答案为 600 元。",
+                        "retrieved_documents": [
+                            {
+                                "id": 7,
+                                "content": "面板知识",
+                                "metadata": {"category": "住宿"},
+                            }
+                        ],
+                    },
+                }
+            ]
+        )
+    )
+    assert "参考来源" in md and "住宿" in md, md
+    assert "参考片段" in md and "面板知识" in md, md
+
+    # 首条无来源信息：来源只列第 2 条，片段序号仍与来源序号对齐
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "rag_knowledge",
+                    "status": "success",
+                    "data": {
+                        "answer": "答案",
+                        "retrieved_documents": [
+                            {"content": "片段零", "metadata": {}},
+                            {
+                                "content": "片段一",
+                                "metadata": {"title": "文档A"},
+                            },
+                        ],
+                    },
+                }
+            ]
+        )
+    )
+    assert "2. 文档A" in md, md
+    assert "1. 片段零" in md and "2. 片段一" in md, md
+
+    # 第 4 条才有标题：来源不得出现片段里没有的「幽灵来源」
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "rag_knowledge",
+                    "status": "success",
+                    "data": {
+                        "answer": "答案",
+                        "retrieved_documents": [
+                            {"content": "片段0", "metadata": {}},
+                            {"content": "片段1", "metadata": {}},
+                            {"content": "片段2", "metadata": {}},
+                            {
+                                "content": "片段3",
+                                "metadata": {"title": "文档D"},
+                            },
+                        ],
+                    },
+                }
+            ]
+        )
+    )
+    assert "文档D" not in md, md
+    print("✓ RAG 参考来源与参考片段按文档序号对齐")
+
+
 def test_information_query_sources():
     data = _wrap([
         {
@@ -991,6 +1068,7 @@ if __name__ == "__main__":
     test_agent_specific_empty_payloads_render_placeholder()
     test_renderer_empty_result_falls_back_to_text()
     test_rag_snippet_truncation_and_skip_non_dict()
+    test_rag_sources_align_with_snippets_per_document()
     test_preference_append_variants_and_legacy_dict()
     test_preference_nested_data_and_empty_legacy_values()
     test_event_collection_type_tolerance()

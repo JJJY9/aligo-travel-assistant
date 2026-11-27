@@ -128,6 +128,14 @@ def evaluate_retrieval(
         "hit5": hit_at(5),
         "mrr": mrr,
         "rows": rows,
+        # 口径说明：评测只取纯向量 top-K 再按阈值过滤，不含 BM25 /
+        # RRF 混合召回（聊天链路的候选池更宽、先过滤再截断）。管理员
+        # 不应把这里的 hit@K 直接当成实际聊天可用率
+        "mode": "vector",
+        "note": (
+            "评测为纯向量 top-K 口径（不含 BM25 / 混合召回），"
+            "实际聊天可用率可能更高"
+        ),
     }
     if total and hit_at(5) == 0:
         # 全部未命中有多种原因，不能只把用户引向「换题库」

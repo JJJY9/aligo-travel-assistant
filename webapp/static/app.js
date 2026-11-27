@@ -6005,8 +6005,9 @@ async function refreshKnowledgeDocuments(
   if (!els.kbList) return;
   if (state.kbSemanticMode) {
     // 保持在语义检索模式：删除 / 编辑 / 导入后刷新的是当前语义结果，
-    // 而不是悄悄切回关键词列表
-    await runSemanticSearch({ silent: true });
+    // 而不是悄悄切回关键词列表。收尾刷新的 silentFailure 契约透传：
+    // 429 / 写锁 503 等瞬态失败不能覆盖刚显示的成功提示
+    await runSemanticSearch({ silent: true, silentFailure });
     // 语义结果不随分类筛选变化，但删除 / 编辑 / 导入会改变分类计数：
     // 之前这里直接 return，分类下拉一直显示旧计数
     if (refreshCategories) refreshKnowledgeCategories();
@@ -6297,7 +6298,7 @@ function knowledgeRowActions(doc) {
   return actions;
 }
 
-async function runSemanticSearch({ silent = false } = {}) {
+async function runSemanticSearch({ silent = false, silentFailure = false } = {}) {
   const query = silent ? state.kbSemanticQuery : els.kbSearch.value.trim();
   if (!query) {
     if (!silent) toast("请输入搜索内容");
@@ -6345,7 +6346,11 @@ async function runSemanticSearch({ silent = false } = {}) {
   } catch (error) {
     if (seq !== kbListSeq) return;
     if (silent) {
-      // 刷新语义结果失败（如知识库暂时不可用）：退回关键词列表，避免面板卡在旧结果
+      // 收尾刷新（删除 / 编辑 / 导入 / 备份恢复之后）失败：静默保留
+      // 当前语义视图，不能 toast 覆盖成功提示、也不能把用户正在看的
+      // 语义结果换成关键词列表；非静默场景仍回退关键词列表，避免
+      // 面板卡在旧结果
+      if (silentFailure) return;
       exitKbSemanticMode();
       state.kbQuery = els.kbSearch.value.trim();
       toast(`语义结果刷新失败：${error.message}`);
@@ -6439,6 +6444,7 @@ async function runKbEval() {
         ` · hit@3 ${pct(data.hit3)} · hit@5 ${pct(data.hit5)}` +
         ` · MRR ${Number(data.mrr || 0).toFixed(2)}` +
         (hit5 < 0.8 ? " · 低于 80% 基线" : "") +
+        (data.note ? ` · ${data.note}` : "") +
         (warning ? ` · ${warning}` : "") +
         missedText;
       els.kbEvalResult.classList.toggle("warn", hit5 < 0.8 || Boolean(warning));
@@ -6786,6 +6792,13 @@ async function removeKnowledgeDocument(doc) {
     if (error.status === 404) {
       removed = true;
       toast("知识片段已不存在，已刷新列表");
+    } else if (error.status === 400) {
+      // 快照已过期（另一会话把该片段改成了多分片 / 整组结构变化）：
+      // DELETE 的 400 只来自结构冲突；刷新后该行按 group/parts 渲染出
+      // 「删除整组」，与编辑保存 409 分支同口径。silentFailure 避免
+      // 刷新失败时的提示覆盖本条错误
+      toast(`${error.message}（已刷新列表）`);
+      refreshKnowledgeDocuments({ silentFailure: true });
     } else {
       toast(error.message);
     }
@@ -7292,7 +7305,10 @@ async function importKnowledgeFile() {
   } catch (error) {
     const status = Number((error && error.status) || 0);
     const queueBusy =
-      status === 503 && String(error.message || "").includes("已有导入任务在处理");
+      status === 503 &&
+      // 与服务端 /api/knowledge/import 槽位繁忙文案（server.py
+      // 「已有知识库导入任务在处理…」）精确对应；本函数只请求知识库导入
+      String(error.message || "").includes("导入任务在处理");
     if (imported > 0) {
       toast(`已导入 ${imported} 条后失败：${error.message}（重试会跳过已导入内容）`);
       await Promise.all([
@@ -7705,6 +7721,10 @@ function bindEvents() {
   els.kbCategoryFilter.addEventListener("change", () => {
     exitKbSemanticMode();
     state.kbCategory = els.kbCategoryFilter.value;
+    // 退出语义模式后列表按 state.kbQuery 过滤：把搜索框里未提交的输入
+    // 同步进来，否则用户刚输入的词被切换分类静默丢弃（与语义刷新失败
+    // 的退出路径同口径）
+    state.kbQuery = els.kbSearch.value.trim();
     refreshKnowledgeDocuments();
   });
   els.kbMore.addEventListener("click", loadMoreKnowledgeDocuments);

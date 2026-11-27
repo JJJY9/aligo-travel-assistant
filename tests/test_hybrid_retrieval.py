@@ -238,6 +238,41 @@ def test_bm25_index_does_not_retain_token_lists():
     print("✓ BM25 索引不保留 token 列表")
 
 
+def test_question_word_only_matches_do_not_score_evidence():
+    """只命中疑问词 / 跨词伪影的片段不能拿高分通过 min_score。
+
+    查询「股票怎么买」的二元组 票怎 与 FAQ 片段「发票怎么办」跨词拼出
+    的 票怎 相同：修复前 rare_hit 成立、真实内容词 股票/么买 被当作
+    伪影剔除 → 覆盖度 1.0、证据量≈1 → 0.999，无关片段以
+    distance=max(向量, 0.999) 越过任意 min_score。
+    """
+    docs = [
+        {"id": "1", "content": "Q15：遗失发票怎么办？请在 30 天内提交补办申请"},
+        {"id": "2", "content": "一线城市住宿标准为每晚 500 元"},
+        {"id": "3", "content": "报销需要发票与行程单"},
+        {"id": "4", "content": "出差审批流程由直属领导确认"},
+        {"id": "5", "content": "酒店预订优先协议价"},
+        {"id": "6", "content": "机场贵宾厅使用规则"},
+        {"id": "7", "content": "火车票改签手续费说明"},
+        {"id": "8", "content": "差旅保险覆盖范围"},
+        {"id": "9", "content": "国际航班行李额度"},
+        {"id": "10", "content": "紧急情况联系差旅平台 24 小时热线"},
+    ]
+    index = BM25Index(docs)
+    for query in (
+        "股票怎么买",
+        "彩票怎么买",
+        "股票怎么办",
+        "股票为什么跌",
+        "股票如何买",
+    ):
+        score = index.normalized_score(query, docs[0]["content"])
+        assert score < 0.5, (query, score)
+    # 命中真实内容词（发票）的合法查询仍给出强证据：不误伤正向召回
+    assert index.normalized_score("丢失发票怎么办", docs[0]["content"]) > 0.5
+    print("✓ 只命中疑问词 / 跨词伪影的片段不再拿假证据分")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -258,4 +293,5 @@ if __name__ == "__main__":
     test_bm25_equal_scores_tie_break_by_document_id()
     test_rrf_equal_scores_tie_break_is_deterministic()
     test_bm25_index_does_not_retain_token_lists()
+    test_question_word_only_matches_do_not_score_evidence()
     print("\n全部通过")
