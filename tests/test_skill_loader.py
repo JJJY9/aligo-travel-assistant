@@ -209,6 +209,146 @@ def test_read_errors_return_none(monkeypatch):
     print("✓ SKILL.md / 正文读取失败返回 None")
 
 
+def test_leading_four_dash_line_is_not_frontmatter_opener():
+    """首行必须是精确的 ---：'----' 分隔线不能把后续正文解析成 frontmatter。"""
+    from utils.skill_loader import _frontmatter_bounds
+
+    root = tempfile.mkdtemp(prefix="chailv_skills_")
+    _write(
+        os.path.join(root, "weird", "SKILL.md"),
+        "----\nname: fake\ndescription: fake desc\n---\n真正正文",
+    )
+    with open(os.path.join(root, "weird", "SKILL.md"), encoding="utf-8") as handle:
+        text = handle.read()
+    assert _frontmatter_bounds(text) is None, "首行不是精确 --- 不能当围栏"
+    loader = SkillLoader(root)
+    assert loader.load_skills() == {}, "伪技能不能被登记"
+    content = loader.get_skill_content("weird")
+    assert content is not None, content
+    assert "----" in content and "name: fake" in content, "正文不能被截断"
+
+    # CRLF 正例：首行 ---\r 经 rstrip 后仍是合法围栏
+    _write(
+        os.path.join(root, "crlf", "SKILL.md"),
+        "---\r\nname: ok\r\ndescription: ok\r\n---\r\n正文\r\n",
+    )
+    assert "ok" in SkillLoader(root).load_skills()
+    print("✓ 首行围栏必须精确 ---（CRLF 仍兼容）")
+
+
+def test_duplicate_frontmatter_name_is_consistent():
+    """同名技能的「宣传」与「注入」必须解析到同一份正文。"""
+    root = tempfile.mkdtemp(prefix="chailv_skills_")
+    _write(
+        os.path.join(root, "dir-a", "SKILL.md"),
+        "---\nname: dup\ndescription: 描述A\n---\n正文A",
+    )
+    _write(
+        os.path.join(root, "dir-b", "SKILL.md"),
+        "---\nname: dup\ndescription: 描述B\n---\n正文B",
+    )
+    loader = SkillLoader(root)
+    skills = loader.load_skills()
+    # 排序后保留首个：目录 dir-a
+    assert skills["dup"]["description"] == "描述A", skills
+    prompt = loader.get_skill_prompt()
+    assert "描述A" in prompt and "描述B" not in prompt, prompt
+    assert loader.get_skill_content("dup") == "正文A", "注入必须与宣传同源"
+    print("✓ 重名技能宣传与注入同源（保留排序首个）")
+
+
+def test_skill_name_is_stripped():
+    """frontmatter name 带首尾空白时归一，意图侧与注册表解析一致。"""
+    root = tempfile.mkdtemp(prefix="chailv_skills_")
+    _write(
+        os.path.join(root, "custom", "SKILL.md"),
+        '---\nname: "  my custom  "\ndescription: 带空白\n---\n正文C',
+    )
+    loader = SkillLoader(root)
+    skills = loader.load_skills()
+    assert "my custom" in skills, skills
+    assert "  my custom  " not in skills
+    assert loader.get_skill_content("my custom") == "正文C"
+    print("✓ frontmatter name 去首尾空白")
+
+
+def test_get_skill_prompt_budget():
+    """description 单条与总量都有上限，且技能名不能被整条省略。"""
+    root = tempfile.mkdtemp(prefix="chailv_skills_")
+    _write(
+        os.path.join(root, "long", "SKILL.md"),
+        "---\nname: long\ndescription: |\n  " + "很长的描述" * 600 + "\n---\n",
+    )
+    _write(os.path.join(root, "long", "script", "agent.py"), "")
+    for index in range(8):
+        _write(
+            os.path.join(root, f"skill-{index}", "SKILL.md"),
+            f"---\nname: skill-{index}\ndescription: " + "描述" * 300 + "\n---\n",
+        )
+        _write(os.path.join(root, f"skill-{index}", "script", "agent.py"), "")
+    loader = SkillLoader(root, dispatchable_only=True)
+    prompt = loader.get_skill_prompt()
+    long_line = next(line for line in prompt.splitlines() if line.startswith("1. long -"))
+    assert long_line.endswith("…"), long_line
+    assert len(long_line) <= 500 + 16, len(long_line)
+    # 总量超预算后只省略描述，所有技能名仍然在清单里
+    for index in range(8):
+        assert f"skill-{index}" in prompt, prompt
+    assert "（描述已省略）" in prompt, prompt
+    assert len(prompt) <= 4000 + 9 * 40, len(prompt)
+    print("✓ 技能 description 单条 / 总量预算")
+
+
+def test_get_skill_content_is_capped():
+    """超长技能正文截断并注明，避免每轮调用撑爆模型上下文。"""
+    from utils.skill_loader import MAX_SKILL_CONTENT_CHARS
+
+    root = tempfile.mkdtemp(prefix="chailv_skills_")
+    _write(
+        os.path.join(root, "big", "SKILL.md"),
+        "---\nname: big\n---\n" + "长正文" * (MAX_SKILL_CONTENT_CHARS // 3 + 100),
+    )
+    loader = SkillLoader(root)
+    content = loader.get_skill_content("big")
+    assert content is not None
+    assert content.endswith("（技能正文过长已截断）"), content[-20:]
+    assert len(content) <= MAX_SKILL_CONTENT_CHARS + 20, len(content)
+    print("✓ 技能正文注入上限")
+
+
+def test_repo_skill_docs_use_valid_json_and_model_factory():
+    """真实 SKILL.md：示例必须是合法 JSON（不能残留 f-string 转义的 {{ }}），
+    且不再示范直接构造 OpenAIChatModel（顶层参数会被静默忽略）。"""
+    import json
+
+    loader = SkillLoader()
+    for skill in ("plan-trip", "preference"):
+        body = loader.get_skill_content(skill) or ""
+        _, _, rest = body.partition("【输出格式】(严格JSON)")
+        assert rest, skill
+        assert "{{" not in rest, skill
+        # 段首即 JSON 示例：按 raw_decode 解析前缀（后续「重要规则」里还有
+        # 内联示例，不能取到段末的 } 再整体解析）
+        parsed, _ = json.JSONDecoder().raw_decode(rest[rest.index("{"):])
+        assert isinstance(parsed, dict) and parsed, skill
+    query_info = loader.get_skill_content("query-info") or ""
+    assert "OpenAIChatModel(" not in query_info
+    assert "create_chat_model" in query_info
+    print("✓ 仓库 SKILL.md 示例为合法 JSON / 统一模型工厂")
+
+
+def test_load_skills_is_idempotent():
+    """重复扫描不应把自身上次登记的名字当成重名冲突（结果保持一致）。"""
+    loader = SkillLoader(_make_skills_dir())
+    first = dict(loader.load_skills())
+    second = loader.load_skills()
+    assert second == first, second
+    # 再取正文 / 提示词也不受二次扫描影响
+    assert loader.get_skill_content("good") == "正文"
+    assert "1. good-skill - 正常技能" in loader.get_skill_prompt()
+    print("✓ 技能扫描幂等")
+
+
 _DIRECT_RUN_SKIP: dict[str, str] = {
 }
 
@@ -239,4 +379,11 @@ if __name__ == "__main__":
     finally:
         _mp.undo()
     test_dispatchable_only_excludes_doc_only_skills()
+    test_leading_four_dash_line_is_not_frontmatter_opener()
+    test_duplicate_frontmatter_name_is_consistent()
+    test_skill_name_is_stripped()
+    test_get_skill_prompt_budget()
+    test_get_skill_content_is_capped()
+    test_repo_skill_docs_use_valid_json_and_model_factory()
+    test_load_skills_is_idempotent()
     print("\n全部通过")

@@ -1388,18 +1388,18 @@ class AligoCLI:
                     info_shown = True
 
                 if missing_info:
-                    if isinstance(missing_info, str):
-                        missing_items = [missing_info]
-                    elif isinstance(missing_info, (list, tuple)):
-                        missing_items = [str(item) for item in missing_info]
-                    else:
-                        missing_items = [str(missing_info)]
-                    self.console.print()
-                    self.console.print(
-                        f"💡 还需要补充: {_field_safe(', '.join(missing_items))}",
-                        style="yellow",
-                    )
-                    info_shown = True
+                    # 与 Web 渲染同一归一：null / 数字条目不显示成
+                    # "None" / "123"（dict 条目取 field/name/description）
+                    from utils.result_formatter import normalize_missing_items
+
+                    missing_items = normalize_missing_items(missing_info)
+                    if missing_items:
+                        self.console.print()
+                        self.console.print(
+                            f"💡 还需要补充: {_field_safe(', '.join(missing_items))}",
+                            style="yellow",
+                        )
+                        info_shown = True
                 
                 if info_shown:
                     current_agent_shown = True

@@ -5,6 +5,16 @@ import yaml
 
 from utils.skill_paths import resolve_skills_root
 
+# 技能 description / 正文来自可写目录（ALIGO_SKILLS_DIR 支持外部技能包），
+# 原样注入会让每轮意图 prompt 或技能调用 prompt 无限膨胀：description 每轮
+# 进意图 prompt（单条 500 / 合计 4000，与偏好注入预算同口径），正文进技能
+# prompt（单份 20000 字符上限，超出截断并注明）。
+MAX_SKILL_DESCRIPTION_CHARS = 500
+MAX_SKILL_PROMPT_CHARS = 4000
+MAX_SKILL_CONTENT_CHARS = 20000
+# 预算告警按技能目录去重：CLI / Web 都是长期进程，每轮重复刷屏没有价值
+_WARNED_BUDGET_DIRS: set[str] = set()
+
 
 def _frontmatter_bounds(content: str) -> tuple[int, int] | None:
     """定位 markdown frontmatter 的 YAML 区间；没有 frontmatter 时返回 None。
@@ -17,6 +27,11 @@ def _frontmatter_bounds(content: str) -> tuple[int, int] | None:
         return None
     first_newline = content.find("\n")
     if first_newline < 0:
+        return None
+    # 开头围栏必须精确为 `---`（允许行尾空白 / CR）：`----` / `---foo`
+    # 这类行是普通正文（如 4 连横线的分隔线），当成围栏会把后面直到某个
+    # 独立 --- 行的正文误解析成 frontmatter，登记伪技能并截断注入正文
+    if content[:first_newline].rstrip() != "---":
         return None
     yaml_start = first_newline + 1
     index = yaml_start
@@ -60,6 +75,11 @@ class SkillLoader:
         # 意图 prompt 若宣传纯文档技能，模型调度时会永远「未注册」
         self.dispatchable_only = dispatchable_only
         self.skills: dict[str, dict] = {}
+        # key → 技能目录名 / SKILL.md 路径：宣传（load_skills）与注入
+        # （get_skill_content）必须解析到同一份文件，否则重名技能会出现
+        # 「宣传 B、注入 A」
+        self._skill_dirs: dict[str, str] = {}
+        self._skill_md_paths: dict[str, str] = {}
         
     def load_skills(self) -> dict[str, dict]:
         """
@@ -77,35 +97,65 @@ class SkillLoader:
             print(f"Warning: cannot list skills directory {self.skills_dir}: {exc}", file=sys.stderr)
             return {}
 
-        for skill_name in entries:
+        # 全量重扫：先清空上次结果，保证重复调用幂等（否则每一步都会把
+        # 自己上次登记的名字当成目录间重名反复告警）
+        self.skills = {}
+        self._skill_dirs = {}
+        self._skill_md_paths = {}
+
+        # 排序遍历：重名技能保留谁必须确定（os.listdir 顺序随文件系统变化，
+        # 同一目录两次启动可能宣传不同技能）
+        for skill_name in sorted(entries):
             skill_path = os.path.join(self.skills_dir, skill_name)
-            if os.path.isdir(skill_path):
-                if self.dispatchable_only and not os.path.exists(
-                    os.path.join(skill_path, "script", "agent.py")
-                ):
+            if not os.path.isdir(skill_path):
+                continue
+            if self.dispatchable_only and not os.path.exists(
+                os.path.join(skill_path, "script", "agent.py")
+            ):
+                continue
+            md_file = os.path.join(skill_path, "SKILL.md")
+            if not os.path.exists(md_file):
+                print(f"Warning: missing SKILL.md in {skill_path}, skipped.", file=sys.stderr)
+                continue
+            skill_info = self._parse_skill_md(md_file)
+            if not skill_info:
+                print(
+                    f"Warning: SKILL.md of {skill_name} has no valid "
+                    "frontmatter, skipped.",
+                    file=sys.stderr,
+                )
+                continue
+            # name 必须是字符串：frontmatter 写错类型时退回目录名，
+            # 不能拿列表等不可哈希值当字典键
+            info_name = skill_info.get("name")
+            key = (
+                info_name
+                if isinstance(info_name, str) and info_name
+                else skill_name
+            )
+            existing_dir = self._skill_dirs.get(key)
+            if existing_dir is not None:
+                if key == skill_name and existing_dir != key:
+                    # 目录名与 frontmatter name 相同：与 get_skill_content
+                    # 的目录直配同向，让该目录自己的 SKILL.md 胜出
+                    print(
+                        f"Warning: duplicate skill name {key!r}: "
+                        f"preferring directory {skill_name!r} over "
+                        f"{existing_dir!r}.",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(
+                        f"Warning: duplicate skill name {key!r} in "
+                        f"{existing_dir!r} and {skill_name!r}, "
+                        f"keeping {existing_dir!r}.",
+                        file=sys.stderr,
+                    )
                     continue
-                md_file = os.path.join(skill_path, "SKILL.md")
-                if not os.path.exists(md_file):
-                    print(f"Warning: missing SKILL.md in {skill_path}, skipped.", file=sys.stderr)
-                if os.path.exists(md_file):
-                    skill_info = self._parse_skill_md(md_file)
-                    if not skill_info:
-                        print(
-                            f"Warning: SKILL.md of {skill_name} has no valid "
-                            "frontmatter, skipped.",
-                            file=sys.stderr,
-                        )
-                    if skill_info:
-                        # name 必须是字符串：frontmatter 写错类型时退回目录名，
-                        # 不能拿列表等不可哈希值当字典键
-                        info_name = skill_info.get("name")
-                        key = (
-                            info_name
-                            if isinstance(info_name, str) and info_name
-                            else skill_name
-                        )
-                        self.skills[key] = skill_info
-                        
+            self.skills[key] = skill_info
+            self._skill_dirs[key] = skill_name
+            self._skill_md_paths[key] = md_file
+
         return self.skills
 
     def _parse_skill_md(self, file_path: str) -> dict | None:
@@ -132,6 +182,12 @@ class SkillLoader:
                         file=sys.stderr,
                     )
                     return None
+                # name 是意图 prompt / 注册器别名共用的键：带首尾空白
+                # （引号标量、`name: |` 块标量）会让意图侧 strip 后登记、
+                # 注册表按原始名匹配，同一技能永远「未注册」——入口统一归一
+                name_value = data.get("name")
+                if isinstance(name_value, str):
+                    data["name"] = name_value.strip()
                 return data
             return None
         except Exception as e:
@@ -151,23 +207,42 @@ class SkillLoader:
             
         prompt_lines = []
         index = 1
-        
+        used = 0
+        clipped = False
+
         # 排序以保证确定性
         sorted_skills = sorted(self.skills.items())
-        
+
         for name, info in sorted_skills:
             display_name = name
             if skill_mapping and name in skill_mapping:
                 display_name = skill_mapping[name]
-            elif skill_mapping:
-                # 尝试反向查找：如果name是目录名，也试试看有没有在mapping里
-                pass
-                
+
             desc = str(info.get("description") or "")
             desc = desc.replace(chr(10), " ")
-            prompt_lines.append(f"{index}. {display_name} - {desc}")
+            # description 来自 SKILL.md 元数据，每轮意图 prompt 都会注入：
+            # 单条与总量都要设上限，否则外部技能包可把 prompt 撑爆
+            if len(desc) > MAX_SKILL_DESCRIPTION_CHARS:
+                desc = desc[:MAX_SKILL_DESCRIPTION_CHARS] + "…"
+                clipped = True
+            line = f"{index}. {display_name} - {desc}"
+            if used + len(line) + 2 > MAX_SKILL_PROMPT_CHARS:
+                # 只省略描述，保留序号与技能名：整条省略会让该技能从
+                # 意图清单里消失、永远不被调度
+                line = f"{index}. {display_name} - （描述已省略）"
+                clipped = True
+            used += len(line) + 2
+            prompt_lines.append(line)
             index += 1
-            
+
+        if clipped and self.skills_dir not in _WARNED_BUDGET_DIRS:
+            _WARNED_BUDGET_DIRS.add(self.skills_dir)
+            print(
+                "Warning: skill descriptions exceed prompt budget in "
+                f"{self.skills_dir}; truncated.",
+                file=sys.stderr,
+            )
+
         return "\n\n".join(prompt_lines)
 
     def get_skill_content(self, skill_name: str) -> str | None:
@@ -177,47 +252,35 @@ class SkillLoader:
         """
         if not self.skills:
             self.load_skills()
-            
+
         target_path = None
-        
+
         # 1. 优先尝试直接按目录名匹配 (最快)
         test_dir_path = os.path.join(self.skills_dir, skill_name, "SKILL.md")
         if os.path.exists(test_dir_path):
             target_path = test_dir_path
-        
-        # 2. 如果没找到，尝试按 metadata 中的 name 匹配 (遍历)
+
+        # 2. 否则按 metadata name 查找：使用 load_skills 记录的同一份
+        #    路径映射，不再按 os.listdir 顺序重新扫描（重名技能时宣传与
+        #    注入必须指向同一份正文）
         if not target_path:
-            if not os.path.isdir(self.skills_dir):
-                return None
-            try:
-                entries = os.listdir(self.skills_dir)
-            except OSError as exc:
-                print(
-                    f"Warning: cannot list skills directory {self.skills_dir}: {exc}",
-                    file=sys.stderr,
-                )
-                return None
-            for dirname in entries:
-                skill_dir = os.path.join(self.skills_dir, dirname)
-                if not os.path.isdir(skill_dir):
-                    continue
-                    
-                md_path = os.path.join(skill_dir, "SKILL.md")
-                if os.path.exists(md_path):
-                    # 简单读取 name
-                    info = self._parse_skill_md(md_path)
-                    if info and info.get("name") == skill_name:
-                        target_path = md_path
-                        break
+            target_path = self._skill_md_paths.get(str(skill_name))
 
         if not target_path:
             return None
-            
+
         try:
             # utf-8-sig：BOM 既不能让技能被跳过，也不能原样混进注入的正文
             with open(target_path, 'r', encoding='utf-8-sig') as f:
                 content = f.read()
-            return _strip_frontmatter(content)
+            content = _strip_frontmatter(content)
+            if len(content) > MAX_SKILL_CONTENT_CHARS:
+                # 只截断注入正文，load_skills / get_skill_prompt 行为不变
+                content = (
+                    content[:MAX_SKILL_CONTENT_CHARS]
+                    + "\n…（技能正文过长已截断）"
+                )
+            return content
         except Exception as e:
             print(f"Error reading skill content {target_path}: {e}", file=sys.stderr)
             return None

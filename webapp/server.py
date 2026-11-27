@@ -5226,8 +5226,7 @@ def create_app(model: Any = None) -> FastAPI:
                 "available": False,
                 "reason": (
                     "知识库向量维度与当前嵌入模型不一致，请重新运行初始化"
-                    "脚本重建：python .claude/skills/ask-question/script/"
-                    "init_knowledge_base.py"
+                    f"脚本重建：{knowledge_init_command()}"
                 ),
             }
         return status
@@ -5348,8 +5347,7 @@ def create_app(model: Any = None) -> FastAPI:
                     status_code=503,
                     detail=(
                         "知识库向量维度与当前嵌入模型不一致，请重新运行"
-                        "初始化脚本重建：python .claude/skills/ask-question/"
-                        "script/init_knowledge_base.py"
+                        f"初始化脚本重建：{knowledge_init_command()}"
                     ),
                 )
 

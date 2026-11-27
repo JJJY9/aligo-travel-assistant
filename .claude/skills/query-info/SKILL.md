@@ -28,21 +28,16 @@ description: Use this skill when the user wants to query real-time information l
 ```python
 import asyncio
 from agentscope.message import Msg
-from agentscope.model import OpenAIChatModel
-from config_agentscope import init_agentscope
-from config import LLM_CONFIG
+from config_agentscope import create_chat_model, init_agentscope
 from agents.information_query_agent import InformationQueryAgent
 import json
 
 async def query_info(user_query: str):
     init_agentscope()
-    model = OpenAIChatModel(
-        model_name=LLM_CONFIG["model_name"],
-        api_key=LLM_CONFIG["api_key"],
-        client_kwargs={"base_url": LLM_CONFIG["base_url"], "timeout": 60},
-        temperature=LLM_CONFIG.get("temperature", 0.7),
-        max_tokens=LLM_CONFIG.get("max_tokens", 2000),
-    )
+    # 与 Web / CLI 同一工厂：非流式（stream=False）+ generate_kwargs；
+    # 直接构造 OpenAIChatModel 时顶层 temperature/max_tokens 会被
+    # agentscope 1.0.16 静默忽略，默认 stream=True 在当前依赖组合下会崩
+    model = create_chat_model()
     agent = InformationQueryAgent(name="InformationQueryAgent", model=model)
     user_msg = Msg(name="user", content=user_query, role="user")
     result = await agent.reply(user_msg)

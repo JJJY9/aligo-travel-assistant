@@ -114,30 +114,30 @@ result = asyncio.run(plan_trip("规划一下2月27日从上海到北京的路程
 4. 在missing_info中列出建议用户补充的信息（但不影响规划）
 
 【输出格式】(严格JSON)
-{{
-    "itinerary": {{
+{
+    "itinerary": {
         "title": "北京3日游",
         "duration": "3天",
         "route": "北京 -> 北京",
         "daily_plans": [
-            {{
+            {
                 "day": 1,
                 "date": "2024-02-27",
                 "city": "北京",
                 "theme": "历史文化之旅",
                 "activities": [
-                    {{
+                    {
                         "time": "09:00-12:00",
                         "location": "故宫博物院",
                         "description": "游览故宫，感受皇家建筑群的宏伟...",
                         "transport": "地铁1号线天安门东站"
-                    }}
+                    }
                 ],
-                "meals": {{ "lunch": "...", "dinner": "..." }}
-            }}
+                "meals": { "lunch": "...", "dinner": "..." }
+            }
         ],
         "notes": ["建议提前7天预约故宫门票..."],
         "estimated_budget": "约2000元"
-    }},
+    },
     "planning_complete": true
-}}
+}

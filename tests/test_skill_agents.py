@@ -5012,6 +5012,47 @@ def test_query_info_does_not_log_user_query_content():
     print("✓ 查询信息日志不含用户提问原文")
 
 
+def test_rag_agent_degrades_when_native_dependency_raises_oserror(monkeypatch):
+    """torch 的 DLL 加载失败是 OSError(WinError 126)：必须走初始化降级，
+    而不是让整个技能模块加载失败、错误提示不可达。"""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def fake_import(name, *args, **kwargs):
+        if name in ("pymilvus", "sentence_transformers"):
+            raise OSError(
+                22,
+                'Error loading "torch\\lib\\c10.dll" or one of its dependencies.',
+                None,
+                126,
+            )
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    path = os.path.join(
+        project_root, ".claude", "skills", "ask-question", "script", "agent.py"
+    )
+    module_name = "_test_rag_oserror_agent"
+    spec = importlib.util.spec_from_file_location(module_name, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+    assert module.DEPENDENCIES_AVAILABLE is False, "OSError 应触发依赖降级"
+    agent = module.RAGKnowledgeAgent(name="x", model=None)
+    assert getattr(agent, "initialized", True) is False
+    out = asyncio.run(
+        agent.reply(Msg(name="u", content="差旅标准", role="user"))
+    )
+    payload = json.dumps(json.loads(out.content), ensure_ascii=False)
+    assert "WinError" not in payload, payload
+    assert "pip install" in payload, payload
+    print("✓ RAG 原生依赖 OSError 时降级为可操作提示")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理

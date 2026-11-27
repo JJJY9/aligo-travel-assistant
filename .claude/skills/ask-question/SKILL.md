@@ -15,7 +15,7 @@ description: Use this skill when the user asks questions about travel policies, 
 ## Agent
 
 - **RAGKnowledgeAgent** (`agents/rag_knowledge_agent.py`)
-- 所有子 Agent 均使用 **model 对象**（非 model_config_name），需先创建 `OpenAIChatModel`
+- 所有子 Agent 均使用 **model 对象**（非 model_config_name），需先创建模型（推荐 `create_chat_model()`，见下方示例）
 - **异步**：`reply()` 为 `async`，需 `await`
 
 ## 初始化与调用

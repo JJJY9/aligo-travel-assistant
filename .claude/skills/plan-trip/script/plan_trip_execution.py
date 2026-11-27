@@ -14,6 +14,12 @@ project_root = Path(__file__).resolve().parents[4]
 if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
+# Windows 中文 locale 下重定向 / 管道时 stdout 是 GBK：脚本里的 ✓ / ❌
+# 会抛 UnicodeEncodeError 让直跑整体失败，统一切 UTF-8
+from utils.console import configure_stdio
+
+configure_stdio(probe_stdin=False)
+
 from agentscope.message import Msg
 
 import config

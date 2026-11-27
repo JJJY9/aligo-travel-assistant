@@ -505,6 +505,125 @@ def test_retry_cache_reuses_completed_agents():
     print("✓ 整轮重试复用已完成智能体，仅重跑失败者")
 
 
+def test_retry_cache_reruns_downstream_when_upstream_result_changes():
+    """上游由失败重跑为成功时，下游不能复用基于失败上游的旧结果。"""
+    calls = {"event": 0, "plan": 0, "budget": 0}
+    plan_inputs: list[dict] = []
+
+    class Event(_StubAgent):
+        async def reply(self, x):
+            calls["event"] += 1
+            if calls["event"] == 1:
+                return Msg(
+                    name="event-collection",
+                    content=json.dumps(
+                        {"status": "error", "error": "模型返回格式有误"},
+                        ensure_ascii=False,
+                    ),
+                    role="assistant",
+                )
+            return Msg(
+                name="event-collection",
+                content=json.dumps(
+                    {"destination": "杭州", "start_date": "2026-12-01"},
+                    ensure_ascii=False,
+                ),
+                role="assistant",
+            )
+
+    class Plan(_StubAgent):
+        async def reply(self, x):
+            calls["plan"] += 1
+            plan_inputs.append(json.loads(x.content))
+            return Msg(
+                name="plan-trip",
+                content=json.dumps(
+                    {"itinerary": {"title": "杭州行"}}, ensure_ascii=False
+                ),
+                role="assistant",
+            )
+
+    class Budget(_StubAgent):
+        async def reply(self, x):
+            calls["budget"] += 1
+            if calls["budget"] <= 2:
+                # 首轮 + 内部重试各一次后上抛，触发外层整轮回退
+                raise ConnectionError("transient blip")
+            return Msg(
+                name="trip-budget",
+                content=json.dumps(
+                    {"budget_advice": "约 2500 元"}, ensure_ascii=False
+                ),
+                role="assistant",
+            )
+
+    class _Registry:
+        def __init__(self):
+            self.agents = {
+                "event-collection": Event("event-collection"),
+                "plan-trip": Plan("plan-trip"),
+                "trip-budget": Budget("trip-budget"),
+            }
+
+        def __contains__(self, name):
+            return name in self.agents
+
+        def __getitem__(self, name):
+            return self.agents[name]
+
+    orchestrator = OrchestrationAgent(agent_registry=_Registry())
+    schedule = [
+        {"agent_name": "event-collection", "priority": 1},
+        {"agent_name": "plan-trip", "priority": 2},
+        {"agent_name": "trip-budget", "priority": 3},
+    ]
+    cache: dict = {}
+    try:
+        asyncio.run(orchestrator.reply(_intent(schedule), retry_cache=cache))
+    except ConnectionError:
+        pass
+    else:
+        raise AssertionError("瞬时错误必须上抛给外层重试")
+    assert calls == {"event": 1, "plan": 1, "budget": 2}, calls
+
+    asyncio.run(orchestrator.reply(_intent(schedule), retry_cache=cache))
+    assert calls["event"] == 2, calls
+    assert calls["plan"] == 2, "上游由失败变成功后计划必须重跑，不能命中旧缓存"
+    event_entry = next(
+        item
+        for item in plan_inputs[1]["previous_results"]
+        if item["agent_name"] == "event_collection"
+    )
+    status = (event_entry.get("result") or {}).get("status", event_entry.get("status"))
+    assert status == "success", event_entry
+    print("✓ 重试缓存绑定上游输入：上游结果变化后下游重跑")
+
+
+def test_missing_info_non_string_items_dropped():
+    """missing_info 里的 null / 数字条目不能被聚合 / 展示成 None / 123。"""
+    orchestrator = OrchestrationAgent(agent_registry={})
+    aggregated = orchestrator._aggregate_results(
+        [
+            {
+                "agent_name": "event_collection",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "destination": "杭州",
+                        "missing_info": ["start_date", None, 123],
+                    },
+                },
+            }
+        ],
+        {},
+    )
+    assert aggregated["missing_info"] == ["start_date"], aggregated
+    assert "None" not in aggregated["clarification"], aggregated
+    assert "123" not in aggregated["clarification"], aggregated
+    print("✓ 聚合 missing_info 丢弃非字符串条目")
+
+
 def test_previous_results_passed_to_next_priority():
     """前一优先级的结果通过 previous_results 传给后续智能体"""
     captured: dict = {}

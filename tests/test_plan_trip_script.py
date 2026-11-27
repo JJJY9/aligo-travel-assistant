@@ -152,6 +152,39 @@ def test_plan_trip_uses_shared_model_factory():
     print("✓ 行程脚本使用共享模型工厂")
 
 
+def test_script_configures_utf8_stdio_for_redirection():
+    """直跑脚本在 GBK stdout（Windows 重定向 / 管道）下打印 ✓ 不能崩。"""
+    import subprocess
+
+    script = (
+        Path(project_root) / ".claude" / "skills" / "plan-trip"
+        / "script" / "plan_trip_execution.py"
+    )
+    driver = (
+        "import importlib.util\n"
+        "import sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "spec = importlib.util.spec_from_file_location('_pt_exec', sys.argv[2])\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        "print('✓ charset ok')\n"
+    )
+    env = {
+        **os.environ,
+        "PYTHONIOENCODING": "gbk",
+        "PYTHONUTF8": "0",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", driver, project_root, str(script)],
+        capture_output=True,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", "replace")
+    assert "charset ok" in result.stdout.decode("utf-8", "replace"), result.stdout
+    print("✓ 直跑脚本切换 UTF-8 输出（GBK 重定向不崩）")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -165,4 +198,5 @@ if __name__ == "__main__":
 
     test_compact_recent_dialogue_trims_assistant_json()
     test_plan_trip_uses_shared_model_factory()
+    test_script_configures_utf8_stdio_for_redirection()
     print("\n全部通过")

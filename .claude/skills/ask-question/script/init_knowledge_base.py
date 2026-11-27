@@ -26,8 +26,10 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 from config_agentscope import create_chat_model
+from utils.atomic_write import write_text_atomic
 from utils.console import configure_stdio
 from utils.knowledge_paths import knowledge_path_encoding_hint
+from utils.paths import clean_env_path
 from utils.text_chunker import split_text
 
 
@@ -107,8 +109,9 @@ def load_documents_from_directory(directory_path: str) -> tuple[list[dict], list
 
             base_doc_id = f"doc_{doc_num}"
 
-            # 读取文件内容
-            with open(file_path, "r", encoding="utf-8") as f:
+            # 读取文件内容（utf-8-sig：Windows 记事本 / 导出工具默认带 BOM，
+            # 原样入库会让正文与标题带上不可见字符，与 kb-add / loader 口径一致）
+            with open(file_path, "r", encoding="utf-8-sig") as f:
                 content = f.read().strip()
 
             if not content:
@@ -349,7 +352,11 @@ def _merge_preserved_backup(
 def _write_preserved_backup(
     knowledge_base_path: Path, preserved: list[dict]
 ) -> Path | None:
-    """删库前把保留片段落盘：写入阶段被中断 / 失败也能在重跑时找回。"""
+    """删库前把保留片段落盘：写入阶段被中断 / 失败也能在重跑时找回。
+
+    原子写：失败（磁盘满 / os.replace 被占用）时自行清理临时文件，不会
+    留下含用户知识的固定名 .tmp；调用方按 OSError 中止并保持知识库原样。
+    """
     if not preserved:
         return None
     path = _preserved_backup_path(knowledge_base_path)
@@ -357,11 +364,13 @@ def _write_preserved_backup(
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "documents": preserved,
     }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
-    return path
+    # 旧实现遗留的固定名 tmp（<名>.preserved_backup.json.tmp）顺手清掉
+    legacy_tmp = path.with_suffix(path.suffix + ".tmp")
+    with contextlib.suppress(OSError):
+        legacy_tmp.unlink(missing_ok=True)
+    return write_text_atomic(
+        path, json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
 
 
 def _batch_by_group(rows: list[dict], size: int) -> list[list[dict]]:
@@ -599,7 +608,9 @@ def main(documents_dir: str | None = None) -> int:
     try:
         # 定义路径
         skill_root = current_dir.parent
-        override = (documents_dir or os.environ.get("ALIGO_KB_DOCS_DIR", "") or "").strip()
+        # 环境变量按 clean_env_path 清洗（BOM / 成对引号 / 空白）：K8s
+        # ConfigMap 与 docker --env-file 注入的引号会让合法目录被判不存在
+        override = documents_dir or clean_env_path("ALIGO_KB_DOCS_DIR")
         documents_dir = (
             Path(override).expanduser() if override else skill_root / "data" / "documents"
         )
@@ -700,7 +711,19 @@ def main(documents_dir: str | None = None) -> int:
             )
             for note in backup_notes:
                 print(f"   ⚠️  {note}")
-            backup_path = _write_preserved_backup(knowledge_base_path, preserved)
+            try:
+                backup_path = _write_preserved_backup(
+                    knowledge_base_path, preserved
+                )
+            except OSError as backup_error:
+                # 旧集合尚未删除：中止即可，知识库保持原样
+                print(
+                    f"❌ 保留片段备份写入失败：{backup_error}，"
+                    "已中止（知识库保持原样）"
+                )
+                if created_knowledge_dir:
+                    _discard_created_library(knowledge_base_path)
+                return 1
             print(
                 f"   已导出 {len(preserved)} 个片段，删除旧集合并按当前嵌入模型重建..."
             )
@@ -781,9 +804,19 @@ def main(documents_dir: str | None = None) -> int:
                     )
                     for note in backup_notes:
                         print(f"   ⚠️  {note}")
-                    backup_path = _write_preserved_backup(
-                        knowledge_base_path, preserved
-                    )
+                    try:
+                        backup_path = _write_preserved_backup(
+                            knowledge_base_path, preserved
+                        )
+                    except OSError as backup_error:
+                        # 旧集合尚未删除：中止即可，知识库保持原样
+                        print(
+                            f"❌ 保留片段备份写入失败：{backup_error}，"
+                            "已中止（知识库保持原样）"
+                        )
+                        if created_knowledge_dir:
+                            _discard_created_library(knowledge_base_path)
+                        return 1
                     if preserved:
                         print(
                             f"   已导出 {len(preserved)} 个库内已有片段（重建后补写）"
