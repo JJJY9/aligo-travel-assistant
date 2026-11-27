@@ -3,6 +3,7 @@ LLM 连接与可用性：重试退避、可重试错误判断、健康检查
 """
 import asyncio
 import errno
+import json
 import logging
 import re
 import time
@@ -58,6 +59,107 @@ def _status_code(exc: BaseException) -> int | None:
     if isinstance(value, int):
         return value
     return None
+
+
+class ProviderResponseError(RuntimeError):
+    """上游把错误对象当作 HTTP 200 的 completion 内容返回。
+
+    网关 / 反向代理（或模型回显）把 ``{"error": {...}}`` 整段塞进
+    choices 内容时，技能会把错误文本当正常答案展示 / 落库（可能回显
+    密钥 / 内部地址），并绕过重试与熔断分类。``status_code`` 从错误体
+    的 code / status 推断，供 :func:`is_retriable_error` /
+    :func:`is_permanent_llm_error` 使用；推断不出时按普通确定性失败。
+    """
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+# 正常回答信封会带这些键之一：含 ``error`` 但同时带它们时按答案处理，
+# 避免误伤「回答内容本身就是一段 JSON 示例」的输出
+_ANSWER_ENVELOPE_KEYS = frozenset(
+    {
+        "answer",
+        "content",
+        "text",
+        "advice",
+        "reply",
+        "result",
+        "results",
+        "status",
+        "skill",
+    }
+)
+
+
+def _coerce_http_status(value: object) -> int | None:
+    """把错误体里的 code / status 转成 HTTP 状态码；非 3 位数字返回 None。"""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if 100 <= value < 600 else None
+    if isinstance(value, str):
+        text = value.strip()
+        if text.isdigit() and 100 <= int(text) < 600:
+            return int(text)
+    return None
+
+
+def provider_error_from_completion_text(
+    text: object, result_key: str | None = None
+) -> ProviderResponseError | None:
+    """识别 ``{"error": {...}}`` 形态的 completion 文本。
+
+    仅当解析结果是 dict、``error`` 为真、且不含任何回答信封键时判定为
+    错误体（``result_key`` 存在同样按正常答案处理）；否则返回 None。
+    返回的异常消息仅保留上游 message（截断），是否重试 / 计熔断由
+    调用方按既有分类处理。
+    """
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+    if not raw.startswith("{"):
+        return None
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("error"):
+        return None
+    if result_key and result_key in data:
+        return None
+    if any(key in data for key in _ANSWER_ENVELOPE_KEYS):
+        return None
+
+    error = data.get("error")
+    status: int | None = None
+    code_text = ""
+    if isinstance(error, dict):
+        for key in ("code", "status", "status_code"):
+            status = _coerce_http_status(error.get(key))
+            if status is not None:
+                break
+        detail = error.get("message") or error.get("msg") or str(error)
+        code_value = error.get("code") or error.get("type") or ""
+        code_text = "" if isinstance(code_value, (dict, list)) else str(code_value)
+    else:
+        detail = str(error)
+    message = str(detail).strip() or "上游返回未知错误"
+    if code_text and code_text not in message:
+        message = f"{message}（{code_text}）"
+    if status is None:
+        match = re.search(
+            r"\b(?:status|code|http)[\s:=]*([1-5]\d{2})\b", message.lower()
+        )
+        if match:
+            status = int(match.group(1))
+    return ProviderResponseError(f"模型服务返回错误：{message[:200]}", status)
 
 
 def _retry_after_seconds(exc: BaseException) -> float | None:
@@ -131,6 +233,11 @@ _QUOTA_EXHAUSTED_MARKERS = (
     "insufficient_quota",
     "insufficient quota",
     "billing_hard_limit_reached",
+    # OpenAI 规范配额错误 message（网关归一成只有 message 的 429 时，
+    # 上面三个 marker 都命中不了，会被当成可重试限流）
+    "exceeded your current quota",
+    "exceeded your quota",
+    "check your plan and billing details",
 )
 
 
@@ -185,6 +292,9 @@ _PERMANENT_LLM_MARKERS = (
     "insufficient_quota",
     "insufficient quota",
     "billing_hard_limit_reached",
+    "exceeded your current quota",
+    "exceeded your quota",
+    "check your plan and billing details",
     "model_not_found",
 )
 

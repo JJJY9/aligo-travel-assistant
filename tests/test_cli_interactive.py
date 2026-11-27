@@ -1056,6 +1056,57 @@ def test_user_sigint_during_query_returns_to_prompt(monkeypatch):
     print("✓ 查询中 Ctrl-C 回到提示符")
 
 
+def test_process_query_marks_pipeline_failed_on_quarantine():
+    """回合开始时检测到记忆隔离：管道模式退出码必须是 1（本轮没有回答）。"""
+    agent, events = _make_cli_stub()
+
+    class _LongTerm:
+        def get_fresh_quarantine_backup(self):
+            return "C:/data/u1.json.corrupt-1"
+
+    agent.memory_manager.long_term = _LongTerm()
+    agent._user_id_from_stdin = True
+    agent._command_failed = False
+    asyncio.run(agent.process_query("明天杭州天气"))
+    assert events["reload"] == 1
+    assert events["persisted"] == [], "隔离回合不能落库任何内容"
+    assert agent._command_failed is True
+    assert agent._pipeline_exit_code() == 1
+
+    # 交互终端（user_id 不是来自 stdin）退出码恒为 0
+    agent._user_id_from_stdin = False
+    agent._command_failed = False
+    asyncio.run(agent.process_query("明天杭州天气"))
+    assert agent._pipeline_exit_code() == 0
+    print("✓ 回合中记忆隔离 → 管道模式退出码 1")
+
+
+def test_pipeline_sigint_during_query_exits_nonzero(monkeypatch):
+    """管道模式查询中被 Ctrl-C 中断：没有任何回答，EOF 收尾不能报成功。"""
+    import signal as signal_module
+
+    calls = {"ask": 0}
+
+    async def fake_process(user_input):
+        loop = asyncio.get_running_loop()
+        loop.call_soon(signal_module.raise_signal, signal_module.SIGINT)
+        await asyncio.sleep(10)
+
+    def fake_ask(prompt, **kwargs):
+        calls["ask"] += 1
+        if calls["ask"] == 1:
+            return "问题"
+        raise EOFError
+
+    agent, buffer = _sigint_cli(monkeypatch, fake_ask, fake_process)
+    agent._user_id_from_stdin = True
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(agent.run())
+    assert exc.value.code == 1
+    assert "使用 'exit' 退出" in buffer.getvalue()
+    print("✓ 管道模式查询中 Ctrl-C → 退出码 1")
+
+
 def test_external_cancel_propagates_out_of_repl(monkeypatch):
     """非 SIGINT 发起的取消（asyncio.run 关闭阶段）不能被 REPL 吞掉。"""
 
@@ -1665,6 +1716,12 @@ if __name__ == "__main__":
     _mp = pytest.MonkeyPatch()
     try:
         test_prompt_sigint_does_not_cancel_next_command(_mp)
+    finally:
+        _mp.undo()
+    test_process_query_marks_pipeline_failed_on_quarantine()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_pipeline_sigint_during_query_exits_nonzero(_mp)
     finally:
         _mp.undo()
     _mp = pytest.MonkeyPatch()

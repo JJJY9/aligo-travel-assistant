@@ -283,6 +283,54 @@ def test_memory_query_tolerates_long_term_read_failure():
     print("✓ 长记忆读取失败按空记忆回答")
 
 
+def test_memory_query_reports_error_when_storage_unavailable():
+    """存储不可用 ≠ 没有记录：不能以空记忆作答成确定的「没去过 / 没有」。"""
+    from utils.errors import MemoryPersistenceError
+
+    agent_class = _load_skill("memory-query", "MemoryQueryAgent")
+
+    class _LongTerm:
+        def get_trip_history(self, limit=None):
+            raise MemoryPersistenceError("PostgreSQL 操作失败：connection lost")
+
+        def get_preference(self):
+            raise AssertionError("首个读取失败后不应继续读取偏好")
+
+    class _Memory:
+        long_term = _LongTerm()
+
+        async def get_long_term_summary_async(self, max_messages=30):
+            return ""
+
+    class _SkillLoader:
+        def get_skill_content(self, name):
+            return ""
+
+    class _Model:
+        def __init__(self):
+            self.called = False
+
+        async def __call__(self, messages, **kwargs):
+            self.called = True
+            return "没有找到你的旅行记录"
+
+    model = _Model()
+    agent = agent_class(
+        name="MemoryQueryAgent", model=model, memory_manager=_Memory()
+    )
+    agent.skill_loader = _SkillLoader()
+    result = asyncio.run(
+        agent.reply(
+            Msg(name="orchestrator", content="我去过北京吗", role="user")
+        )
+    )
+    payload = json.loads(result.content)
+    assert payload["status"] == "error"
+    assert "不可用" in payload["message"]
+    assert model.called is False, "存储不可用时不能基于空记忆调用模型作答"
+    print("✓ memory-query 存储不可用返回 error（而不是假否定）")
+
+
 def test_memory_query_filters_blank_list_items():
     """偏好列表里的 null / 空白项不能拼进 prompt（"None" 不是偏好值）。"""
     agent_class = _load_skill("memory-query", "MemoryQueryAgent")

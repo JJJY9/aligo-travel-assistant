@@ -1257,8 +1257,9 @@ class ConversationRuntime:
             raise
         except RetryBudgetExhausted as exc:
             # 整轮重试预算耗尽不是 LLM 故障（模型调用可能全部成功、只是
-            # 接近读超时）：不计入共享熔断，并把固定文案原样交给用户
-            raise UserFacingError(str(exc)) from exc
+            # 接近读超时）：不计入共享熔断，并把固定文案原样交给用户。
+            # 这是瞬时状态（稍后重试即可），HTTP 语义为 503 + Retry-After
+            raise UserFacingError(str(exc), status_code=503) from exc
         except Exception:
             if self.circuit_breaker:
                 self.circuit_breaker.record_failure()

@@ -35,7 +35,11 @@ from agentscope.message import Msg
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 from utils.json_parser import extract_json_from_async_response
-from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
+from utils.llm_resilience import (
+    is_permanent_llm_error,
+    is_retriable_error,
+    provider_error_from_completion_text,
+)
 from utils.simple_skill import unwrap_answer_envelope
 from utils.milvus_client import (  # noqa: F401 - shutdown_milvus_clients 供外部清理
     get_milvus_client,
@@ -1492,6 +1496,10 @@ class RAGKnowledgeAgent(AgentBase):
                 answer = unwrap_answer_envelope(answer_text)
                 if not answer.strip():
                     raise ConnectionError("模型服务返回空响应")
+                # 200 + 错误体（网关把上游错误塞进内容）：不能当知识回答
+                provider_error = provider_error_from_completion_text(answer)
+                if provider_error is not None:
+                    raise provider_error
 
             except Exception as e:
                 if is_retriable_error(e) or is_permanent_llm_error(e):

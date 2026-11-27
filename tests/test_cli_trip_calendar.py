@@ -204,6 +204,9 @@ def test_main_dispatch_rejects_html_and_bad_args(monkeypatch):
         ["cli.py", "trip-calendar", "u1", "trip_1", "--stdout", "x.ics"],
         ["cli.py", "trip-calendar", "u1"],
         ["cli.py", "trip-calendar", "-u1", "trip_1"],
+        # dispatch 层非法用户 / 行程 ID：用法错误（2），不能落到 run_* 报 1
+        ["cli.py", "trip-calendar", "bad/id", "trip_1"],
+        ["cli.py", "trip-calendar", "u1", "bad/id"],
     ):
         monkeypatch.setattr(sys, "argv", argv)
         buf = io.StringIO()

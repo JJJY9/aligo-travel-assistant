@@ -865,7 +865,49 @@ def test_quota_exhausted_429_is_permanent():
     )
     assert is_retriable_error(exc) is False
     assert is_permanent_llm_error(exc) is True
-    print("✓ 配额耗尽 429 判为永久故障")
+
+    # 网关把配额错误归一成只有 message 的 429（无 code 字段）
+    class _MessageOnlyQuota(Exception):
+        status_code = 429
+
+    message_only = _MessageOnlyQuota(
+        "Error code: 429 - {'error': {'message': 'You exceeded your current "
+        "quota, please check your plan and billing details.'}}"
+    )
+    assert is_retriable_error(message_only) is False
+    assert is_permanent_llm_error(message_only) is True
+    print("✓ 配额耗尽 429 判为永久故障（含 message-only 形态）")
+
+
+def test_provider_error_body_detection():
+    """200 + 错误体识别：回答信封不误伤，status 从 code / 文本推断。"""
+    from utils.llm_resilience import (
+        ProviderResponseError,
+        provider_error_from_completion_text,
+    )
+
+    assert provider_error_from_completion_text("正常回答") is None
+    assert provider_error_from_completion_text('{"status": "success", "answer": "x"}') is None
+    assert (
+        provider_error_from_completion_text(
+            '{"error": {"message": "boom"}, "answer": "正常"}'
+        )
+        is None
+    )
+    plain = provider_error_from_completion_text(
+        '{"error": {"message": "upstream overloaded"}}'
+    )
+    assert isinstance(plain, ProviderResponseError)
+    assert plain.status_code is None
+    coded = provider_error_from_completion_text(
+        '{"error": {"code": 503, "message": "gateway timeout"}}'
+    )
+    assert coded is not None and coded.status_code == 503
+    fenced = provider_error_from_completion_text(
+        '```json\n{"error": {"code": "401", "message": "invalid api key"}}\n```'
+    )
+    assert fenced is not None and fenced.status_code == 401
+    print("✓ 200 + 错误体识别（信封不误伤、状态码推断）")
 
 
 def test_retry_budget_deadline_stops_attempts(monkeypatch):
@@ -1008,6 +1050,8 @@ def test_retry_budget_exhaustion_not_counted_against_circuit():
                 exhausted, max_retries=0, base_delay=0.0, max_delay=0.0
             )
         assert "超出预算" in str(info.value)
+        # 瞬时状态：Web 映射 503 + Retry-After，不能按客户端错误 4xx 返回
+        assert info.value.status_code == 503
 
     asyncio.run(scenario())
     assert breaker.get_status()["failure_count"] == 0
@@ -1154,6 +1198,7 @@ if __name__ == "__main__":
     test_json_formatter_sanitizes_any_message()
     test_local_io_errors_not_retriable()
     test_quota_exhausted_429_is_permanent()
+    test_provider_error_body_detection()
     _mp = pytest.MonkeyPatch()
     try:
         test_retry_budget_deadline_stops_attempts(_mp)

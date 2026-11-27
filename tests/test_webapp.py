@@ -4506,7 +4506,7 @@ def test_session_export_sanitizes_custom_title():
 
 
 def test_import_rejects_when_existing_totals_would_exceed_limits(monkeypatch):
-    """存量 + 备份越过导出上限：返回可修正的 400，而不是通用 503。"""
+    """存量 + 备份越过导出上限：返回可修正的 409，而不是通用 503/400。"""
     from webapp import server as server_module
 
     class _FullStore:
@@ -4539,7 +4539,7 @@ def test_import_rejects_when_existing_totals_would_exceed_limits(monkeypatch):
             }
         },
     )
-    assert response.status_code == 400, response.text[:300]
+    assert response.status_code == 409, response.text[:300]
     assert "上限" in response.json()["detail"]
 
 def test_import_accepts_utf8_bom_backup():
@@ -6897,6 +6897,42 @@ def test_trips_import_partial_error_reports_counts(monkeypatch):
     print("✓ /api/trips/import 部分提交如实报告条数")
 
 
+def test_trips_import_capacity_maps_conflict(monkeypatch):
+    """/api/trips/import 的容量越限与实时新增同口径：409 而不是 400。"""
+    from utils.errors import AccountCapacityError
+    from webapp import server as server_module
+
+    class _FullStore:
+        def get_trip_history(self, limit=None):
+            return []
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "_open_long_term",
+        lambda user_id, strict=False, **kwargs: _FullStore(),
+    )
+
+    def over_cap(store, content, dry_run=False, user_tz=None):
+        raise AccountCapacityError(
+            "导入后行程总数将超过上限 5000（现有 5000 + 新增 1），"
+            "请先清理历史行程后重试"
+        )
+
+    monkeypatch.setattr(server_module, "import_trips_from_text", over_cap)
+    client = _client()
+    response = client.post(
+        "/api/trips/import",
+        params={"user_id": _unique_user("web_test_trips_cap")},
+        json={"content": "出发地,目的地,出发日期\n上海,成都,2026-05-01\n"},
+    )
+    assert response.status_code == 409, response.text[:300]
+    assert "上限" in response.json()["detail"]
+    print("✓ /api/trips/import 容量越限映射 409")
+
+
 def test_web_session_pending_and_no_backup_messages(monkeypatch, tmp_path):
     """聊天会话构造守卫的 pending / 无备份文案（此前 0 覆盖）：不得
     引导用户恢复不存在的备份。"""
@@ -7397,6 +7433,60 @@ def test_import_rolls_back_sessions_deleted_during_write(monkeypatch):
     finally:
         _cleanup(user_id)
     print("✓ /api/import 回滚恢复写入期间被删除的会话")
+
+
+def test_import_rollback_failure_reports_not_ok(monkeypatch):
+    """迟到回滚失败：被删会话的消息已复活，ok 必须为 false（不能只记日志）。"""
+    from context.long_term_memory import LongTermMemory
+    from utils.errors import MemoryPersistenceError
+    from utils import user_import as user_import_module
+
+    client = _client()
+    user_id = _unique_user("web_test_import_rbfail")
+    state = client.app.state.aligo
+    flags = {"late": False}
+    monkeypatch.setattr(
+        state,
+        "is_recently_deleted",
+        lambda uid, sid: uid == user_id and sid == "s-late" and flags["late"],
+    )
+    original_import = user_import_module.import_user_data
+
+    def import_then_delete(store, sections, **kwargs):
+        counts = original_import(store, sections, **kwargs)
+        flags["late"] = True
+        return counts
+
+    monkeypatch.setattr(user_import_module, "import_user_data", import_then_delete)
+    original_delete = LongTermMemory.delete_chat_session
+
+    def failing_delete(self, session_id):
+        if str(session_id) == "s-late":
+            raise MemoryPersistenceError("PostgreSQL 操作失败：connection lost")
+        return original_delete(self, session_id)
+
+    monkeypatch.setattr(LongTermMemory, "delete_chat_session", failing_delete)
+    backup = {
+        "chat_history": [
+            {"role": "user", "content": "回滚会失败", "session_id": "s-late"}
+        ]
+    }
+    try:
+        response = client.post(
+            "/api/import", params={"user_id": user_id}, json={"backup": backup}
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["ok"] is False, payload
+        assert payload["rollback_failed"] is True, payload
+        assert any("回滚失败" in item for item in payload["skipped"]), payload[
+            "skipped"
+        ]
+        # 消息确实仍在库中：计数如实保留，语义由 ok/rollback_failed 表达
+        assert payload["messages_added"] >= 1, payload
+    finally:
+        _cleanup(user_id)
+    print("✓ /api/import 回滚失败 → ok=false + rollback_failed")
 
 
 def test_import_rollback_counts_only_applied_entries(monkeypatch):
@@ -9844,7 +9934,7 @@ def test_trips_dedupe_endpoint_dry_run_and_apply(monkeypatch):
 
 
 def test_trips_dedupe_failure_detail_redacts_paths(monkeypatch):
-    """去重部分失败：503 详情只留可重试提示，不回显锁文件绝对路径。"""
+    """去重部分失败：503 详情只留固定文案，不回显路径 / SQL / 表名。"""
     from webapp import server as server_module
 
     class _Store:
@@ -9858,8 +9948,8 @@ def test_trips_dedupe_failure_detail_redacts_paths(monkeypatch):
         server_module, "_open_long_term", lambda user_id, **kwargs: _Store()
     )
     leaked = (
-        r"长期记忆写锁等待超时：无法获取文件锁："
-        r"C:\Users\alice\AppData\Local\aligo\data\memory\u1.json.lock"
+        r"PostgreSQL 操作失败：relation \"aligo_trips\" does not exist"
+        "\nLINE 1: DELETE FROM aligo_trips WHERE user_id = %s AND id = %s"
     )
     monkeypatch.setattr(
         server_module,
@@ -9873,9 +9963,10 @@ def test_trips_dedupe_failure_detail_redacts_paths(monkeypatch):
     )
     assert response.status_code == 503, response.text[:300]
     detail = response.json()["detail"]
-    assert "alice" not in detail and "<路径>" in detail, detail
     assert "已删除 0 条" in detail, detail
-    print("✓ 去重失败详情遮蔽内部路径")
+    for secret in ("aligo_trips", "PostgreSQL", "DELETE", "LINE 1"):
+        assert secret not in detail, detail
+    print("✓ 去重失败详情不回显内部 SQL / 表名")
 
 
 def test_trips_dedupe_endpoint_errors_and_ambiguous(monkeypatch):
@@ -14796,6 +14887,51 @@ def test_kb_import_error_mapping(monkeypatch):
     print("✓ 知识导入 / 预览错误映射（503 / 400）")
 
 
+def test_kb_import_partial_and_capacity_mapping(monkeypatch):
+    """知识导入：部分提交 503 带已提交条数；容量上限 409（不是 400）。"""
+    from utils.errors import AccountCapacityError, PartialImportError
+    from webapp import server as server_module
+
+    client = _client()
+
+    def partial(documents, dry_run=False):
+        raise PartialImportError(
+            "第 2 批导入失败（已导入 500 条）：milvus down",
+            created=500,
+            updated=0,
+        )
+
+    monkeypatch.setattr(server_module, "import_documents", partial)
+    response = client.post(
+        "/api/knowledge/import", json={"documents": [{"content": "x"}]}
+    )
+    assert response.status_code == 503, response.text[:300]
+    detail = response.json()["detail"]
+    assert "已提交 500 条" in detail and "跳过已导入" in detail, detail
+    assert "milvus down" not in detail, detail
+
+    def capacity(documents, dry_run=False):
+        raise AccountCapacityError("知识库片段总数已达上限（200000），请先删除旧片段")
+
+    monkeypatch.setattr(server_module, "import_documents", capacity)
+    response = client.post(
+        "/api/knowledge/import", json={"documents": [{"content": "x"}]}
+    )
+    assert response.status_code == 409, response.text[:300]
+    assert "上限" in response.json()["detail"]
+
+    def add_capacity(content, metadata=None):
+        raise AccountCapacityError("知识库片段总数已达上限（200000），请先删除旧片段")
+
+    monkeypatch.setattr(server_module, "add_document", add_capacity)
+    response = client.post(
+        "/api/knowledge/documents",
+        json={"content": "x", "metadata": {"category": "c"}},
+    )
+    assert response.status_code == 409, response.text[:300]
+    print("✓ 知识导入部分提交 503 / 容量上限 409")
+
+
 def test_kb_group_error_mapping(monkeypatch):
     """整篇回填接口的错误映射：库未初始化 / 读取失败都返回 503。"""
     from webapp import server as server_module
@@ -15568,8 +15704,12 @@ def test_validation_error_truncates_large_input():
     print("✓ 422 大输入截断")
 
 
-def test_chat_maps_user_facing_error_to_400(monkeypatch):
-    """UserFacingError 的消息可原样返回（400），不能吞成通用 500。"""
+def test_chat_maps_user_facing_error_to_502(monkeypatch):
+    """UserFacingError 的消息可原样返回（默认 502），不能吞成通用 500。
+
+    该类异常全部来自服务端 / 上游（解析失败、预算耗尽），不是客户端请求
+    非法；返回 4xx 会让客户端重试中间件放弃重试。
+    """
     from utils.errors import UserFacingError
     from webapp import server as server_module
 
@@ -15586,11 +15726,36 @@ def test_chat_maps_user_facing_error_to_400(monkeypatch):
             "/api/chat",
             json={"message": "你好", "user_id": user_id, "session_id": "s-uf"},
         )
-        assert response.status_code == 400, response.text
+        assert response.status_code == 502, response.text
         detail = response.json()["detail"]
         assert "意图识别结果解析失败，请重试" in detail
         assert "请求 ID" in detail
-        print("✓ UserFacingError 映射 400 并原样透出文案")
+        print("✓ UserFacingError 映射 502 并原样透出文案")
+    finally:
+        _cleanup(user_id)
+
+
+def test_chat_maps_budget_exhausted_to_503_with_retry_after(monkeypatch):
+    """整轮预算耗尽是瞬时状态：503 + Retry-After，不是客户端错误 400。"""
+    from utils.errors import UserFacingError
+    from webapp import server as server_module
+
+    async def broken_ask(self, message, on_event=None, turn_id=""):
+        raise UserFacingError("本轮处理时间超出预算，请重试", status_code=503)
+
+    monkeypatch.setattr(
+        server_module.ConversationRuntime, "ask", broken_ask
+    )
+    client = _client()
+    user_id = _unique_user("web_test_budget")
+    try:
+        response = client.post(
+            "/api/chat",
+            json={"message": "你好", "user_id": user_id, "session_id": "s-budget"},
+        )
+        assert response.status_code == 503, response.text
+        assert response.headers.get("Retry-After") == "5"
+        print("✓ 预算耗尽映射 503 + Retry-After")
     finally:
         _cleanup(user_id)
 

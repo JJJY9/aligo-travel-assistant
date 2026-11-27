@@ -703,6 +703,9 @@ class AligoCLI:
             quarantined = _manager_quarantine_marker(self.memory_manager)
             if quarantined:
                 self._print_quarantine_notice(quarantined)
+                # 管道模式：本轮没有回答，EOF 收尾不能以 0 汇报成功
+                # （与 _reload_long_term_checked 的读命令口径一致）
+                self._command_failed = True
                 return
 
             with self.console.status("正在理解需求…", spinner="dots"):
@@ -2140,6 +2143,10 @@ class AligoCLI:
                     interrupt["user"] = False
                     interrupt["count"] = 0
                     _clear_pending_cancel()
+                    if getattr(self, "_user_id_from_stdin", False):
+                        # 管道模式：被中断、没有任何回答的回合仍是失败
+                        # 回合，EOF 收尾不能以 0 汇报成功
+                        self._command_failed = True
                     self.console.print("\n使用 'exit' 退出", style="dim")
                 except KeyboardInterrupt:
                     interrupt["user"] = False
@@ -4033,6 +4040,9 @@ def run_user_import_standalone(
     }
     active_sessions = set(candidate_sessions) - skipped_sessions
     skipped_emptied_sections = False
+    # 迟到删除回滚失败的会话（消息已随恢复写回）：独立于「跳过」清单，
+    # 并让整体 ok=false / 退出码 1——被删会话已复活，不能以成功汇报
+    rollback_failures: list[str] = []
     if skipped_sessions:
         for session_id in sorted(skipped_sessions):
             if session_id in RESERVED_SESSION_IDS:
@@ -4126,7 +4136,9 @@ def run_user_import_standalone(
                     try:
                         store.delete_chat_session(str(session_id))
                     except Exception as exc:  # noqa: BLE001 - 尽力回滚
-                        errors.append(
+                        # 回滚失败：被删会话的消息仍在库中（已复活），不能
+                        # 与成功回滚 / 常规跳过混在一起，也不能报成功
+                        rollback_failures.append(
                             f"会话 {session_id} 在恢复写入期间被删除，"
                             f"回滚失败：{exc}"
                         )
@@ -4186,7 +4198,8 @@ def run_user_import_standalone(
         )
     knowledge_error = str(counts.pop("knowledge_error", "") or "")
     incomplete = bool(counts.pop("recovery_incomplete", False))
-    ok = not knowledge_error and not incomplete
+    rollback_failed = bool(rollback_failures)
+    ok = not knowledge_error and not incomplete and not rollback_failed
     if ok and skipped_emptied_sections:
         # 备份条目全部落在墓碑期 / 保留字会话：本次没有恢复任何数据。
         # 函数契约：没有可恢复的数据返回 1，不能以「已恢复」+ 退出码 0
@@ -4208,6 +4221,12 @@ def run_user_import_standalone(
                     **counts,
                     **({"recovery_incomplete": True} if incomplete else {}),
                     **({"knowledge_error": knowledge_error} if knowledge_error else {}),
+                    **({"rollback_failed": True} if rollback_failed else {}),
+                    **(
+                        {"rollback_errors": rollback_failures}
+                        if rollback_failed
+                        else {}
+                    ),
                     "skipped": errors,
                 },
                 ensure_ascii=False,
@@ -4217,8 +4236,9 @@ def run_user_import_standalone(
     else:
         if dry_run:
             prefix = "预览（未写入）："
-        elif incomplete:
-            # 无写回用户数据（隔离证据尚在）：不能以「已恢复」汇报
+        elif incomplete or rollback_failed:
+            # 无写回用户数据（隔离证据尚在）/ 有会话回滚失败（消息已复活）：
+            # 不能以「已恢复」汇报
             prefix = "已写入："
         else:
             prefix = "已恢复："
@@ -4260,6 +4280,11 @@ def run_user_import_standalone(
             print(
                 "⚠ 用户数据未恢复：本次备份没有可写回的用户数据，"
                 "账号仍处于记忆隔离状态；请使用含偏好 / 行程 / 消息的备份重试"
+            )
+        for error in rollback_failures[:10]:
+            print(
+                f"  ❌ 回滚失败：{_plain_safe(error)}"
+                "（被删会话的消息可能已复活，请再次删除该会话）"
             )
         for error in errors[:10]:
             print(f"  跳过：{_plain_safe(error)}")
@@ -7626,9 +7651,14 @@ def run_preference_set_standalone(
                     f"偏好条目已达上限（{_MAX_PREFERENCES}），请先删除旧偏好"
                 )
             store.save_preference(pref_type, saved_value)
-            saved = store.get_preference(pref_type)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"保存偏好失败：{exc}")
+        try:
+            saved = store.get_preference(pref_type)
+        except Exception:  # noqa: BLE001 - 读回失败时按提交值展示（写入已提交）
+            # PG 主备切换窗口：UPSERT 已 autocommit，随后 SELECT 失败不能
+            # 把已成功的写入报成失败（与 session-title / session-pin 同口径）
+            saved = saved_value
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -8400,7 +8430,14 @@ def _main_impl():
                 target, other, value = positional
             else:
                 valid = False
-            if not valid or value is None:
+            if (
+                not valid
+                or value is None
+                # README 口径：非法用户 / 偏好 ID 是用法错误（退出码 2），
+                # 不能落到 run_* 被当成执行失败（退出码 1）
+                or not _valid_user_id(target)
+                or not _valid_pref_type(other.strip())
+            ):
                 _cli_fail(
                     "用法：python cli.py pref-set <user_id> <偏好类型> <值> [--json-value] [--json]",
                     _args_have_json(sys.argv[2:]),
@@ -8429,7 +8466,12 @@ def _main_impl():
                     target = item
                 else:
                     other = item
-            if not valid or other is None:
+            if (
+                not valid
+                or other is None
+                or not _valid_user_id(target)
+                or not _valid_pref_type(other)
+            ):
                 _cli_fail(
                     "用法：python cli.py pref-delete <user_id> <偏好类型> [--json]",
                     _args_have_json(sys.argv[2:]),
@@ -8770,7 +8812,9 @@ def _main_impl():
             calendar_positional, calendar_flags = _split_positionals(
                 sys.argv[2:]
             )
-            if not 2 <= len(calendar_positional) <= 3:
+            if not 2 <= len(calendar_positional) <= 3 or not _valid_user_id(
+                calendar_positional[0]
+            ) or not _valid_web_id(calendar_positional[1]):
                 print(usage)
                 sys.exit(2)
             parsed_calendar = _parse_session_export_args(
@@ -8795,7 +8839,9 @@ def _main_impl():
                 "[path] [--stdout] [--force] [--html]"
             )
             export_positional, export_flags = _split_positionals(sys.argv[2:])
-            if not 2 <= len(export_positional) <= 3:
+            if not 2 <= len(export_positional) <= 3 or not _valid_user_id(
+                export_positional[0]
+            ) or not _valid_session_id(export_positional[1]):
                 print(usage)
                 sys.exit(2)
             parsed_export = _parse_session_export_args(
@@ -8821,7 +8867,9 @@ def _main_impl():
                 "[--stdout] [--force] [--html]"
             )
             batch_positional, batch_flags = _split_positionals(sys.argv[2:])
-            if not 1 <= len(batch_positional) <= 2:
+            if not 1 <= len(batch_positional) <= 2 or not _valid_user_id(
+                batch_positional[0]
+            ):
                 print(usage)
                 sys.exit(2)
             raw_export_args = batch_positional[1:] + batch_flags
