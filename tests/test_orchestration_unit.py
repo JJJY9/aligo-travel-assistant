@@ -4138,3 +4138,271 @@ def test_agent_timeout_ceiling_warns_when_llm_timeout_budget_exceeds(caplog):
     with caplog.at_level(logging.WARNING, logger="agents.orchestration_agent"):
         orchestration_agent._warn_agent_timeout_ceiling()
     assert caplog.text == "", caplog.text
+
+
+def test_trip_duration_days_rejects_dates_negatives_and_fractional():
+    """日期 / 负数 / 4 位数字不是时长；礼拜按周；小数向上取整。"""
+    from agents.orchestration_agent import _trip_duration_days
+
+    assert _trip_duration_days("1.5天") == 2
+    assert _trip_duration_days("0.5天") == 1
+    assert _trip_duration_days("2.5天") == 3
+    assert _trip_duration_days(1.5) == 2
+    assert _trip_duration_days("一个礼拜") == 7
+    assert _trip_duration_days("2个礼拜") == 14
+    assert _trip_duration_days("2026-03-11") is None
+    assert _trip_duration_days("3650") is None
+    assert _trip_duration_days("-5") is None
+    assert _trip_duration_days("100000") is None
+    assert _trip_duration_days(100000) is None
+    # 既有口径不变
+    assert _trip_duration_days("周末3天") == 3
+    assert _trip_duration_days("3天2晚") == 3
+    assert _trip_duration_days("一周") == 7
+    assert _trip_duration_days("3个星期") == 21
+    print("✓ 时长解析：日期 / 负数 / 礼拜 / 小数")
+
+
+def test_update_memory_reuses_existing_end_when_return_date_missing():
+    """再次规划同趟行程但缺返程日期时，沿用既有返程与出发地，不重复建档。"""
+    memory = _StubMemory()
+    memory.long_term.save_preference("home_location", "北京")
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+
+    def results(event_data):
+        return [
+            {
+                "agent_name": "event_collection",
+                "priority": 1,
+                "result": {"status": "success", "data": event_data},
+            },
+            {
+                "agent_name": "itinerary_planning",
+                "priority": 2,
+                "result": {
+                    "status": "success",
+                    "data": {"itinerary": {"title": "杭州出差"}},
+                },
+            },
+        ]
+
+    orchestrator._update_memory(
+        {},
+        results(
+            {
+                "origin": "上海",
+                "destination": "杭州",
+                "start_date": "2026-03-11",
+                "duration_days": "3天",
+            }
+        ),
+    )
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 1 and trips[0]["end_date"] == "2026-03-13", trips
+
+    # 再次规划：只给目的地 + 出发日，缺 origin / 返程 / 时长
+    orchestrator._update_memory(
+        {}, results({"destination": "杭州", "start_date": "2026-03-11"})
+    )
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 1, trips
+    assert trips[0]["origin"] == "上海", "不应被 home_location 误推成北京"
+    assert trips[0]["end_date"] == "2026-03-13", trips
+    assert memory.long_term.get_statistics()["total_trips"] == 1
+    print("✓ 缺返程日期再次规划沿用既有行程，不重复建档")
+
+
+def test_update_memory_normalizes_city_suffix():
+    """目的地「杭州市」与历史「杭州」应识别为同一趟，不拆分统计。"""
+    memory = _StubMemory()
+    memory.long_term.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "杭州",
+            "start_date": "2026-03-11",
+            "end_date": "2026-03-18",
+        }
+    )
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    results = [
+        {
+            "agent_name": "event_collection",
+            "priority": 1,
+            "result": {
+                "status": "success",
+                "data": {
+                    "origin": "北京",
+                    "destination": "杭州市",
+                    "start_date": "2026-03-11",
+                    "end_date": "2026-03-18",
+                },
+            },
+        },
+        {
+            "agent_name": "itinerary_planning",
+            "priority": 2,
+            "result": {
+                "status": "success",
+                "data": {"itinerary": {"title": "trip"}},
+            },
+        },
+    ]
+    orchestrator._update_memory({}, results)
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 1, trips
+    assert trips[0]["destination"] == "杭州", trips
+    assert memory.long_term.get_statistics()["total_trips"] == 1
+    assert (
+        orchestrator._infer_trip_origin(
+            "", "杭州市", "2026-03-11", "2026-03-18"
+        )
+        == "北京"
+    )
+    print("✓ 城市行政后缀归一，避免重复建档")
+
+
+def test_update_memory_list_skips_explanatory_types():
+    """新列表格式里的 note/summary/status 不能被当成偏好落库。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    results = [
+        {
+            "agent_name": "preference",
+            "priority": 1,
+            "result": {
+                "status": "success",
+                "data": {
+                    "preferences": [
+                        {"type": "hotel_brands", "value": "汉庭"},
+                        {"type": "note", "value": "下周去上海"},
+                        {"type": "summary", "value": "已记录"},
+                        {"type": "status", "value": "ok"},
+                    ]
+                },
+            },
+        }
+    ]
+    orchestrator._update_memory({}, results)
+    prefs = memory.long_term.get_preference()
+    assert prefs == {"hotel_brands": "汉庭"}, prefs
+    assert orchestrator._last_memory_write_failures == []
+    print("✓ 列表格式说明性 type 不落库")
+
+
+def test_previous_preferences_context_list_skips_explanatory():
+    """列表格式说明性 type 不进入后续批次上下文。"""
+    orchestrator = OrchestrationAgent(agent_registry={})
+    result = {
+        "agent_name": "preference",
+        "priority": 1,
+        "result": {
+            "status": "success",
+            "data": {
+                "preferences": [
+                    {"type": "hotel_brands", "value": "汉庭"},
+                    {"type": "note", "value": "下周去上海"},
+                    {"type": "summary", "value": "已记录"},
+                ]
+            },
+        },
+    }
+    context = orchestrator._context_with_previous_preferences({}, [result])
+    assert context["user_preferences"] == {"hotel_brands": "汉庭"}
+    print("✓ 列表格式说明性 type 不进入上下文")
+
+
+def test_update_memory_key_entities_overrides_unparseable_event_date():
+    """事件抽取给出无法解析的日期时，意图 key_entities 的合法日期应兜底。"""
+    memory = _StubMemory()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    results = [
+        {
+            "agent_name": "event_collection",
+            "priority": 1,
+            "result": {
+                "status": "success",
+                "data": {"destination": "杭州", "start_date": "下周一"},
+            },
+        },
+        {
+            "agent_name": "itinerary_planning",
+            "priority": 2,
+            "result": {
+                "status": "success",
+                "data": {"itinerary": {"title": "trip"}},
+            },
+        },
+    ]
+    orchestrator._update_memory(
+        {"key_entities": {"destination": "杭州", "date": "2026-12-07"}}, results
+    )
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 1, trips
+    assert trips[0]["start_date"] == "2026-12-07", trips
+    print("✓ 不可解析事件日期由 key_entities 兜底")
+
+
+def test_checkpoint_reuse_registers_retry_cache(tmp_path):
+    """检查点命中后登记 retry_cache，同一轮整轮重试不再重复发进度事件。"""
+    import hashlib
+
+    from utils.execution_checkpoint import CheckpointStore
+
+    store = CheckpointStore(tmp_path, ttl_sec=3600)
+    schedule = [
+        {"agent_name": "a", "priority": 1, "reason": "r", "expected_output": "e"}
+    ]
+    digest = hashlib.sha256(b"a|1|r|e").hexdigest()
+    store.update_step(
+        "u:s:rc",
+        "a",
+        {"status": "success", "data": {"ok": True}, "duration": 0.2},
+        task_digest=digest,
+    )
+    stub = _StubAgent("a", {"ok": True})
+    orch = OrchestrationAgent(agent_registry={"a": stub})
+    orch._checkpoint_store = store
+    events: list[dict] = []
+    cache: dict = {}
+    asyncio.run(
+        orch.reply(
+            _intent(schedule),
+            on_event=events.append,
+            retry_cache=cache,
+            checkpoint_key="u:s:rc",
+        )
+    )
+    asyncio.run(
+        orch.reply(
+            _intent(schedule),
+            on_event=events.append,
+            retry_cache=cache,
+            checkpoint_key="u:s:rc",
+        )
+    )
+    assert stub.calls == 0, "检查点复用的步骤不应真正执行"
+    starts = [
+        event
+        for event in events
+        if event.get("type") == "agent_start" and event.get("agent_name") == "a"
+    ]
+    assert len(starts) == 1, events
+    print("✓ 检查点复用登记 retry_cache，整轮重试不重复发事件")
+
+
+def test_agent_result_at_timeout_boundary_is_kept(monkeypatch):
+    """超时上限触发的同时技能已成功返回时，结果应保留而不是当作超时丢弃。"""
+    import agents.orchestration_agent as mod
+
+    stub = _StubAgent("demo", {"ok": True})
+    orch = OrchestrationAgent(agent_registry={"demo": stub})
+
+    async def fake_wait_for(awaitable, timeout):
+        await awaitable  # 让 shield 内的 attempt 成功完成
+        raise asyncio.TimeoutError()
+
+    monkeypatch.setattr(mod.asyncio, "wait_for", fake_wait_for)
+    result = asyncio.run(orch._run_agent("demo", {}, "", "", []))
+    assert result["status"] == "success", result
+    assert stub.calls == 1
+    print("✓ 超时边界上已成功的结果被保留")
