@@ -526,6 +526,9 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 
 .msg { display: flex; flex-direction: column; animation: rise 0.25s ease both; }
 
+/* 历史批量渲染的节点不做入场动画：一次插入上百条时整屏同时播放会掉帧 */
+.msg.msg-static { animation: none; }
+
 .msg.user { align-self: flex-end; align-items: flex-end; max-width: 78%; }
 .msg.user .bubble {
   padding: 10px 15px;

@@ -1639,8 +1639,7 @@ async function scenarioDownloadGuards(source) {
 async function scenarioSessionRefresh(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
-  const page1 = Array.from({ length: 200 }, (_, i) => ({ session_id: "s-" + i }));
-  const page2 = Array.from({ length: 50 }, (_, i) => ({ session_id: "s-" + (200 + i) }));
+  const page1 = Array.from({ length: 250 }, (_, i) => ({ session_id: "s-" + i }));
   run(`
     state.userId = "u1";
     state.searchQuery = "";
@@ -1656,14 +1655,13 @@ async function scenarioSessionRefresh(source) {
   const promise = run("loadSessions(state.searchQuery, {})");
   const first = await waitRequest(env);
   first.resolve({ sessions: page1, total: 300 });
-  const second = await waitRequest(env);
-  second.resolve({ sessions: page2, total: 300 });
   await promise;
   return {
     count: run("state.sessions.length"),
     offset: run("state.sessionsOffset"),
     first_url: first.args[0],
-    second_url: second.args[0],
+    // 单次请求即可满足目标条数时不应再发第二页（有在途请求会留在队列里）
+    pending_requests: env.__requests.length,
   };
 }
 
