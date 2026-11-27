@@ -1649,10 +1649,57 @@ def test_redis_backfill_skipped_while_degraded(monkeypatch):
     runtime._memory_snapshot()
     assert added == [], "client=None 时必须按降级处理，不能写入重放日志"
 
+    seeded: list[list[str]] = []
+    redis_mem.seed_fallback_context = (  # type: ignore[method-assign]
+        lambda messages: seeded.append([m["content"] for m in messages])
+    )
     redis_mem.client = object()  # 模拟客户端实际可用
     runtime._memory_snapshot()
-    assert added == [("user", "旧问题", None), ("assistant", "旧回答", None)]
-    print("✓ Redis 降级期间 / 客户端未取到时跳过历史回填写回")
+    assert seeded == [["旧问题", "旧回答"]], (
+        "在线回填必须走有序 seed：append 会把旧历史排到其它实例的新回合之后"
+    )
+    assert added == [], "在线路径不再逐条 add_message"
+    print("✓ Redis 降级期间跳过回填写回；在线回填走有序 seed")
+
+def test_online_backfill_orders_history_before_concurrent_turn(monkeypatch):
+    """在线回填按 timestamp 有序插入：其它实例已写入的新回合留在窗口尾部。
+
+    竞态窗口：本实例读到空窗口后、写回完成前，另一实例把最新回合写入了
+    同一 Redis 键。append 模式会把旧历史排到新回合之后，编排器与子智能体
+    读到的「最近对话」只剩旧轮次。
+    """
+    fakeredis = pytest.importorskip("fakeredis")
+    from context.short_term_memory import RedisShortTermMemory
+
+    from agents import conversation as conversation_module
+
+    client = fakeredis.FakeRedis(decode_responses=True)
+    short_term = RedisShortTermMemory(client, "s-ctx", user_id="u-ctx")
+    other = RedisShortTermMemory(client, "s-ctx", user_id="u-ctx")
+    other.add_message("user", "新问题", timestamp="2026-03-11T10:10:00")
+    other.add_message("assistant", "新回答", timestamp="2026-03-11T10:11:00")
+    # 模拟交错：本实例在其它实例写入之前读到了空窗口
+    short_term.get_recent_context = lambda n_turns=5: []  # type: ignore[method-assign]
+
+    runtime, memory = _make_runtime()
+    memory.short_term = short_term
+    memory.get_chat_history = lambda limit=None, session_id=None: [  # type: ignore[method-assign]
+        {"role": "user", "content": "旧问题", "timestamp": "2026-03-11T10:00:00"},
+        {"role": "assistant", "content": "旧回答", "timestamp": "2026-03-11T10:01:00"},
+    ]
+    monkeypatch.setattr(
+        conversation_module, "redis_short_term_available", lambda: True
+    )
+    _prefs, recent = runtime._memory_snapshot()
+    assert [m["content"] for m in recent] == ["旧问题", "旧回答"]
+
+    contents = [
+        json.loads(raw)["content"]
+        for raw in client.lrange(short_term.key, 0, -1)
+    ]
+    assert contents == ["旧问题", "旧回答", "新问题", "新回答"], contents
+    print("✓ 在线回填按时间序插入，并发实例的新回合不被挤到旧历史之前")
+
 
 def test_runtime_uses_default_data_root_for_long_term(monkeypatch, tmp_path):
     """对话运行时的长期记忆必须落在 default_data_root()/memory。
@@ -2093,6 +2140,11 @@ if __name__ == "__main__":
         test_redis_backfill_skipped_while_degraded(_mp)
     finally:
         _mp.undo()
+    _mp2 = pytest.MonkeyPatch()
+    try:
+        test_online_backfill_orders_history_before_concurrent_turn(_mp2)
+    finally:
+        _mp2.undo()
     test_runtime_wires_epoch_guard_into_persist()
     test_assistant_meta_not_sent_to_intention_prompt()
     if _DIRECT_RUN_SKIP:

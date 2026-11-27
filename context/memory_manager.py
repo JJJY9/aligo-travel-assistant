@@ -357,13 +357,15 @@ class MemoryManager:
             if base is not None:
                 if not base():
                     return False
-            elif tombstones.is_session_deleted(self.user_id, self.session_id):
+            elif tombstones.is_session_deleted(
+                self.user_id, self.session_id, force=True
+            ):
                 return False
             if epoch_at_start is None:
                 return True
             start_available, start_value = epoch_at_start
             now_available, now_value = tombstones.get_session_epoch_state(
-                self.user_id, self.session_id
+                self.user_id, self.session_id, force=True
             )
             if not start_available or not now_available:
                 # 未配置 Redis（单进程部署）时纪元本就不可读：这不是故障，
@@ -423,8 +425,11 @@ class MemoryManager:
             # 无 Redis 共享通道时 is_session_deleted 快速返回 False（不同
             # 进程之间没有共享通道，也就不存在跨实例删除），行为与此前一致
             def should_commit() -> bool:
+                # force：提交守卫是低频关键路径，Redis 瞬时故障后的冷却期
+                # 不能把「是否已删除」的保护静默关掉（恢复后 60 秒内仍须
+                # 挡住其它实例 / CLI 写入的墓碑）
                 return not tombstones.is_session_deleted(
-                    self.user_id, self.session_id
+                    self.user_id, self.session_id, force=True
                 )
         # 共用短期暂存已生成的消息时间戳：内容指纹（角色+内容+时间戳）
         # 才能在长期记忆回填 / 故障重放与实时副本之间对齐

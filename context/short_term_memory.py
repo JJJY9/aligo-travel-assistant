@@ -186,9 +186,11 @@ def _canonical_timestamp(value: Any) -> str | None:
     PostgreSQL 回读的时间戳带连接会话时区偏移（``10:00+08:00``）：换算成
     同一时刻的本地 naive 串后，Redis 实时副本 / 回填副本 / 影子缓存的
     时间戳逐字节一致——内容指纹（角色+内容+原始时间戳）才能跨来源命中。
-    升级前以 naive 串写入 seen 集合的旧指纹继续匹配；升级前经 PG 回填
-    写入的 aware 串指纹（若有）在消息 TTL 窗口内不会命中，属一次性的
-    发布过渡影响。"""
+    注意这里用的是**进程本地时区**：多实例共享 Redis / PostgreSQL 时必须
+    统一各实例的 TZ（建议全部设为 UTC），仅时钟同步不足以保证跨实例
+    指纹、有序插入与截断守卫口径一致。升级前以 naive 串写入 seen 集合的
+    旧指纹继续匹配；升级前经 PG 回填写入的 aware 串指纹（若有）在消息
+    TTL 窗口内不会命中，属一次性的发布过渡影响。"""
     if not isinstance(value, str) or not value.strip():
         return None
     parsed = parse_iso_datetime(value)
@@ -208,7 +210,9 @@ def message_content_id(message: dict[str, Any]) -> str:
     正常重复提问（内容相同、时间不同）不会被误判为同一条。
 
     时间戳在入口处经 ``_canonical_timestamp`` 统一为本地 naive ISO：
-    不同后端 / 不同进程写同一消息得到逐字节相同的指纹串。"""
+    同一后端 / 同一部署（进程时区一致）下不同进程写同一消息得到逐字节
+    相同的指纹串；跨时区混布时指纹不一致，见 ``_canonical_timestamp``
+    的部署前提。"""
     import hashlib
 
     raw = json.dumps(

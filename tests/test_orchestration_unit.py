@@ -1639,6 +1639,41 @@ def test_prepare_context_includes_user_query():
     print("✓ 上下文包含用户本轮原话（user_query）")
 
 
+def test_prepare_context_strips_turn_meta_from_recent_dialogue():
+    """传给子智能体的最近对话剥离 _meta；短期记忆原对象保持不变。"""
+    from utils.turn_meta import attach_turn_meta
+
+    assistant_content = json.dumps(
+        attach_turn_meta(
+            {"results": [{"agent_name": "weather", "status": "success"}]},
+            {"client_turn_id": "turn-1", "usage": {"input_tokens": 12345}},
+        ),
+        ensure_ascii=False,
+    )
+    messages = [
+        {"role": "user", "content": "北京天气"},
+        {"role": "assistant", "content": assistant_content},
+    ]
+
+    class _ShortTerm:
+        def get_recent_context(self, n_turns=3):
+            return messages
+
+    memory = _StubMemory()
+    memory.short_term = _ShortTerm()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    context = orchestrator._prepare_context({})
+
+    dialogue = context["recent_dialogue"]
+    assert dialogue[0]["content"] == "北京天气"
+    assert "_meta" not in dialogue[1]["content"]
+    assert "12345" not in dialogue[1]["content"]
+    assert json.loads(dialogue[1]["content"])["results"], "可见正文必须保留"
+    # 共享对象不得被原地修改：删除最后一轮仍要读原始 _meta 的 turn_id
+    assert "_meta" in messages[1]["content"]
+    print("✓ 子智能体上下文剥离 _meta，短期记忆原对象不变")
+
+
 def test_agent_status_error_and_null_error():
     """status=error 视为失败；error 为 null 视为正常输出。"""
 

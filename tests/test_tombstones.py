@@ -183,6 +183,16 @@ def test_force_bypasses_failure_cooldown(monkeypatch):
     # force：绕过冷却真实读取
     assert tombstones.is_session_deleted("u1", "s1", force=True) is True
     assert calls == [True]
+    # 纪元读取同口径：冷却期默认读不到（不可用），force 真实读取
+    client.values[tombstones.epoch_key("u1", "s1")] = "2"
+    calls.clear()
+    assert tombstones.get_session_epoch_state("u1", "s1") == (False, None)
+    assert calls == []
+    assert tombstones.get_session_epoch_state("u1", "s1", force=True) == (
+        True,
+        "2",
+    ), "提交守卫必须在冷却期也真实读取纪元"
+    assert calls == [True]
     print("✓ force 跳过墓碑失败冷却")
 
 

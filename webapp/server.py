@@ -150,7 +150,7 @@ from utils.trip_import import (
     trip_skip_label,
 )
 from utils.travel_stats import summarize_travel
-from utils.timestamps import chronological_key
+from utils.timestamps import chronological_key, to_aware
 from utils.turn_meta import extract_turn_meta
 from utils.version import APP_VERSION
 from utils.weather import WeatherError, fetch_weather, peek_cached_weather
@@ -2112,7 +2112,10 @@ class AligoWebApp:
                     # 守卫运行在存储写锁 / 事务内：不触发待补写墓碑的补写，
                     # 否则高延迟 Redis 下 40 次往返会让锁持有时间远超预算
                     persist_guard=lambda: not self.is_recently_deleted(
-                        user_id, session_id, replay_pending=False
+                        user_id,
+                        session_id,
+                        replay_pending=False,
+                        force_shared=True,
                     ),
                 )
                 with self._sessions_lock:
@@ -2460,6 +2463,7 @@ class AligoWebApp:
         session_id: str | None,
         *,
         replay_pending: bool = True,
+        force_shared: bool = False,
     ) -> bool:
         if not session_id:
             return False
@@ -2480,7 +2484,13 @@ class AligoWebApp:
                     remaining = self.tombstone_ttl_sec - elapsed
                 else:
                     self._deleted_sessions.pop(key, None)
-        client = self._shared_tombstones()
+        # 落库守卫传 force_shared：冷却窗口内也要真实读一次共享墓碑，否则
+        # Redis 恢复后 60 秒内提交的在途回合看不到其它实例的删除。已有
+        # 客户端时才跳过重试窗口；客户端尚未创建时不做现场 from_url+ping
+        # （写锁内 1.5 秒级 socket 超时），交给工厂冷却/后台补写
+        client = self._shared_tombstones(
+            force=force_shared and self._redis_client is not None
+        )
         if client is not None:
             try:
                 if remaining is not None:
@@ -4460,16 +4470,20 @@ def _usage_summary(
 
             timestamp = str(message.get("timestamp") or "")
             try:
-                parsed_timestamp = datetime.fromisoformat(timestamp)
-                if parsed_timestamp.tzinfo is not None:
-                    # PostgreSQL timestamptz 序列化为 UTC；统一转到浏览器
-                    # （缺省本地）时区再取日期
-                    parsed_timestamp = (
-                        parsed_timestamp.astimezone(zone)
+                # JSON 后端写的是 naive 服务器本地墙钟、PostgreSQL 回读的是
+                # aware 时间戳：统一先按本机时区本地化（同时兼容 3.10 的 Z
+                # 后缀），再转到浏览器（缺省本地）时区取日期。只对 aware
+                # 值转换会让容器 UTC + 东八区浏览器的 0–8 点调用记到前一天
+                aware = to_aware(timestamp)
+                if aware is None:
+                    message_day = ""
+                else:
+                    localized = (
+                        aware.astimezone(zone)
                         if zone is not None
-                        else parsed_timestamp.astimezone()
+                        else aware.astimezone()
                     )
-                message_day = parsed_timestamp.date().isoformat()
+                    message_day = localized.date().isoformat()
             except (ValueError, OSError, OverflowError):
                 # Windows 上 astimezone() 对越界年份还会抛 OSError/OverflowError
                 message_day = ""
@@ -6599,29 +6613,13 @@ def create_app(model: Any = None) -> FastAPI:
                 # 不能在回退 JSON 上删除并谎报成功
                 store = _open_long_term(user_id, strict=True)
                 try:
-                    if turn_id:
-                        history = store.get_chat_history(session_id=session_id)
-                        last_assistant = next(
-                            (
-                                item
-                                for item in reversed(history)
-                                if item.get("role") == "assistant"
-                            ),
-                            None,
-                        )
-                        meta = (
-                            extract_turn_meta(
-                                str(last_assistant.get("content") or "")
-                            )
-                            if last_assistant is not None
-                            else None
-                        )
-                        if (
-                            not isinstance(meta, dict)
-                            or str(meta.get("client_turn_id") or "") != turn_id
-                        ):
-                            return -1
-                    return store.delete_last_turn(session_id, expect)
+                    # turn_id 交给存储层在同一把写锁 / 事务内复核：删除前
+                    # 整会话预读既撑大竞态窗口（预检与删除之间另一进程
+                    # 追加同文提问会被删错轮次），也让长会话每次编辑 / 重发
+                    # 都 O(n) 取回全部历史
+                    return store.delete_last_turn(
+                        session_id, expect, turn_id=turn_id or None
+                    )
                 finally:
                     _close_long_term(store)
 
