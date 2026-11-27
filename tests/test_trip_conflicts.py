@@ -331,6 +331,41 @@ def test_trip_interval_parses_identity_dates():
     print("✓ 斜杠 / 全角日期按身份口径参与区间、状态与统计")
 
 
+def test_placeholder_end_counts_as_single_day():
+    """9999-12-31 返程占位按出发当日计算，不再永久「进行中」/ 全民重叠。
+
+    与对话写入路径 agents/orchestration_agent 丢弃 9999 返程的口径一致；
+    存储与导出仍保真保留原值。
+    """
+    from utils.trip_conflicts import trip_conflicts, trip_state_label
+
+    placeholder = {
+        "trip_id": "t-9999",
+        "destination": "上海",
+        "start_date": "2020-01-01",
+        "end_date": "9999-12-31",
+    }
+    interval = trip_interval(placeholder)
+    assert interval is not None, interval
+    assert interval[0].date() == date(2020, 1, 1)
+    assert interval[1].date() == date(2020, 1, 1), "占位返程按出发当日计算"
+    assert trip_state_label(placeholder, today=date(2026, 11, 28)) == "已结束"
+    future = {
+        "trip_id": "t-future",
+        "destination": "杭州",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-03",
+    }
+    start, end = interval
+    assert (
+        trip_conflicts(
+            [placeholder, future], start, end, exclude_trip=placeholder
+        )
+        == []
+    ), "占位行程不应与未来行程重叠"
+    print("✓ 9999-12-31 占位返程按单日参与状态 / 冲突")
+
+
 def test_slash_dates_overlap_detected():
     """斜杠日期的行程与 ISO 行程的真实重叠不能被漏报。"""
     slash_trip = {
@@ -438,6 +473,7 @@ if __name__ == "__main__":
     test_find_saved_trip_normalizes_identity_fields()
     test_find_saved_trip_distinguishes_origin()
     test_trip_interval_parses_identity_dates()
+    test_placeholder_end_counts_as_single_day()
     test_slash_dates_overlap_detected()
     test_conflict_order_uses_parsed_slash_dates()
     test_iso_date_parse_cache_reuses_normalized_text()

@@ -449,6 +449,11 @@ function scenarioRender(source) {
     date_bad: invoke("normalizeISODate", "下周一"),
     date_invalid_calendar: invoke("normalizeISODate", "2026-02-31"),
     date_leap_valid: invoke("normalizeISODate", "2024-02-29"),
+    date_full_width: invoke("normalizeISODate", "２０２６-０３-１２"),
+    status_placeholder_end: invoke("tripStatus", {
+      start_date: "2020-01-01",
+      end_date: "9999-12-31",
+    }),
   };
 }
 

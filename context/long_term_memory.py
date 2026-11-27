@@ -1484,17 +1484,19 @@ class LongTermMemory:
             # 补 0 后与列表长度永久脱节
             chats_changed = trips_changed = True
         # 计数器合法但与列表长度不符（缺 chat_history 键后补空列表 /
-        # 旧版本把计数写大）：只向下对齐到真实条数——与 PG 的 COUNT(*)
-        # 口径一致，删除路径按差值扣减后不再永久偏大
+        # 旧版本把计数写大 / 手写或外部工具写小）：一律对齐到真实条数——
+        # 与 PG 的 COUNT(*) 口径一致，删除路径按差值扣减后不再永久偏大
+        # 或偏小。偏小值若保留，Markdown 导出与 CLI REPL 状态会读计数器
+        # 给出与面板 / CLI stats（按列表长度）不同的统计
         if (
             isinstance(stats.get("total_messages"), int)
-            and stats["total_messages"] > len(data["chat_history"])
+            and stats["total_messages"] != len(data["chat_history"])
         ):
             stats["total_messages"] = len(data["chat_history"])
             chats_changed = True
         if (
             isinstance(stats.get("total_trips"), int)
-            and stats["total_trips"] > len(data["trip_history"])
+            and stats["total_trips"] != len(data["trip_history"])
         ):
             stats["total_trips"] = len(data["trip_history"])
             trips_changed = True

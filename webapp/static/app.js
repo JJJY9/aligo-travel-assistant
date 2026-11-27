@@ -5381,8 +5381,12 @@ function normalizeISODate(value) {
   // 只接受 YYYY-M-D / YYYY/M/D 形态并补零：历史数据可能未补零（2026-1-5）
   // 或来自备份保真的斜杠写法（2026/3/12），字符串字典序会把它们排错；
   // 斜杠与后端 trip_interval 的身份口径一致，否则后端显示了状态徽标、
-  // 前端却解析失败不出徽标
-  const text = String(value || "").trim();
+  // 前端却解析失败不出徽标。全角数字（２０２６-０３-１２）同样按身份
+  // 口径归一：后端 normalize_identity_date 用 Python \d + int() 接受它，
+  // 前端的 JS \d 只认 ASCII，不转就出现「后端算进行中、前端无徽标」
+  const text = String(value || "")
+    .replace(/[０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+    .trim();
   const match = text.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
   if (!match) return null;
   const year = Number(match[1]);
@@ -5404,9 +5408,12 @@ function tripStatus(trip) {
   const start = normalizeISODate(trip.start_date);
   if (!start) return null;
   const rawEnd = normalizeISODate(trip.end_date);
-  // 返程缺失 / 非法时按出发当日计算：此前任意非日期文本会让「今天 > end」
-  // 恒为假，行程永久显示「进行中」
-  const end = rawEnd && rawEnd >= start ? rawEnd : start;
+  // 返程缺失 / 非法 / 9999-12-31 占位时按出发当日计算：占位值与后端
+  // trip_interval 同口径（模型常用「返程未定」占位，按真实区间会让行程
+  // 永久「进行中」并与所有未来行程重叠）；任意非日期文本此前会让
+  // 「今天 > end」恒为假，也是同样的永久进行中
+  const placeholderEnd = rawEnd && rawEnd.startsWith("9999-");
+  const end = rawEnd && !placeholderEnd && rawEnd >= start ? rawEnd : start;
   const today = todayISO();
   if (today < start) return { label: "即将出行", cls: "upcoming" };
   if (today > end) return { label: "已结束", cls: "past" };
