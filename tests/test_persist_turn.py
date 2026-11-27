@@ -514,6 +514,25 @@ def test_memory_manager_persist_guard_vetoes_on_epoch_change(monkeypatch):
         "读不到纪元时按墓碑结果放行，不能把瞬时故障当成删除"
     )
     assert manager.persist_guard((False, None), None)() is True
+    # 回合开始时就读不到纪元：提交侧读取结果必然被丢弃，不能再发起一次
+    # 强制读取（它发生在 JSON 后端文件锁临界区内，force=True 会跳过冷却
+    # 甚至现场建连 / 跟随创建波次数秒，吃掉 6 秒写锁预算）
+    calls: list[bool] = []
+
+    def _record(u, s, force=False):
+        calls.append(force)
+        return (False, None)
+
+    monkeypatch.setattr(tombstones, "get_session_epoch_state", _record)
+    assert manager.persist_guard((False, None), None)() is True
+    assert calls == [], "开始不可读时不得再做提交侧强制读取"
+    assert manager.persist_guard((False, None), lambda: False)() is False, (
+        "base 守卫仍然优先"
+    )
+    assert calls == []
+    # 开始可读时仍必须 force=True 读一次（冷却期内的删除保护）
+    assert manager.persist_guard((True, "1"), None)() is True
+    assert calls == [True]
     # 回合开始时有纪元、提交时键自然过期 / 被逐出：删除一定会写非空纪元，
     # 键消失不是删除信号——否则合法回合被整轮否决，用户回答静默丢失
     epochs["state"] = (True, None)

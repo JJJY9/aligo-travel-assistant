@@ -325,11 +325,17 @@ class RedisRateLimiter:
         window_sec: float,
         client_factory: Any = None,
         max_keys: int = MAX_KEYS,
+        probe_factory: Any = None,
     ) -> None:
         self._client = client
         # 启动时 Redis 不可用时通过工厂在后续请求中重试接入，避免整个
         # 生命周期固化为进程内限流（多实例额度会被放大）
         self._client_factory = client_factory
+        # 健康 / 指标探测专用的取客户端工厂：调用方传入 wait=False 的
+        # get_shared_redis_client，探测不被别人的创建波次阻塞（跟随者最多
+        # 等 5 秒），从而守住健康检查的 2 秒预算；权威记账（check / refund）
+        # 仍用 client_factory（wait=True），共享计数语义不变
+        self._probe_factory = probe_factory
         self.name = name
         self.limit = max(1, int(limit))
         self.window_sec = max(0.01, float(window_sec))
@@ -368,27 +374,49 @@ class RedisRateLimiter:
         """
         return tuple(sorted(self._corrupt_keys))
 
-    def _get_client(self) -> Any:
-        """返回 Redis 客户端；启动时不可用则通过工厂重试获取。"""
-        if self._client is None and self._client_factory is not None:
-            try:
-                self._client = self._client_factory()
-            except Exception as exc:  # noqa: BLE001 - 工厂失败按不可用处理
-                logger.warning("获取 Redis 限流客户端失败：%s", exc)
-                self._client = None
+    def _get_client(self, *, for_probe: bool = False) -> Any:
+        """返回 Redis 客户端；启动时不可用则通过工厂重试获取。
+
+        ``for_probe=True``（健康 / 指标探测）优先用 ``probe_factory``：
+        wait=False 的工厂在别的线程创建在途时立即返回当前缓存状态，不再
+        跟随等待创建波次。
+        """
+        if self._client is None:
+            factory = (
+                self._probe_factory if for_probe else None
+            ) or self._client_factory
+            if factory is not None:
+                try:
+                    self._client = factory()
+                except Exception as exc:  # noqa: BLE001 - 工厂失败按不可用处理
+                    logger.warning("获取 Redis 限流客户端失败：%s", exc)
+                    self._client = None
         return self._client
 
     def _key(self, key: str) -> str:
         return f"{REDIS_KEY_PREFIX}:{self.name}:{key}"
 
     def _eval(
-        self, script: str, key: str, *args: Any, read_only: bool = False
+        self,
+        script: str,
+        key: str,
+        *args: Any,
+        read_only: bool = False,
+        authoritative: bool = True,
+        probe: bool = False,
     ) -> Any:
         """执行 Lua 脚本；Redis 不可用时返回 None 表示应使用回退实现。
 
         ``read_only=True`` 用于 peek / status：这类调用失败只说明只读探测
         不可靠，不代表权威记账（check / refund）不可用，因此只进入短冷却、
         不降级整桶（降级会用空进程内桶，已用额度被清零）。
+
+        ``authoritative=False`` 用于 refund：它执行的脚本只做 ZREMRANGEBYRANK
+        （不受 maxmemory / denyoom 限制），成功不能证明权威记账（ZADD 写
+        路径）可用——降级期间不借它清除降级标记，直接退还进程内桶。
+
+        ``probe=True`` 让取客户端走 ``probe_factory``（健康 / 指标探测
+        不等别人的 Redis 创建波次）。
         """
         # 冷却判定放在取客户端之前：启动不可达的路径不应每个请求都走一遍
         # 工厂（工厂内部虽有单飞，但连接惰性创建在冷却期也会被反复触发）
@@ -401,7 +429,11 @@ class RedisRateLimiter:
             # 已降级时只读查询不尝试恢复：Redis 可读不代表可写（OOM /
             # 只读副本），恢复只能由真实的 check / probe 完成
             return None
-        client = self._get_client()
+        if self._degraded and not authoritative:
+            # refund 的写命令不受 denyoom 约束，成功不代表 ZADD 可用：
+            # 降级期间直接退还进程内桶（本请求的 check 也记在那里）
+            return None
+        client = self._get_client(for_probe=probe)
         if client is None:
             self._degraded = True
             return None
@@ -412,12 +444,22 @@ class RedisRateLimiter:
                 return None
             try:
                 return self._eval_client(
-                    client, script, key, *args, read_only=read_only
+                    client,
+                    script,
+                    key,
+                    *args,
+                    read_only=read_only,
+                    authoritative=authoritative,
                 )
             finally:
                 self._recovery_lock.release()
         return self._eval_client(
-            client, script, key, *args, read_only=read_only
+            client,
+            script,
+            key,
+            *args,
+            read_only=read_only,
+            authoritative=authoritative,
         )
 
     def _note_corrupt_key(self, key: str) -> None:
@@ -449,6 +491,7 @@ class RedisRateLimiter:
         key: str,
         *args: Any,
         read_only: bool = False,
+        authoritative: bool = True,
     ) -> Any:
         try:
             result = client.eval(script, 1, self._key(key), *args)
@@ -479,7 +522,10 @@ class RedisRateLimiter:
                 REDIS_FAILURE_COOLDOWN_SEC,
             )
             return None
-        if not read_only:
+        if not read_only and authoritative:
+            # 只有真实写路径（check / probe 的 ZADD）成功才能证明已恢复：
+            # refund 的 ZREMRANGEBYRANK 不受 denyoom 限制，成功不代表
+            # 权威记账可用，不能借它清除降级标记（否则健康 / 指标谎报恢复）
             self._degraded = False
             self._degraded_until = 0.0
         self._read_failed_until = 0.0
@@ -513,9 +559,10 @@ class RedisRateLimiter:
         """归还最近一次 :meth:`check` 记录的额度（罕见竞态分支专用）。
 
         Redis 后端删除该键分数最高（最新）的成员；同窗口内其它请求的
-        事件按「归还一单位额度」近似处理。Redis 不可用时退还进程内桶。
+        事件按「归还一单位额度」近似处理。Redis 不可用时退还进程内桶；
+        降级期间不尝试 Redis（退还进程内桶），也不清除降级标记。
         """
-        result = self._eval(_REFUND_SCRIPT, key)
+        result = self._eval(_REFUND_SCRIPT, key, authoritative=False)
         if result is None:
             self._fallback.refund(key)
 
@@ -544,6 +591,7 @@ class RedisRateLimiter:
             _PROBE_SCRIPT,
             f"__probe__:{uuid.uuid4().hex}",
             uuid.uuid4().hex,
+            probe=True,
         )
         return result is not None
 
@@ -598,12 +646,15 @@ def create_rate_limiter(
     redis_client: Any = None,
     client_factory: Any = None,
     max_keys: int = MAX_KEYS,
+    probe_factory: Any = None,
 ) -> RateLimiter | RedisRateLimiter:
     """优先创建 Redis 共享限流器；未提供客户端 / 工厂时使用进程内实现。
 
     配置了 ``REDIS_URL`` 但启动时不可达时传 ``client_factory``（如
     ``get_shared_redis_client``）：先回退进程内计数，工厂可用后自动重新
     接入共享计数，而不是整个进程生命周期固化为本地限流。
+    ``probe_factory`` 是健康 / 指标探测专用的取客户端工厂（应传
+    ``wait=False`` 版本，避免探测跟随别人的创建波次超出预算）。
     ``max_keys`` 只约束进程内实现（含 Redis 故障回退时的本地桶）。
     """
     if redis_client is not None or client_factory is not None:
@@ -614,5 +665,6 @@ def create_rate_limiter(
             window_sec,
             client_factory=client_factory,
             max_keys=max_keys,
+            probe_factory=probe_factory,
         )
     return RateLimiter(limit=limit, window_sec=window_sec, max_keys=max_keys)

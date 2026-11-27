@@ -165,6 +165,14 @@ class _WeatherBusyError(WeatherError):
     """本地排队繁忙（上游并发闸门 / 单飞等待轮次耗尽），不是上游故障。"""
 
 
+class UpstreamQuotaError(WeatherError):
+    """全进程上游额度用尽（未发出任何上游请求，可稍后重试）。"""
+
+    def __init__(self, message: str, retry_after: int = 60) -> None:
+        super().__init__(message)
+        self.retry_after = max(1, int(retry_after))
+
+
 def clear_weather_cache() -> None:
     """清空天气成功 / 失败 / 降级缓存（测试或运维需要时使用）。"""
     with _cache_lock:
@@ -539,7 +547,15 @@ def _admit_upstream() -> None:
         while _upstream_calls and now - _upstream_calls[0] >= 60.0:
             _upstream_calls.popleft()
         if len(_upstream_calls) >= _UPSTREAM_MAX_PER_MINUTE:
-            raise WeatherError("天气查询过于频繁，请稍后再试")
+            # 没有发出任何上游请求：带上真实恢复等待，调用方据此回 429
+            # 而不是把它当上游故障重试（503）
+            retry_after = (
+                60.0 - (now - _upstream_calls[0]) if _upstream_calls else 60.0
+            )
+            raise UpstreamQuotaError(
+                "天气查询过于频繁，请稍后再试",
+                retry_after=max(1, math.ceil(retry_after)),
+            )
         _upstream_calls.append(now)
 
 

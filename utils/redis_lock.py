@@ -8,7 +8,10 @@
 - Redis 调用失败时只回退本次加锁，保留客户端并在下次 acquire 重试，
   不会因为一次异常永久禁用共享锁；
 - 释放时用 token 比对删除，避免误删其它实例重新获得的锁；SET 响应超时
-  但可能已在服务端生效时保留 token，释放阶段尽力清理。
+  但可能已在服务端生效时保留 token，释放阶段尽力清理；释放失败时记住
+  token，下次加锁被自己的残留键挡住时先按 token 校验删除再重试；
+- :meth:`DistributedLock.verify_owned` 供长任务收尾前只读复核归属，
+  补上「心跳间隔内锁已失效」的检测空窗。
 """
 import logging
 import threading
@@ -28,6 +31,14 @@ return 0
 _RENEW_SCRIPT = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
   return redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+# 只读归属复核：不刷新 TTL，只回答「键现在是否仍归本 token」
+_VERIFY_SCRIPT = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+  return 1
 end
 return 0
 """
@@ -58,6 +69,13 @@ class DistributedLock:
         # 持有期间是否在续期时发现锁已失效（过期后被其它实例拿走）：
         # 此时互斥已不成立，长任务不能再假定自己是唯一执行者
         self.lost = False
+        # 本实例当前持有的 token（acquire 设置、release 清除）：收尾复核用它
+        # 区分「自己的旧 token」与「重新加锁后的新持有点」
+        self._held_token: str | None = None
+        # 释放失败（CAS DEL 抛异常）时保留的 token：下次 acquire 被自己的
+        # 残留键挡住时先按 token 校验删除再重试一次 SET NX，避免本实例在
+        # 键 TTL（最长约 5 分钟）内一直误报「已有任务在运行」
+        self._stale_release_token: str | None = None
 
     def _get_client(self) -> Any:
         """返回 Redis 客户端；启动时不可用则通过工厂重试获取。"""
@@ -80,6 +98,7 @@ class DistributedLock:
         client = self._get_client()
         if client is None:
             self.degraded = True
+            self._held_token = _LOCAL_TOKEN
             return _LOCAL_TOKEN
         token = uuid.uuid4().hex
         try:
@@ -88,24 +107,39 @@ class DistributedLock:
             # SET 可能已在服务端生效（响应超时），保留 token 让 release 尽力清理；
             # 保留客户端，下次 acquire 会再次尝试 Redis
             logger.warning("Redis 互斥锁不可用（%s），回退进程内锁", exc)
-            self.degraded = True
             # SET 可能已在服务端生效：启动心跳（续期脚本按 token 校验归属，
             # 未真正持有键时不会续期别人的锁），否则长任务超过 TTL 后共享
             # 锁静默过期且 lost 永远为 False
+            return self._degraded_hold(token)
+        if not acquired and self._stale_release_token is not None:
+            # 上一次 release 的 CAS DEL 失败，键仍以本实例旧 token 残留：
+            # 只删除自己的键（token 比对），成功后再试一次 SET NX
+            stale = self._stale_release_token
             try:
-                self._start_heartbeat(token)
-            except BaseException:
-                # 心跳线程起不来（线程耗尽 / 解释器收尾）时不能让进程内锁
-                # 处于「已持有但调用方拿不到 token」的半状态：复用 release
-                # 归还本地锁并按 token 尽力清理可能已生效的键
-                self.release(token)
-                raise
-            return token
+                cleaned = client.eval(_RELEASE_SCRIPT, 1, self._key, stale)
+            except Exception as exc:  # noqa: BLE001 - 清理失败等 TTL 自愈
+                logger.warning("清理残留 Redis 互斥锁失败：%s", exc)
+                cleaned = None
+            if cleaned is not None:
+                # 0 表示键已不存在或已被其它实例持有：都不再需要本实例清理
+                self._stale_release_token = None
+                if cleaned:
+                    try:
+                        acquired = client.set(
+                            self._key, token, nx=True, ex=self._ttl_sec
+                        )
+                    except Exception as exc:  # noqa: BLE001 - 同 SET 超时口径
+                        logger.warning(
+                            "清理残留锁后重新加锁失败（%s），按降级处理", exc
+                        )
+                        return self._degraded_hold(token)
         if not acquired:
             self._local.release()
             self.degraded = False
             return None
+        self._stale_release_token = None
         self.degraded = False
+        self._held_token = token
         try:
             self._start_heartbeat(token)
         except BaseException:
@@ -115,10 +149,26 @@ class DistributedLock:
             raise
         return token
 
+    def _degraded_hold(self, token: str) -> str:
+        """SET 结果不确定（异常 / 清理后重试仍超时）时按「可能已持锁」继续。"""
+        self.degraded = True
+        self._held_token = token
+        try:
+            self._start_heartbeat(token)
+        except BaseException:
+            # 心跳线程起不来（线程耗尽 / 解释器收尾）时不能让进程内锁
+            # 处于「已持有但调用方拿不到 token」的半状态：复用 release
+            # 归还本地锁并按 token 尽力清理可能已生效的键
+            self.release(token)
+            raise
+        return token
+
     def release(self, token: str | None) -> None:
         """释放锁；token 不匹配（锁已过期并被他人获取）时不动 Redis 键。"""
         if token is None:
             return
+        if self._held_token == token:
+            self._held_token = None
         if token == _LOCAL_TOKEN:
             self._local.release()
             return
@@ -127,11 +177,50 @@ class DistributedLock:
         if client is not None:
             try:
                 client.eval(_RELEASE_SCRIPT, 1, self._key, token)
+                if self._stale_release_token == token:
+                    self._stale_release_token = None
             except Exception as exc:  # noqa: BLE001 - 释放失败时等待 TTL 自动过期
-                logger.warning("释放 Redis 互斥锁失败：%s", exc)
+                logger.warning(
+                    "释放 Redis 互斥锁失败（键将在 TTL 后过期）：%s", exc
+                )
+                # 记住 token：残留键属于本实例，下次 acquire 被它挡住时
+                # 可按 token 校验删除后重试，不必等 TTL 自然过期
+                self._stale_release_token = token
         # Redis 释放失败也要放开进程内锁，否则本进程会一直卡住
         if self._local.locked():
             self._local.release()
+
+    def verify_owned(self, token: str | None) -> bool | None:
+        """只读复核 token 是否仍持有共享锁（不刷新 TTL，不改变键状态）。
+
+        用于长任务收尾前检测「锁在运行期间已失效」（如主从切换丢失键）：
+        心跳只在下一次续期时才发现，短任务可能整段窗口都漏检。
+
+        Returns:
+            True 仍持有；False 键已删除 / 被其它实例取得（并置 ``lost``）；
+            None 本地锁或 Redis 不可达，无法判断（维持现有 lost 状态）。
+        """
+        if token is None:
+            return None
+        if token == _LOCAL_TOKEN:
+            return True
+        client = self._get_client()
+        if client is None:
+            return None
+        try:
+            owned = client.eval(_VERIFY_SCRIPT, 1, self._key, token)
+        except Exception as exc:  # noqa: BLE001 - 复核失败不改变既有标记
+            logger.warning("校验 Redis 互斥锁归属失败：%s", exc)
+            return None
+        if owned:
+            return True
+        if self._held_token == token:
+            self.lost = True
+            logger.warning(
+                "Redis 互斥锁在收尾复核时已失效（%s），互斥保护已丢失",
+                self._key,
+            )
+        return False
 
     def _start_heartbeat(self, token: str) -> None:
         """持有期间按 TTL/3 续期，避免长任务在 TTL 到期后失去锁。"""

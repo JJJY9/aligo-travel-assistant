@@ -218,16 +218,18 @@ def _get_redis_client(url: str, force: bool = False, wait: bool = True):
         event.set()
 
 
-def get_shared_redis_client(force: bool = False) -> Any | None:
+def get_shared_redis_client(force: bool = False, wait: bool = True) -> Any | None:
     """返回共享 Redis 客户端（供限流等模块复用连接池）。
 
     未配置 ``REDIS_URL``、Redis 不可用或处于失败冷却期时返回 None；
     ``force=True`` 跳过失败冷却（供删除 / 重放等关键路径重试一次）。
+    ``wait=False`` 供健康 / 指标等只读视图：创建在途时直接返回当前缓存
+    状态，不等别人的创建波次（跟随者最多等 5 秒，会超出探测预算）。
     """
     url = STORAGE_CONFIG.get("redis_url") or ""
     if not url:
         return None
-    return _get_redis_client(url, force=force)
+    return _get_redis_client(url, force=force, wait=wait)
 
 
 def shared_redis_configured() -> bool:
