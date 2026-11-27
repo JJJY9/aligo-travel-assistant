@@ -156,6 +156,9 @@ const state = {
   tripsComposing: false,
   kbSemanticQuery: "",
   tripEditingId: null,
+  // 进入编辑时回填到表单的字段快照：跨行切换 / 只提交改动字段 / 判断
+  // 「未修改」都按它比较，避免把刷新后的服务端值误当成用户改动
+  tripEditBaseline: null,
   tripsExpanded: false,
   tripsAll: [],
   tripsAllTotal: 0,
@@ -1737,6 +1740,9 @@ function triggerExport() {
 
 async function toggleTripsExpanded() {
   if (state.tripsExpanded) {
+    // 收起后不能再让防抖定时器补发一次请求：它会把刚收起的视图重新
+    // 展开，并覆盖收起时本该更新的概览
+    clearTimeout(tripFilterTimer);
     state.tripsExpanded = false;
     renderOverviewUnlessEditing();
     return;
@@ -1826,6 +1832,9 @@ async function importTripsFromFile(file) {
   // 结果不确定但服务端可能已写入（503 部分失败 / 客户端超时）：按钮复位后
   // 也要刷新面板，否则已落库的行程在列表里不可见
   let reconcile = false;
+  // 真正写库的请求是否已发出：预览（dry_run）超时零写入，不能提示
+  // 「服务端可能仍在写入」，也不需要刷新对账
+  let applySent = false;
   try {
     if (file.size > 2 * 1024 * 1024) {
       toast("文件过大（上限 2 MB），请拆分后再导入");
@@ -1926,6 +1935,7 @@ async function importTripsFromFile(file) {
         toast("已取消导入");
         return;
       }
+      applySent = true;
       const result = await postImport(false);
       const created = Number(result.created || 0);
       const updated = Number(result.updated || 0);
@@ -1953,11 +1963,19 @@ async function importTripsFromFile(file) {
         toast(message);
         reconcile = true;
       } else if (!status && message.includes("超时")) {
-        // 客户端放弃等待不代表服务端没在写（单 worker 执行器不可取消）
-        toast(
-          "导入请求超时：服务端可能仍在写入，请稍后重新打开面板确认结果（首次任务结束前重试可能提示「已有导入任务在处理」）",
-        );
-        reconcile = true;
+        if (!applySent) {
+          // 预览请求 dry_run：超时只说明预览没返回，服务端没有写入任何
+          // 行程，可以直接重试
+          toast(
+            "导入预览超时：预览不写库，未导入任何行程，可直接重试（服务端可能仍在处理该预览，重试可能提示「已有导入任务在处理」）",
+          );
+        } else {
+          // 客户端放弃等待不代表服务端没在写（单 worker 执行器不可取消）
+          toast(
+            "导入请求超时：服务端可能仍在写入，请稍后重新打开面板确认结果（首次任务结束前重试可能提示「已有导入任务在处理」）",
+          );
+          reconcile = true;
+        }
       } else {
         toast(`导入行程失败：${message}`);
       }
@@ -1983,6 +2001,7 @@ async function importTripsFromFile(file) {
 
 function resetTripForm() {
   state.tripEditingId = null;
+  state.tripEditBaseline = null;
   els.tripForm.reset();
   els.tripEnd.dataset.hadInvalid = "";
   els.tripSubmit.textContent = "保存行程";
@@ -2028,12 +2047,23 @@ function startEditTrip(trip) {
       return;
     }
   } else {
-    const draft =
-      els.tripDestination.value.trim() ||
-      els.tripOrigin.value.trim() ||
-      els.tripStart.value ||
-      els.tripEnd.value ||
-      els.tripPurpose.value.trim();
+    // 正在编辑另一条行程时按「表单 vs 回填基线」逐字段比较：未改动只是
+    // 点了另一行的编辑按钮，不应弹「未提交内容」确认。基线按写进表单的
+    // 原值保存，刷新后服务端值变化也不会误判成用户改动
+    const base = state.tripEditBaseline;
+    const draft = base
+      ? els.tripOrigin.value !== base.origin ||
+        els.tripDestination.value !== base.destination ||
+        els.tripStart.value !== base.start ||
+        els.tripEnd.value !== base.end ||
+        els.tripPurpose.value !== base.purpose
+      : Boolean(
+          els.tripDestination.value.trim() ||
+            els.tripOrigin.value.trim() ||
+            els.tripStart.value ||
+            els.tripEnd.value ||
+            els.tripPurpose.value.trim(),
+        );
     if (draft && !window.confirm("表单里有未提交的内容，编辑将覆盖，继续？")) {
       return;
     }
@@ -2044,6 +2074,14 @@ function startEditTrip(trip) {
   els.tripStart.value = startDate || "";
   els.tripEnd.value = endDate || "";
   els.tripPurpose.value = trip.purpose || "";
+  // 回填后的快照：保存时只提交改动字段、跨行切换时判断是否真有草稿
+  state.tripEditBaseline = {
+    origin: els.tripOrigin.value,
+    destination: els.tripDestination.value,
+    start: els.tripStart.value,
+    end: els.tripEnd.value,
+    purpose: els.tripPurpose.value,
+  };
   els.tripEnd.dataset.hadInvalid = trip.end_date && !endDate ? "1" : "";
   if (!startDate || (trip.end_date && !endDate)) {
     toast("存在格式异常的日期，请核对后重新填写出发日期并确认返程日期");
@@ -2079,19 +2117,44 @@ async function addTrip(event) {
   ) {
     return;
   }
-  const payload = {
-    user_id: state.userId,
-    origin: els.tripOrigin.value.trim(),
-    destination,
-    start_date: startDate,
-    end_date: els.tripEnd.value || null,
+  const payload = { user_id: state.userId };
+  const baseline = state.tripEditBaseline;
+  if (editingId && baseline) {
+    // 只提交改动字段：整表单 PUT 会把刷新前表单里的旧值一起写回，静默
+    // 回滚 CLI / 另一标签页刚保存的字段（服务端按 exclude_unset 保留
+    // 未提交字段）。清空的返程日期 / 目的显式发 null；原日期格式异常、
+    // 用户确认清除时也要显式发 null（此时表单值与基线都一样是空串）
+    const originValue = els.tripOrigin.value.trim();
+    const endValue = els.tripEnd.value || null;
+    const purposeValue = els.tripPurpose.value.trim() || null;
+    if (originValue !== baseline.origin) payload.origin = originValue;
+    if (destination !== baseline.destination) payload.destination = destination;
+    if (startDate !== baseline.start) payload.start_date = startDate;
+    if (
+      (endValue || "") !== baseline.end ||
+      els.tripEnd.dataset.hadInvalid === "1"
+    ) {
+      payload.end_date = endValue;
+    }
+    if ((purposeValue || "") !== baseline.purpose) {
+      payload.purpose = purposeValue;
+    }
+  } else {
+    payload.origin = els.tripOrigin.value.trim();
+    payload.destination = destination;
+    payload.start_date = startDate;
+    payload.end_date = els.tripEnd.value || null;
     // 空目的按「未显式提供」发送：新增时后端落默认「出差」，命中既有
     // 行程（重复提交同一趟）时保留用户改过的目的，不会被重置成模板值
-    purpose: els.tripPurpose.value.trim() || null,
-  };
+    payload.purpose = els.tripPurpose.value.trim() || null;
+  }
+  // 编辑但没有任何字段变化：服务端会以 400「没有需要更新的字段」拒绝，
+  // 按成功 no-op 处理（表单复位由下方 unchanged 分支完成）
+  const noFieldChanges = Boolean(editingId) && Object.keys(payload).length === 1;
   const submitted = {
     editingId,
-    origin: payload.origin,
+    // 用表单值而不是 payload：只提交改动字段时 payload.origin 可能缺省
+    origin: els.tripOrigin.value.trim(),
     destination,
     startDate,
     endDate: els.tripEnd.value || "",
@@ -2107,21 +2170,26 @@ async function addTrip(event) {
   try {
     let message = "行程已更新";
     if (editingId) {
-      const result = await getJSON(`/api/trips/${encodeURIComponent(editingId)}`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (
-        result &&
-        result.trip &&
-        result.trip.trip_id &&
-        state.userId === requestUserId
-      ) {
-        // 服务端返回的保存后行程：刷新在途 / 失败时再次编辑也回填新值
-        state.tripLatest.set(result.trip.trip_id, result.trip);
+      if (!noFieldChanges) {
+        const result = await getJSON(
+          `/api/trips/${encodeURIComponent(editingId)}`,
+          {
+            method: "PUT",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload),
+          },
+        );
+        if (
+          result &&
+          result.trip &&
+          result.trip.trip_id &&
+          state.userId === requestUserId
+        ) {
+          // 服务端返回的保存后行程：刷新在途 / 失败时再次编辑也回填新值
+          state.tripLatest.set(result.trip.trip_id, result.trip);
+        }
+        message += conflictNote(result.conflicts);
       }
-      message += conflictNote(result.conflicts);
     } else {
       const result = await getJSON("/api/trips", {
         method: "POST",
@@ -4603,6 +4671,10 @@ async function loadExpandedTrips(options = {}) {
   // 更早的行程会被误报为无匹配）；limit 仍是最近 200 条匹配。
   // 返回是否已渲染：refreshStatus 据此避免随后再整块渲染一遍（面板打开且
   // 展开时一次刷新会把整块面板建两次、天气请求发两次）
+  // 视图已收起 / 面板已关时不再请求：防抖定时器可能在收起后才触发
+  if (!state.tripsExpanded || (els.memorySheet && els.memorySheet.hidden)) {
+    return false;
+  }
   const userId = state.userId;
   const requestId = (tripsRequestId += 1);
   const query = state.tripsFilter.trim();
@@ -4858,7 +4930,8 @@ function renderOverview() {
   if (!trips.length) {
     const empty = document.createElement("div");
     empty.className = "empty";
-    empty.textContent = filterText ? "没有匹配的行程" : "还没有行程记录";
+    empty.textContent =
+      filterText || statusValue ? "没有匹配的行程" : "还没有行程记录";
     els.trips.appendChild(empty);
   } else {
     // 状态接口按记录顺序（旧→新）返回，界面新→旧展示；
@@ -4866,7 +4939,9 @@ function renderOverview() {
     const ordered = state.tripsExpanded ? [...trips] : [...trips].reverse();
     ordered.forEach((trip) => {
       // 记录最近一次渲染的服务端值：刷新在途 / 失败时再点「编辑」用它回填
-      state.tripLatest.set(trip.trip_id, trip);
+      // （缺编号的行不能进缓存：undefined 键会互相覆盖）
+      const tripIdText = trip.trip_id ? String(trip.trip_id) : "";
+      if (tripIdText) state.tripLatest.set(tripIdText, trip);
       const row = document.createElement("div");
       row.className = "trip";
       const route = document.createElement("div");
@@ -4886,18 +4961,23 @@ function renderOverview() {
         meta.appendChild(badge);
       }
       const conflicts = Array.isArray(trip.conflicts) ? trip.conflicts : [];
+      // 列表 / 状态接口把已列出的重叠截断到 20 条，真实总数在
+      // conflict_count：忽略它会把「与 200 条重叠」显示成「等 20 条」
+      const conflictTotal = Number(trip.conflict_count) || conflicts.length;
       if (conflicts.length) {
         const badge = document.createElement("span");
         badge.className = "trip-status conflict";
         badge.textContent = "重叠";
-        badge.title = conflicts
-          .map((item) => {
-            const dates = item.start_date
-              ? `（${item.start_date}${item.end_date ? ` ~ ${item.end_date}` : ""}）`
-              : "";
-            return `${item.origin || "—"} → ${item.destination || "—"}${dates}`;
-          })
-          .join("\n");
+        const lines = conflicts.map((item) => {
+          const dates = item.start_date
+            ? `（${item.start_date}${item.end_date ? ` ~ ${item.end_date}` : ""}）`
+            : "";
+          return `${item.origin || "—"} → ${item.destination || "—"}${dates}`;
+        });
+        if (conflictTotal > conflicts.length) {
+          lines.push(`等 ${conflictTotal} 条`);
+        }
+        badge.title = lines.join("\n");
         badge.setAttribute("aria-label", `与其它行程日期重叠：${badge.title}`);
         meta.appendChild(badge);
       }
@@ -5000,6 +5080,15 @@ function renderOverview() {
         }
       });
 
+      // 历史数据可能缺 trip_id（旧格式 / 手写 JSON）：按 id 寻址的编辑、
+      // 日历、删除都会 404（删除提示成功后行又复活）。禁用按钮而不是
+      // 让用户反复失败
+      if (!tripIdText) {
+        for (const button of [edit, calendar, remove]) {
+          button.disabled = true;
+          button.title = "历史数据缺少行程编号，无法编辑 / 删除";
+        }
+      }
       actions.append(edit, calendar, remove);
       row.appendChild(actions);
 
@@ -5010,6 +5099,15 @@ function renderOverview() {
   els.exportTrips.hidden = !trips.length;
   els.exportTripsCsv.hidden = !trips.length;
   els.exportTripsHtml.hidden = !trips.length;
+  // 展开且带筛选时导出的是筛选子集（与列表同口径）：按钮文案必须体现，
+  // 否则用户以为拿到的是全部行程
+  const tripsFilterActive = Boolean(filterText) || Boolean(statusValue);
+  els.exportTrips.textContent = tripsFilterActive
+    ? "导出筛选结果日历"
+    : "导出全部日历";
+  els.exportTrips.title = tripsFilterActive
+    ? "按当前关键词 / 状态筛选导出（与列表同口径）"
+    : "把全部行程导出为一个日历文件";
   if (els.tripsDedupe) els.tripsDedupe.hidden = !trips.length;
   const tripTotal = Number(status.trip_count || trips.length);
   els.expandTrips.hidden = !state.tripsExpanded && tripTotal <= 5;
@@ -5399,15 +5497,40 @@ async function addPreference(event) {
     return;
   }
   let value = newPreferenceValue(type, text);
+  // 响应返回前可能已切换用户：请求体与写回都按发起时的用户（合并基线
+  // 刷新也可能异步等待，必须先固定归属）
+  const requestUserId = state.userId;
   if (LIST_PREF_TYPES.has(type) && Array.isArray(value)) {
     // 「添加偏好」对列表型偏好是追加语义：面板唯一的整值覆盖入口是行内
     // 「编辑」。直接 PUT 覆盖会让既有品牌 / 航司静默丢失（存储层 PUT 是
     // 整值替换，不合并）
-    const existing =
-      preferenceLatest.get(type) ??
-      (state.status && state.status.preferences
-        ? state.status.preferences[type]
-        : undefined);
+    // 合并基线以 /api/status 权威快照为准、preferenceLatest 兜底：偏好
+    // 行内编辑期间被跳过的状态刷新不会写回 preferenceLatest，先取缓存
+    // 会让对话侧新增的条目被旧列表覆盖
+    let snapshot = state.status && state.status.preferences;
+    let existing =
+      snapshot && Object.prototype.hasOwnProperty.call(snapshot, type)
+        ? snapshot[type]
+        : preferenceLatest.get(type);
+    if (existing === undefined && !snapshot) {
+      // 无权威快照（切号后 /api/status 失败或超时）：追加没有合并基线，
+      // 直接 PUT 会把账号里已有的品牌 / 航司整值覆盖掉。先刷新一次再
+      // 决定，仍拿不到就拒绝保存，而不是静默退化成覆盖
+      await refreshStatus({ silentFailure: true });
+      if (state.userId !== requestUserId) {
+        toast("已切换用户，本次偏好未保存");
+        return;
+      }
+      snapshot = state.status && state.status.preferences;
+      existing =
+        snapshot && Object.prototype.hasOwnProperty.call(snapshot, type)
+          ? snapshot[type]
+          : preferenceLatest.get(type);
+      if (!snapshot) {
+        toast("无法读取现有偏好，暂不能追加保存，请稍后重试");
+        return;
+      }
+    }
     const merged = Array.isArray(existing)
       ? existing.filter(
           (item) => item !== null && String(item).trim() !== "",
@@ -5428,8 +5551,6 @@ async function addPreference(event) {
   }
   els.prefSubmit.disabled = true;
   els.prefCancel.disabled = true;
-  // 响应返回前可能已切换用户：请求体与写回都按发起时的用户
-  const requestUserId = state.userId;
   try {
     const result = await getJSON(
       `/api/preferences/${encodeURIComponent(type)}`,
@@ -5461,7 +5582,24 @@ async function addPreference(event) {
     // 静默：失败时「刷新数据概览失败」不能覆盖刚显示的保存成功提示
     await refreshStatus({ silentFailure: true });
   } catch (error) {
-    toast(error.message);
+    const status = Number((error && error.status) || 0);
+    if (!status || status >= 500) {
+      // 无 HTTP 状态（超时 / 断连）或 5xx：PUT 是 UPSERT，请求可能已被
+      // 服务端执行。不能当作确定失败只提示错误，否则下一次「添加偏好」
+      // 仍以旧基线合并，刚写入的条目会被覆盖（与行内编辑 / 删除同口径）
+      toast(
+        `保存结果未知：${error.message}；服务端可能已保存，请稍后刷新确认`,
+      );
+      if (state.userId === requestUserId) {
+        preferenceLatest.set(type, value);
+        if (state.status && state.status.preferences) {
+          state.status.preferences[type] = value;
+        }
+      }
+      await refreshStatus({ silentFailure: true });
+    } else {
+      toast(error.message);
+    }
   } finally {
     els.prefSubmit.disabled = false;
     els.prefCancel.disabled = false;
@@ -5482,8 +5620,15 @@ function formatPreferenceValue(value) {
 
 function preferenceInputValue(value) {
   // 数组项可能是对象：直接 join 会渲染成 "[object Object]"，保存时回写的
-  // 就是一串字面量。与概览显示共用同一格式化（对象项按 JSON 文本展示）
-  if (Array.isArray(value)) return formatPreferenceValue(value);
+  // 就是一串字面量。对象数组整段按 JSON 文本回填——按「、」拼接出来的
+  // 文本（{"a":1}、{"b":2}）不是合法 JSON，用户改一个字段就必然提示
+  // 「格式无效」，等于无法编辑
+  if (Array.isArray(value)) {
+    if (value.some((item) => item !== null && typeof item === "object")) {
+      return JSON.stringify(value);
+    }
+    return formatPreferenceValue(value);
+  }
   if (value !== null && typeof value === "object") return JSON.stringify(value);
   return String(value ?? "");
 }
@@ -5539,12 +5684,13 @@ function preferenceOutputValue(original, text) {
     }
   }
   const trimmed = text.trim();
-  if (
-    typeof original === "number" &&
-    trimmed !== "" &&
-    !Number.isNaN(Number(trimmed))
-  ) {
-    return Number(trimmed);
+  if (typeof original === "number" && trimmed !== "") {
+    const number = Number(trimmed);
+    if (Number.isFinite(number)) return number;
+    // 1e999 / Infinity 会被 JSON 序列化成 null，服务端按空值拒绝：
+    // 明确判为格式无效；非数字文本仍按文本保存（既有行为）
+    if (Number.isNaN(number)) return trimmed;
+    return undefined;
   }
   if (typeof original === "boolean" && /^(true|false)$/i.test(trimmed)) {
     return trimmed.toLowerCase() === "true";
@@ -7465,6 +7611,8 @@ function openMemorySheet() {
 function closeMemorySheet() {
   if (els.memorySheet.hidden) return;
   els.memorySheet.hidden = true;
+  // 面板关闭后筛选防抖不能再补发请求（展开列表已不可见，收起时也清）
+  clearTimeout(tripFilterTimer);
   if (state.statusStale) {
     state.statusStale = false;
     refreshStatus();
@@ -7930,8 +8078,9 @@ function bindEvents() {
     els.tripsDedupe.addEventListener("click", async () => {
       if (els.tripsDedupe.disabled) return;
       const button = els.tripsDedupe;
-      // 固定发起时的用户：清理期间切换用户不能把去重打到另一个账号
-      const userId = state.userId;
+      // 固定发起时的用户：清理期间切换用户不能把去重打到另一个账号，
+      // 迟到的预览 / 结果也不能改写新账号的界面与草稿
+      const requestUserId = state.userId;
       // 清理请求是否已发出：超时 / 断连 / 503 时服务端可能已部分删除
       let applySent = false;
       button.disabled = true;
@@ -7940,11 +8089,12 @@ function bindEvents() {
         const preview = await getJSON("/api/trips/dedupe", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ user_id: userId, dry_run: true }),
+          body: JSON.stringify({ user_id: requestUserId, dry_run: true }),
         });
         // 只看记忆面板本身：快捷键浮层打开时 isModalOpen() 也为真，
-      // 面板已关仍会弹确认并在看不见的界面里写库
-      if (els.memorySheet.hidden) return;
+        // 面板已关仍会弹确认并在看不见的界面里写库；期间切换用户时
+        // 结果属于原账号，同样不能再弹确认
+        if (els.memorySheet.hidden || state.userId !== requestUserId) return;
         const count = Number(preview.would_remove || 0);
         const ambiguous = Array.isArray(preview.ambiguous_ids)
           ? preview.ambiguous_ids
@@ -7974,23 +8124,27 @@ function bindEvents() {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           // 服务端默认 dry_run=true（只预览）：真实删除必须显式传 false
-          body: JSON.stringify({ user_id: userId, dry_run: false }),
+          body: JSON.stringify({ user_id: requestUserId, dry_run: false }),
         });
         const removedCount = Number(result.removed || 0);
-        toast(`已清理 ${removedCount} 条重复行程`);
-        // 去重可能删掉正在编辑的行程：退出编辑态，避免「保存修改」永远 404
-        if (removedCount > 0 && state.tripEditingId) resetTripForm();
-        await refreshStatus({ silentFailure: true });
+        if (state.userId === requestUserId) {
+          toast(`已清理 ${removedCount} 条重复行程`);
+          // 去重可能删掉正在编辑的行程：退出编辑态，避免「保存修改」永远 404
+          if (removedCount > 0 && state.tripEditingId) resetTripForm();
+          await refreshStatus({ silentFailure: true });
+        }
       } catch (error) {
         if (applySent) {
           // 服务端 apply_trip_dedupe 中途失败会返回 503「已删除 N 条」，
           // 客户端超时 / 断连时也可能已部分删除：刷新并退出编辑态，
           // 避免用户对已删除行反复「保存修改」得到 404
-          toast(
-            `清理重复行程失败：${error.message || error}（服务端可能已删除部分行程，已刷新）`,
-          );
-          if (state.tripEditingId) resetTripForm();
-          await refreshStatus({ silentFailure: true });
+          if (state.userId === requestUserId) {
+            toast(
+              `清理重复行程失败：${error.message || error}（服务端可能已删除部分行程，已刷新）`,
+            );
+            if (state.tripEditingId) resetTripForm();
+            await refreshStatus({ silentFailure: true });
+          }
         } else {
           toast(`清理重复行程失败：${error.message || error}`);
         }
@@ -8030,8 +8184,9 @@ function bindEvents() {
     clearTimeout(tripFilterTimer);
     if (state.tripsComposing) return;
     tripFilterTimer = setTimeout(() => {
-      // 防抖定时器可能跨进下一次合成：preedit 文本不是用户意图
-      if (state.tripsComposing) return;
+      // 防抖定时器可能跨进下一次合成：preedit 文本不是用户意图；
+      // 期间收起视图 / 关闭面板时也不再请求
+      if (state.tripsComposing || !state.tripsExpanded) return;
       loadExpandedTrips();
     }, 250);
   };

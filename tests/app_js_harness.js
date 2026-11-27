@@ -3455,6 +3455,9 @@ async function scenarioEditorsRound2(source) {
   run(`
     __toasts = [];
     globalThis.__resolvePut = null;
+    // 列表型追加需要 /api/status 权威快照作为合并基线（无基线时不再退化成
+    // 整值覆盖，见 addNoBaseline 用例）
+    state.status = { preferences: { hotel_brands: [] } };
     getJSON = () => new Promise((resolve) => { __resolvePut = resolve; });
     els.prefValue.value = "汉庭";
     els.prefType.value = "hotel_brands";
@@ -3585,6 +3588,83 @@ async function scenarioEditorsRound2(source) {
   results.href = run(
     'renderInline("[链接](http://example.com/`code`-x)")',
   );
+  // 对象数组偏好：编辑框回填整段合法 JSON，改一个字段即可保存（按「、」
+  // 拼接的文本不是合法 JSON，用户任何修改都会被判「格式无效」）
+  results.prefObjectArrayInput = run(`({
+    text: preferenceInputValue([{ name: "汉庭", level: 1 }]),
+    roundtrip: preferenceOutputValue(
+      [{ name: "汉庭", level: 1 }],
+      preferenceInputValue([{ name: "汉庭", level: 2 }]),
+    ),
+    plainList: preferenceInputValue(["汉庭", "如家"]),
+  })`);
+
+  // 列表型追加以 /api/status 权威快照为准：preferenceLatest 落后（行内编辑
+  // 期间被跳过的刷新）时，不能用旧列表覆盖对话侧新增的条目
+  run(`
+    __toasts = [];
+    globalThis.__putBodies2 = [];
+    preferenceLatest.clear();
+    preferenceLatest.set("hotel_brands", ["汉庭"]);
+    state.status = { preferences: { hotel_brands: ["汉庭", "全季"] } };
+    getJSON = async (url, options) => {
+      __putBodies2.push(JSON.parse(options.body).value);
+      return {};
+    };
+    refreshStatus = async () => {};
+    els.prefValue.value = "如家";
+    els.prefType.value = "hotel_brands";
+  `);
+  await run("addPreference({ preventDefault() {} })");
+  results.addStatusBaseline = run("__putBodies2[0]");
+
+  // 无权威快照且刷新失败：追加没有合并基线，不得退化成整值覆盖
+  run(`
+    __toasts = [];
+    globalThis.__putCount2 = 0;
+    globalThis.__refreshCalls2 = 0;
+    preferenceLatest.clear();
+    state.status = null;
+    getJSON = async () => { __putCount2 += 1; return {}; };
+    refreshStatus = async () => { __refreshCalls2 += 1; };
+    els.prefValue.value = "全季";
+    els.prefType.value = "hotel_brands";
+  `);
+  await run("addPreference({ preventDefault() {} })");
+  results.addNoBaseline = run(`({
+    puts: __putCount2,
+    refreshes: __refreshCalls2,
+    toasts: __toasts.slice(),
+  })`);
+
+  // 保存结果未知（超时 / 断连）：提示未知、写回基线与状态并静默对账，
+  // 下一次追加不会再用旧列表整值覆盖刚写入的值
+  run(`
+    __toasts = [];
+    globalThis.__refreshes3 = 0;
+    state.userId = "u1";
+    preferenceLatest.clear();
+    state.status = { preferences: { hotel_brands: ["汉庭"] } };
+    getJSON = async () => { throw new Error("请求超时，请稍后重试"); };
+    refreshStatus = async () => { __refreshes3 += 1; };
+    els.prefValue.value = "全季";
+    els.prefType.value = "hotel_brands";
+  `);
+  await run("addPreference({ preventDefault() {} })");
+  results.addUnknownOutcome = run(`({
+    toasts: __toasts.slice(),
+    refreshes: __refreshes3,
+    latest: preferenceLatest.get("hotel_brands"),
+    status: state.status.preferences.hotel_brands,
+  })`);
+
+  // 数值偏好编辑拒绝非有限数（Infinity / 1e999 序列化成 null 会被
+  // 服务端按空值拒绝）
+  results.prefScalarFinite = run(`({
+    infinity: preferenceOutputValue(3, "1e999"),
+    normal: preferenceOutputValue(3, "4.5"),
+  })`);
+
   return results;
 }
 
@@ -4113,6 +4193,194 @@ async function scenarioTripDedupeUnknown(source) {
       button: els.tripsDedupe.textContent,
     })`);
   }
+  return results;
+}
+
+async function scenarioTripDedupeSwitchGuard(source) {
+  // 预览返回前已切换用户：不能再弹确认、不能发出真实删除，也不能重置
+  // 新账号正在编辑的行程表单
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    __toasts = []; __refreshed = 0; __reset = 0; __confirm = 0;
+    confirm = () => { __confirm += 1; return true; };
+    refreshStatus = async () => { __refreshed += 1; };
+    resetTripForm = () => { __reset += 1; state.tripEditingId = null; };
+    state.userId = "u1"; state.tripEditingId = "trip_1";
+    bindEvents();
+    __pendingReq = [];
+    getJSON = (url, options) =>
+      new Promise((resolve, reject) => { __pendingReq.push({ resolve, reject }); });
+  `);
+  run("els.tripsDedupe.click();");
+  await tick();
+  run('state.userId = "u2"; state.tripEditingId = "trip_9";');
+  run("__pendingReq[0].resolve({ would_remove: 2, ambiguous_ids: [] });");
+  for (let i = 0; i < 50; i += 1) {
+    await tick();
+    if (!run("els.tripsDedupe.disabled")) break;
+  }
+  return run(`({
+    toasts: __toasts.slice(),
+    confirmCalls: __confirm,
+    requests: __pendingReq.length,
+    refreshed: __refreshed,
+    reset: __reset,
+    editing: state.tripEditingId,
+    button: els.tripsDedupe.textContent,
+  })`);
+}
+
+async function scenarioTripEditPartial(source) {
+  // 编辑行程只提交改动字段：整表单 PUT 会把刷新前旧值写回，静默回滚
+  // CLI / 另一标签页刚保存的字段
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    __toasts = [];
+    toast = (message) => { __toasts.push(message); };
+    globalThis.__puts = [];
+    getJSON = async (url, options) => {
+      __puts.push({ url, body: JSON.parse(options.body) });
+      return {
+        trip: {
+          trip_id: "trip_1",
+          origin: "北京",
+          destination: "上海",
+          start_date: "2026-12-01",
+          end_date: "2026-12-03",
+          purpose: "客户会议",
+        },
+        conflicts: [],
+      };
+    };
+    refreshStatus = async () => {};
+    confirm = () => true;
+    state.userId = "u1";
+    state.tripLatest.clear();
+    startEditTrip({ trip_id: "trip_1", origin: "北京", destination: "上海", start_date: "2026-12-01", end_date: "2026-12-03", purpose: "出差" });
+    els.tripPurpose.value = "客户会议";
+  `);
+  await run("addTrip({ preventDefault() {} })");
+  const partial = run("__puts.map((item) => item.body)");
+
+  // 未改任何字段直接保存：不发请求（服务端会 400「没有需要更新的字段」）
+  run(`
+    __toasts = [];
+    __puts = [];
+    startEditTrip({ trip_id: "trip_1", origin: "北京", destination: "上海", start_date: "2026-12-01", end_date: "2026-12-03", purpose: "出差" });
+  `);
+  await run("addTrip({ preventDefault() {} })");
+  const noop = run(`({
+    puts: __puts.length,
+    toasts: __toasts.slice(),
+    editing: state.tripEditingId,
+    formHidden: els.tripForm.hidden,
+  })`);
+
+  // 编辑另一行但未改动：跨行切换不应弹「未提交内容」确认
+  run(`
+    globalThis.__confirmCalls = 0;
+    confirm = () => { __confirmCalls += 1; return false; };
+    resetTripForm();
+    els.tripOrigin.value = ""; els.tripDestination.value = ""; els.tripStart.value = "";
+    els.tripEnd.value = ""; els.tripPurpose.value = "";
+    state.tripLatest.clear();
+    startEditTrip({ trip_id: "trip_1", origin: "北京", destination: "上海", start_date: "2026-12-01", end_date: "", purpose: "出差" });
+    startEditTrip({ trip_id: "trip_2", origin: "杭州", destination: "成都", start_date: "2026-12-10", end_date: "", purpose: "培训" });
+  `);
+  const crossRow = run(`({
+    confirmCalls: __confirmCalls,
+    dest: els.tripDestination.value,
+  })`);
+
+  return { partial, noop, crossRow };
+}
+
+async function scenarioPanelRound(source) {
+  // 行程空态文案、筛选导出按钮文案、重叠徽标总数
+  const results = {};
+
+  {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      state.userId = "u1";
+      els.memorySheet.hidden = false;
+      state.tripsExpanded = true;
+      state.tripsStatusFilter = "past";
+      state.tripsFilter = "";
+      state.tripsAll = [];
+      state.tripsAllTotal = 0;
+      state.tripsLoadedFilter = "";
+      state.tripsLoadedStatus = "past";
+      state.status = { preferences: {}, trips: [], statistics: {}, usage: {}, storage: {}, trip_count: 0 };
+      renderOverview();
+    `);
+    results.emptyWithStatus = run(`({
+      text: els.trips.children[0] ? els.trips.children[0].textContent : null,
+      exportLabel: els.exportTrips.textContent,
+      exportTitle: els.exportTrips.title,
+    })`);
+  }
+
+  {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      state.userId = "u1";
+      els.memorySheet.hidden = false;
+      state.tripsExpanded = true;
+      state.tripsStatusFilter = "";
+      state.tripsFilter = "";
+      state.tripsAll = [];
+      state.tripsAllTotal = 0;
+      state.tripsLoadedFilter = "";
+      state.tripsLoadedStatus = "";
+      state.status = { preferences: {}, trips: [], statistics: {}, usage: {}, storage: {}, trip_count: 0 };
+      renderOverview();
+    `);
+    results.emptyNoFilter = run(`({
+      text: els.trips.children[0] ? els.trips.children[0].textContent : null,
+      exportLabel: els.exportTrips.textContent,
+    })`);
+  }
+
+  {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      state.userId = "u1";
+      els.memorySheet.hidden = false;
+      state.tripsExpanded = true;
+      state.tripsStatusFilter = "";
+      state.tripsFilter = "";
+      state.tripsAll = [{
+        trip_id: "trip_1",
+        origin: "北京",
+        destination: "上海",
+        start_date: "2026-01-01",
+        end_date: "2026-01-02",
+        purpose: "出差",
+        conflicts: [{ origin: "杭州", destination: "成都", start_date: "2026-01-01", end_date: "2026-01-03" }],
+        conflict_count: 25,
+      }];
+      state.tripsAllTotal = 1;
+      state.tripsLoadedFilter = "";
+      state.tripsLoadedStatus = "";
+      state.status = { preferences: {}, trips: [], statistics: {}, usage: {}, storage: {}, trip_count: 1 };
+      renderOverview();
+    `);
+    results.conflictBadge = run(`(() => {
+      const row = els.trips.children[0];
+      const meta = row && row.children[1];
+      const badge = meta && meta.children.find(
+        (node) => node && String(node.className || "").includes("conflict"),
+      );
+      return badge ? { title: badge.title, label: badge.getAttribute("aria-label") } : null;
+    })()`);
+  }
+
   return results;
 }
 
@@ -4945,10 +5213,14 @@ async function scenarioTripImportFailure(source) {
       globalThis.__urls = [];
       getJSON = (url) => {
         __urls.push(url);
+        const kind = ${JSON.stringify(kind)};
+        if (kind === "previewTimeout") {
+          // 预览（dry_run）阶段超时：服务端零写入
+          return Promise.reject(new Error("请求超时，请稍后重试"));
+        }
         if (__urls.length === 1) {
           return Promise.resolve({ format: "csv", rows: 2, created: 1, updated: 0, skipped: [], skipped_total: 0 });
         }
-        const kind = ${JSON.stringify(kind)};
         if (kind === "partial") {
           return Promise.reject(Object.assign(new Error("导入部分失败：已提交 1 条新增、0 条更新；重试会按同路线同日期去重，可安全重跑"), { status: 503 }));
         }
@@ -4977,6 +5249,7 @@ async function scenarioTripImportFailure(source) {
     timeout: await runCase("timeout"),
     badRequest: await runCase("badRequest"),
     switched: await runCase("switched"),
+    previewTimeout: await runCase("previewTimeout"),
   };
 }
 
@@ -5632,6 +5905,12 @@ async function main() {
     payload = await scenarioEditDeleteOutcome(source);
   } else if (scenario === "perfRound") {
     payload = await scenarioPerfRound(source);
+  } else if (scenario === "tripDedupeSwitchGuard") {
+    payload = await scenarioTripDedupeSwitchGuard(source);
+  } else if (scenario === "tripEditPartial") {
+    payload = await scenarioTripEditPartial(source);
+  } else if (scenario === "panelRound") {
+    payload = await scenarioPanelRound(source);
   } else if (scenario === "theme") {
     payload = await scenarioTheme(source);
   } else {

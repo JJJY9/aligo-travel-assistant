@@ -1869,6 +1869,13 @@ def test_unmanageable_preference_types_skipped_everywhere():
     assert is_manageable_pref_type("x" + chr(0x0A) + "fake") is False
     assert is_manageable_pref_type("x" + chr(0x00) + "y") is False
     assert is_manageable_pref_type("x" + chr(0x2028) + "y") is False
+    # 尾随控制字符不能被 strip 洗掉：加载清洗与面板 / CLI 的原始键校验
+    # 必须同口径，否则 "home\n" 逃过加载却永远删不掉
+    assert is_manageable_pref_type("home" + chr(0x0A)) is False
+    assert is_manageable_pref_type("home" + chr(0x09)) is False
+    assert is_manageable_pref_type(" home") is True
+    assert is_manageable_pref_type(".") is False
+    assert is_manageable_pref_type("..") is False
 
     entries = [
         {"type": "a/b", "value": "x"},

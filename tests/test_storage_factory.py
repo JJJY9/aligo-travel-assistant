@@ -3618,6 +3618,87 @@ def test_migrate_missing_last_trip_number_is_not_destructive():
     print("✓ 缺失 last_trip_number 不再误报破坏性迁移")
 
 
+def test_migrate_nested_empty_preference_does_not_shadow_valid_value():
+    """旧版嵌套容器里的空值项不能影子覆盖同类型有效偏好并在写盘后丢失。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-nested-null.json"
+    path.write_text(
+        json.dumps(
+            {
+                "preferences": [
+                    {"type": "hotel_brands", "value": ["汉庭"]},
+                    {
+                        "type": "preferences",
+                        "value": [
+                            {"type": "home_location", "value": "上海"},
+                            {"type": "hotel_brands", "value": None},
+                        ],
+                    },
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-nested-null", storage_dir)
+    preferences = memory.get_preference()
+    assert preferences["hotel_brands"] == ["汉庭"], preferences
+    assert preferences["home_location"] == "上海", preferences
+    # 写盘一次后再加载：空值项不能被固化后按顶层空值清洗掉有效偏好
+    memory.save_preference("meal_preference", "素")
+    reloaded = LongTermMemory("u-nested-null", storage_dir)
+    assert reloaded.get_preference()["hotel_brands"] == ["汉庭"]
+    print("✓ 嵌套空值偏好不再影子覆盖有效值")
+
+
+def test_migrate_backfills_missing_trip_ids():
+    """缺 trip_id 的历史行程在加载时补发编号：编辑 / 删除不再恒 404。"""
+    storage_dir = tempfile.mkdtemp()
+    path = Path(storage_dir) / "u-no-trip-id.json"
+    path.write_text(
+        json.dumps(
+            {
+                "trip_history": [
+                    {
+                        "destination": "上海",
+                        "start_date": "2026-12-01",
+                        "end_date": "2026-12-02",
+                    },
+                    {
+                        "trip_id": "trip_2",
+                        "destination": "杭州",
+                        "start_date": "2026-12-03",
+                        "end_date": "2026-12-04",
+                    },
+                    {
+                        "destination": "成都",
+                        "start_date": "2026-12-05",
+                        "end_date": "2026-12-06",
+                    },
+                ],
+                "statistics": {"last_trip_number": 2},
+            }
+        ),
+        encoding="utf-8",
+    )
+    memory = LongTermMemory("u-no-trip-id", storage_dir)
+    trips = memory.get_trip_history(limit=None)
+    ids = [trip.get("trip_id") for trip in trips]
+    assert all(ids), ids
+    assert ids[1] == "trip_2", "已有编号不能被改写"
+    assert len(set(ids)) == 3, ids
+    # 按补发的 id 删除能命中（面板「删除后复活」的根因）
+    assert memory.delete_trip(ids[0]) is True
+    remaining = [trip.get("trip_id") for trip in memory.get_trip_history(limit=None)]
+    assert remaining == [ids[1], ids[2]], remaining
+    # 写盘后重新加载：编号保持稳定（每次加载确定性补发）
+    reloaded = LongTermMemory("u-no-trip-id", storage_dir)
+    assert [trip.get("trip_id") for trip in reloaded.get_trip_history(limit=None)] == [
+        ids[1],
+        ids[2],
+    ]
+    print("✓ 缺编号历史行程加载时补发 trip_id")
+
+
 def test_migrate_sanitizes_invalid_preferences():
     """type 非字符串 / 缺 value 的偏好记录在迁移时丢弃（否则整文件被隔离）。"""
     storage_dir = tempfile.mkdtemp()

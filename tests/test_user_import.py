@@ -367,6 +367,35 @@ def test_parse_export_skips_invalid_rows():
     print("✓ 非法偏好 / 行程 / 消息逐条处理（脏日期保真、倒置保留）")
 
 
+def test_parse_export_truncates_oversize_trip_fields():
+    """备份恢复的超长行程字段按 100 字截断并提示：恢复后仍可在面板 / CLI 编辑。
+
+    整条跳过会让备份静默丢行程（#581 的保真约定），但原样恢复的 300 字
+    字段在面板 PUT / CLI 编辑时必然 422。
+    """
+    long_text = "长" * 130
+    payload = {
+        "trip_history": [
+            {
+                "origin": long_text,
+                "destination": "上海",
+                "purpose": long_text,
+                "start_date": "2026-12-01",
+            }
+        ]
+    }
+    sections, errors = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    trip = sections["trips"][0]
+    assert len(trip["origin"]) == 100, trip
+    assert len(trip["purpose"]) == 100, trip
+    assert trip["destination"] == "上海", trip
+    assert any("出发地、目的超过 100 字，已截断" in item for item in errors), errors
+    # 同一备份重复恢复：截断结果一致，不会因身份漂移新增重复行程
+    again, _ = parse_user_export(json.dumps(payload, ensure_ascii=False))
+    assert again["trips"] == sections["trips"]
+    print("✓ 超长行程字段按 100 字截断并提示")
+
+
 def test_import_keeps_inverted_date_trip():
     """倒置日期（结束早于出发）的行程随备份恢复，不再整条丢弃。"""
     payload = {
