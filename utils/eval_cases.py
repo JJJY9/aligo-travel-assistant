@@ -177,7 +177,7 @@ def _pick_slots(template: str, rng: random.Random) -> dict[str, str]:
 
 
 def _required_keywords(
-    slot_names: Sequence[str], slots: dict[str, str]
+    slot_names: Sequence[str], slots: dict[str, str], template: str = ""
 ) -> list[str]:
     keywords: list[str] = []
     for name in slot_names:
@@ -186,7 +186,9 @@ def _required_keywords(
             if value:
                 keywords.append(value)
         elif name == "policy_keyword":
-            keywords.append("标准")
+            # 两个 policy_rag 模板问的措辞不同：住宿类问「标准」，报销类
+            # 问「上限」。统一要求「标准」会把正确回答误报为缺关键词
+            keywords.append("上限" if "上限" in template else "标准")
         elif name in slots:
             keywords.append(slots[name])
     return [keyword for keyword in keywords if keyword]
@@ -194,8 +196,10 @@ def _required_keywords(
 
 def build_cases(count: int = 500, seed: int = 7) -> list[dict[str, Any]]:
     """确定性生成分层评测集（默认 500 条），覆盖全部 18 类场景。"""
-    if count < 0:
-        raise ValueError("count 不能为负数")
+    if count < 1:
+        # 0 条不是有效评测集：CLI 已按 1..5000 收窄，程序化调用同样
+        # 拒绝（否则「已生成 0 条」会把现有 JSONL 截断成空文件）
+        raise ValueError("count 必须至少为 1")
     rng = random.Random(seed)
     cases: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -239,14 +243,42 @@ def dump_cases(
 
     与其它导出命令（trips-export / session-export / kb-export）同一守卫：
     ``--out`` 指向用户记忆文件、旧备份或人工维护的用例集时不能被静默
-    截断覆盖；写入走原子替换，中途失败不会留下半截文件。
+    截断覆盖；写入走原子替换，中途失败不会留下半截文件。覆盖判定用
+    ``O_CREAT|O_EXCL`` 占名而不是 ``exists()`` 预检：并发两次导出都可能
+    在文件尚不存在时通过检查，后者会静默覆盖先写者的完整用例集。
     """
     from utils.atomic_write import write_text_atomic
+    from utils.exporter import claim_export_path
 
     output = Path(path)
-    if output.exists() and not force:
-        raise FileExistsError(f"文件已存在：{output}（加 --force 覆盖）")
+    if output.is_dir():
+        raise IsADirectoryError(f"目标是一个目录：{output}（--out 需要文件路径）")
+    if output.parent.exists() and not output.parent.is_dir():
+        raise NotADirectoryError(f"父路径不是目录：{output.parent}")
     text = "".join(
         json.dumps(case, ensure_ascii=False) + "\n" for case in cases
     )
-    write_text_atomic(output, text, newline="\n")
+    if force:
+        write_text_atomic(output, text, newline="\n")
+        return
+    if not claim_export_path(output):
+        raise FileExistsError(f"文件已存在：{output}（加 --force 覆盖）")
+    try:
+        stat = output.stat()
+    except OSError:
+        stat = None
+    identity = (stat.st_dev, stat.st_ino, stat.st_size) if stat else None
+    try:
+        write_text_atomic(output, text, newline="\n")
+    except BaseException:
+        # 只清理仍是本次占下的空占位：另一进程 --force 已用完整用例集
+        # 替换时不能误删他人的文件
+        try:
+            current = output.stat()
+            if identity is None or (
+                current.st_dev, current.st_ino, current.st_size
+            ) == identity:
+                output.unlink()
+        except OSError:
+            pass
+        raise

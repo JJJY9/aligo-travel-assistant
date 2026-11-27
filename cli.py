@@ -2942,10 +2942,6 @@ def run_agent_eval_standalone(
     intention_factory: Any = None,
 ) -> int:
     """跑意图评测（`python cli.py eval-agent`），可注入 fake 意图智能体。"""
-    from utils.agent_eval import (
-        collect_intent_predictions,
-        evaluate_intent_predictions,
-    )
     from utils.eval_cases import build_cases
 
     try:
@@ -2964,6 +2960,13 @@ def run_agent_eval_standalone(
         return 1
 
     try:
+        # 依赖导入放进 try：agentscope 缺失 / 装坏时按 --json 契约输出
+        # 失败对象，而不是把 ImportError 直接抛到终端
+        from utils.agent_eval import (
+            collect_intent_predictions,
+            evaluate_intent_predictions,
+        )
+
         if intention_factory is None:
             from config import LLM_CONFIG
 
@@ -3028,6 +3031,9 @@ def run_agent_eval_standalone(
             print(f"  {item['id']}（{item['category']}）：{reasons}")
     if not passed:
         print(f"低于阈值 Pass@1 >= {min_pass:.0%}")
+    elif min_pass <= 0.0:
+        # 默认阈值 0.0 恒达标：明确告知这不是门禁，避免 CI 误用
+        print("提示：--min-pass 0.0 仅生成报告（任何得分都退出 0），CI 回归请显式设置阈值")
     return 0 if passed else 1
 
 

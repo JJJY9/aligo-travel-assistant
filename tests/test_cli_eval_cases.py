@@ -72,11 +72,31 @@ def test_run_eval_cases_write_failure_is_error():
         with contextlib.redirect_stdout(output):
             code = cli.run_eval_cases_standalone(3, 7, root)
         assert code == 1
-        # 目标已存在（这里是同名目录）走覆盖守卫，而不是「生成失败」
-        assert "文件已存在" in output.getvalue(), output.getvalue()
+        # 目录目标明确报「目标是一个目录」，而不是误导用户加 --force
+        assert "目标是一个目录" in output.getvalue(), output.getvalue()
+        assert "生成评测用例失败" in output.getvalue(), output.getvalue()
     finally:
         shutil.rmtree(root, ignore_errors=True)
     print("✓ eval-cases 写入失败返回错误")
+
+
+def test_build_cases_rejects_zero():
+    """0 条不是有效评测集：CLI 与程序化调用同一口径拒绝。"""
+    with pytest.raises(ValueError):
+        build_cases(0, 7)
+    root = tempfile.mkdtemp(prefix="chailv_eval_cases_zero_")
+    try:
+        path = os.path.join(root, "cases.jsonl")
+        Path(path).write_text("{}\n", encoding="utf-8")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = cli.run_eval_cases_standalone(0, 7, path, force=True)
+        assert code == 1, output.getvalue()
+        # 既有文件不能被「0 条成功」截断
+        assert Path(path).read_text(encoding="utf-8") == "{}\n"
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    print("✓ build_cases(0) 拒绝且不截断既有文件")
 
 
 def test_eval_cases_dispatch(monkeypatch):
@@ -135,6 +155,7 @@ if __name__ == "__main__":
     test_parse_eval_cases_args()
     test_run_eval_cases_writes_jsonl()
     test_run_eval_cases_write_failure_is_error()
+    test_build_cases_rejects_zero()
     mp = pytest.MonkeyPatch()
     try:
         test_eval_cases_dispatch(mp)

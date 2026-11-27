@@ -56,6 +56,74 @@ class _AlwaysPlan(_KeywordIntention):
         )
 
 
+class _DegradedIntention:
+    """模拟 IntentionAgent 解析失败后的降级输出（默认 information_query）。"""
+
+    async def reply(self, message):
+        return Msg(
+            name="Intention",
+            content=json.dumps(
+                {
+                    "reasoning": "意图识别出错，使用默认策略。错误: Failed to parse JSON",
+                    "agent_schedule": [
+                        {"agent_name": "information_query", "priority": 1}
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+            role="assistant",
+        )
+
+
+def test_degraded_output_is_not_scored_as_prediction():
+    """兜底成 information_query 的降级输出不能当真实预测：记为失败。"""
+    prediction = prediction_from_intention_content(
+        json.dumps(
+            {
+                "reasoning": "意图识别出错，使用默认策略。错误: 模板回显",
+                "agent_schedule": [
+                    {"agent_name": "information_query", "priority": 1}
+                ],
+            },
+            ensure_ascii=False,
+        )
+    )
+    assert prediction["error"] == "意图识别降级为默认调度"
+    assert prediction["intents"] == []
+
+    cases = build_cases(3, 7)
+    with pytest.raises(RuntimeError):
+        asyncio.run(collect_intent_predictions(cases, _DegradedIntention()))
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = cli.run_agent_eval_standalone(
+            count=2,
+            seed=7,
+            min_pass=0.0,
+            as_json=False,
+            intention_factory=_DegradedIntention,
+        )
+    assert code == 1, output.getvalue()
+    assert "意图评测失败" in output.getvalue()
+    print("✓ 降级输出计为失败，全部降级时退出 1")
+
+
+def test_default_min_pass_is_report_only_notice():
+    """默认 --min-pass 0.0 只报告：输出必须明确提示不是门禁。"""
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        code = cli.run_agent_eval_standalone(
+            count=2,
+            seed=7,
+            min_pass=0.0,
+            as_json=False,
+            intention_factory=_KeywordIntention,
+        )
+    assert code == 0, output.getvalue()
+    assert "仅生成报告" in output.getvalue()
+    print("✓ 默认阈值提示仅报告")
+
+
 def test_prediction_parses_and_canonicalizes_schedule():
     prediction = prediction_from_intention_content(
         json.dumps(
@@ -257,6 +325,8 @@ if __name__ == "__main__":
     test_parse_failure_is_marked_error_not_empty_intents()
     test_other_cases_expect_no_scheduled_agent()
     test_collect_isolates_single_failure_and_raises_when_all_fail()
+    test_degraded_output_is_not_scored_as_prediction()
+    test_default_min_pass_is_report_only_notice()
     test_parse_eval_agent_args()
     test_run_agent_eval_with_fake_intention()
     mp = pytest.MonkeyPatch()

@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
+import json
 import re
 import sys
 from dataclasses import dataclass
@@ -201,15 +202,28 @@ def check_storage() -> CheckResult:
 
     if backends["long_term"] == "postgres":
         try:
-            from context.postgres_long_term_memory import PostgresLongTermMemory
+            # 只读连通性探测：构造 PostgresLongTermMemory 会执行建表 / 建
+            # 索引 DDL 并抢 advisory lock（doctor 不该改目标库，只读账号也
+            # 应能通过自检）。这里只做一次 SELECT，表结构缺失只提示、
+            # 由应用首次使用时自动创建。
+            import psycopg
 
-            # 自检探测给 DDL / 查询设上限：只有 connect_timeout 挡不住
-            # _ensure_schema 在网络半通时无限等待
-            memory = PostgresLongTermMemory(
-                "__doctor_probe__", dsn, statement_timeout_ms=3000
+            conn = psycopg.connect(
+                dsn,
+                connect_timeout=3,
+                options="-c statement_timeout=3000",
             )
-            memory.close()
-            parts.append("长期记忆 · PostgreSQL 可用")
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("SELECT to_regclass('aligo_trips')")
+                    row = cursor.fetchone()
+            finally:
+                conn.close()
+            schema_ready = bool(row and row[0] is not None)
+            parts.append(
+                "长期记忆 · PostgreSQL 可用"
+                + ("" if schema_ready else "（表结构尚未创建，首次使用时自动建表）")
+            )
         except Exception as exc:  # noqa: BLE001 - 连通性检查失败属于检查结果
             failures.append(f"PostgreSQL 不可用：{_redact_secret(exc)[:120]}")
     else:
@@ -439,6 +453,50 @@ def _default_model_dir() -> Path:
 
 _HF_MODEL_ID_RE = re.compile(r"^[\w.-]+/[\w.-]+$")
 
+_WEIGHT_FILES = ("model.safetensors", "pytorch_model.bin")
+_SHARD_INDEXES = ("model.safetensors.index.json", "pytorch_model.bin.index.json")
+
+
+def _has_content(path: Path) -> bool:
+    """文件存在且非空：0 字节常见于下载 / 复制中断或磁盘写满。"""
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _sharded_weights_state(model_path: Path) -> tuple[bool, str | None]:
+    """分片权重索引状态：``(是否存在索引, 问题描述或 None)``。
+
+    SentenceTransformer / HF 导出的分片模型没有单文件权重，只有
+    ``*.index.json`` + 多个分片文件；旧判定把这类健康模型报成「缺少
+    关键文件」并让 doctor 以失败退出。
+    """
+    for index_name in _SHARD_INDEXES:
+        index_path = model_path / index_name
+        if not index_path.is_file():
+            continue
+        try:
+            data = json.loads(index_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, ValueError):
+            return True, f"{index_name} 无法解析（下载可能不完整）"
+        weight_map = data.get("weight_map") if isinstance(data, dict) else None
+        if not isinstance(weight_map, dict) or not weight_map:
+            return True, f"{index_name} 缺少 weight_map"
+        shards: list[str] = []
+        for value in weight_map.values():
+            name = str(value or "").strip()
+            if name and name not in shards:
+                shards.append(name)
+        # 分片名必须落在模型目录内：索引引用上级/绝对路径时不能跟随
+        if any("/" in name or "\\" in name for name in shards):
+            return True, f"{index_name} 的分片名包含路径分隔符"
+        broken = sorted(name for name in shards if not _has_content(model_path / name))
+        if broken:
+            return True, "缺少或为空的分片权重: " + ", ".join(broken[:5])
+        return True, None
+    return False, None
+
 
 def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
     """检查本地嵌入模型文件完整性。"""
@@ -466,15 +524,22 @@ def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
         )
     # 权重 / 分词器有多种合法形态：SentenceTransformer 可加载
     # pytorch_model.bin，慢分词器模型可能只有 vocab.txt / spiece.model，
-    # 硬编码 safetensors + tokenizer.json 会把可用的模型误报为缺失
+    # 硬编码 safetensors + tokenizer.json 会把可用的模型误报为缺失；
+    # 分片权重（*.index.json + 多个 shard）同样合法，单独校验。
     required_groups = (
         ("config.json",),
-        ("model.safetensors", "pytorch_model.bin"),
-        ("tokenizer.json", "vocab.txt", "spiece.model", "tokenizer.model"),
+        _WEIGHT_FILES,
+        (
+            "tokenizer.json",
+            "vocab.txt",
+            "spiece.model",
+            "sentencepiece.bpe.model",
+            "tokenizer.model",
+        ),
     )
     # mean pooling 回退警告只由 sentence-transformers 的元数据缺失引起；
     # vocab.txt 不在推荐列表：fast tokenizer（tokenizer.json）模型本就不需要它，
-    # required_groups 也已按四种等价形态判定分词器满足
+    # required_groups 也已按多种等价形态判定分词器满足
     recommended = ["modules.json", "1_Pooling/config.json"]
 
     if not model_path.exists():
@@ -484,24 +549,51 @@ def check_model_files(model_dir: Path | str | None = None) -> CheckResult:
             f"未下载: {model_path}（RAG 功能不可用；下载方式见 README）",
         )
 
-    missing_required = [
-        " / ".join(group)
-        for group in required_groups
-        if not any((model_path / name).exists() for name in group)
-    ]
+    missing_required: list[str] = []
+    empty_required: list[str] = []
+    shard_problem: str | None = None
+    for group in required_groups:
+        present = [
+            model_path / name for name in group if (model_path / name).exists()
+        ]
+        if present:
+            if not any(_has_content(path) for path in present):
+                empty_required.append(" / ".join(group))
+            continue
+        if group == _WEIGHT_FILES:
+            found, problem = _sharded_weights_state(model_path)
+            if found:
+                shard_problem = problem
+                continue
+        missing_required.append(" / ".join(group))
     if missing_required:
         return CheckResult(
             "嵌入模型文件",
             STATUS_FAIL,
             "缺少关键文件: " + ", ".join(missing_required),
         )
+    if empty_required:
+        return CheckResult(
+            "嵌入模型文件",
+            STATUS_FAIL,
+            "关键文件为空（下载 / 复制可能中断，请重新下载模型）: "
+            + ", ".join(empty_required),
+        )
+    if shard_problem:
+        return CheckResult(
+            "嵌入模型文件",
+            STATUS_FAIL,
+            f"分片权重不完整：{shard_problem}（请重新下载模型）",
+        )
 
-    missing_recommended = [f for f in recommended if not (model_path / f).exists()]
+    missing_recommended = [
+        f for f in recommended if not _has_content(model_path / f)
+    ]
     if missing_recommended:
         return CheckResult(
             "嵌入模型文件",
             STATUS_WARN,
-            "缺少 " + ", ".join(missing_recommended)
+            "缺少或为空的 " + ", ".join(missing_recommended)
             + "（可运行，但会出现 mean pooling 回退警告；请从 HuggingFace 下载完整模型仓库文件）",
         )
 
@@ -556,6 +648,33 @@ def check_knowledge_base(db_path: Path | str | None = None) -> CheckResult:
                 f"已初始化 {count} 个片段，但集合维度（{collection_dim}）"
                 f"与当前嵌入模型配置（{configured_dim}）不一致，请重新初始化知识库",
             )
+        if configured_dim is None:
+            # HuggingFace 模型 ID 未下载到本地缓存时无法推断维度：此时
+            # 不能对维度一致性给出 ok（假绿），明确提示未校验
+            try:
+                from config import RAG_CONFIG
+
+                configured_model = str(
+                    RAG_CONFIG.get("embedding_model") or ""
+                )
+            except Exception:  # noqa: BLE001 - 配置缺失按未知处理
+                configured_model = ""
+            try:
+                local_model_exists = _default_model_dir().exists()
+            except Exception:  # noqa: BLE001 - 目录解析失败按未下载处理
+                local_model_exists = False
+            if (
+                configured_model
+                and _HF_MODEL_ID_RE.match(configured_model)
+                and not local_model_exists
+            ):
+                return CheckResult(
+                    "RAG 知识库",
+                    STATUS_WARN,
+                    f"已初始化 {count} 个片段；嵌入模型 {configured_model} "
+                    "尚未下载到本地缓存，无法校验向量维度"
+                    "（首次检索下载后若维度不一致会失败）",
+                )
     return CheckResult("RAG 知识库", STATUS_OK, f"已初始化，{count} 个知识片段")
 
 
@@ -652,4 +771,8 @@ def summarize(results: list[CheckResult]) -> tuple[str, str]:
         return "✗ 存在必须处理的问题，请根据上表修复", "red"
     if any(r.status == STATUS_WARN for r in results):
         return "⚠ 环境可用，但存在建议修复的警告", "yellow"
+    skipped = sum(1 for r in results if r.status == STATUS_SKIP)
+    if skipped:
+        # 有跳过项（如 --offline 的 LLM 连通性）时不能说「全部通过」
+        return f"✓ 检查通过（{skipped} 项跳过，未验证）", "green"
     return "✓ 环境检查全部通过", "green"

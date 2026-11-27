@@ -220,6 +220,52 @@ def test_dump_cases_jsonl_roundtrip():
     print("✓ 评测用例 JSONL 导出（默认拒绝覆盖，--force 覆盖）")
 
 
+def test_invalid_case_is_failure_not_pass():
+    """缺字段 / 字段类型错误的用例必须判失败，不能按空值白送通过。"""
+    missing = evaluate_case({"id": "x"}, {"intents": [], "answer": ""})
+    assert missing["passed"] is False
+    assert "用例无效" in " ".join(missing["reasons"])
+
+    bad_type = evaluate_case(
+        {"expected_intents": [], "required_keywords": 5},
+        {"intents": [], "answer": ""},
+    )
+    assert bad_type["passed"] is False
+    assert "required_keywords" in " ".join(bad_type["reasons"])
+
+    # 关键词写成字符串会被拆成单字匹配，同样按无效用例拒绝
+    bad_str = evaluate_case(
+        {"expected_intents": [], "forbidden_keywords": "无法"},
+        {"intents": [], "answer": ""},
+    )
+    assert bad_str["passed"] is False
+
+    bad_prediction = evaluate_case(
+        _case(required_keywords=[], forbidden_keywords=[]), "oops"
+    )
+    assert bad_prediction["passed"] is False
+    assert "预测返回类型非法" in " ".join(bad_prediction["reasons"])
+    print("✓ 坏用例 / 坏预测判失败而非崩溃或白送通过")
+
+
+def test_run_eval_isolates_invalid_case():
+    """一条坏用例只让自己失败，其余照常计分。"""
+    cases = [
+        _case(id="ok1"),
+        {"id": "bad", "category": "x"},
+        _case(id="ok2"),
+    ]
+
+    def predict(case):
+        return {"intents": ["itinerary_planning"], "answer": "杭州三天"}
+
+    summary = run_eval(cases, predict)
+    assert summary["total"] == 3
+    assert summary["passed"] == 2
+    assert [item["id"] for item in summary["failures"]] == ["bad"]
+    print("✓ 坏用例隔离：整批不再因 TypeError 中止")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -230,6 +276,8 @@ if __name__ == "__main__":
     test_judge_invalid_scores_are_unscored_not_crash()
     test_prediction_error_is_failure_even_for_empty_expectations()
     test_empty_expected_intents_still_checked()
+    test_invalid_case_is_failure_not_pass()
+    test_run_eval_isolates_invalid_case()
     test_run_eval_aggregates_and_handles_errors()
     test_build_cases_covers_all_categories()
     test_build_cases_cover_every_runnable_skill()

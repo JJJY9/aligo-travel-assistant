@@ -9,8 +9,24 @@ RAG 检索离线评测
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
+
+
+def keyword_hit(keyword: str, text: str) -> bool:
+    """关键词命中判定：含数字的关键词要求两侧不再接数字。
+
+    裸子串匹配会让「500元」命中「1500元」、「30天」命中「130天」、
+    「90%」命中「190%」——片段里恰好出现更长的数字时评测给出假命中。
+    """
+    lowered = keyword.lower()
+    if not any(ch.isdigit() for ch in lowered):
+        return lowered in text
+    return (
+        re.search(r"(?<!\d)" + re.escape(lowered) + r"(?!\d)", text)
+        is not None
+    )
 
 
 @dataclass(frozen=True)
@@ -107,7 +123,7 @@ def evaluate_retrieval(
         rank: int | None = None
         for index, document in enumerate(documents[:top_k], start=1):
             text = str(document.get("content", "")).lower()
-            if any(keyword.lower() in text for keyword in case.keywords):
+            if any(keyword_hit(keyword, text) for keyword in case.keywords):
                 rank = index
                 break
         ranks.append(rank)

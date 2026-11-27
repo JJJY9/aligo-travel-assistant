@@ -205,10 +205,15 @@ def _redact_error_text(error: BaseException) -> str:
         return str(error)
 
 
+# 降级结果的 reasoning 前缀：评测（utils.agent_eval）据它识别「模型输出
+# 故障被兜底成默认调度」，不能把兜底结果当成真实预测计分
+DEFAULT_INTENT_REASONING_PREFIX = "意图识别出错，使用默认策略"
+
+
 def _default_intent_result(user_query: str, error: str) -> dict:
     """意图识别失败 / 结果形状非法时的降级结果：默认走信息查询。"""
     return {
-        "reasoning": f"意图识别出错，使用默认策略。错误: {error}",
+        "reasoning": f"{DEFAULT_INTENT_REASONING_PREFIX}。错误: {error}",
         "intents": [
             {
                 "type": "information_query",
