@@ -45,6 +45,30 @@ def test_env_switch(monkeypatch):
     print("✓ LOG_FORMAT 环境变量切换")
 
 
+def test_env_switch_strips_injected_quotes_and_bom(monkeypatch, caplog):
+    """文件注入形态（成对引号 / BOM）仍启用 JSON 日志，未知值告警一次。"""
+    import logging
+
+    monkeypatch.setenv("LOG_FORMAT", '"json"')
+    assert access_log_format() == "json"
+    data = json.loads(format_access_log("GET", "/api/x", 200, 1.0, "r"))
+    assert data["status"] == 200
+
+    monkeypatch.setenv("LOG_FORMAT", chr(0xFEFF) + "JSON")
+    assert access_log_format() == "json"
+
+    monkeypatch.setenv("LOG_FORMAT", "jsno")
+    with caplog.at_level(logging.WARNING):
+        assert access_log_format() == "text"
+    assert "LOG_FORMAT" in caplog.text, caplog.text
+    # 每请求都会调用：同一未知值只告警一次
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        assert access_log_format() == "text"
+    assert caplog.text == "", caplog.text
+    print("✓ LOG_FORMAT 去成对引号 / BOM，未知值告警一次")
+
+
 def test_json_formatter_merges_access_fields():
     """JSON 模式下整行必须是合法 JSON，访问日志字段提升到顶层。"""
     import logging
@@ -89,4 +113,13 @@ if __name__ == "__main__":
         test_json_formatter_merges_access_fields()
     finally:
         mp.undo()
+    import _caplog_shim
+
+    _shim = _caplog_shim.CaplogShim()
+    mp2 = pytest.MonkeyPatch()
+    try:
+        test_env_switch_strips_injected_quotes_and_bom(mp2, _shim)
+    finally:
+        mp2.undo()
+        _shim.close()
     print("\n全部通过")

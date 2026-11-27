@@ -65,6 +65,45 @@ def test_env_override_strips_bom_and_quotes(monkeypatch, tmp_path=None):
     print("✓ ALIGO_DATA_DIR 去 BOM / 成对引号")
 
 
+def test_relative_override_resolved_against_cwd(monkeypatch, tmp_path=None):
+    """相对 ALIGO_DATA_DIR 统一按进程 CWD 归一为绝对路径。"""
+    import tempfile
+    from pathlib import Path
+
+    base = Path(tmp_path or tempfile.mkdtemp(prefix="chailv_paths_rel_"))
+    base.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(base)
+    monkeypatch.setenv("ALIGO_DATA_DIR", "rel-data")
+    root = default_data_root()
+    assert root.is_absolute(), root
+    assert root == (base / "rel-data").resolve(), root
+    print("✓ 相对 ALIGO_DATA_DIR 按 CWD 归一为绝对路径")
+
+
+def test_wheel_fallback_strips_quoted_base_dir(monkeypatch, tmp_path=None):
+    """LOCALAPPDATA / XDG_DATA_HOME 带成对引号 / BOM 时仍回退到正确目录。"""
+    import tempfile
+    from pathlib import Path
+
+    from utils import paths
+
+    base = Path(tmp_path or tempfile.mkdtemp(prefix="chailv_paths_wheelq_"))
+    fake_site = base / "site-packages"
+    (fake_site / "webapp").mkdir(parents=True)
+    monkeypatch.setattr(paths, "package_root", lambda: fake_site)
+    monkeypatch.delenv("ALIGO_DATA_DIR", raising=False)
+    if os.name == "nt":
+        monkeypatch.setenv("LOCALAPPDATA", '"' + str(base / "local") + '"')
+        expected = base / "local" / "aligo" / "data"
+    else:
+        monkeypatch.setenv(
+            "XDG_DATA_HOME", chr(0xFEFF) + str(base / "xdg")
+        )
+        expected = base / "xdg" / "aligo" / "data"
+    assert paths.default_data_root() == expected
+    print("✓ wheel 回退基目录去成对引号 / BOM")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -76,6 +115,8 @@ if __name__ == "__main__":
     for case in (
         test_env_override_wins,
         test_env_override_strips_bom_and_quotes,
+        test_relative_override_resolved_against_cwd,
+        test_wheel_fallback_strips_quoted_base_dir,
         test_source_checkout_uses_repo_data,
         test_wheel_install_falls_back_to_user_dir,
     ):

@@ -943,7 +943,22 @@ def test_ddgs_proxy_env_resolution(monkeypatch):
         == "http://127.0.0.1:9999"
     )
 
+    # 文件注入形态（成对引号 / BOM）不能让带引号的 URL 进入 primp
+    monkeypatch.setenv("DDGS_PROXY", '"http://127.0.0.1:9999"')
+    assert (
+        module._ddgs_proxy_for_backend("duckduckgo")
+        == "http://127.0.0.1:9999"
+    )
+    monkeypatch.setenv("DDGS_PROXY", chr(0xFEFF) + "'http://127.0.0.1:9998'")
+    assert (
+        module._ddgs_proxy_for_backend("duckduckgo")
+        == "http://127.0.0.1:9998"
+    )
+
     monkeypatch.delenv("DDGS_PROXY")
+    monkeypatch.setenv("HTTPS_PROXY", '"http://127.0.0.1:8899"')
+    assert module._ddgs_proxy_for_backend("google") == "http://127.0.0.1:8899"
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:8899")
     monkeypatch.setenv("NO_PROXY", "html.duckduckgo.com")
     assert module._ddgs_proxy_for_backend("duckduckgo") is None
     assert module._ddgs_proxy_for_backend("google") == "http://127.0.0.1:8899"

@@ -60,6 +60,20 @@ _DDGS_BACKEND_HOSTS = {
 }
 
 
+def _clean_proxy_value(value: str) -> str:
+    """代理环境变量的清洗：去 BOM 与文件注入的成对引号。
+
+    与 config.py / utils.paths.clean_env_path 同一口径：docker --env-file、
+    K8s ConfigMap、Windows ``set VAR="..."`` 会把引号连值一起注入，primp
+    对带引号的代理 URL 直接抛 BuilderError（相对 URL），三个搜索后端全部
+    失败且错误文案不指向配置。
+    """
+    value = value.replace("\ufeff", "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
+
 def _ddgs_proxy_for_backend(backend: str) -> str | None:
     """ddgs 搜索的代理（与 LLM / 天气链路统一口径）。
 
@@ -67,7 +81,7 @@ def _ddgs_proxy_for_backend(backend: str) -> str | None:
     全局代理只设 ALL_PROXY 时搜索会直连超时。这里显式解析——DDGS_PROXY
     优先，其次 HTTPS_PROXY / ALL_PROXY，并尊重 NO_PROXY 的后端主机排除。
     """
-    explicit = os.environ.get("DDGS_PROXY", "").replace("\ufeff", "").strip()
+    explicit = _clean_proxy_value(os.environ.get("DDGS_PROXY", ""))
     if explicit:
         return explicit
     try:
@@ -77,7 +91,9 @@ def _ddgs_proxy_for_backend(backend: str) -> str | None:
         )
 
         proxies = getproxies_environment()
-        proxy = proxies.get("https") or proxies.get("all")
+        proxy = _clean_proxy_value(
+            proxies.get("https") or proxies.get("all") or ""
+        ) or None
         if not proxy:
             return None
         host = _DDGS_BACKEND_HOSTS.get(backend)

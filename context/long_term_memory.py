@@ -1350,9 +1350,15 @@ class LongTermMemory:
         #      被误判为损坏并隔离为空数据，必须丢弃
         if isinstance(data.get("preferences"), list):
             fixed_prefs = []
-            for pref in data["preferences"]:
+            for pref_index, pref in enumerate(data["preferences"], 1):
                 if not isinstance(pref, dict):
-                    logger.warning("丢弃非对象的偏好记录：%r", pref)
+                    # 偏好条目可能含住址 / 证件号等隐私原文：只记序号与类型，
+                    # 不打印整条记录（与写入路径「只记类型」同口径）
+                    logger.warning(
+                        "丢弃非对象的偏好记录（第 %d 条，类型 %s）",
+                        pref_index,
+                        type(pref).__name__,
+                    )
                     destructive = True
                     continue
                 if not isinstance(pref.get("type"), str):
@@ -1382,7 +1388,7 @@ class LongTermMemory:
                     continue
                 # 错误的嵌套：{"type": "preferences", "value": [...]}
                 if pref.get("type") == "preferences" and isinstance(pref.get("value"), list):
-                    for nested_pref in pref["value"]:
+                    for nested_index, nested_pref in enumerate(pref["value"], 1):
                         if (
                             isinstance(nested_pref, dict)
                             and isinstance(nested_pref.get("type"), str)
@@ -1400,7 +1406,8 @@ class LongTermMemory:
                             )
                         else:
                             logger.warning(
-                                "丢弃嵌套偏好中的非法条目：%r", nested_pref
+                                "丢弃嵌套偏好中的非法条目（第 %d 条）",
+                                nested_index,
                             )
                             destructive = True
                     logger.info("Migrated: Fixed nested preferences bug")
@@ -1736,7 +1743,8 @@ class LongTermMemory:
             preferences.append({"type": "hotel_brands", "value": [brand]})
 
         self._persist()
-        logger.info(f"Added hotel brand preference: {brand}")
+        # 偏好值可能是隐私内容：只记事件，不打印品牌
+        logger.info("Added hotel brand preference")
 
     @_locked_mutation
     def add_airline(self, airline: str):
@@ -1780,7 +1788,8 @@ class LongTermMemory:
             preferences.append({"type": "airlines", "value": [airline]})
 
         self._persist()
-        logger.info(f"Added airline preference: {airline}")
+        # 偏好值可能是隐私内容：只记事件，不打印航司
+        logger.info("Added airline preference")
 
     @_locked_mutation
     def add_chat_message(

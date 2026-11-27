@@ -23,6 +23,23 @@ def clean_env_path(name: str) -> str:
     return value
 
 
+def clean_env_abs_path(name: str) -> Path | None:
+    """读取路径类环境变量并归一为绝对路径（未设置 / 清洗后为空返回 None）。
+
+    相对值按进程 CWD 归一：同一个 ``ALIGO_DATA_DIR=data`` 在不同消费方
+    有的锚 package_root（LongTermMemory）、有的锚 CWD（检查点 / 知识库 /
+    导出预检），不归一会让同一配置的记忆与检查点落到不同目录（wheel 下
+    记忆甚至写回 site-packages，重建安装即丢失）。
+    """
+    raw = clean_env_path(name)
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = (Path.cwd() / path).resolve()
+    return path
+
+
 def package_root() -> Path:
     """仓库根（源码运行）或 site-packages（wheel 安装）。"""
     return Path(__file__).resolve().parent.parent
@@ -43,16 +60,23 @@ def default_data_root() -> Path:
       （Windows: ``%LOCALAPPDATA%\\aligo\\data``；其它:
       ``$XDG_DATA_HOME/aligo/data`` 或 ``~/.local/share/aligo/data``）。
     """
-    override = clean_env_path("ALIGO_DATA_DIR")
-    if override:
-        return Path(override).expanduser()
+    override = clean_env_abs_path("ALIGO_DATA_DIR")
+    if override is not None:
+        return override
     root = package_root()
     if is_source_checkout(root):
         return root / "data"
     if os.name == "nt":
-        base = os.environ.get("LOCALAPPDATA", "").strip()
+        base = clean_env_path("LOCALAPPDATA")
         base_path = Path(base) if base else Path.home() / "AppData" / "Local"
+        if not base_path.is_absolute():
+            # 带引号 / BOM / 相对值按默认位置处理：原样拼接会在 mkdir
+            # 时抛 WinError 123，所有存储操作统一 503 且没有指向根因的线索
+            base_path = Path.home() / "AppData" / "Local"
         return base_path / "aligo" / "data"
-    xdg = os.environ.get("XDG_DATA_HOME", "").strip()
+    xdg = clean_env_path("XDG_DATA_HOME")
     base_path = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+    if not base_path.is_absolute():
+        # XDG Base Directory 规范：非绝对路径的 XDG_DATA_HOME 应被忽略
+        base_path = Path.home() / ".local" / "share"
     return base_path / "aligo" / "data"

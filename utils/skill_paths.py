@@ -12,7 +12,7 @@ wheel 中的技能文件通过 ``[tool.setuptools.data-files]`` 安装到 ``sys.
 import sys
 from pathlib import Path
 
-from utils.paths import clean_env_path
+from utils.paths import clean_env_abs_path
 
 ENV_SKILLS_DIR = "ALIGO_SKILLS_DIR"
 
@@ -67,9 +67,9 @@ def _user_base_skills() -> Path | None:
 def skill_roots() -> list[Path]:
     """按优先级返回候选技能目录列表（去重，保持顺序）。"""
     candidates: list[Path] = []
-    override = clean_env_path(ENV_SKILLS_DIR)
-    if override:
-        candidates.append(Path(override).expanduser())
+    override = clean_env_abs_path(ENV_SKILLS_DIR)
+    if override is not None:
+        candidates.append(override)
     candidates.append(Path(__file__).resolve().parent.parent / ".claude" / "skills")
     candidates.append(Path(sys.prefix) / ".claude" / "skills")
     data_scheme = _data_scheme_skills()

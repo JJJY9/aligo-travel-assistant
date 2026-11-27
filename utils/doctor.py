@@ -22,7 +22,6 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.util
-import os
 import re
 import sys
 from dataclasses import dataclass
@@ -148,9 +147,12 @@ def check_config() -> CheckResult:
     base_url = LLM_CONFIG["base_url"]
     if api_key:
         # 空 / 纯空白（含仅 BOM）的环境变量在 config 里会回退
-        # config_local.py：按与 config 完全相同的口径（去 BOM 后 strip）判断
-        # 来源，避免「空格 + BOM」这类值两边结论不一致
-        env_key = os.environ.get("LLM_API_KEY", "").replace("\ufeff", "").strip()
+        # config_local.py：按与 config 完全相同的口径（去 BOM、成对引号后
+        # strip）判断来源，避免「空格 + BOM」「成对引号空值」这类值两边
+        # 结论不一致
+        from utils.paths import clean_env_path
+
+        env_key = clean_env_path("LLM_API_KEY")
         source = "环境变量" if env_key else "config_local.py"
         return CheckResult(
             "大模型配置",
