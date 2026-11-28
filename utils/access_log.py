@@ -29,15 +29,22 @@ def _safe_log_text(value: object) -> str:
     return text.replace("\u2028", "?").replace("\u2029", "?")
 
 
-# 文本格式以空格 / "->" / "(ms)" / "[id]" 分词：path 是唯一可被请求方
+# 文本格式以空白 / "->" / "(ms)" / "[id]" 分词：path 是唯一可被请求方
 # 控制且未转义的字段（method 来自请求行、request_id 由中间件生成），
 # 其中出现同名分隔符时用 percent-encoding 转义，避免路径伪造出额外的
-# 状态码 / 请求 ID。JSON 模式字段相互独立，不受影响。
-_TEXT_DELIMITERS = re.compile(r"[ \[\]()>]")
+# 状态码 / 请求 ID。JSON 模式字段相互独立，不受影响。\s 覆盖 Unicode
+# 空白（U+00A0 / U+3000 等，uvicorn percent-decode 后可出现在路径里）：
+# 按 str.split() 分词的分析器同样把它们当分隔符，漏转义会让字段错位。
+_TEXT_DELIMITERS = re.compile(r"[ \[\]()>\s]")
 
 
 def _escape_text_delimiters(value: str) -> str:
-    return _TEXT_DELIMITERS.sub(lambda m: f"%{ord(m.group()):02X}", value)
+    # 非 Latin-1 字符（U+3000 等）没有合法的 %XX 编码，与 _safe_log_text
+    # 的控制符处理一致替换为 '?'
+    return _TEXT_DELIMITERS.sub(
+        lambda m: f"%{ord(m.group()):02X}" if ord(m.group()) < 0x100 else "?",
+        value,
+    )
 
 
 def access_log_format() -> str:

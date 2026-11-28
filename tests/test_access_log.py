@@ -44,6 +44,15 @@ def test_text_format_escapes_path_delimiters():
     # JSON 模式字段独立，路径原样保留（不改变机器消费方契约）
     data = json.loads(format_access_log("GET", path, 200, 1.0, "rid", fmt="json"))
     assert data["path"] == path
+
+    # Unicode 空白（全角空格 / NBSP）：按 str.split() 分词的分析器同样会把
+    # 它们当分隔符，文本格式必须一并转义 / 替换，否则字段错位
+    ideographic_space = chr(0x3000)
+    nbsp = chr(0xA0)
+    unicode_path = f"/api/a{ideographic_space}b{nbsp}c"
+    line = format_access_log("GET", unicode_path, 200, 1.0, "rid", fmt="text")
+    assert ideographic_space not in line and nbsp not in line, line
+    assert len(line.split()) == 6, line.split()
     print("✓ 文本访问日志转义路径分隔符")
 
 

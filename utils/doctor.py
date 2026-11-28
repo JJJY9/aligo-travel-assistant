@@ -164,10 +164,18 @@ def check_config() -> CheckResult:
 
         env_key = clean_env_path("LLM_API_KEY")
         source = "环境变量" if env_key else "config_local.py"
+        # 含空白的 base_url 无法用通用正则安全脱敏（空白是 token 边界，
+        # 跨空白规则会吞掉 Connection refused 等排障关键词）：整段隐藏，
+        # 防止未编码密码原样回显到 /api/doctor 与工单
+        shown_url = (
+            "<已隐藏：base_url 含空白字符，密码请做百分号编码>"
+            if any(ch.isspace() for ch in str(base_url))
+            else _redact_secret(base_url)
+        )
         return CheckResult(
             "大模型配置",
             STATUS_OK,
-            f"{model_name} @ {_redact_secret(base_url)}（密钥来自 {source}）",
+            f"{model_name} @ {shown_url}（密钥来自 {source}）",
         )
     return CheckResult(
         "大模型配置",
@@ -804,12 +812,13 @@ def build_report_table(results: list[CheckResult]):
     from rich.markup import escape
     from rich.table import Table
 
-    from utils.console import strip_terminal_controls
+    from utils.console import strip_display_format_controls
 
     def _safe(value: object) -> str:
         # 详情常含上游错误原文 / base_url / 本机路径：方括号标记会让整张表
-        # 渲染时抛 MarkupError，ESC 序列会直接送达终端
-        return escape(strip_terminal_controls(value))
+        # 渲染时抛 MarkupError，ESC 序列会直接送达终端；双向 / 零宽格式符
+        # 可做视觉欺骗（把一行伪装成另一行），与 CLI 显示层同口径剥除
+        return escape(strip_display_format_controls(value))
 
     icons = {
         STATUS_OK: ("✓", "green"),

@@ -114,6 +114,12 @@ def test_control_characters_are_sanitized():
     path = next(iter(metrics.snapshot()["by_path"]))
     assert "\n" not in path
     assert "?" in path
+    # 清洗口径与访问日志 _safe_log_text 对齐：C1（NEL 会断行破坏
+    # Prometheus 文本格式）与 U+2028/2029 同样替换
+    metrics.record("GET", "/api/x\u0085y\u2028z", 200, 1.0)
+    paths = [p for p in metrics.snapshot()["by_path"] if "x" in p]
+    assert all("\u0085" not in p and "\u2028" not in p for p in paths), paths
+    assert "/api/x?y?z" in paths, paths
     print("✓ 指标路径清理控制字符")
 
 

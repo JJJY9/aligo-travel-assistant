@@ -63,6 +63,10 @@ logger = logging.getLogger(__name__)
 # set(range(1, parts + 1)) 会被 1e9 撑爆内存。
 _GROUP_PARTS_MAX = 100000
 
+# 依赖探测失败信息（OSError 含 DLL 路径）也要脱敏：导入必须放在 try 之前
+from utils.access_log import _safe_log_text
+from utils.log_redact import redact_paths
+
 try:
     import pymilvus  # noqa: F401 - 仅用于检测依赖是否安装
     from sentence_transformers import SentenceTransformer  # noqa: F401 - 依赖检测
@@ -72,7 +76,7 @@ except (ImportError, OSError) as e:
     # Windows 缺 VC++ 运行库 / ABI 不匹配时 torch 导入抛 OSError(WinError 126)
     # 而不是 ImportError：漏掉会让整个技能模块加载失败，初始化降级提示不可达
     _DEPENDENCY_ERROR_KIND = "oserror" if isinstance(e, OSError) else "import"
-    logger.warning(f"RAG dependencies not available: {e}")
+    logger.warning("RAG dependencies not available: %s", _safe_log_text(redact_paths(e)))
     logger.warning("Install with: pip install pymilvus sentence-transformers")
     DEPENDENCIES_AVAILABLE = False
 
@@ -85,8 +89,6 @@ from utils.hybrid_retrieval import (
     rrf_fuse,
     tokenize,
 )
-from utils.access_log import _safe_log_text
-from utils.log_redact import redact_paths
 from utils.skill_paths import knowledge_init_command
 from utils.user_query import extract_user_query
 
@@ -421,14 +423,20 @@ class RAGKnowledgeAgent(AgentBase):
             # 尝试一个轻量级操作来检查连接
             self.milvus_client.has_collection(self.collection_name)
         except Exception as e:
-            logger.warning(f"Milvus connection issue detected: {e}, reconnecting...")
+            logger.warning(
+                "Milvus connection issue detected: %s, reconnecting...",
+                _safe_log_text(redact_paths(e)),
+            )
             try:
                 # 丢弃并关闭旧共享客户端；属性会重新创建并取到新实例
                 reset_milvus_client(self._milvus_db_path)
                 self.milvus_client.has_collection(self.collection_name)
                 logger.info("Milvus client reconnected successfully")
             except Exception as reconnect_error:
-                logger.error(f"Failed to reconnect Milvus: {reconnect_error}")
+                logger.error(
+                    "Failed to reconnect Milvus: %s",
+                    _safe_log_text(redact_paths(reconnect_error)),
+                )
                 raise
 
     def add_documents(self, documents: list[dict[str, str]]) -> dict:
@@ -498,7 +506,10 @@ class RAGKnowledgeAgent(AgentBase):
                 stats = self.milvus_client.get_collection_stats(self.collection_name)
                 total_count = int(stats.get("row_count", len(documents)) or 0)
             except Exception as stats_err:  # noqa: BLE001 - 写入已成功，统计失败只记录
-                logger.warning(f"get_collection_stats failed after insert: {stats_err}")
+                logger.warning(
+                    "get_collection_stats failed after insert: %s",
+                    _safe_log_text(redact_paths(stats_err)),
+                )
                 total_count = None
 
             logger.info(f"Successfully added {len(documents)} documents to knowledge base")
@@ -657,7 +668,7 @@ class RAGKnowledgeAgent(AgentBase):
                 load_error = load_err
                 logger.warning(
                     "load_collection 失败（索引可能损坏或版本不兼容）: %s",
-                    load_err,
+                    _safe_log_text(redact_paths(load_err)),
                 )
 
             if top_k is None:
@@ -734,7 +745,9 @@ class RAGKnowledgeAgent(AgentBase):
             return retrieved_docs
 
         except Exception as e:
-            logger.error(f"Error searching knowledge: {e}")
+            logger.error(
+                "Error searching knowledge: %s", _safe_log_text(redact_paths(e))
+            )
             if strict:
                 if load_error is not None:
                     # 后续的 "call load() before search/get/query" 只是症状：

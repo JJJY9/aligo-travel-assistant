@@ -37,7 +37,7 @@ from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.errors import MemoryPersistenceError, UserFacingError
 from utils.json_safe import sanitize_json
 from utils.llm_resilience import RetryBudgetExhausted, retry_with_backoff
-from utils.log_redact import redact_secret
+from utils.log_redact import redact_secret, redacted_exc_text
 from utils.paths import default_data_root
 from utils.preference_values import (
     has_preference_value,
@@ -563,8 +563,15 @@ class ConversationRuntime:
                     pending_commit = getattr(self, "_pending_memory_commit", None)
                     if pending_commit is not None:
                         await asyncio.shield(pending_commit)
-                except Exception:  # noqa: BLE001 - 逐条写入已吞异常，这里兜底
-                    logger.warning("提交延迟记忆写入失败", exc_info=True)
+                except Exception as exc:  # noqa: BLE001 - 逐条写入已吞异常，这里兜底
+                    # 不用 exc_info：日志 Formatter 会从异常对象重新格式化
+                    # 未脱敏 traceback（与 webapp 侧 _redacted_exc_log_text 同口径）
+                    logger.warning(
+                        "提交延迟记忆写入失败（会话 %s/%s）：%s",
+                        self.user_id,
+                        self.session_id,
+                        redacted_exc_text(exc),
+                    )
                     memory_commit_failed = True
         # 成功落库（True / 旧的 None 语义）时 _meta.usage 已在消息里；
         # 否决分支已记账——本轮用量已有归宿
@@ -705,8 +712,13 @@ class ConversationRuntime:
             # 调用方（except 处理器）的取消不能顶掉后续用量结算 / 状态置位：
             # 回滚线程自行完成，这里吞掉取消继续收尾
             logger.debug("等待回滚时被取消，回滚由后台线程完成")
-        except Exception:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
-            logger.warning("回滚暂存提问失败", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
+            logger.warning(
+                "回滚暂存提问失败（会话 %s/%s）：%s",
+                self.user_id,
+                self.session_id,
+                redacted_exc_text(exc),
+            )
 
     async def _rollback_staged_user_message(
         self,
@@ -744,8 +756,13 @@ class ConversationRuntime:
             )
         except (asyncio.CancelledError, asyncio.TimeoutError):
             logger.debug("回滚暂存提问未在限时内完成，后台线程继续执行")
-        except Exception:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
-            logger.warning("回滚暂存提问失败", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - 回滚尽力而为，不能顶掉调用方的错误
+            logger.warning(
+                "回滚暂存提问失败（会话 %s/%s）：%s",
+                self.user_id,
+                self.session_id,
+                redacted_exc_text(exc),
+            )
 
     def _clear_checkpoint(self) -> None:
         """丢弃本轮检查点（成功落库后调用；失败只记日志）。"""
@@ -754,8 +771,13 @@ class ConversationRuntime:
             return
         try:
             clear()
-        except Exception:  # noqa: BLE001 - 清理失败不影响已完成的回合
-            logger.warning("清理执行检查点失败", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - 清理失败不影响已完成的回合
+            logger.warning(
+                "清理执行检查点失败（会话 %s/%s）：%s",
+                self.user_id,
+                self.session_id,
+                redacted_exc_text(exc),
+            )
 
     def _clear_checkpoint_key(self, key: str) -> None:
         """按轮次键清理检查点（迟到的落库回调使用，避免误删下一轮）。"""
@@ -763,8 +785,13 @@ class ConversationRuntime:
         if callable(clear_key):
             try:
                 clear_key(key)
-            except Exception:  # noqa: BLE001 - 清理失败不影响已完成的回合
-                logger.warning("清理执行检查点失败", exc_info=True)
+            except Exception as exc:  # noqa: BLE001 - 清理失败不影响已完成的回合
+                logger.warning(
+                    "清理执行检查点失败（会话 %s/%s）：%s",
+                    self.user_id,
+                    self.session_id,
+                    redacted_exc_text(exc),
+                )
             return
         # 旧编排器没有按键清理：退回清理当前键（同进程版本一致时适用）
         self._clear_checkpoint()
@@ -870,7 +897,12 @@ class ConversationRuntime:
         if not task.cancelled():
             exc = task.exception()
             if exc is not None:
-                logger.warning("提交延迟记忆写入失败", exc_info=exc)
+                logger.warning(
+                    "提交延迟记忆写入失败（会话 %s/%s）：%s",
+                    self.user_id,
+                    self.session_id,
+                    redacted_exc_text(exc),
+                )
 
     def _consume_background_task(self, task: asyncio.Future) -> None:
         # 完成即清空槽位：陈旧任务会让后续新调度的回滚无法登记，drain

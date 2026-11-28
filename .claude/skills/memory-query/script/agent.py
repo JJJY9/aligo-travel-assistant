@@ -198,14 +198,20 @@ class MemoryQueryAgent(AgentBase):
                     role="assistant",
                 )
             except Exception as e:  # noqa: BLE001 - 存储抖动按空记忆继续回答
-                logger.warning(f"Failed to load long-term memory: {e}")
+                logger.warning(
+                    "Failed to load long-term memory: %s",
+                    _safe_log_text(redact_paths(e)),
+                )
                 trip_history, preferences = [], {}
 
             # 获取历史对话摘要（如果有LLM的话）
             try:
                 chat_summary = await self.memory_manager.get_long_term_summary_async(max_messages=30)
             except Exception as e:
-                logger.warning(f"Failed to get chat summary: {e}")
+                logger.warning(
+                    "Failed to get chat summary: %s",
+                    _safe_log_text(redact_paths(e)),
+                )
                 chat_summary = ""
                 memory_unavailable = True
 

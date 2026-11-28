@@ -226,6 +226,36 @@ def test_persist_guard_reaches_memory_write():
     print("✓ 落库守卫传递到记忆写入")
 
 
+def test_memory_commit_failure_log_is_redacted(caplog):
+    """延迟记忆提交失败的告警：traceback 脱敏、带会话标识、不用 exc_info。"""
+    import asyncio
+    import logging
+
+    from utils.errors import MemoryPersistenceError
+
+    runtime = object.__new__(ConversationRuntime)
+    runtime.user_id = "u-logredact"
+    runtime.session_id = "s-logredact"
+    runtime._pending_memory_commit = None
+    loop = asyncio.new_event_loop()
+    try:
+        future = loop.create_future()
+        error = MemoryPersistenceError("长期记忆写入失败")
+        error.__cause__ = RuntimeError(
+            "could not connect: postgresql://alice:S3cr3tPw@db.internal:5432/aligo"
+        )
+        future.set_exception(error)
+        with caplog.at_level(logging.WARNING):
+            runtime._consume_memory_commit(future)
+    finally:
+        loop.close()
+    text = caplog.text
+    assert "S3cr3tPw" not in text, text
+    assert "会话 u-logredact/s-logredact" in text, text
+    assert "MemoryPersistenceError" in text, text
+    print("✓ 延迟记忆提交失败日志脱敏并带会话标识")
+
+
 def test_deferred_memory_committed_after_successful_persist():
     """编排器的偏好 / 行程写入延迟到整轮落库成功之后。"""
     runtime, memory = _make_runtime()
@@ -2127,6 +2157,13 @@ if __name__ == "__main__":
         mp.undo()
     test_parse_failure_is_user_facing_error()
     test_persist_guard_reaches_memory_write()
+    import _caplog_shim
+
+    _shim = _caplog_shim.CaplogShim()
+    try:
+        test_memory_commit_failure_log_is_redacted(_shim)
+    finally:
+        _shim.close()
     test_deferred_memory_committed_after_successful_persist()
     test_deferred_memory_skipped_when_persist_vetoed()
     test_persist_veto_rolls_back_staged_question()

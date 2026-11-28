@@ -31,6 +31,7 @@ from utils.chat_import import (
 from utils.atomic_write import fsync_parent_dir
 from utils.errors import MemoryPersistenceError
 from utils.file_lock import file_lock
+from utils.log_redact import redacted_exc_text
 from utils.preference_values import (
     merge_preference_value,
     preference_value_problem,
@@ -1201,10 +1202,11 @@ class LongTermMemory:
                         self._batch_dirty = False
                         try:
                             self._reload_latest()
-                        except Exception:  # noqa: BLE001 - 回滚尽力而为
+                        except Exception as exc:  # noqa: BLE001 - 回滚尽力而为
                             self._dirty = True
                             logger.warning(
-                                "批量写失败后回滚内存快照失败", exc_info=True
+                                "批量写失败后回滚内存快照失败：%s",
+                                redacted_exc_text(exc),
                             )
                         raise
                     else:
