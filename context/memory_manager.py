@@ -4,13 +4,13 @@
 """
 import asyncio
 import copy
+import hashlib
 import logging
-import re
 import threading
 import time
 import weakref
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 from .long_term_memory import LongTermMemory
@@ -25,7 +25,8 @@ from utils.preference_values import (
     has_preference_value,
     is_manageable_pref_type,
 )
-from utils.timestamps import chronological_key, to_aware
+from utils.timestamps import to_aware
+from utils.trip_sort import normalized_date_key, trip_sort_key
 from utils.turn_meta import strip_turn_meta
 
 logger = logging.getLogger(__name__)
@@ -77,38 +78,14 @@ def _is_future_timestamp(message: dict) -> bool:
         return False
 
 
-_DATE_TEXT_RE = re.compile(r"^(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})")
-
-
 def _normalized_date_key(value: object) -> str:
-    """把常见历史日期写法（ISO / 未补零 / 斜杠 / 中文）归一成可比字符串。
-
-    无法解析返回空串（排最前）：备份恢复允许原样保留旧格式日期，直接按
-    字符串比较会把 3 月排到 12 月之后、斜杠日期排到最后。
-    """
-    text = str(value or "").strip()
-    match = _DATE_TEXT_RE.match(text)
-    if not match:
-        return ""
-    year, month, day = (int(part) for part in match.groups())
-    try:
-        return date(year, month, day).isoformat()
-    except ValueError:
-        return ""
+    """把常见历史日期写法归一成可比字符串（见 ``utils.trip_sort``）。"""
+    return normalized_date_key(value)
 
 
 def _trip_sort_key(trip: dict) -> tuple[str, str, str]:
-    """按出发日期排序（缺失 / 非法日期排最前），最近行程取窗口尾部。
-
-    第二键用归一后的时间序：JSON 后端实时写入 naive 本地时间，备份恢复 /
-    同身份更新写入带偏移的 aware 串，两种格式混存时原始字符串的字典序
-    不是时间序，同日行程的入选与提示词顺序会错。
-    """
-    return (
-        _normalized_date_key(trip.get("start_date")),
-        chronological_key(trip.get("timestamp")),
-        str(trip.get("trip_id") or ""),
-    )
+    """按出发日期排序（见 ``utils.trip_sort``）。"""
+    return trip_sort_key(trip)
 
 
 class MemoryManager:
@@ -153,6 +130,9 @@ class MemoryManager:
         self._summary_cache: tuple[tuple, str] | None = None
         # 总结失败后的短时冷却：避免模型持续报错时每轮都重试
         self._summary_failure_until = 0.0
+        # 上一次跨会话总结是否因读取 / 模型失败拿不到内容（区别于「真的
+        # 没有历史」）：调用方据此提示「暂时不可用」而不是「暂无记录」
+        self.last_summary_unavailable = False
         # 当前会话滚动摘要（v2.0）：按最近窗口内容指纹缓存
         self._recent_summary_cache: tuple[tuple, str] | None = None
         self._recent_summary_failure_until = 0.0
@@ -299,6 +279,29 @@ class MemoryManager:
         for instance in instances:
             try:
                 instance.invalidate_preference_cache()
+            except Exception:  # noqa: BLE001 - 单个实例失败不影响其它
+                continue
+
+    def invalidate_summary_cache(self) -> None:
+        """清空本实例的跨会话 / 最近摘要缓存与失败冷却。
+
+        会话删除、末轮删除与备份恢复后，旧摘要可能仍含已删除内容：冷却
+        期内该方法还会原样返回未校验窗口的旧缓存，必须在删除路径显式失效。
+        """
+        self._summary_cache = None
+        self._summary_failure_until = 0.0
+        self.last_summary_unavailable = False
+        self._recent_summary_cache = None
+        self._recent_summary_failure_until = 0.0
+
+    @classmethod
+    def invalidate_all_summary_caches(cls) -> None:
+        """清空本进程所有实例的摘要缓存（删除会话 / 导入恢复后调用）。"""
+        with cls._preference_cache_instances_lock:
+            instances = list(cls._preference_cache_instances)
+        for instance in instances:
+            try:
+                instance.invalidate_summary_cache()
             except Exception:  # noqa: BLE001 - 单个实例失败不影响其它
                 continue
 
@@ -738,8 +741,17 @@ class MemoryManager:
             history_from_other_sessions = [
                 message for message in expanded if not _is_future_timestamp(message)
             ][-_SUMMARY_WINDOW_MESSAGES:]
-        # 行程按出发日期取最近的窗口：恢复的旧行程不再把最近行程挤出窗口
-        trip_history = self.long_term.get_trip_history(limit=_SUMMARY_TRIP_FETCH)
+        # 行程按出发日期取最近的窗口：恢复的旧行程不再把最近行程挤出
+        # 窗口。优先走按日期取数的存储方法——插入序先截 200 条会让恢复
+        # 超过 200 条旧行程的账号把真实近期行程挤出取数池，后续再排序
+        # 也无从补救（自定义 / 测试替身没有该方法时退回旧路径）
+        by_date = getattr(self.long_term, "get_recent_trips_by_date", None)
+        if callable(by_date):
+            trip_history = by_date(_SUMMARY_TRIP_WINDOW)
+        else:
+            trip_history = self.long_term.get_trip_history(
+                limit=_SUMMARY_TRIP_FETCH
+            )
         if isinstance(trip_history, list) and len(trip_history) > _SUMMARY_TRIP_WINDOW:
             trip_history = sorted(trip_history, key=_trip_sort_key)[
                 -_SUMMARY_TRIP_WINDOW:
@@ -759,6 +771,7 @@ class MemoryManager:
             总结后的文本
         """
         if not self.llm_model:
+            self.last_summary_unavailable = False
             return ""
 
         # 失败冷却先检查：冷却期内不做阻塞查询、不调用 LLM。但已有成功
@@ -767,6 +780,9 @@ class MemoryManager:
         # 冷却口径一致）
         if time.monotonic() < self._summary_failure_until:
             cached = self._summary_cache
+            # 冷却期只有「完全没有摘要」才算不可用；返回旧缓存时内容仍
+            # 存在，不能让调用方同时看到 has_chat_summary 与 unavailable
+            self.last_summary_unavailable = cached is None
             return cached[1] if cached is not None else ""
 
         # 聊天窗口 / 行程查询是阻塞 IO（JSON 文件、PostgreSQL 网络往返），
@@ -788,10 +804,12 @@ class MemoryManager:
             # 冷却期内不再发起阻塞查询：有成功总结时回退到它，避免一次
             # 瞬时失败让跨会话事实整段消失；没有缓存仍返回空
             cached = self._summary_cache
+            self.last_summary_unavailable = cached is None
             return cached[1] if cached is not None else ""
 
         # 如果既没有聊天记录也没有行程记录，直接返回
         if not history_from_other_sessions and not trip_history:
+            self.last_summary_unavailable = False
             return ""
 
         # 指纹要能感知「其它会话的消息被删除后由更旧消息补位」：
@@ -829,6 +847,7 @@ class MemoryManager:
             trip_signature,
         )
         if self._summary_cache is not None and self._summary_cache[0] == fingerprint:
+            self.last_summary_unavailable = False
             return self._summary_cache[1]
 
         # 构建聊天记录文本：单条截断 + 总字符预算，按时间倒序装入后再反转，
@@ -951,12 +970,14 @@ class MemoryManager:
             if summary:
                 self._summary_cache = (fingerprint, summary)
                 self._summary_failure_until = 0.0
+                self.last_summary_unavailable = False
             else:
                 # 网关 HTTP 200 但 choices 为空 / 纯空白：与异常同样进入冷却，
                 # 否则每个回合都会重复调用一次总结 LLM，且跨会话总结始终为空
                 self._summary_failure_until = (
                     time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SEC
                 )
+                self.last_summary_unavailable = True
                 logger.warning("Long-term summary is empty; cooldown applied")
             logger.info(f"Generated long-term memory summary ({len(summary)} chars)")
             return summary
@@ -965,6 +986,7 @@ class MemoryManager:
             self._summary_failure_until = (
                 time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SEC
             )
+            self.last_summary_unavailable = True
             logger.error(
                 "Failed to generate long-term summary: %s", redact_secret(e)
             )
@@ -1007,8 +1029,13 @@ class MemoryManager:
         fingerprint = tuple(
             (
                 str(item.get("role") or ""),
-                len(str(item.get("content") or "")),
-                str(item.get("content") or "")[:500],
+                # 指纹覆盖完整正文：只取前 500 字符会让同长度尾部变化的
+                # 窗口命中旧摘要（编辑 / 重新生成后的回答常共享结构化前缀）
+                hashlib.sha256(
+                    str(item.get("content") or "").encode(
+                        "utf-8", "surrogatepass"
+                    )
+                ).hexdigest(),
             )
             for item in items
         )
@@ -1017,6 +1044,9 @@ class MemoryManager:
             return cache[1]
         if time.monotonic() < self._recent_summary_failure_until:
             return ""
+        # 上一版摘要覆盖已滑出窗口的较早轮次：重算时并入 prompt 让摘要
+        # 跨窗口累积，长会话早期约定（预算 / 地点）不会随窗口一起消失
+        previous_summary = cache[1] if cache is not None else ""
 
         lines: list[str] = []
         for item in items:
@@ -1041,7 +1071,15 @@ class MemoryManager:
             "只输出摘要正文，不要复述指令。\n\n"
             "【最近对话】\n<<<\n"
             + _neutralize("\n".join(lines))
-            + "\n>>>\n\n摘要："
+            + "\n>>>\n"
+            + (
+                "\n【上一版摘要（覆盖已滑出窗口的较早对话）】\n<<<\n"
+                + _neutralize(previous_summary)
+                + "\n>>>\n"
+                if previous_summary
+                else ""
+            )
+            + "\n摘要："
         )
         try:
             response = await self.llm_model(

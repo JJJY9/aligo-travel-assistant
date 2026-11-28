@@ -47,6 +47,8 @@ from utils.preference_values import (
     is_manageable_pref_type,
     merge_preference_value,
     preference_value_problem,
+    shadow_preference_types,
+    visible_preferences,
 )
 from utils.result_formatter import normalize_missing_items
 from utils.turn_meta import strip_turn_meta
@@ -852,7 +854,14 @@ class OrchestrationAgent(AgentBase):
                 if callable(get_preferences)
                 else self.memory_manager.long_term.get_preference()
             )
-            context["user_preferences"] = preferences
+            # PG 读取期不清洗不可寻址键 / 空值脏行：面板与导出口径都会
+            # 隐藏它们，下发子智能体前统一切到同一可见口径，避免脏键进入
+            # plan-trip / memory-query 的模型提示词（JSON 后端加载即过滤）
+            context["user_preferences"] = (
+                visible_preferences(preferences)
+                if isinstance(preferences, dict)
+                else preferences
+            )
 
         return context
 
@@ -1747,6 +1756,45 @@ class OrchestrationAgent(AgentBase):
         if callable(invalidate):
             invalidate()
 
+    def _cleanup_shadow_preferences(self, written_types: list[str]) -> None:
+        """清理与刚写入类型仅差首尾空白的存量偏好键（best-effort）。
+
+        历史备份导入为防碰撞保留了「 home_location」这类原始键：写入规范
+        键后影子行仍回显旧值、继续占类型名额。面板 PUT / CLI pref-set 已
+        清理，对话写入在此补齐；异常只记警告，不影响本轮写入结果。
+        """
+        if not written_types:
+            return
+        long_term = getattr(self.memory_manager, "long_term", None)
+        if long_term is None:
+            return
+        try:
+            existing = long_term.get_preference()
+        except Exception:  # noqa: BLE001 - 读不到就不清理
+            return
+        if not isinstance(existing, dict):
+            return
+        shadows: list[str] = []
+        for pref_type in written_types:
+            for shadow in shadow_preference_types(existing, pref_type):
+                if shadow not in shadows:
+                    shadows.append(shadow)
+        if not shadows:
+            return
+        try:
+            delete_many = getattr(long_term, "delete_preferences", None)
+            if callable(delete_many):
+                removed = delete_many(shadows)
+            else:
+                removed = {
+                    key for key in shadows if long_term.delete_preference(key)
+                }
+        except Exception:  # noqa: BLE001 - 清理失败不阻断本次写入
+            logger.warning("清理影子偏好失败（%d 条）", len(shadows))
+            return
+        for key in sorted(removed, key=str):
+            logger.info("清理影子偏好条目: %s", key)
+
     def _apply_single_preference(
         self, pref_type: str, pref_value: Any, pref_action: str
     ) -> None:
@@ -1875,6 +1923,9 @@ class OrchestrationAgent(AgentBase):
                 if result["result"].get("status") != "success":
                     continue
                 preferences_data = self._extract_preferences_payload(data)
+                # 本轮成功写入的规范类型：写完后清理首尾空白存量影子键
+                # （面板 PUT / CLI pref-set 已清理，对话写入此前漏掉）
+                written_pref_types: list[str] = []
 
                 # 新格式：preferences 是列表，包含 {type, value, action}
                 if isinstance(preferences_data, list):
@@ -1907,6 +1958,7 @@ class OrchestrationAgent(AgentBase):
                             self._apply_single_preference(
                                 pref_type, pref_value, pref_action
                             )
+                            written_pref_types.append(pref_type)
                         except Exception as exc:  # noqa: BLE001 - 单条失败继续
                             logger.warning(
                                 "保存偏好失败（%s，类型 %s），继续处理其余结果",
@@ -1917,7 +1969,10 @@ class OrchestrationAgent(AgentBase):
 
                 # 旧格式兼容：preferences 是字典
                 elif isinstance(preferences_data, dict):
-                    for pref_type, value in preferences_data.items():
+                    for raw_pref_type, value in preferences_data.items():
+                        # 先 strip 再校验 / 落库：与列表分支同一口径，否则
+                        # 「 hotel_brands 」这类键会被原样写成影子行
+                        pref_type = str(raw_pref_type).strip()
                         if (
                             has_preference_value(value)
                             and pref_type not in _PREF_EXPLANATORY_KEYS
@@ -1928,6 +1983,7 @@ class OrchestrationAgent(AgentBase):
                                     pref_type, value
                                 )
                                 self._invalidate_preference_cache()
+                                written_pref_types.append(pref_type)
                                 logger.info(
                                     "Updated preference: %s (legacy format)",
                                     pref_type,
@@ -1941,6 +1997,10 @@ class OrchestrationAgent(AgentBase):
                                 self._last_memory_write_failures.append(
                                     str(pref_type)
                                 )
+
+                # 规范键写入成功后清理首尾空白影子键（best-effort）：
+                # 否则规范键与影子键并存、互相矛盾的旧值仍回显进面板与 prompt
+                self._cleanup_shadow_preferences(written_pref_types)
 
             # 如果是行程规划智能体，保存行程到长期记忆
             if agent_name == "itinerary_planning" and isinstance(data, dict):

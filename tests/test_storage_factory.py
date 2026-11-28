@@ -4338,7 +4338,15 @@ def test_falsey_preferences_included_in_context():
     manager = MemoryManager("u-falsey", "s1", storage_path=tempfile.mkdtemp())
     manager.long_term.save_preference("budget_level", 0)
     manager.long_term.save_preference("window_seat", False)
-    manager.long_term.save_preference("home_location", "")
+    # 空串视为未设置：存储写入口已拒绝空值，直接写历史脏数据模拟
+    # 旧版本落库（加载期会丢弃该行）
+    memory_file = Path(manager.long_term.db_path)
+    raw = json.loads(memory_file.read_text(encoding="utf-8"))
+    raw.setdefault("preferences", []).append(
+        {"type": "home_location", "value": ""}
+    )
+    memory_file.write_text(json.dumps(raw, ensure_ascii=False), encoding="utf-8")
+    manager.reload_long_term()
     text = manager.get_context_for_agent()
     assert "budget_level: 0" in text
     assert "window_seat: False" in text
@@ -8320,6 +8328,78 @@ def test_pg_delete_duplicate_trip_is_not_replayed():
     assert memory.delete_duplicate_trip("trip_1") is True
     assert calls == [False], "delete_duplicate_trip 不能自动重放"
     print("✓ PG 去重删除禁止自动重放")
+
+
+def test_pg_recent_trips_by_date_prefers_departure_date():
+    """PG 按出发日期取最近行程：恢复的旧备份不能把近期行程挤出窗口。"""
+    from datetime import datetime
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-trip-date"
+    memory._ensure_trip_uid_column = lambda: None  # type: ignore[method-assign]
+    queries: list[str] = []
+
+    def _fetchall(sql, params=None):
+        queries.append(" ".join(sql.split()))
+        if "start_date ~" in sql:
+            return [
+                (
+                    1,
+                    "t-recent",
+                    "上海",
+                    "杭州",
+                    "2026-06-01",
+                    None,
+                    "出差",
+                    None,
+                    None,
+                    datetime(2026, 6, 1, 8, 0, 0),
+                )
+            ]
+        return [
+            (
+                2,
+                "t-old",
+                "上海",
+                "北京",
+                "2019-01-01",
+                None,
+                "旅游",
+                None,
+                None,
+                datetime(2026, 6, 2, 8, 0, 0),
+            )
+        ]
+
+    memory._fetchall = _fetchall  # type: ignore[method-assign]
+    trips = memory.get_recent_trips_by_date(2)
+    assert [trip["start_date"] for trip in trips] == ["2019-01-01", "2026-06-01"]
+    assert trips[-1]["destination"] == "杭州", "最近行程必须取日期最新的"
+    assert any("ORDER BY start_date DESC" in query for query in queries), queries
+    print("✓ PG 按出发日期取最近行程")
+
+
+def test_pg_save_preference_rejects_unmanageable_type_and_blank():
+    """PG 存储写入口同样拒绝不可寻址类型 / 空值：直连调用方不应留下
+    面板改不掉也删不掉的脏行。"""
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-pref-guard"
+    executed: list[bool] = []
+    memory._execute = lambda *args, **kwargs: executed.append(True)
+    for pref_type, value in (
+        ("bad/key", "x"),
+        (".", "x"),
+        ("home_location", ""),
+        ("home_location", None),
+    ):
+        with pytest.raises(ValueError):
+            memory.save_preference(pref_type, value)
+    assert not executed, "被拒绝的写入不能产生 SQL"
+    print("✓ PG 偏好写入口拒绝不可寻址类型 / 空值")
 
 
 def test_pg_preference_cap_ignores_hidden_rows(monkeypatch):

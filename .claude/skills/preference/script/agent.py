@@ -291,6 +291,21 @@ def _as_preference_result(obj: object, _depth: int = 0) -> dict | None:
     if "preferences" in candidate:
         return _result_from_preferences(candidate, candidate.get("preferences"))
     if "has_preferences" in candidate:
+        if candidate.get("has_preferences") and "preferences" not in candidate:
+            # 旧格式 / 单对象 + has_preferences：不能直接原样返回（编排层
+            # 取不到 preferences 列表，偏好静默不落库）。先按正常形状
+            # 归一（单对象 {type,value} 或旧字典），命中再补回标志；
+            # has_preferences=false 错误负载与空结果保持原样
+            inner = _as_preference_result(
+                {
+                    key: value
+                    for key, value in candidate.items()
+                    if key != "has_preferences"
+                },
+                _depth + 1,
+            )
+            if inner is not None and isinstance(inner.get("preferences"), list):
+                return {**inner, "has_preferences": True}
         return candidate
     # 模型常见单对象偏差：{"type": ..., "value": ..., "action": ...}
     if "type" in obj and "value" in obj:

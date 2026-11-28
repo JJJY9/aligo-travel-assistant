@@ -171,6 +171,22 @@ def _prompt_preference_text(value: Any) -> str:
     return str(value)
 
 
+def neutralize_prompt_text(value: object) -> str:
+    """中和偏好文本里的数据块分隔符与全角方括号。
+
+    偏好值可经备份导入 / 面板写入外部内容，原样拼进意图或规划 prompt 能
+    伪造「【重要提示】」等结构；与 preference / memory-query / plan-trip
+    技能对同类内容的处理同一口径。
+    """
+    return (
+        str(value if value is not None else "")
+        .replace("<<<", "＜＜＜")
+        .replace(">>>", "＞＞＞")
+        .replace("【", "［")
+        .replace("】", "］")
+    )
+
+
 def preference_prompt_lines(
     preferences: object,
     *,
@@ -184,14 +200,18 @@ def preference_prompt_lines(
     ``max_total_chars`` 后不再输出值，但对剩余类型仍保留「值已省略」行
     ——模型据此判断该字段已存在，不会把既有列表型偏好当首次设置而
     replace 覆盖；类型名也放不下时以「（更多偏好已省略）」收尾。
+    面板不可寻址的键（含 "/"、控制字符等）与未设置的空值不渲染：
+    PG 存量脏键不能经提示词进入模型，空值也不该显示成 ``None``。
     """
     if not isinstance(preferences, dict):
         return []
     lines: list[str] = []
     used = 0
     for key, value in preferences.items():
-        name = str(key)
-        text = _prompt_preference_text(value)
+        if not is_manageable_pref_type(key) or not has_preference_value(value):
+            continue
+        name = neutralize_prompt_text(key)
+        text = neutralize_prompt_text(_prompt_preference_text(value))
         if len(text) > max_value_chars:
             text = text[:max_value_chars] + "…"
         line = f"{bullet} {name}: {text}"

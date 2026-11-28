@@ -4107,6 +4107,20 @@ def _invalidate_preference_caches() -> None:
         logger.debug("清理偏好快照缓存失败", exc_info=True)
 
 
+def _invalidate_summary_caches() -> None:
+    """删除会话 / 末轮 / 导入恢复后清空各会话的摘要缓存（失败不阻断操作）。
+
+    摘要失败冷却期内会原样返回旧摘要、不校验窗口：不清理的话，已删除
+    会话的内容仍会进入其它会话的意图上下文与记忆查询。
+    """
+    try:
+        from context.memory_manager import MemoryManager
+
+        MemoryManager.invalidate_all_summary_caches()
+    except Exception:  # noqa: BLE001 - 缓存清理失败由下次重算兜底
+        logger.debug("清理摘要缓存失败", exc_info=True)
+
+
 def _safe_filename(value: str, fallback: str = "aligo") -> str:
     """把用户 / 会话 ID 转为只含 ASCII 的安全下载文件名。
 
@@ -6656,6 +6670,7 @@ def create_app(model: Any = None) -> FastAPI:
         # strict：PG 故障期间不能把偏好静默写进回退 JSON（恢复后读 PG，
         # 偏好「凭空消失」；与删除 / 行程写入 / CLI 的严格语义一致）
         store = _open_long_term(payload.user_id, strict=True)
+        read_warning = ""
         try:
             existing = store.get_preference()
             # 编辑影子行时原键会在写入后释放：本次等于替换而非新增，不占新名额
@@ -6707,7 +6722,19 @@ def create_app(model: Any = None) -> FastAPI:
                     ),
                 )
             store.save_preference(pref_type, payload.value)
-            value = store.get_preference(pref_type)
+            # 写入已提交：立即失效本进程各会话的偏好快照，读回失败也不能
+            # 让旧偏好继续服务（此前失效在异常路径被整体跳过）
+            _invalidate_preference_caches()
+            try:
+                value = store.get_preference(pref_type)
+            except Exception as exc:  # noqa: BLE001 - 写后读回失败≠保存失败
+                # 与 CLI pref-set / 行程 PUT 同一口径：UPSERT 已提交，读回
+                # 失败只降级为警告并回显提交值，不能报 503「保存失败」
+                logger.warning(
+                    "保存偏好后读取失败: %s", redact_paths(exc)
+                )
+                value = payload.value
+                read_warning = "偏好已保存，但暂时无法读取，请稍后刷新"
             # 编辑影子行（" home_location" 等首尾空格存量键）时把原键一并
             # 清掉：否则规范键拿到新值、被编辑行仍回显旧值，同一偏好并存
             # 两份并继续占用名额。best-effort，失败不阻断本次写入；
@@ -6729,7 +6756,10 @@ def create_app(model: Any = None) -> FastAPI:
         finally:
             _close_long_term(store)
         _invalidate_preference_caches()
-        return {"type": pref_type, "value": value}
+        result: dict[str, Any] = {"type": pref_type, "value": value}
+        if read_warning:
+            result["warning"] = read_warning
+        return result
 
     @app.delete("/api/preferences/{pref_type}")
     def delete_preference(
@@ -6746,7 +6776,25 @@ def create_app(model: Any = None) -> FastAPI:
         # （恢复后偏好会「复活」），strict 打开会返回 503
         store = _open_long_term(user_id, strict=True)
         try:
+            try:
+                existing = store.get_preference()
+            except Exception:  # noqa: BLE001 - 读不到就只删精确键
+                existing = None
             removed = store.delete_preference(pref_type)
+            # 删除规范键后同时清理首尾空白的影子行：否则被删偏好仍以
+            # 「 home_location」形态回显并占用类型名额（best-effort）
+            if removed and isinstance(existing, dict):
+                shadows = shadow_preference_types(existing, pref_type)
+                if shadows:
+                    delete_many = getattr(store, "delete_preferences", None)
+                    try:
+                        if callable(delete_many):
+                            delete_many(shadows)
+                        else:
+                            for shadow in shadows:
+                                store.delete_preference(shadow)
+                    except Exception:  # noqa: BLE001 - 清理失败不阻断删除
+                        logger.warning("清理影子偏好失败（%d 条）", len(shadows))
         except Exception as exc:  # noqa: BLE001 - 写盘失败统一提示
             logger.warning("删除偏好失败: %s", redact_paths(exc))
             raise _storage_failure("删除失败", exc) from exc
@@ -7237,6 +7285,9 @@ def create_app(model: Any = None) -> FastAPI:
             await asyncio.to_thread(
                 clear_session_checkpoints, user_id, session_id
             )
+            # 摘要缓存可能仍含已删除会话的内容：不失效会在失败冷却期内
+            # 继续注入其它会话的意图上下文与记忆查询
+            _invalidate_summary_caches()
         finally:
             lock.release()
         return {"session_id": session_id, "deleted": removed}
@@ -7312,6 +7363,8 @@ def create_app(model: Any = None) -> FastAPI:
                 await asyncio.to_thread(
                     state.idempotency.discard_session, user_id, session_id
                 )
+                # 被删除轮次仍可能留在摘要缓存里（冷却期不校验窗口）
+                _invalidate_summary_caches()
 
                 def _truncate_short_term() -> None:
                     # 短期记忆只是上下文缓存：清理失败不影响已完成的长期记忆删除。
@@ -9432,7 +9485,9 @@ def create_app(model: Any = None) -> FastAPI:
                         incoming_prefs = sections.get("preferences") or {}
                         if incoming_prefs:
                             try:
-                                existing_prefs = store.get_preference()
+                                existing_prefs = _visible_preferences(
+                                    store.get_preference()
+                                )
                             except Exception:  # noqa: BLE001 - 读取失败交给导入层
                                 existing_prefs = None
                             if isinstance(existing_prefs, dict):
@@ -9507,6 +9562,8 @@ def create_app(model: Any = None) -> FastAPI:
                             state.end_user_import(user_id)
                         # 导入可能覆盖 / 删除偏好：清掉已建会话的 5 秒快照
                         _invalidate_preference_caches()
+                        # 恢复可能覆盖 / 丢弃会话：旧摘要不能再注入其它会话
+                        _invalidate_summary_caches()
                         # 写库期间（大备份可能数十秒）其它实例 / CLI 可能删除
                         # 某个会话：最后再查一次墓碑并整会话回滚，避免迟到的
                         # 删除被恢复写回。若删除发生在本次检查之后，它自己的

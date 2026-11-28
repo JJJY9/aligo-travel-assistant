@@ -32,6 +32,7 @@ from utils.atomic_write import fsync_parent_dir
 from utils.errors import MemoryPersistenceError
 from utils.file_lock import file_lock
 from utils.log_redact import redacted_exc_text
+from utils.trip_sort import trip_sort_key
 from utils.preference_values import (
     merge_preference_value,
     preference_value_problem,
@@ -1817,6 +1818,12 @@ class LongTermMemory:
         偏好（例如本轮 LLM 调用期间用户在记忆面板修改了同一类型）。
         """
         _reject_reserved_preference_type(pref_type)
+        # 存储层是直连调用方（独立脚本 / 技能）的最后一道守卫：不可寻址
+        # 类型写入「成功」后会被下次加载静默丢弃并生成迁移备份
+        if not is_manageable_pref_type(pref_type):
+            raise ValueError(
+                "偏好类型不合法（不能为 . / ..，不能含 / 或控制字符，最长 64 字符）"
+            )
         preferences = self.data["preferences"]
         existing = None
         for pref in preferences:
@@ -1825,6 +1832,10 @@ class LongTermMemory:
                 break
         current = existing.get("value") if existing is not None else None
         merged = merge_preference_value(current, value)
+        if not has_preference_value(merged):
+            # 空值 append 是 no-op（不落库、不抛错）：与既有「空列表追加
+            # 为零操作」语义一致，清空请使用 delete_preference
+            return merged
         # 必须校验合并后的值：多轮 append 累积同样能越过 10000 字符上限
         problem = preference_value_problem(merged)
         if problem:
@@ -1858,6 +1869,12 @@ class LongTermMemory:
             value: 偏好值
         """
         _reject_reserved_preference_type(pref_type)
+        if not is_manageable_pref_type(pref_type):
+            raise ValueError(
+                "偏好类型不合法（不能为 . / ..，不能含 / 或控制字符，最长 64 字符）"
+            )
+        if not has_preference_value(value):
+            raise ValueError("偏好值不能为空（清空请使用 delete_preference）")
         problem = preference_value_problem(value)
         if problem:
             raise ValueError(problem)
@@ -3173,6 +3190,18 @@ class LongTermMemory:
             行程列表
         """
         return self.data["trip_history"][-limit:] if limit else self.data["trip_history"]
+
+    def get_recent_trips_by_date(self, limit: int = 20) -> list[dict[str, Any]]:
+        """按出发日期取最近 ``limit`` 条行程。
+
+        存储按插入序保存，备份恢复会把旧行程追加到表尾：先按插入序截取
+        再排序，恢复超过取数池容量的旧行程后近期行程会被挤出。全量在
+        内存（上限 5000 条）时直接排序开销可忽略。
+        """
+        history = [trip for trip in self.data["trip_history"] if isinstance(trip, dict)]
+        if limit:
+            history = sorted(history, key=trip_sort_key)[-limit:]
+        return history
 
     def get_frequent_destinations(self, top_n: int = 5) -> list[tuple]:
         """

@@ -168,6 +168,134 @@ def test_summary_failure_logs_are_redacted():
         shutil.rmtree(storage, ignore_errors=True)
 
 
+def test_recent_summary_fingerprint_covers_full_content():
+    """同长度尾部变化也必须重算：指纹不能只看前 500 字符。"""
+    model = _CountingModel()
+    manager, storage = _manager(model)
+    try:
+        _add_turn(manager, "一", "二")
+        _add_turn(manager, "三", "前" * 500 + "甲" * 300)
+        first = asyncio.run(manager.get_recent_summary_async())
+        assert first == model.response
+        assert model.calls == 1
+
+        # 保留前缀 500 字符、替换尾部为同长度内容
+        messages = manager.short_term.messages
+        content = messages[-1]["content"]
+        messages[-1]["content"] = content[:500] + "乙" * (len(content) - 500)
+        second = asyncio.run(manager.get_recent_summary_async())
+        assert second == model.response
+        assert model.calls == 2, "正文尾部变化不能命中旧摘要缓存"
+        assert "乙" in model.prompts[-1]
+        print("✓ 最近摘要指纹覆盖完整正文")
+    finally:
+        shutil.rmtree(storage, ignore_errors=True)
+
+
+def test_recent_summary_accumulates_previous_window():
+    """窗口滑出后的重算把上一版摘要并入 prompt，早期约定不随窗口消失。"""
+    model = _CountingModel(response="预算 1000")
+    manager, storage = _manager(model)
+    try:
+        for index in range(5):
+            _add_turn(manager, f"第 {index} 轮", "好的")
+        first = asyncio.run(manager.get_recent_summary_async())
+        assert first == "预算 1000"
+        assert model.calls == 1
+
+        for index in range(5, 12):
+            _add_turn(manager, f"第 {index} 轮", "好的")
+        second = asyncio.run(manager.get_recent_summary_async())
+        assert second == "预算 1000"
+        assert model.calls == 2
+        prompt = model.prompts[-1]
+        assert "【上一版摘要" in prompt
+        assert "预算 1000" in prompt
+        print("✓ 最近摘要跨窗口累积")
+    finally:
+        shutil.rmtree(storage, ignore_errors=True)
+
+
+def test_long_term_summary_flags_unavailable_on_store_failure():
+    """摘要读取失败要区别于「真的没有历史」（last_summary_unavailable）。"""
+    from utils.errors import MemoryPersistenceError
+
+    model = _CountingModel()
+    manager, storage = _manager(model)
+    try:
+        original = manager.long_term.get_chat_history
+
+        def boom(*args, **kwargs):
+            raise MemoryPersistenceError("db down")
+
+        manager.long_term.get_chat_history = boom  # type: ignore[method-assign]
+        assert asyncio.run(manager.get_long_term_summary_async()) == ""
+        assert manager.last_summary_unavailable is True
+        assert model.calls == 0
+
+        manager._summary_failure_until = 0.0
+        manager.long_term.get_chat_history = original  # type: ignore[method-assign]
+        assert asyncio.run(manager.get_long_term_summary_async()) == ""
+        assert manager.last_summary_unavailable is False, "真无历史不能标不可用"
+        print("✓ 摘要失败标记不可用，真无历史不标记")
+    finally:
+        shutil.rmtree(storage, ignore_errors=True)
+
+
+def test_invalidate_all_summary_caches_clears_cooldown_cache():
+    """删除会话后旧摘要（失败冷却期直接回放）必须能被全局失效。"""
+    model = _CountingModel()
+    manager, storage = _manager(model)
+    try:
+        manager._summary_cache = ((123,), "已删除会话的旧摘要")
+        manager._recent_summary_cache = (((),), "旧摘要")
+        import time as _time
+
+        manager._summary_failure_until = _time.monotonic() + 60
+        MemoryManager.invalidate_all_summary_caches()
+        assert manager._summary_cache is None
+        assert manager._recent_summary_cache is None
+        assert asyncio.run(manager.get_long_term_summary_async()) == ""
+        assert model.calls == 0, "冷却已清除，但空历史应直接返回空"
+        print("✓ 摘要缓存全局失效")
+    finally:
+        shutil.rmtree(storage, ignore_errors=True)
+
+
+def test_summary_trip_window_uses_dates_not_insertion_order():
+    """恢复大量旧行程后，总结窗口仍取出发日期最新的 20 条。"""
+    model = _CountingModel()
+    manager, storage = _manager(model)
+    try:
+        recent = [
+            {
+                "origin": "上海",
+                "destination": f"城市{index}",
+                "start_date": f"2026-06-{(index % 28) + 1:02d}",
+                "purpose": "出差",
+            }
+            for index in range(30)
+        ]
+        old = [
+            {
+                "origin": "上海",
+                "destination": f"旧地{index}",
+                "start_date": f"2019-{(index % 12) + 1:02d}-{(index % 28) + 1:02d}",
+                "purpose": "旅游",
+            }
+            for index in range(500)
+        ]
+        manager.long_term.save_trip_histories(recent + old)
+        _, trips = manager._summary_inputs()
+        assert len(trips) == 20
+        assert all(str(trip.get("start_date", "")).startswith("2026-") for trip in trips), [
+            trip.get("start_date") for trip in trips
+        ]
+        print("✓ 总结行程窗口按出发日期取最近")
+    finally:
+        shutil.rmtree(storage, ignore_errors=True)
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -177,4 +305,9 @@ if __name__ == "__main__":
     test_summary_truncated_to_200_chars()
     test_summary_failure_cooldown()
     test_summary_failure_logs_are_redacted()
+    test_recent_summary_fingerprint_covers_full_content()
+    test_recent_summary_accumulates_previous_window()
+    test_long_term_summary_flags_unavailable_on_store_failure()
+    test_invalidate_all_summary_caches_clears_cooldown_cache()
+    test_summary_trip_window_uses_dates_not_insertion_order()
     print("\n全部通过")

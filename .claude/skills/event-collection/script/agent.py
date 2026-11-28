@@ -26,6 +26,7 @@ from utils.llm_resilience import (
     provider_error_from_completion_text,
 )
 from utils.log_redact import redact_paths
+from utils.preference_values import neutralize_prompt_text
 from utils.user_query import extract_user_query
 from utils.json_parser import (
     decode_json_array_at,
@@ -757,6 +758,20 @@ def _format_pref_value(value) -> str:
     return str(value)
 
 
+_PREF_VALUE_PROMPT_MAX_CHARS = 500
+
+
+def _budget_pref_value(value) -> str:
+    """进入 prompt 的偏好值：单值预算 + 中和数据块分隔符。
+
+    偏好单值上限 10000 字符：原样拼接会让每轮事项收集多注入数万字符。
+    """
+    text = _format_pref_value(value)
+    if len(text) > _PREF_VALUE_PROMPT_MAX_CHARS:
+        text = text[:_PREF_VALUE_PROMPT_MAX_CHARS] + "…"
+    return neutralize_prompt_text(text)
+
+
 class EventCollectionAgent(AgentBase):
     """事项收集智能体"""
 
@@ -814,11 +829,11 @@ class EventCollectionAgent(AgentBase):
         if user_preferences:
             bg_parts = ["【用户背景信息】（可用于推断缺失信息）"]
             if user_preferences.get("home_location"):
-                bg_parts.append(f"• 家庭住址: {_format_pref_value(user_preferences['home_location'])}")
+                bg_parts.append(f"• 家庭住址: {_budget_pref_value(user_preferences['home_location'])}")
             if user_preferences.get("hotel_brands"):
-                bg_parts.append(f"• 酒店偏好: {_format_pref_value(user_preferences['hotel_brands'])}")
+                bg_parts.append(f"• 酒店偏好: {_budget_pref_value(user_preferences['hotel_brands'])}")
             if user_preferences.get("airlines"):
-                bg_parts.append(f"• 航空偏好: {_format_pref_value(user_preferences['airlines'])}")
+                bg_parts.append(f"• 航空偏好: {_budget_pref_value(user_preferences['airlines'])}")
 
             if len(bg_parts) > 1:
                 background_info = "\n".join(bg_parts) + "\n\n"

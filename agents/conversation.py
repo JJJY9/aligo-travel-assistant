@@ -1194,11 +1194,25 @@ class ConversationRuntime:
             # 完整历史、追问「把刚才的行程改到周五」时模型侧没有任何上文
             # （默认进程内短期记忆的部署必现）
             try:
+                # 回填深度与最近摘要窗口一致：窗口按 max_turns 轮（2×条数）
+                # 计算，只补 10 条（5 轮）会让摘要覆盖范围减半，较早的
+                # 几轮既无原文也无摘要
+                backfill_limit = (
+                    int(getattr(self.memory.short_term, "max_turns", 10) or 10) * 2
+                )
                 recent = list(
                     self.memory.long_term.get_chat_history(
-                        limit=10, session_id=self.session_id
+                        limit=backfill_limit, session_id=self.session_id
                     )
                 )
+                # 历史条数为奇数时开头是没有对应提问的孤立助手消息：
+                # 丢弃后窗口按完整回合对齐
+                if (
+                    recent
+                    and isinstance(recent[0], dict)
+                    and recent[0].get("role") == "assistant"
+                ):
+                    recent = recent[1:]
             except Exception:  # noqa: BLE001 - 回填失败按无历史继续
                 logger.debug("回填本会话历史失败", exc_info=True)
                 recent = []
