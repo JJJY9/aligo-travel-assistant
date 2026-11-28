@@ -2546,7 +2546,7 @@ def run_knowledge_status_standalone(as_json: bool = False) -> int:
         as_json: 输出机器可读的 JSON（便于监控 / 脚本）
 
     Returns:
-        0 知识库可用；1 未初始化或不可用
+        0 知识库可用且非空；1 未初始化、不可用或集合为空
     """
     from utils.knowledge_stats import (
         configured_dimension_mismatch,
@@ -2556,6 +2556,7 @@ def run_knowledge_status_standalone(as_json: bool = False) -> int:
 
     status = knowledge_status()
     configured_dim = configured_dimension_mismatch(status.get("dimension"))
+    documents = int(status.get("documents") or 0)
     if as_json:
         if configured_dim is not None:
             # 集合维度与当前嵌入模型不一致时检索必然 503：JSON 的 available
@@ -2571,9 +2572,29 @@ def run_knowledge_status_standalone(as_json: bool = False) -> int:
                 "dimension_mismatch": True,
                 "configured_dimension": configured_dim,
             }
+        if status.get("available") and documents <= 0:
+            # 空集合能 load、状态查询报 available=True，但检索必然全空；
+            # 健康门禁（README 明确 `cli kb` 可当门禁用）与 doctor 的
+            # 「知识集合为空」告警同口径：按不可用退出 1
+            status = {
+                **status,
+                "available": False,
+                "reason": (
+                    "知识集合为空，请运行初始化脚本写入内置知识："
+                    f"{knowledge_init_command()}"
+                ),
+                "empty": True,
+            }
         print(json.dumps(status, ensure_ascii=False, indent=2))
         return 0 if status.get("available") and configured_dim is None else 1
     if status.get("available"):
+        if documents <= 0:
+            print(
+                "知识库不可用：知识集合为空，请运行初始化脚本写入内置知识："
+                f"{knowledge_init_command()}"
+            )
+            print(f"数据库：{status['path']}")
+            return 1
         print(f"知识库：{status['collection']} · {status['documents']} 片段")
         print(f"数据库：{status['path']}")
         if configured_dim is not None:
@@ -2628,7 +2649,10 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
     Returns:
         0 评测完成且 hit@5 达标（或知识库未初始化，跳过）；1 未达标或后端故障
     """
-    from utils.knowledge_stats import knowledge_status
+    from utils.knowledge_stats import (
+        configured_dimension_mismatch,
+        knowledge_status,
+    )
     from utils.log_redact import redact_paths
 
     status = knowledge_status()
@@ -2681,6 +2705,36 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
             )
         else:
             print(f"评测失败：知识库不可用（{_plain_safe(safe_reason)}）")
+        return 1
+
+    # 独立 CLI 从不加载嵌入模型，但模型目录配置可零成本推断维度：换模型
+    # 未重建时 Agent 构造才报错（先触发 torch 加载 / 下载），与 `cli kb`
+    # 和 Web /api/knowledge/eval 的预检口径不一致
+    configured_dim = configured_dimension_mismatch(status.get("dimension"))
+    if configured_dim is not None:
+        from utils.skill_paths import knowledge_init_command
+
+        message = (
+            f"知识库向量维度（{status.get('dimension')}）与当前嵌入模型配置"
+            f"（{configured_dim}）不一致，请重新运行初始化脚本重建："
+            f"{knowledge_init_command()}"
+        )
+        if as_json:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "skipped": False,
+                        "dimension_mismatch": True,
+                        "configured_dimension": configured_dim,
+                        "error": message,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        else:
+            print(f"评测失败：{message}")
         return 1
 
     try:
@@ -2764,10 +2818,19 @@ def run_rag_eval_standalone(min_hit5: float = 0.8, as_json: bool = False) -> int
     eval_note = result.get("note")
     if eval_note:
         print(f"口径：{eval_note}")
+    # rag_eval 的多原因诊断（空库 / 阈值过严 / 题库不适用）在 --json 与
+    # Web 面板都会原样展示，文本模式此前丢弃会把调高 min_score 后的全
+    # 未命中误归因给索引或切分策略
+    eval_warning = str(result.get("warning") or "").strip()
+    if eval_warning:
+        print(f"警告：{eval_warning}")
     if not passed:
         if result["hit5"] == 0:
-            print("提示：所有问题均未命中，可能是索引未加载 / 知识库故障，而非切分策略问题")
-        print(f"低于阈值 hit@5 >= {min_hit5:.0%}，请检查知识库内容或切分策略")
+            print("提示：所有问题均未命中，可能是索引未加载 / 知识库故障")
+        print(
+            f"低于阈值 hit@5 >= {min_hit5:.0%}，"
+            "请检查知识库内容、切分策略或 min_score 阈值"
+        )
         return 1
     return 0
 
@@ -3380,8 +3443,11 @@ def run_knowledge_list_standalone(
         tag = f" · {category}" if category else ""
         chunk = ""
         try:
+            # 库里可能存有损坏的 parts（JSON 容器的 Infinity → int(inf)
+            # 抛 OverflowError）：与 knowledge_admin._meta_int 同口径兜底，
+            # 不能让整个 kb-list 展示路径崩掉
             parts = int(meta.get("parts") or 1)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             parts = 1
         if parts > 1:
             chunk = f" · 分片 {meta.get('part') or '?'}/{parts}"
@@ -4329,13 +4395,30 @@ def _parse_kb_write_args(
     return positional, metadata
 
 
+_KB_FILE_MAX_BYTES = 1024 * 1024
+
+
 def _read_kb_file(path: str) -> str | None:
     from pathlib import Path
 
+    # 体积预检先于读取：read_text 会整份读入内存再解码，GB 级文本 / 误传
+    # 的数据库或压缩包会先占满内存才被内容上限拒绝（kb-import 已有同类
+    # 预检）。UTF-8 下字节数恒 ≥ 字符数，超过 1 MiB 必然超过添加 / 更新
+    # 的字符上限，不会误拒合法文件
+    try:
+        file_size = os.path.getsize(path)
+    except OSError:
+        file_size = 0
+    if file_size > _KB_FILE_MAX_BYTES:
+        print(
+            f"读取文件失败：文件过大（{file_size} 字节），"
+            "知识内容上限约 2 万字，请拆分后再添加/更新"
+        )
+        return None
     try:
         text = Path(path).read_text(encoding="utf-8-sig")
     except MemoryError:
-        print("读取文件失败：文件过大，内存不足以整体读入；请拆分后再导入")
+        print("读取文件失败：文件过大，内存不足以整体读入；请拆分后再添加/更新")
         return None
     except UnicodeDecodeError as exc:
         print(f"读取文件失败：{exc}（文件需为 UTF-8 编码）")

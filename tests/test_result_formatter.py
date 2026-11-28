@@ -182,6 +182,36 @@ def test_rag_sources_align_with_snippets_per_document():
     print("✓ RAG 参考来源与参考片段按文档序号对齐")
 
 
+def test_rag_duplicate_source_names_not_merged():
+    """同名来源（同一分类下多条片段）逐条列出：片段序号都能找到来源行。"""
+    from utils.result_formatter import rag_source_extracts
+
+    data = {
+        "retrieved_documents": [
+            {"id": 1, "content": "片段一", "metadata": {"category": "差旅规定"}},
+            {"id": 2, "content": "片段二", "metadata": {"title": "文档B"}},
+            {"id": 3, "content": "片段三", "metadata": {"category": "差旅规定"}},
+        ]
+    }
+    names, snippets = rag_source_extracts(data)
+    assert names == ["1. 差旅规定", "2. 文档B", "3. 差旅规定"], names
+    assert len(snippets) == 3 and len(names) == len(snippets), (names, snippets)
+
+    md = result_to_markdown(
+        _wrap(
+            [
+                {
+                    "agent_name": "rag_knowledge",
+                    "status": "success",
+                    "data": {"answer": "答案", **data},
+                }
+            ]
+        )
+    )
+    assert "3. 差旅规定" in md and "3. 片段三" in md, md
+    print("✓ 同名来源逐条列出，片段与来源序号一一对应")
+
+
 def test_information_query_sources():
     data = _wrap([
         {
@@ -1198,6 +1228,7 @@ if __name__ == "__main__":
     test_preference_list_explanatory_not_rendered()
     test_information_query_nested_data_fallback()
     test_rag_nested_data_fallback()
+    test_rag_duplicate_source_names_not_merged()
     test_unclosed_code_fence_does_not_swallow_next_result()
     test_simple_skill_result_key_without_answer_still_renders()
     _mp = __import__("pytest").MonkeyPatch()

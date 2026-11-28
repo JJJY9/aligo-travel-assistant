@@ -13913,10 +13913,19 @@ def test_knowledge_document_write_api(monkeypatch):
     )
     assert accepted.status_code == 200
     assert "part" not in updated["call"][2] and "group" not in updated["call"][2]
+    # 11 个用户键在 PUT schema 层不再 422：历史遗留的 >10 键记录（#553
+    # 之前旧 CLI 可写出）必须能原样保存，键数上限由 knowledge_admin 按
+    # 「库内已有键集」判断（新增键超限仍拒绝，见知识管理测试）
     too_many_keys = {f"k{index}": "v" for index in range(11)}
+    eleven_keys = client.put(
+        "/api/knowledge/documents/7",
+        json={"content": "x", "metadata": too_many_keys},
+    )
+    assert eleven_keys.status_code == 200
+    # 新增接口保持严格的 10 键上限
     assert (
-        client.put(
-            "/api/knowledge/documents/7",
+        client.post(
+            "/api/knowledge/documents",
             json={"content": "x", "metadata": too_many_keys},
         ).status_code
         == 422
@@ -14607,7 +14616,7 @@ def test_knowledge_eval_import_failure(monkeypatch):
     monkeypatch.setattr(
         server_module,
         "knowledge_status",
-        lambda **_: {"available": True, "collection": "kb", "path": "p"},
+        lambda **_: {"available": True, "collection": "kb", "documents": 3, "path": "p"},
     )
     monkeypatch.setitem(
         sys.modules, "agents.rag_knowledge_agent", types.ModuleType("agents.rag_knowledge_agent")
@@ -14791,6 +14800,89 @@ def test_knowledge_export_strips_nul(monkeypatch):
     documents = response.json()["documents"]
     assert documents == [{"content": "前后", "metadata": {"title": "标题"}}], documents
     print("✓ 知识专用导出剥离 NUL（导出→导入不丢片段）")
+
+
+def test_knowledge_export_guard_counts_utf8_bytes(monkeypatch):
+    """导出 413 守卫按 UTF-8 字节而非字符数：中文库不能放行面板拒收的文件。"""
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "export_documents",
+        lambda: [{"id": 1, "content": "住" * 100, "metadata": {}}],
+    )
+    # 中文文档紧凑序列化约 140 字符、UTF-8 约 340 字节：字符口径会放行
+    monkeypatch.setattr("utils.user_import.MAX_BACKUP_BYTES", 200)
+    response = _client().get("/api/knowledge/export")
+    assert response.status_code == 413, response.text[:200]
+    assert "面板导入上限" in response.json()["detail"]
+
+    # ASCII 小文档仍正常导出（字节口径不误伤）
+    monkeypatch.setattr(
+        server_module,
+        "export_documents",
+        lambda: [{"id": 2, "content": "ok", "metadata": {}}],
+    )
+    ok = _client().get("/api/knowledge/export")
+    assert ok.status_code == 200 and ok.json()["documents"][0]["id"] == 2
+
+    # 估算助手：同一文档 UTF-8 字节严格大于字符数
+    estimated = server_module._estimated_export_bytes(
+        [{"content": "住" * 10}], indent=2
+    )
+    assert estimated > len('{"content": "' + "住" * 10 + '"}')
+    print("✓ 知识导出守卫按 UTF-8 字节计算（中文库不放行超限文件）")
+
+
+def test_knowledge_empty_collection_degrades_status_and_eval(monkeypatch):
+    """空集合（0 片段）按不可用展示；评测直接 503，不白跑 30 题 0%。"""
+    from webapp import server as server_module
+
+    monkeypatch.setattr(
+        server_module,
+        "knowledge_status",
+        lambda **_: {
+            "available": True,
+            "collection": "kb",
+            "documents": 0,
+            "path": "p",
+        },
+    )
+    body = _client().get("/api/knowledge").json()
+    assert body["available"] is False and body["empty"] is True, body
+    assert "集合为空" in body["reason"], body
+    response = _client().get("/api/knowledge/eval")
+    assert response.status_code == 503
+    assert "集合为空" in response.json()["detail"]
+    print("✓ 空集合时状态降级、评测 503（与 doctor / CLI 同口径）")
+
+
+def test_kb_group_lookup_uses_read_slots(monkeypatch):
+    """整组回填也是全库扫描：槽满时 503，不触发底层扫描。"""
+    from webapp import server as server_module
+
+    calls = []
+
+    def fake_group(doc_id):
+        calls.append(doc_id)
+        return {"id": doc_id, "content": "x", "parts": 1}
+
+    monkeypatch.setattr(server_module, "get_document_group", fake_group)
+    client = _client()
+    state = client.app.state.aligo
+    held = [state.kb_read_slots.acquire(blocking=False) for _ in range(4)]
+    try:
+        assert all(held)
+        response = client.get("/api/knowledge/documents/1/group")
+        assert response.status_code == 503
+        assert "知识库读取任务过多" in response.json()["detail"]
+        assert calls == [], "槽满时不得触发底层全库扫描"
+    finally:
+        for _ in held:
+            state.kb_read_slots.release()
+    ok = client.get("/api/knowledge/documents/1/group")
+    assert ok.status_code == 200 and calls == [1]
+    print("✓ 整组回填受知识库读并发槽约束")
 
 
 def test_kb_delete_grouped_fragment_maps_400(monkeypatch):

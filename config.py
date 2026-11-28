@@ -190,6 +190,7 @@ class RAGConfig(TypedDict):
     rerank_candidates: int
     bm25_max_docs: int
     bm25_ttl_sec: int
+    bm25_over_limit_ttl_sec: int
 
 
 class PlanConfig(TypedDict):
@@ -289,7 +290,8 @@ RAG_CONFIG: RAGConfig = {
     "min_score": min(1.0, max(0.0, _env_float("RAG_MIN_SCORE", 0.5))),
     # 混合检索（v2.0）：默认开启；BM25 索引构建失败时自动退回纯向量。
     # 重排模型（如 BAAI/bge-reranker-base）留空表示不加载，避免默认
-    # 拉取额外模型；启用后对 RRF 候选做 cross-encoder 精排。
+    # 拉取额外模型；启用后对候选做 cross-encoder 精排（混合检索与纯
+    # 向量回退路径同序执行）。
     "hybrid_enabled": _env_bool("RAG_HYBRID_ENABLED", True),
     "hybrid_candidates": max(
         1, min(200, _env_int("RAG_HYBRID_CANDIDATES", 20))
@@ -300,6 +302,11 @@ RAG_CONFIG: RAGConfig = {
         1, min(200, _env_int("RAG_RERANK_CANDIDATES", 20))
     ),
     "bm25_max_docs": max(1, _env_int("RAG_BM25_MAX_DOCS", 20000)),
+    # 片段数超过 bm25_max_docs 是确定性失败：短 TTL 重试只会每分钟重扫
+    # 上限，单独使用更长退避（写操作 bump 版本号仍会立即重试）
+    "bm25_over_limit_ttl_sec": max(
+        1, min(3600, _env_int("RAG_BM25_OVER_LIMIT_TTL_SEC", 600))
+    ),
     # 0 / 负数留到下面统一钳制：消费方按 (now - cached) <= ttl 判定，
     # 0 会让缓存永不命中、每次问答都在请求线程重建索引（数万片段）
     "bm25_ttl_sec": _env_int("RAG_BM25_TTL_SEC", 60),

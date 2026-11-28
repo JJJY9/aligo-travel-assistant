@@ -133,6 +133,32 @@ def test_kb_status_flags_configured_dimension_mismatch(monkeypatch):
     print("✓ kb 冷进程按配置维度判失败（文本 / JSON）")
 
 
+def test_kb_status_empty_collection_is_failure(monkeypatch):
+    """空集合（0 片段）按不可用退出 1：与 doctor 告警 / 检索全空同口径。"""
+    from utils import knowledge_stats
+
+    monkeypatch.setattr(
+        knowledge_stats,
+        "knowledge_status",
+        lambda: {
+            "available": True,
+            "collection": "aligo_knowledge",
+            "documents": 0,
+            "path": "data/x.db",
+        },
+    )
+    code, out = _capture(cli.run_knowledge_status_standalone, False)
+    assert code == 1, out
+    assert "集合为空" in out and "0 片段" not in out, out
+
+    code, out = _capture(cli.run_knowledge_status_standalone, True)
+    payload = json.loads(out)
+    assert code == 1
+    assert payload["available"] is False and payload["empty"] is True
+    assert "集合为空" in payload["reason"]
+    print("✓ 空集合按不可用退出 1（文本 / JSON 同口径）")
+
+
 def test_health_missing_runtime_dependencies(monkeypatch):
     """运行时依赖导入失败时给出提示而不是对 None 调用。"""
     monkeypatch.setattr(cli, "init_agentscope", None)
@@ -267,6 +293,7 @@ if __name__ == "__main__":
         test_health_text_failure_strips_terminal_controls,
         test_kb_status_json,
         test_kb_status_flags_configured_dimension_mismatch,
+        test_kb_status_empty_collection_is_failure,
         test_health_missing_runtime_dependencies,
     ):
         mp = pytest.MonkeyPatch()

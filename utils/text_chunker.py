@@ -40,9 +40,12 @@ def _split_long_paragraph(paragraph: str, max_chars: int) -> list[str]:
 _TITLE_PREFIX = re.compile(
     r"^(?:#+\s*|\d+[.、)）]\s*|[（(]\d+[)）]\s*|[一二三四五六七八九十]+[、.]\s*)"
 )
-# 编号列表项的起始（「1. 北京」「(2) 500元」）：没有结尾冒号时是正文清单，
-# 不能当标题——否则整节正文会被 _merge_short_chunks 并入下一章节
-_LIST_NUMBER_PREFIX = re.compile(r"^(?:\d+[.、)）]|[（(]\d+[)）])\s*")
+# 编号列表项的起始（「1. 北京」「(2) 500元」「a) 提前7天」「① 先值机」）：
+# 没有结尾冒号时是正文清单，不能当标题——否则整节正文会被
+# _merge_short_chunks 并入下一章节
+_LIST_NUMBER_PREFIX = re.compile(
+    r"^(?:\d+[.、)）]|[（(]\d+[)）]|[A-Za-z][.)）]|[①-⑳㉑-㉟㊱-㊿])\s*"
+)
 
 
 def _is_title_like(chunk: str, min_chars: int = 30) -> bool:

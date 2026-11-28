@@ -320,7 +320,6 @@ def rag_source_extracts(data: Any) -> tuple[list[str], list[str]]:
         return [], []
     doc_names: list[str] = []
     snippets: list[str] = []
-    seen_names: set[str] = set()
     for index, document in enumerate(documents[:3], 1):
         if not isinstance(document, dict):
             continue
@@ -334,12 +333,10 @@ def rag_source_extracts(data: Any) -> tuple[list[str], list[str]]:
         if not doc_name and document.get("id") is not None:
             doc_name = f"#{document['id']}"
         if doc_name:
-            name_text = str(doc_name)
-            # 多分片文档的多条片段可能共享同一来源：只列一次（序号保留
-            # 文档序号，片段段按同一序号对齐）
-            if name_text not in seen_names:
-                seen_names.add(name_text)
-                doc_names.append(f"{index}. {name_text}")
+            # 每个文档序号都产生一条来源行：按来源名去重会让同名来源被
+            # 合并，片段序号在来源列表里找不到对应行（生产路径检索侧已按
+            # group 折叠多分片，这里无需再去重）
+            doc_names.append(f"{index}. {doc_name}")
         excerpt = " ".join(str(document.get("content") or "").split())
         if excerpt:
             if len(excerpt) > 140:

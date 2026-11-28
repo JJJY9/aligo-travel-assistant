@@ -262,6 +262,59 @@ def test_hint_when_all_miss(monkeypatch):
     print("✓ 全部未命中时提示索引故障")
 
 
+def test_text_mode_shows_rag_eval_warning(monkeypatch):
+    """文本模式必须展示 rag_eval 的多原因诊断（含 min_score），不能只归因切分。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status(True))
+    monkeypatch.setattr(
+        rag_knowledge_agent, "RAGKnowledgeAgent", lambda **kw: _FakeAgent()
+    )
+    warning = (
+        "没有命中任何评测题：请先确认知识库已初始化且片段数量正常，"
+        "再检查 min_score 阈值是否过严"
+    )
+    monkeypatch.setattr(
+        rag_eval,
+        "evaluate_retrieval",
+        lambda search, **kwargs: {**_fake_result(0.0), "warning": warning},
+    )
+    code, out = _run(monkeypatch)
+    assert code == 1
+    assert "min_score" in out, out
+    assert "索引未加载" in out, "仍保留索引故障提示"
+    print("✓ 文本模式展示评测 warning（含 min_score 归因）")
+
+
+def test_config_dimension_mismatch_precheck_before_agent(monkeypatch):
+    """换模型未重建：CLI eval 在加载嵌入模型前按配置维度失败（与 kb 同口径）。"""
+    monkeypatch.setattr(
+        knowledge_stats,
+        "knowledge_status",
+        lambda: {**_status(True), "documents": 3, "dimension": 512},
+    )
+    monkeypatch.setattr(
+        knowledge_stats, "configured_dimension_mismatch", lambda dimension: 1024
+    )
+    constructed = []
+
+    class _Agent:
+        def __init__(self, **kwargs):
+            constructed.append(kwargs)
+            raise AssertionError("维度不一致时不应构造 Agent（会加载嵌入模型）")
+
+    monkeypatch.setattr(rag_knowledge_agent, "RAGKnowledgeAgent", _Agent)
+    code, out = _run(monkeypatch)
+    assert code == 1
+    assert "维度" in out and "不一致" in out, out
+    assert constructed == []
+
+    code, out = _run(monkeypatch, as_json=True)
+    payload = json.loads(out)
+    assert code == 1 and payload["dimension_mismatch"] is True
+    assert payload["configured_dimension"] == 1024
+    assert constructed == []
+    print("✓ 维度预检先于 Agent 构造（文本 / JSON）")
+
+
 def test_json_output(monkeypatch):
     """eval --json：成功 / 未达标 / 跳过 / 基础设施故障四种状态。"""
     monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status(True))
@@ -318,6 +371,8 @@ if __name__ == "__main__":
         test_min_hit5_flag_changes_threshold,
         test_eval_dispatch_passes_threshold,
         test_hint_when_all_miss,
+        test_text_mode_shows_rag_eval_warning,
+        test_config_dimension_mismatch_precheck_before_agent,
         test_json_output,
         test_parse_eval_args,
     ):

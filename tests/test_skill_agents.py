@@ -1978,6 +1978,134 @@ def test_hybrid_search_threshold_precedes_rerank():
     print("✓ 证据门槛先于精排截断")
 
 
+def test_hybrid_vector_fallback_reranks():
+    """纯向量回退同样执行精排：RAG_RERANK_MODEL 语义与混合开关无关。"""
+    module = _load_skill_module("ask-question")
+    agent_class = module.RAGKnowledgeAgent
+    docs = [
+        {"id": 1, "content": "a", "distance": 0.9},
+        {"id": 2, "content": "b", "distance": 0.4},
+        {"id": 3, "content": "c", "distance": 0.8},
+    ]
+
+    def make_agent(**overrides):
+        agent = object.__new__(agent_class)
+        agent._rerank_documents = lambda query, candidates: (
+            calls.append([doc["id"] for doc in candidates])
+            or list(reversed(candidates))
+        )
+        agent._get_bm25_index = lambda: None
+        agent._hybrid_settings = lambda: (True, 20)
+        for key, value in overrides.items():
+            setattr(agent, key, value)
+        return agent
+
+    calls = []
+    agent = make_agent(_hybrid_settings=lambda: (False, 20))
+    result = agent._hybrid_search(
+        "q", [dict(doc) for doc in docs], 2, min_distance=0.5
+    )
+    assert calls == [[1, 3]], "hybrid 关闭：先过门槛、再精排、最后截断"
+    assert [doc["id"] for doc in result] == [3, 1]
+
+    calls.clear()
+    agent = make_agent()
+    result = agent._hybrid_search("q", [dict(doc) for doc in docs], 2)
+    assert calls == [[1, 2, 3]], "BM25 不可用：回退前同样精排"
+    assert [doc["id"] for doc in result] == [3, 2]
+
+    calls.clear()
+
+    class _EmptyIndex:
+        def __len__(self):
+            return 3
+
+        def search(self, query, top_k):
+            return []
+
+    agent = make_agent(_get_bm25_index=lambda: _EmptyIndex())
+    result = agent._hybrid_search("q", [dict(doc) for doc in docs], 2)
+    assert calls == [[1, 2, 3]], "BM25 零命中：回退前同样精排"
+    assert [doc["id"] for doc in result] == [3, 2]
+    print("✓ 纯向量回退路径也执行精排")
+
+
+def test_hybrid_fusion_failure_fallback_reranks(monkeypatch):
+    """RRF 融合异常的回退路径同样精排（精排自身失败仍保持顺序）。"""
+    module = _load_skill_module("ask-question")
+    agent_class = module.RAGKnowledgeAgent
+
+    class _Index:
+        def __len__(self):
+            return 1
+
+        def search(self, query, top_k):
+            return [({"id": 9, "content": "x"}, 1.0)]
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("rrf boom")
+
+    monkeypatch.setattr(module, "rrf_fuse", boom)
+    calls = []
+    agent = object.__new__(agent_class)
+    agent._hybrid_settings = lambda: (True, 20)
+    agent._get_bm25_index = lambda: _Index()
+    agent._rerank_documents = lambda query, candidates: (
+        calls.append([doc["id"] for doc in candidates]) or candidates
+    )
+    docs = [{"id": 1, "content": "a", "distance": 0.9}]
+    result = agent._hybrid_search("q", docs, 1)
+    assert calls == [[1]], "融合异常回退前也要精排"
+    assert [doc["id"] for doc in result] == [1]
+    print("✓ 融合异常回退路径同样精排")
+
+
+def test_bm25_over_limit_uses_long_backoff(monkeypatch):
+    """片段数超上限是确定性失败：长退避，不能每分钟重扫上限。"""
+    module = _load_skill_module("ask-question")
+    agent_class = module.RAGKnowledgeAgent
+    agent = object.__new__(agent_class)
+    agent.knowledge_base_path = "kb"
+    agent.collection_name = "c"
+    scans = []
+
+    def over_limit(max_docs):
+        scans.append(max_docs)
+        raise module._Bm25OverLimitError("知识库片段数超过 BM25 上限")
+
+    agent._fetch_all_documents = over_limit
+    clock = [1000.0]
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+    module._BM25_CACHE.clear()
+    module._BM25_FAILED_AT.clear()
+    from config import RAG_CONFIG
+
+    monkeypatch.setitem(RAG_CONFIG, "bm25_max_docs", 20000)
+    monkeypatch.setitem(RAG_CONFIG, "bm25_ttl_sec", 60)
+    monkeypatch.setitem(RAG_CONFIG, "bm25_over_limit_ttl_sec", 600)
+
+    assert agent._get_bm25_index() is None
+    key = ("kb", "c")
+    assert module._BM25_FAILED_AT[key][2] == 600, "超限使用长退避"
+    assert len(scans) == 1
+
+    clock[0] += 120
+    assert agent._get_bm25_index() is None
+    assert len(scans) == 1, "60s 普通退避到期也不应重扫"
+
+    clock[0] += 600
+    assert agent._get_bm25_index() is None
+    assert len(scans) == 2, "长退避到期后重试一次"
+
+    # 知识写入 bump 版本号：立即重试（删除可能让库回到上限内）
+    module.invalidate_bm25_cache()
+    assert agent._get_bm25_index() is None
+    assert len(scans) == 3
+    module._BM25_CACHE.clear()
+    module._BM25_FAILED_AT.clear()
+    print("✓ BM25 超限退避拉长且写操作后立即重试")
+
+
 def test_rag_dimension_mismatch_fails_init():
     """集合维度与嵌入模型不一致时初始化直接失败（否则每问都抛底层 matmul 异常）。"""
     agent_class = _load_skill("ask-question", "RAGKnowledgeAgent")
