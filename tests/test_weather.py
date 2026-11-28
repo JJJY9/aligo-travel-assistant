@@ -1178,7 +1178,8 @@ def test_geocode_prefers_trusted_alias_for_foreign_city(monkeypatch):
     assert data["timezone"] == "Europe/London"
     assert data["city"] == "London"
     languages = [params["language"] for url, params in calls if "geocoding" in url]
-    assert languages == ["zh", "en"], calls
+    # 别名境外城市先查 en 索引（zh 只是回退来源），不再先白耗一次 zh 请求
+    assert languages == ["en"], calls
     assert calls[-1][1]["latitude"] == 51.5
     print("✓ 境外中文城市按英文别名改查")
 
@@ -1266,6 +1267,124 @@ def test_peek_cached_weather_returns_fresh_entry():
     finally:
         weather.clear_weather_cache()
     print("✓ peek_cached_weather 只返回新鲜缓存")
+
+
+def test_peek_cached_weather_returns_degraded_entry():
+    """降级复用（stale）同样零上游请求：端点限流前的探测应能看到。"""
+    weather.clear_weather_cache()
+    try:
+        key = weather._cache_key("北京")
+        stale = {"city": "北京", "stale": True, "current": {}, "daily": []}
+        weather._store_degraded(key, stale)
+        assert weather.peek_cached_weather("北京") == stale
+    finally:
+        weather.clear_weather_cache()
+    print("✓ peek_cached_weather 能看到降级复用结果")
+
+
+def test_follower_wait_exhaustion_serves_stale(monkeypatch):
+    """单飞等待耗尽（本地繁忙）有 1 小时内旧数据时沿用，不抛错。"""
+    key = weather._cache_key("北京")
+    stale_payload = {"city": "北京", "current": {}, "daily": []}
+    with weather._cache_lock:
+        weather._cache[key] = (
+            time.monotonic() - weather.CACHE_TTL_SEC - 10,
+            stale_payload,
+        )
+
+    class _FakeEvent:
+        def wait(self, timeout=None):
+            return True
+
+    monkeypatch.setattr(weather, "_claim_fetch", lambda name: (False, _FakeEvent()))
+    data = weather.fetch_weather("北京")
+    assert data.get("stale") is True
+    assert weather._failure_hit(key) is None
+    print("✓ 单飞等待耗尽时沿用旧数据而不是报繁忙")
+
+
+def test_busy_gate_refunds_upstream_window(monkeypatch):
+    """并发闸门超时未发上游请求：退还全进程窗口额度，不留幽灵调用。"""
+    slots = threading.BoundedSemaphore(1)
+    slots.acquire()
+    monkeypatch.setattr(weather, "_upstream_slots", slots)
+    weather._upstream_calls.clear()
+    with pytest.raises(weather.WeatherBusyError):
+        weather.fetch_weather("北京", timeout=0.01)
+    assert len(weather._upstream_calls) == 0
+    print("✓ 闸门繁忙退还上游窗口额度")
+
+
+def test_upstream_429_is_busy_without_failure_cache(monkeypatch):
+    """上游 429 是「稍后重试」信号：不写 60 秒失败缓存把城市钉住。"""
+    import types
+
+    err = weather.requests.HTTPError("429 Too Many Requests")
+    err.response = types.SimpleNamespace(status_code=429)
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        return _Response({}, error=err)
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    with pytest.raises(weather.WeatherBusyError):
+        weather.fetch_weather("北京")
+    assert weather._failure_hit(weather._cache_key("北京")) is None
+    print("✓ 上游 429 按本地繁忙处理且不写失败缓存")
+
+
+def test_shared_cache_rejects_future_fetched_at(monkeypatch):
+    """明显未来的信封时刻按未命中处理：未知年龄的旧快照不能被当刚抓取。"""
+    client = _FakeSharedRedis()
+    key = weather._cache_key("杭州")
+    payload = {"city": "杭州", "current": {}, "daily": []}
+    monkeypatch.setattr(weather, "_shared_cache_client", lambda: client)
+    weather.clear_weather_cache()
+    client.data[f"aligo:weather:{key}"] = _shared_envelope(
+        payload, fetched_at=time.time() + 3600
+    )
+    assert weather._shared_cache_get(key) is None
+    # 小幅抖动（<120 秒）仍容忍：正常多实例部署不受影响
+    client.data[f"aligo:weather:{key}"] = _shared_envelope(
+        payload, fetched_at=time.time() + 30
+    )
+    assert weather._shared_cache_get(key) is not None
+    print("✓ 共享缓存的未来信封按未命中处理")
+
+
+def test_alias_geocode_en_first_not_blocked_by_zh_failure(monkeypatch):
+    """别名境外城市先查 en：zh 索引瞬时失败不能阻断权威 en 查询。"""
+    calls = []
+
+    def fake_get(url, params=None, timeout=None, headers=None):
+        params = dict(params or {})
+        calls.append((url, params))
+        if "geocoding" in url:
+            if params["language"] == "zh":
+                raise weather.requests.ConnectionError("zh index down")
+            return _Response(
+                {
+                    "results": [
+                        {
+                            "name": "Tokyo",
+                            "latitude": 35.68,
+                            "longitude": 139.69,
+                            "timezone": "Asia/Tokyo",
+                            "population": 8336599,
+                            "feature_code": "PPLC",
+                        }
+                    ]
+                }
+            )
+        return _Response(_forecast())
+
+    monkeypatch.setattr(weather.requests, "get", fake_get)
+    weather.clear_weather_cache()
+    data = weather.fetch_weather("东京")
+    assert data["city"] == "Tokyo"
+    assert [p["language"] for u, p in calls if "geocoding" in u] == ["en"]
+    print("✓ 别名城市 zh 失败不阻断 en 查询")
+
 
 def test_city_name_variant_guards(monkeypatch):
     """裸名 / X市 变体：单字与「沙市」这类两字市名不补查。"""
@@ -1492,6 +1611,11 @@ if __name__ == "__main__":
         test_shared_fill_keeps_negative_stamp_on_fresh_boot,
         test_shared_fill_respects_cache_limits,
         test_shared_cache_success_resets_redis_availability,
+        test_follower_wait_exhaustion_serves_stale,
+        test_busy_gate_refunds_upstream_window,
+        test_upstream_429_is_busy_without_failure_cache,
+        test_shared_cache_rejects_future_fetched_at,
+        test_alias_geocode_en_first_not_blocked_by_zh_failure,
     ):
         mp = pytest.MonkeyPatch()
         try:
@@ -1517,6 +1641,7 @@ if __name__ == "__main__":
     test_weather_codes_include_freezing_drizzle()
     test_describe_tolerates_non_finite_codes()
     test_peek_cached_weather_returns_fresh_entry()
+    test_peek_cached_weather_returns_degraded_entry()
     with pytest.MonkeyPatch.context() as _mp:
         from context import storage as _storage_module
 

@@ -19175,6 +19175,29 @@ def test_weather_upstream_quota_maps_429_and_refunds(monkeypatch):
     print("✓ 天气上游额度用尽映射 429 并归还额度")
 
 
+def test_weather_busy_maps_503_and_refunds(monkeypatch):
+    """本地排队繁忙：503 + Retry-After，且归还本次 IP 天气桶。"""
+    from utils.weather import WeatherBusyError
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+
+    def busy(city):
+        raise WeatherBusyError("天气服务繁忙，请稍后再试")
+
+    monkeypatch.setattr(server_module, "fetch_weather", busy)
+    before = state.weather_limiter.status("testclient")[0]
+    response = client.get("/api/weather", params={"city": "本地繁忙测试城"})
+    assert response.status_code == 503
+    assert response.headers.get("Retry-After") == "5"
+    assert "繁忙" in response.json()["detail"]
+    assert state.weather_limiter.status("testclient")[0] == before, (
+        "本地繁忙未产生可用结果，必须归还天气桶"
+    )
+    print("✓ 天气本地繁忙映射 503 并归还额度")
+
+
 def test_pending_tombstone_replay_is_single_flight(monkeypatch):
     """恢复期并发触发补写只允许一轮：节流判定与补写循环互斥。"""
     import threading as _threading

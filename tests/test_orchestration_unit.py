@@ -1931,6 +1931,29 @@ def test_transient_nested_error_triggers_retry():
         )
         is None
     )
+    # 天气本地繁忙 / 全局额度耗尽都是「稍后重试」语义
+    for message in ("天气服务繁忙，请稍后再试", "天气查询过于频繁，请稍后再试"):
+        assert (
+            module._transient_agent_error(
+                _Reply(
+                    json.dumps(
+                        {"query_success": False, "results": {"message": message}}
+                    )
+                )
+            )
+            == message
+        ), message
+    # 只加完整短语：其它技能的「繁忙」文本不能被误判成天气瞬时错误
+    assert (
+        module._transient_agent_error(
+            _Reply(
+                json.dumps(
+                    {"query_success": False, "results": {"message": "导入槽位繁忙"}}
+                )
+            )
+        )
+        is None
+    )
     print("✓ 嵌套瞬时错误触发重试、永久错误不重试")
 
 
