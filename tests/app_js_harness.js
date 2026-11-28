@@ -423,6 +423,8 @@ function scenarioRender(source) {
     session_device_name: invoke("isValidSessionId", "con"),
     session_export_reserved: invoke("isValidSessionId", "export"),
     session_bad_chars: invoke("isValidSessionId", "bad id!"),
+    session_astral_53: invoke("isValidSessionId", "𝐀".repeat(53)),
+    session_astral_64: invoke("isValidSessionId", "𝐀".repeat(64)),
     crlf_heading: invoke(
       "renderMarkdown",
       "## 标题" + String.fromCharCode(13, 10) + "正文",

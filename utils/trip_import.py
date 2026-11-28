@@ -916,6 +916,9 @@ def trip_export_roundtrip_problems(
 # 面板或 CLI 回导会被整份拒绝——必须提前告知，不能把「导出成功」当成
 # 「备份可用」。
 WEB_IMPORT_MAX_CHARS = 500_000
+# 2 MB 按原始 UTF-8 字节计：转义非 ASCII 的客户端（Python requests 的
+# json= 默认 ensure_ascii=True，每个中文字符 6 字节）实际有效上限约
+# 34.9 万字符，与面板的原文发送口径不同（见 README「行程导入编码」）。
 WEB_IMPORT_MAX_BYTES = 2 * 1024 * 1024
 
 

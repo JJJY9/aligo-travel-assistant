@@ -48,7 +48,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BeforeValidator, BaseModel, Field, ValidationError, field_validator
 from starlette.middleware.gzip import GZipMiddleware
 from starlette.requests import ClientDisconnect
 
@@ -254,6 +254,29 @@ def _is_loopback_host(host: str) -> bool:
 
 # 用户 / 会话 ID 会用于文件名与数据库主键，限制字符集以避免路径穿越等问题
 _ID_PATTERN = r"^[\w-]{1,64}$"
+
+
+# pydantic 的宽松 int 会把查询 / 路径参数里的 "1_0" 读成 10、"5.00" 读成 5、
+# "+1" 读成 1：非法写法静默作用到另一个 id 或分页窗口上，与 0 / abc 的
+# 422 口径不一致。分页与 doc_id 一律只接受纯十进制字符串。
+_STRICT_DECIMAL_INT_RE = re.compile(r"[0-9]+")
+
+
+def _strict_decimal_int(value: Any) -> Any:
+    if isinstance(value, str) and not _STRICT_DECIMAL_INT_RE.fullmatch(value):
+        raise ValueError("必须为十进制整数")
+    return value
+
+
+_StrictQueryInt = Annotated[int, BeforeValidator(_strict_decimal_int)]
+
+
+def _require_positive_path_int(request: Request, name: str) -> None:
+    """路径参数必须是规范正整数（"1_0" / "1.0" / "+1" 一律 422）。"""
+    raw = request.path_params.get(name)
+    if not isinstance(raw, str) or not re.fullmatch(r"[1-9][0-9]*", raw):
+        raise HTTPException(status_code=422, detail=f"{name} 必须为正整数")
+
 # 与静态路由冲突的会话 ID（清单与 CLI 共用）：GET /api/sessions/export 永远
 # 命中导出接口，这类会话无法查看 / 继续（聊天请求与备份恢复都必须拒绝）
 _RESERVED_SESSION_IDS = RESERVED_SESSION_IDS
@@ -1319,7 +1342,9 @@ class PreferencePayload(BaseModel):
         if problem:
             raise ValueError(f"偏好值{problem}")
         try:
-            size = len(json.dumps(value, ensure_ascii=False))
+            size = len(
+                json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            )
         except (TypeError, ValueError) as exc:
             raise ValueError("偏好值不是可序列化的 JSON") from exc
         if size > _PREFERENCE_VALUE_MAX_JSON:
@@ -1340,6 +1365,26 @@ class LastTurnPayload(BaseModel):
 
 
 _DATE_PATTERN = r"^\d{4}-\d{2}-\d{2}$"
+
+
+def _strict_today(value: str | None) -> date | None:
+    """``today`` 查询参数按严格 ISO 日期解析。
+
+    pydantic 的宽松日期解析会把字符串 "0" 当成 1970-01-01 并返回 200，
+    状态筛选 / 概览 / 导出按错误日期计算且没有任何提示；这里只接受
+    ``YYYY-MM-DD``（日历非法值在 fromisoformat 处同样 422）。
+    """
+    if value is None:
+        return None
+    if not re.fullmatch(_DATE_PATTERN, value):
+        raise ValueError("today 应为 YYYY-MM-DD")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("today 应为有效日期") from exc
+
+
+_StrictTodayQuery = Annotated[date | None, BeforeValidator(_strict_today)]
 
 
 class TripPayload(BaseModel):
@@ -1383,8 +1428,10 @@ class TripImportPayload(BaseModel):
     """从 CSV / iCalendar 文本导入行程（记忆面板文件选择）。
 
     必须走 JSON body：跨站表单无法发送 application/json。``content`` 上限
-    50 万字符：JSON 序列化后中文约 1.5 MB、转义最多的 ASCII 约 1 MB，仍在
-    2 MB 请求体上限内（100 万字符的中文会超过 2 MB，永远无法送达）。
+    50 万字符；请求体 2 MB 按原始 UTF-8 字节计算，面板按原文发送时 50 万
+    中文字符约 1.5 MB 可通过；转义非 ASCII 的客户端（如 Python ``requests``
+    的 ``json=`` 默认 ``ensure_ascii=True``）每个中文字符 6 字节，有效上限
+    约 34.9 万字符，需改用 ``ensure_ascii=False`` 或 CLI。
     """
 
     content: str = Field(min_length=1, max_length=500_000)
@@ -4345,7 +4392,16 @@ def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
     # 行上有回溯开销，没命中的消息根本不需要清理
     position = _ci_find(haystack, needle)
     if position < 0:
-        return ""
+        # 查询或原文内部空白不一致（双空格 / Tab）：两侧都折叠空白后再找。
+        # 直接判空会让本已命中的会话被整条过滤，与行程搜索按空白拆词的口径
+        # 也不一致；片段从折叠后的文本截取（与下面的空白归一 fallback 同义）
+        needle = " ".join(needle.split())
+        if not needle:
+            return ""
+        haystack = " ".join(haystack.split())
+        position = _ci_find(haystack, needle)
+        if position < 0:
+            return ""
     # 只清理命中位置附近的窗口：单条消息可达数 MB（导入上限 64MB），整条
     # 清理没有意义，超长单行还会放大任何正则的扫描范围
     span = radius * 4 + len(needle)
@@ -4433,8 +4489,9 @@ def _group_sessions(
     # 片段 / 标题匹配都用原文查询：_ci_find 自己处理大小写（lower() 改变
     # 长度时改在原文上用正则定位）。先把查询 lower 会让含 İ 的关键字在
     # 原文里完全匹配不到——仅助手消息命中「İstanbul」的会话被整条过滤，
-    # 仅标题命中的会话也拿不到 snippet / match_index
-    raw_query = query.strip()
+    # 仅标题命中的会话也拿不到 snippet / match_index。
+    # 查询内部空白折叠为单空格：双空格 / Tab 与正文单空格不应造成 0 结果
+    raw_query = " ".join(query.split())
     tz_epoch = _tz_epoch()
     # 归档集合提前到消息循环前：搜索时「当前视图下必被过滤」的会话不必
     # 渲染助手消息（_message_search_text 要做 json.loads + Markdown 渲染，
@@ -4526,7 +4583,8 @@ def _group_sessions(
             entry
             for entry in sessions
             if entry.get("snippet")
-            or _ci_find(str(entry.get("title", "")), raw_query) >= 0
+            or _ci_find(" ".join(str(entry.get("title", "")).split()), raw_query)
+            >= 0
         ]
     for entry in sessions:
         if not entry["title"]:
@@ -5781,8 +5839,8 @@ def create_app(model: Any = None) -> FastAPI:
     def knowledge_documents(
         request: Request,
         response: Response,
-        limit: int = Query(default=20, ge=1, le=100),
-        offset: int = Query(default=0, ge=0),
+        limit: Annotated[_StrictQueryInt, Query(ge=1, le=100)] = 20,
+        offset: Annotated[_StrictQueryInt, Query(ge=0)] = 0,
         q: str = Query(default="", max_length=100),
         # 200 字只约束新写入；读侧必须能承载库内历史超长分类（旧版本写入），
         # 否则选中该分类必得 422、分类筛选不可用。仅用于精确串比较，给传输
@@ -5831,7 +5889,7 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request,
         response: Response,
         q: str = Query(..., min_length=1, max_length=100),
-        top_k: int = Query(default=5, ge=1, le=10),
+        top_k: Annotated[_StrictQueryInt, Query(ge=1, le=10)] = 5,
     ) -> dict[str, Any]:
         """语义检索知识片段（向量相似度排序；首次调用会加载嵌入模型）。"""
         _reject_cross_site_side_effect(request)
@@ -5974,7 +6032,7 @@ def create_app(model: Any = None) -> FastAPI:
     def knowledge_duplicates(
         request: Request,
         response: Response,
-        limit: int = Query(default=20, ge=0, le=200),
+        limit: Annotated[_StrictQueryInt, Query(ge=0, le=200)] = 20,
     ) -> dict[str, Any]:
         """列出内容完全相同的独立知识片段组（与 CLI ``kb-duplicates`` 同一实现）。
 
@@ -6089,6 +6147,7 @@ def create_app(model: Any = None) -> FastAPI:
         doc_id: int = ApiPath(..., ge=1, le=2**63 - 1),
     ) -> dict[str, Any]:
         """更新知识片段（内容重新向量化；片段不存在返回 404）。"""
+        _require_positive_path_int(request, "doc_id")
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             metadata = payload.metadata
@@ -6141,6 +6200,7 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request, response: Response, doc_id: int = ApiPath(..., ge=1, le=2**63 - 1)
     ) -> dict[str, Any]:
         """返回片段所属的整篇文档（多分片按 part 拼接），供整份编辑回填。"""
+        _require_positive_path_int(request, "doc_id")
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             result = get_document_group(doc_id)
@@ -6163,6 +6223,7 @@ def create_app(model: Any = None) -> FastAPI:
         group: bool = Query(default=False),
     ) -> dict[str, Any]:
         """按 id 删除知识片段；``group=1`` 时连同同组分片一起删除。"""
+        _require_positive_path_int(request, "doc_id")
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             removed = delete_document(doc_id, whole_group=group)
@@ -6357,7 +6418,7 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request,
         response: Response,
         user_id: str = Query(..., pattern=_ID_PATTERN),
-        today: date | None = Query(default=None),
+        today: Annotated[_StrictTodayQuery, Query()] = None,
         tz: str | None = Query(default=None, max_length=64),
     ) -> dict[str, Any]:
         response.headers.update(_enforce_read_rate_limit(state, request))
@@ -6559,8 +6620,10 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request,
         response: Response,
         user_id: str = Query(..., pattern=_ID_PATTERN),
-        limit: int = Query(default=50, ge=1, le=SESSION_LIST_MAX_LIMIT),
-        offset: int = Query(default=0, ge=0),
+        limit: Annotated[
+            _StrictQueryInt, Query(ge=1, le=SESSION_LIST_MAX_LIMIT)
+        ] = 50,
+        offset: Annotated[_StrictQueryInt, Query(ge=0)] = 0,
         q: str = Query(default="", max_length=100),
         archived: bool = Query(default=False),
     ) -> dict[str, Any]:
@@ -7986,12 +8049,12 @@ def create_app(model: Any = None) -> FastAPI:
         request: Request,
         response: Response,
         user_id: str = Query(..., pattern=_ID_PATTERN),
-        limit: int = Query(default=50, ge=1, le=200),
-        offset: int = Query(default=0, ge=0),
+        limit: Annotated[_StrictQueryInt, Query(ge=1, le=200)] = 50,
+        offset: Annotated[_StrictQueryInt, Query(ge=0)] = 0,
         order: str = Query(default="asc", pattern="^(asc|desc)$"),
         q: str = Query(default="", max_length=100),
         status: Literal["active", "upcoming", "past"] | None = Query(default=None),
-        today: date | None = Query(default=None),
+        today: Annotated[_StrictTodayQuery, Query()] = None,
     ) -> dict[str, Any]:
         """列出历史行程（默认记录顺序，支持分页；附带日期重叠信息）。
 
@@ -8083,7 +8146,7 @@ def create_app(model: Any = None) -> FastAPI:
                 "start_date": payload.start_date,
                 "end_date": payload.end_date,
             }
-            purpose = payload.purpose
+            purpose = payload.purpose or None
             if purpose is None:
                 from utils.trip_import import trip_identity
 
@@ -8428,7 +8491,7 @@ def create_app(model: Any = None) -> FastAPI:
         user_id: str = Query(..., pattern=_ID_PATTERN),
         q: str = Query(default="", max_length=100),
         status: Literal["active", "upcoming", "past"] | None = Query(default=None),
-        today: date | None = Query(default=None),
+        today: Annotated[_StrictTodayQuery, Query()] = None,
         format: Literal["csv", "html", "ics"] = Query(default="csv"),
     ) -> Response:
         """导出历史行程为 CSV（UTF-8 BOM）/ HTML 台账 / iCalendar 合集。
@@ -8903,6 +8966,7 @@ def create_app(model: Any = None) -> FastAPI:
         import asyncio
 
         from utils.user_import import (
+            _enforce_import_limits,
             _store_export_snapshot,
             drop_sessions,
             import_user_data,
@@ -9007,12 +9071,34 @@ def create_app(model: Any = None) -> FastAPI:
                     ),
                     headers={"Connection": "close"},
                 ) from None
-            # 与 CLI 的 utf-8-sig 读取一致：带 BOM 的备份不应 422
-            if raw_body.startswith(b"\xef\xbb\xbf"):
-                raw_body = raw_body[3:]
+            # 与 json.loads 同口径识别 BOM 编码：model_validate_json 只接受
+            # UTF-8 字节，合法的 UTF-16 / UTF-32 备份（CLI / 第三方工具产物）
+            # 此前被当成 Invalid JSON 422；无法解码的非 UTF-8 给出明确的
+            # 415，而不是把编码问题伪装成备份内容损坏
+            try:
+                if raw_body.startswith(
+                    (b"\xff\xfe\x00\x00", b"\x00\x00\xfe\xff")
+                ):
+                    backup_text = raw_body.decode("utf-32")
+                elif raw_body.startswith((b"\xff\xfe", b"\xfe\xff")):
+                    backup_text = raw_body.decode("utf-16")
+                else:
+                    # utf-8-sig 同时剥掉 UTF-8 BOM（与 CLI 的读取口径一致）
+                    backup_text = raw_body.decode("utf-8-sig")
+            except UnicodeDecodeError:
+                raise HTTPException(
+                    status_code=415,
+                    detail=(
+                        "备份恢复只接受 UTF-8 编码的 JSON"
+                        "（可另存为 UTF-8 后重试）"
+                    ),
+                    headers={"Connection": "close"},
+                ) from None
             try:
                 payload = await loop.run_in_executor(
-                    state.import_executor, UserImportPayload.model_validate_json, raw_body
+                    state.import_executor,
+                    UserImportPayload.model_validate_json,
+                    backup_text,
                 )
             except ValidationError as exc:
                 # 与全局 RequestValidationError 处理器同一口径：input 截断为
@@ -9214,6 +9300,11 @@ def create_app(model: Any = None) -> FastAPI:
                         # 序列化重复一遍，备份不含知识时也一样。
                         knowledge_skip_reason = ""
                         if dry_run:
+                            # 条数轴与真实执行同一预检：import_user_data 会
+                            # 在写锁内调用它并映射 409；预览若只走下面的
+                            # merged 体积复核会把同一超限报成 413，预览与
+                            # 真实执行结论不一致（README 承诺容量上限 409）
+                            _enforce_import_limits(store, sections)
                             knowledge_unverified: dict[str, str] = {}
                             merged_problem = merged_backup_limit_problem(
                                 store,

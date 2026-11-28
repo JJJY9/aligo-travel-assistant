@@ -5212,8 +5212,12 @@ def _session_summaries(store, *, needle: str = "") -> list[dict]:
         entry["pinned"] = entry["session_id"] in pinned
         entry["archived"] = entry["session_id"] in archived
         if needle:
-            # 标题 + 消息内容（已归一空白）供 --query 关键词过滤与命中片段
-            entry["_parts"] = [entry["title"], *entry.pop("_parts", [])]
+            # 标题 + 消息内容（已归一空白）供 --query 关键词过滤与命中片段；
+            # 标题同样折叠内部空白后再匹配，双空格不应让标题命中失效
+            entry["_parts"] = [
+                " ".join(entry["title"].split()),
+                *entry.pop("_parts", []),
+            ]
     return sorted(
         grouped.values(),
         key=lambda item: chronological_key(item["updated_at"]),
@@ -5254,7 +5258,9 @@ def run_sessions_list_standalone(
                 "（当前会按空快照处理，请先用备份文件恢复）",
                 as_json,
             )
-        needle = query.strip().lower()
+        # 查询内部空白折叠为单空格：双空格 / Tab 与正文单空格不应造成 0
+        # 结果（正文已用 _collapsed_whitespace 归一，与 Web 搜索同口径）
+        needle = " ".join(query.split()).lower()
         try:
             summaries = _session_summaries(store, needle=needle)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
@@ -7655,7 +7661,8 @@ def run_preference_set_standalone(
     # 与 Web PUT /api/preferences 同一序列化上限（10000 字符）：文本模式
     # 同样按序列化长度判断，--json-value 不能成为绕过通道
     try:
-        serialized = json.dumps(saved_value, ensure_ascii=False)
+        # 与服务端 / 前端一致的紧凑分隔符口径（见 preference_value_problem）
+        serialized = json.dumps(saved_value, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError) as exc:
         return _fail(f"偏好值无法序列化：{exc}")
     if len(serialized) > 10000:

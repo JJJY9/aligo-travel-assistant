@@ -450,7 +450,9 @@ def list_documents(
 def _list_documents(
     client: Any, limit: int, offset: int, query: str, category: str
 ) -> dict[str, Any]:
-    needle = query.strip().lower()
+    # 查询内部空白折叠为单空格：双空格 / Tab 与正文单空格不应造成 0 结果
+    # （与行程搜索按空白拆词、会话搜索折叠空白的口径一致）
+    needle = " ".join(query.split()).lower()
     wanted_category = category.strip()
     start = max(0, int(offset))
     size = max(0, int(limit))
@@ -468,8 +470,11 @@ def _list_documents(
         documents = [
             doc
             for doc in documents
-            if needle in doc["content"].lower()
-            or needle in json.dumps(doc["metadata"], ensure_ascii=False).lower()
+            if needle in " ".join(doc["content"].split()).lower()
+            or needle
+            in " ".join(
+                json.dumps(doc["metadata"], ensure_ascii=False).split()
+            ).lower()
         ]
         if wanted_category:
             documents = [
