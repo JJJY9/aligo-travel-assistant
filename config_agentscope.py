@@ -27,6 +27,16 @@ def init_agentscope():
         name="multi_agent_system",
         logging_level="INFO"
     )
+    # agentscope 为 logging.getLogger("as") 安装了 plain 格式 handler 并设
+    # propagate=False：LOG_FORMAT=json 时这些行不是合法 JSON，按行采集的
+    # 管道会解析失败。JSON 模式下交还根日志统一格式化；文本模式保持库的
+    # 默认输出，不影响 CLI 现有观感
+    from utils.access_log import access_log_format
+
+    if access_log_format() == "json":
+        as_logger = logging.getLogger("as")
+        as_logger.handlers.clear()
+        as_logger.propagate = True
 
     try:
         print(f"✓ AgentScope initialized (version: {agentscope.__version__})")

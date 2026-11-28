@@ -2037,6 +2037,36 @@ def test_import_invalid_group_member_skips_group_not_batch(monkeypatch):
     print("✓ 组内无效分片整组跳过、不拖垮整份备份")
 
 
+def test_import_encoding_problems_logged_as_bounded_summary(monkeypatch):
+    """批量坏数据只打一条汇总 WARNING（逐条日志会随单请求线性放大）。"""
+    import logging
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_existing_contents", lambda: set())
+    documents = [{"content": "\ud800", "metadata": {}} for _ in range(300)]
+    documents.append({"content": "正常文档", "metadata": {}})
+
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    logger = logging.getLogger("utils.knowledge_admin")
+    handler = _Capture(level=logging.WARNING)
+    logger.addHandler(handler)
+    try:
+        result = knowledge_admin.import_documents(documents, dry_run=True)
+    finally:
+        logger.removeHandler(handler)
+    assert result["skipped_invalid"] == 300, result
+    warnings = [r for r in records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1, [r.getMessage() for r in warnings]
+    assert "300" in warnings[0].getMessage()
+    print("✓ 坏数据导入日志按原因汇总一条")
+
+
 def test_import_skips_absurd_parts_declaration(monkeypatch):
     """parts 声明过大（1e12）的组整组跳过：不构造缺失集合（内存安全）。"""
     from pathlib import Path
@@ -4403,6 +4433,7 @@ if __name__ == "__main__":
         test_import_tolerates_non_finite_parts_metadata,
         test_import_missing_part_conflict_skips_group,
         test_import_invalid_group_member_skips_group_not_batch,
+        test_import_encoding_problems_logged_as_bounded_summary,
         test_import_skips_absurd_parts_declaration,
         test_import_dry_run_reports_skip_reasons,
         test_read_agent_not_cached_when_uninitialized,

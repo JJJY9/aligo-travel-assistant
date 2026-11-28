@@ -88,8 +88,10 @@ class RequestMetrics:
         ``count_only=True`` 用于 Host 拒绝探测与未匹配路径的 404：它们不受
         限流、可被无限次触发，计入最近样本窗口会把 P50 / P95 稀释到近 0。
         """
-        # 路径由 uvicorn percent-decode，可能含控制字符；指标 key 里清理掉
-        safe_path = re.sub(r"[\x00-\x1f\x7f]", "?", str(path))[:200]
+        # 路径由 uvicorn percent-decode，可能含控制字符；指标 key 里清理掉。
+        # 清洗口径与访问日志 _safe_log_text 对齐：C1（含 NEL 会断行破坏
+        # Prometheus 文本格式）与 U+2028/2029 一并替换
+        safe_path = re.sub(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]", "?", str(path))[:200]
         elapsed = max(0.0, float(elapsed_ms))
         with self._lock:
             self._total += 1

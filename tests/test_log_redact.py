@@ -45,6 +45,21 @@ def test_redact_secret_keeps_url_punctuation_passwords_out():
     colon = redact_secret("redis://:pa:ss@cache:6379/0")
     assert "pa:ss" not in colon, colon
     assert "cache:6379" in colon, colon
+
+    # 密码含未编码 # / ?：不能只留下「用户名:密码前缀」
+    for raw in (
+        "https://alice:Pa#ssw0rd@gateway.example/v1",
+        "https://alice:Pa?ssw0rd@gateway.example/v1",
+    ):
+        masked = redact_secret(raw)
+        assert "ssw0rd" not in masked and "alice" not in masked, masked
+        assert masked == "https://***@gateway.example/v1", masked
+
+    # 路径里的 @ 不是 userinfo：Google Maps / 邮箱路径链接保留主机
+    path_url = "see https://gw.example.com/user/alice@example.com/x for details"
+    assert redact_secret(path_url) == path_url
+    maps = "https://www.google.com/maps/@39.9,116.4,12z"
+    assert redact_secret(maps) == maps
     print("✓ redact_secret 遮蔽含 URL 标点 / 多个 @ 的密码")
 
 
@@ -77,6 +92,9 @@ def test_redact_secret_masks_auth_headers_and_colon_forms():
         ("'api_key': 'abcd1234efgh5678'", "abcd1234efgh5678"),
         ("api-key: 0123456789abcdef", "0123456789abcdef"),
         ("password: hunter2", "hunter2"),
+        # 引号已给出明确边界：值里的空格 / 逗号也属于凭据
+        ('{"password": "pa ss"}', "pa ss"),
+        ("'password': 'pa,ss'", "pa,ss"),
     ):
         redacted = redact_secret(text)
         assert secret not in redacted, (text, redacted)
@@ -265,6 +283,14 @@ def test_redact_secret_url_scheme_is_bounded_for_linear_time():
     started = time.perf_counter()
     redact_secret("a" * 200_000)
     assert time.perf_counter() - started < 5.0
+
+    # 前缀密集输入（重复 scheme / 重复 name:）：尾部分支带终止条件时每个
+    # 起点都会回扫到串尾，O(n²) 会在这里暴露
+    for payload in ("https://" * 2000, "ab:" * 4000):
+        started = time.perf_counter()
+        redact_secret(payload)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 1.0, (payload[:12], elapsed)
     print("✓ URL scheme 限长，长文本脱敏近线性")
 
 
@@ -289,6 +315,25 @@ def test_redact_secret_masks_illegal_header_values():
     print("✓ Illegal header value 异常整段遮蔽")
 
 
+def test_redacted_exc_text_masks_cause_chain():
+    """exc_info 替代品：整段 traceback（含 __cause__ 链）脱敏后才进日志。"""
+    from utils.log_redact import redacted_exc_text
+
+    try:
+        try:
+            raise RuntimeError(
+                "could not connect: postgresql://alice:S3cr3tPw@db.internal:5432/aligo"
+            )
+        except RuntimeError as cause:
+            raise ValueError("长期记忆写入失败") from cause
+    except ValueError as exc:
+        text = redacted_exc_text(exc)
+    assert "S3cr3tPw" not in text, text
+    assert "postgresql://***@" in text, text
+    assert "长期记忆写入失败" in text and "ValueError" in text
+    print("✓ redacted_exc_text 遮蔽异常链中的凭据")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -302,6 +347,7 @@ if __name__ == "__main__":
     test_redact_secret_masks_illegal_header_values()
     test_redact_secret_masks_libpq_quoted_tokens()
     test_redact_secret_url_scheme_is_bounded_for_linear_time()
+    test_redacted_exc_text_masks_cause_chain()
     test_redact_paths_hides_internal_paths_and_urls()
     test_redact_paths_covers_macos_and_nix_roots()
     test_redact_local_paths_keeps_urls_intact()

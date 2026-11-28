@@ -10,6 +10,7 @@ from typing import Any
 import logging
 import re
 
+from utils.log_redact import redacted_exc_text
 from utils.preference_values import (
     EXPLANATORY_PREF_KEYS,
     has_preference_value,
@@ -189,8 +190,11 @@ def result_to_markdown(result_data: dict[str, Any]) -> str:
             continue
         try:
             rendered = _render_agent(agent_name, data)
-        except Exception:  # noqa: BLE001 - 渲染失败不能让整轮回答 500
-            logger.warning("渲染智能体结果失败: %s", agent_name, exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - 渲染失败不能让整轮回答 500
+            # 不用 exc_info：Formatter 会从未脱敏异常对象重新格式化 traceback
+            logger.warning(
+                "渲染智能体结果失败: %s：%s", agent_name, redacted_exc_text(exc)
+            )
             rendered = _fallback_text(data)
         if not rendered:
             # 已知渲染器对无法识别的载荷返回空字符串（非 dict 被包成

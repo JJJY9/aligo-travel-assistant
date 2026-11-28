@@ -791,8 +791,14 @@ class RequestContextMiddleware:
                 _redacted_exc_log_text(exc),
             )
             if response_started:
-                # 响应已开始（如流式输出中断），无法再补发 500，交由服务器断开连接
-                raise
+                # 响应已开始（如流式输出中断），无法再补发 500，交由服务器
+                # 断开连接。不能裸 raise：Starlette 的 ServerErrorMiddleware
+                # 会原样再抛，uvicorn 的 exc_info 会把未脱敏 traceback 再写
+                # 一遍（与上面不用 logger.exception 同理）。脱敏后的完整
+                # traceback 已在上面记录，这里只保留不含原文的占位异常
+                raise RuntimeError(
+                    f"响应已开始后发生未处理异常（请求 ID：{request_id}）"
+                ) from None
             try:
                 await send_wrapper(
                     {
@@ -3913,8 +3919,12 @@ def _persistence_failure_status(exc: Exception) -> int:
 
 
 def _storage_failure(action: str, exc: Exception) -> HTTPException:
-    """存储 / 依赖类失败的统一 503：细节只进日志，响应不回显内部路径 / SQL。"""
-    logger.warning("%s失败: %s", action, redact_paths(exc))
+    """存储 / 依赖类失败的统一 503：细节只进日志，响应不回显内部路径 / SQL。
+
+    调用方已用更具体的上下文（user_id / session_id 等）记录过同一异常，
+    本函数只构造 503，不再重复写日志（此前每次故障产生两条 WARNING，
+    且「%s失败」会拼出「保存失败失败」这类文案）。
+    """
     return HTTPException(status_code=503, detail=f"{action}，请稍后再试")
 
 

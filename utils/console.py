@@ -28,6 +28,26 @@ def strip_terminal_controls(text: object) -> str:
     return _TERMINAL_CONTROLS.sub("", str(text))
 
 
+# 终端显示专用的不可见格式符：双向嵌入 / 覆盖 / 隔离、方向标记、零宽空格、
+# 词连接符、BOM、软连字符、行 / 段分隔符。零宽连接符 U+200C / U+200D 故意
+# 保留：ZWJ 是 emoji 组合序列与部分文字整形的一部分，剥掉会改变正常渲染。
+# 存储与导出保持原值（exporter / session_html 需要保真），只在终端显示层剥除。
+_DISPLAY_FORMAT_CONTROLS = re.compile(
+    "[\\u061c\\u00ad\\u200b\\u200e\\u200f\\u2028\\u2029"
+    "\\u202a-\\u202e\\u2060\\u2066-\\u2069\\ufeff]"
+)
+
+
+def strip_display_format_controls(text: object) -> str:
+    """终端显示层清洗：剥终端控制序列 + 不可见格式符（含双向覆盖）。
+
+    RLO / LRI 等双向控制符与零宽字符可以把「详见 C:\\x」在终端里伪装成
+    「详见 /etc/passwd」之类的另一个字节序列；所有把不可信文本送上终端的
+    路径（CLI 字段 / doctor 表格）都应先过本函数。
+    """
+    return _DISPLAY_FORMAT_CONTROLS.sub("", strip_terminal_controls(text))
+
+
 class _AutoDecodeInput:
     """非终端 stdin 的按行自动解码包装。
 

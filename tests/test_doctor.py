@@ -672,6 +672,15 @@ def test_doctor_redacts_base_url_credentials(monkeypatch):
     assert "sk-secret" not in config_result.detail, config_result.detail
     assert "user:" not in config_result.detail, config_result.detail
 
+    # 含空白字符的 base_url（未编码密码）无法用通用正则安全脱敏：整段隐藏
+    monkeypatch.setitem(
+        LLM_CONFIG, "base_url", "https://user:Pa ss@gw.example.com/v1"
+    )
+    spaced_result = doctor_module.check_config()
+    assert "Pa ss" not in spaced_result.detail, spaced_result.detail
+    assert "user:" not in spaced_result.detail, spaced_result.detail
+    assert "已隐藏" in spaced_result.detail, spaced_result.detail
+
     async def _fail(**kwargs):
         return False, "connect https://user:sk-secret@gw.example.com/v1?x=1 failed"
 
@@ -690,13 +699,29 @@ def test_report_table_escapes_markup_and_controls():
     poisoned = CheckResult(
         "LLM", STATUS_FAIL, "网关错误 [/red] \x1b]52;c;ZWNobyBwd25lZA==\x1b\\"
     )
+    bidi = CheckResult(
+        "LLM",
+        STATUS_FAIL,
+        "详情 "
+        + chr(0x202E)
+        + "gnp.exe"
+        + chr(0x202C)
+        + chr(0x200B)
+        + chr(0x2028)
+        + "next "
+        + chr(0x200D),
+    )
     buffer = io.StringIO()
     Console(file=buffer, force_terminal=False, width=160).print(
-        build_report_table([poisoned])
+        build_report_table([poisoned, bidi])
     )
     text = buffer.getvalue()
     assert "[/red]" in text
     assert "\x1b]" not in text, "OSC 序列必须被剥离"
+    # 双向覆盖 / 零宽空格 / 行分隔符可做视觉欺骗；ZWJ 属于正常渲染必须保留
+    assert chr(0x202E) not in text and chr(0x200B) not in text, text
+    assert chr(0x2028) not in text, text
+    assert chr(0x200D) in text, "零宽连接符不应被剥除"
     print("✓ doctor 表格转义标记并剥离终端控制序列")
 
 

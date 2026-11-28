@@ -2363,8 +2363,11 @@ def test_stream_internal_error_recorded_as_500():
     try:
         asyncio.run(middleware(scope, receive, send))
         raise AssertionError("流内异常必须向上传播")
-    except RuntimeError:
-        pass
+    except RuntimeError as propagated:
+        # 交给 uvicorn 的占位异常不能携带原始错误文本：ServerErrorMiddleware
+        # 会原样再抛，uvicorn 的 exc_info 会把未脱敏 traceback 再写一遍
+        assert "stream bug" not in str(propagated), propagated
+        assert "请求 ID" in str(propagated), propagated
     assert scope["state"].get("aligo_stream_failed") is True, scope
     assert not scope["state"].get("aligo_stream_aborted"), scope
     snapshot = REQUEST_METRICS.snapshot()
@@ -7597,6 +7600,19 @@ def test_import_rollback_counts_only_applied_entries(monkeypatch):
     finally:
         _cleanup(user_id)
     print("✓ 迟到回滚只扣本次实际生效的条目")
+
+
+def test_storage_failure_does_not_double_log(caplog):
+    """调用方已用具体上下文记录异常：_storage_failure 只构造 503，不再重复。"""
+    import logging
+
+    from webapp.server import _storage_failure
+
+    with caplog.at_level(logging.WARNING):
+        error = _storage_failure("读取行程失败", RuntimeError("boom"))
+    assert error.status_code == 503
+    assert "读取行程失败" in str(error.detail)
+    assert caplog.text == "", caplog.text
 
 
 def test_preference_storage_failure_maps_503(monkeypatch):
@@ -19013,8 +19029,9 @@ def test_export_abort_recorded_as_499_and_slot_released():
     }
     try:
         asyncio.run(app(scope, receive, send))
-    except OSError:
-        pass
+    except RuntimeError as propagated:
+        # 响应已开始后的异常以占位异常交还服务器：不能携带原始错误文本
+        assert "broken pipe" not in str(propagated), propagated
     snapshot = REQUEST_METRICS.snapshot()
     assert 200 in events, events
     assert snapshot["by_status"].get("499") == 1, snapshot

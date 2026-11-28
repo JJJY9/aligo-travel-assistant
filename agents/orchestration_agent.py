@@ -34,7 +34,7 @@ from utils.agent_names import canonical_agent_name
 from utils.daemon_executor import DaemonThreadPoolExecutor
 from utils.entity_normalize import normalize_city
 from utils.json_safe import sanitize_json, strip_nul
-from utils.log_redact import redact_paths
+from utils.log_redact import redact_paths, redacted_exc_text
 from utils.llm_resilience import (
     RetryBudgetExhausted,
     is_permanent_llm_error,
@@ -1093,6 +1093,13 @@ class OrchestrationAgent(AgentBase):
         except Exception:  # noqa: BLE001 - 进度展示失败不应中断执行
             logger.debug("Progress callback failed", exc_info=True)
 
+    def _session_scope_text(self) -> str:
+        """日志用会话标识：检查点告警可能发生在后台线程，需要能对应到用户。"""
+        memory = getattr(self, "memory_manager", None)
+        user_id = getattr(memory, "user_id", None) or "-"
+        session_id = getattr(memory, "session_id", None) or "-"
+        return f"{user_id}/{session_id}"
+
     async def _checkpoint_store_for_turn(self):
         """本轮检查点存储（懒加载）；未提供键或初始化失败时返回 None。
 
@@ -1134,7 +1141,11 @@ class OrchestrationAgent(AgentBase):
             # 循环上阻塞其它用户请求
             return await asyncio.to_thread(_init_store)
         except Exception as exc:  # noqa: BLE001 - 检查点不可用不影响对话
-            logger.warning("初始化执行检查点失败，跳过持久化: %s", exc)
+            logger.warning(
+                "初始化执行检查点失败（会话 %s），跳过持久化: %s",
+                self._session_scope_text(),
+                redacted_exc_text(exc),
+            )
             return None
 
     def clear_checkpoint(self) -> None:
@@ -1153,7 +1164,11 @@ class OrchestrationAgent(AgentBase):
         try:
             store.clear(key)
         except Exception as exc:  # noqa: BLE001 - 清理失败不影响对话
-            logger.warning("清理执行检查点失败: %s", exc)
+            logger.warning(
+                "清理执行检查点失败（会话 %s）: %s",
+                self._session_scope_text(),
+                redact_paths(exc),
+            )
 
     def clear_checkpoint_key(self, key: str) -> None:
         """清理指定键的检查点（取消回合的迟到落库回调使用）。
@@ -1168,7 +1183,11 @@ class OrchestrationAgent(AgentBase):
         try:
             store.clear(target)
         except Exception as exc:  # noqa: BLE001 - 清理失败不影响对话
-            logger.warning("清理执行检查点失败: %s", exc)
+            logger.warning(
+                "清理执行检查点失败（会话 %s）: %s",
+                self._session_scope_text(),
+                redact_paths(exc),
+            )
         if getattr(self, "_checkpoint_key", None) == target:
             self._checkpoint_key = None
             self._checkpoint_scope = None
@@ -1243,7 +1262,11 @@ class OrchestrationAgent(AgentBase):
             try:
                 state = await asyncio.to_thread(checkpoint_store.load, checkpoint_key)
             except Exception as exc:  # noqa: BLE001 - 检查点读取失败按无缓存
-                logger.warning("读取执行检查点失败: %s", exc)
+                logger.warning(
+                    "读取执行检查点失败（会话 %s）: %s",
+                    self._session_scope_text(),
+                    redact_paths(exc),
+                )
                 state = None
             steps = state.get("steps") if isinstance(state, dict) else None
             step_keys = (
@@ -1358,7 +1381,11 @@ class OrchestrationAgent(AgentBase):
                         task_digest=task_digest or None,
                     )
                 except Exception as exc:  # noqa: BLE001 - 检查点失败不阻断对话
-                    logger.warning("保存执行检查点失败: %s", exc)
+                    logger.warning(
+                        "保存执行检查点失败（会话 %s）: %s",
+                        self._session_scope_text(),
+                        redact_paths(exc),
+                    )
                     return
                 # 落盘期间可能刚被跨实例删除：删除方的按作用域清理扫描
                 # 早于本次落盘时不会包含该文件。落盘后再复查一次——

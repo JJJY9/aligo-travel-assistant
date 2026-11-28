@@ -391,7 +391,9 @@ class PostgresLongTermMemory:
                     # 其它实例正在初始化且耗时较长：跳过本次 DDL（表结构
                     # 由其创建）；本进程照常启用，读取最多稍慢。不标记
                     # schema 完成，下次构造重试。
-                    logger.warning("等待表结构初始化锁超时，跳过 DDL: %s", exc)
+                    logger.warning(
+                        "等待表结构初始化锁超时，跳过 DDL: %s", redact_secret(exc)
+                    )
                     return False
                 if locked:
                     try:
@@ -426,7 +428,9 @@ class PostgresLongTermMemory:
                                 "ON aligo_trips (user_id, trip_id)"
                             )
                         except Exception as exc:  # noqa: BLE001 - 仅提示，写入仍有 advisory lock 保护
-                            logger.warning("无法创建 trip_id 唯一索引: %s", exc)
+                            logger.warning(
+                                "无法创建 trip_id 唯一索引: %s", redact_secret(exc)
+                            )
                         try:
                             # 读取按 created_at 排序（恢复的旧消息 created_at
                             # 很旧、id 最大）。CONCURRENTLY 不阻塞并发写入；
@@ -450,7 +454,10 @@ class PostgresLongTermMemory:
                                 "ON aligo_chat_messages (user_id, created_at, id)"
                             )
                         except Exception as exc:  # noqa: BLE001 - 仅影响读取性能
-                            logger.warning("无法创建消息时间索引（读取会稍慢）: %s", exc)
+                            logger.warning(
+                                "无法创建消息时间索引（读取会稍慢）: %s",
+                                redact_secret(exc),
+                            )
                         try:
                             # 会话级操作（详情 / 删除 / 编辑末条 / 改名 / 置顶 /
                             # 归档）都按 user_id + session_id 过滤：没有该索引时
@@ -482,7 +489,8 @@ class PostgresLongTermMemory:
                             )
                         except Exception as exc:  # noqa: BLE001 - 仅影响会话读取性能
                             logger.warning(
-                                "无法创建消息会话索引（会话读取会稍慢）: %s", exc
+                                "无法创建消息会话索引（会话读取会稍慢）: %s",
+                                redact_secret(exc),
                             )
                     finally:
                         with contextlib.suppress(Exception):

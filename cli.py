@@ -30,6 +30,7 @@ from utils.console import (
     PipeSafeTextIO,
     configure_stdio,
     is_pipe_error,
+    strip_display_format_controls,
     strip_terminal_controls,
 )
 from utils.atomic_write import write_bytes_atomic, write_text_atomic
@@ -80,19 +81,13 @@ except Exception as exc:  # noqa: BLE001 - 依赖缺失时诊断命令仍要能�
     _rich_split_graphemes = None  # type: ignore[assignment]
 
 
-# 终端显示专用的不可见格式符：双向嵌入 / 覆盖 / 隔离、方向标记、零宽空格、
-# 词连接符、BOM、软连字符、行 / 段分隔符。零宽连接符 U+200C / U+200D 故意
-# 保留：ZWJ 是 emoji 组合序列与部分文字整形的一部分，剥掉会改变正常渲染。
-# 存储与导出保持原值（exporter / session_html 需要保真），只在终端显示层剥除。
-_DISPLAY_FORMAT_CONTROLS = re.compile(
-    "[\\u061c\\u00ad\\u200b\\u200e\\u200f\\u2028\\u2029"
-    "\\u202a-\\u202e\\u2060\\u2066-\\u2069\\ufeff]"
-)
+# 终端显示专用的不可见格式符集合在 utils.console.strip_display_format_controls
+# 统一维护（doctor 表格等其它显示路径共用同一口径）。
 
 
 def _strip_display_unsafe(value: object) -> str:
     """终端显示层清洗：剥终端控制序列 + 不可见格式符（含双向覆盖）。"""
-    return _DISPLAY_FORMAT_CONTROLS.sub("", strip_terminal_controls(value))
+    return strip_display_format_controls(value)
 
 
 def _markup_safe(value: object) -> str:

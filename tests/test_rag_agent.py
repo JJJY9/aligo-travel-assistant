@@ -255,6 +255,55 @@ def test_rag_query_extraction_falls_back_to_raw_query():
     print("✓ RAG 使用原始提问兜底（空 / null 改写结果）")
 
 
+def test_search_error_log_is_redacted(monkeypatch, caplog):
+    """检索失败日志：本机库路径遮蔽、换行单行化（#965 同文件漏网的分支）。"""
+    import contextlib
+    import logging
+
+    import utils.knowledge_admin as knowledge_admin
+
+    agent = object.__new__(RAGKnowledgeAgent)
+    agent.initialized = True
+    agent.collection_name = "kb"
+
+    class _Vector:
+        def tolist(self):
+            return [0.0]
+
+    class _Embedding:
+        def encode(self, _query):
+            return _Vector()
+
+    class _Client:
+        def load_collection(self, _name):
+            return None
+
+        def search(self, **_kwargs):
+            raise RuntimeError(
+                "milvus lite failed at C:\\Users\\alice\\kb\\milvus_lite.db\n伪造日志行"
+            )
+
+    agent.embedding_model = _Embedding()
+    agent._milvus_db_path = "kb-test"
+    # milvus_client 是只读 property（每次从共享注册表取）：替换类定义所在
+    # 模块命名空间里的工厂函数（技能模块由兼容层动态加载，不在 sys.modules）
+    skill_globals = RAGKnowledgeAgent.search_knowledge.__globals__
+    monkeypatch.setitem(skill_globals, "get_milvus_client", lambda _path: _Client())
+    agent.top_k = 3
+    agent._ensure_connection = lambda: None
+    monkeypatch.setattr(knowledge_admin, "_read_lock", contextlib.nullcontext)
+
+    with caplog.at_level(logging.ERROR):
+        with pytest.raises(RuntimeError):
+            agent.search_knowledge("住宿标准是多少", strict=True)
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "alice" not in text, text
+    assert "C:\\Users" not in text, text
+    assert "<路径>" in text, text
+    assert "\n" not in text and "\r" not in text, text
+    print("✓ 检索失败日志已脱敏且单行化")
+
+
 def test_strict_search_error_has_top_level_message():
     """strict 检索失败的错误载荷要带顶层 error/message，编排聚合才能展示原因。"""
     agent = object.__new__(RAGKnowledgeAgent)
@@ -388,3 +437,12 @@ if __name__ == "__main__":
     finally:
         _mp.undo()
     test_strict_search_error_has_top_level_message()
+    import _caplog_shim
+
+    _mp2 = pytest.MonkeyPatch()
+    _shim = _caplog_shim.CaplogShim()
+    try:
+        test_search_error_log_is_redacted(_mp2, _shim)
+    finally:
+        _mp2.undo()
+        _shim.close()

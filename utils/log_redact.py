@@ -7,16 +7,28 @@ psycopg / redis-py 的连接异常经常把完整 URI 拼进异常文本（含�
 import re
 
 # userinfo 允许出现 "/" ":" ";" "," 与多个 "@"（密码未编码 / 多 @）：
-# 贪婪吃到 "?" "#" 前的最后一个 "@"，避免只遮住第一段密码片段。
-# scheme 限长 63（RFC 3986 事实上限）：不设上限时，每个起点先贪心吃完整段
-# \w 再回溯找 "://"，一段不含分隔符的长文本（模型输出 / base64）呈 O(n²)
-_URL_USERINFO = re.compile(r"(?P<scheme>[a-zA-Z][\w+.-]{0,63}://)[^\s?#]*@")
+# 处理时吃到 "?" "#" 前的最后一个 "@"，避免只遮住第一段密码片段。
+# scheme 限长 63（RFC 3986 事实上限）。尾部用无失败条件的 [^\s?#]* 再由
+# 回调判断：带终止条件的贪心类（如 [^\s?#]*@）会在每个起点向后扫到空白
+# 才失败，前缀密集的长文本（模型输出 / base64 错误体）呈 O(n²)。
+_URL_USERINFO = re.compile(
+    r"(?P<scheme>[a-zA-Z][\w+.-]{0,63}://)(?P<rest>[^\s?#]*)"
+)
+# 密码里的 # / ? 未编码时 URL 语法把它们当 fragment/query 分隔符：
+# [^\s?#]*@ 失配、查询串规则又从 #/? 起截断，只剩 scheme://用户名:密码前缀。
+# 只在「authority 内出现 ':' 且其后无 '/'、紧跟 #/? 再出现 '@'」的形态上
+# 放宽（中段有界，避免重复前缀输入回退成 O(n²)），避免把正常查询串
+# （?to=a@b.com）当凭据。
+_URL_MALFORMED_USERINFO = re.compile(
+    r"(?P<scheme>[a-zA-Z][\w+.-]{0,63}://)[^\s/?#:]{0,512}:"
+    r"[^\s/?#]{0,512}[?#][^\s/]{0,2048}@"
+)
 _URL_QUERY = re.compile(
-    r"(?P<base>[a-zA-Z][\w+.-]{0,63}://[^\s?#]+)[?#][^\s]*"
+    r"(?P<scheme>[a-zA-Z][\w+.-]{0,63}://)(?P<rest>[^\s]*)"
 )
 # 没有 scheme 的 user:pass@host（常见粘贴错误：DATABASE_URL 少了 postgresql://）
 _BARE_USERINFO = re.compile(
-    r"(?<![\w+.-])([A-Za-z0-9_.%+-]+):(?!//)([^\s?#]*@)"
+    r"(?<![\w+.-])(?P<name>[A-Za-z0-9_.%+-]+):(?!//)(?P<rest>[^\s?#]*)"
 )
 # libpq / psycopg 在 DSN 解析失败时把原始参数值整段回显在引号里：
 # ``unexpected spaces found in "pa ss"``、``missing "=" after "alice:pw"``。
@@ -31,6 +43,13 @@ _LIBPQ_QUOTED_TOKEN = re.compile(
 _KEY_VALUE = re.compile(
     r"(?i)((?:password|pwd|api[_-]?key|secret|token)\s*['\"]?\s*[:=]\s*['\"]?)"
     r"[^\s;,'\"}]+"
+)
+# 引号形态值里的空格 / 逗号是值的一部分（``{'password': 'pa ss'}``、
+# ``{"password": "pa,ss"}``）：引号已给出明确边界，整段遮蔽。先于
+# _KEY_VALUE 应用，未加引号的形态仍走上一条的窄终止符。
+_KEY_VALUE_QUOTED = re.compile(
+    r"(?i)((?:password|pwd|api[_-]?key|secret|token)\s*['\"]?\s*[:=]\s*)"
+    r"(['\"])(?:\\.|(?!\2)[^\\\r\n])*\2"
 )
 # 请求头形态：Authorization: Bearer/Basic/Token <凭据>（网关 4xx 常原样
 # 回显请求头）。裸 Bearer 不遮蔽——误伤面太大
@@ -118,18 +137,66 @@ def redact_paths(text: object) -> str:
     return redact_secret(cleaned)
 
 
+def _mask_url_userinfo(match: re.Match[str]) -> str:
+    scheme = match.group("scheme")
+    rest = match.group("rest")
+    last_at = rest.rfind("@")
+    if last_at < 0:
+        return match.group(0)
+    authority, sep, _tail = rest.partition("/")
+    # authority 里没有 @ / 凭据冒号、且形如域名时，@ 属于路径而非 userinfo
+    # （Google Maps / 邮箱路径链接）：保留主机，不伪造 ***@
+    if sep and "@" not in authority and ":" not in authority and "." in authority:
+        return match.group(0)
+    # 贪婪吃到最后一个 @，避免只遮住第一段密码片段（未编码 / 多 @）
+    return f"{scheme}***@{rest[last_at + 1:]}"
+
+
+def _strip_url_query(match: re.Match[str]) -> str:
+    scheme = match.group("scheme")
+    rest = match.group("rest")
+    cut = min((i for i in (rest.find("?"), rest.find("#")) if i >= 0), default=-1)
+    if cut <= 0:
+        return match.group(0)
+    return scheme + rest[:cut]
+
+
+def _mask_bare_userinfo(match: re.Match[str]) -> str:
+    rest = match.group("rest")
+    last_at = rest.rfind("@")
+    if last_at < 0:
+        return match.group(0)
+    return f"{match.group('name')}:***@{rest[last_at + 1:]}"
+
+
 def redact_secret(text: object) -> str:
     """去掉文本中 URL / DSN 的 userinfo 与查询串（保留协议与主机便于排查）。
 
     psycopg 的报错会把整条连接串拼进异常文本：URI 形态、缺 scheme 的
     ``user:pass@host`` 粘贴、``password=`` 关键字形态都要遮蔽。
     """
-    cleaned = _URL_USERINFO.sub(r"\g<scheme>***@", str(text))
-    cleaned = _URL_QUERY.sub(r"\g<base>", cleaned)
+    cleaned = _URL_USERINFO.sub(_mask_url_userinfo, str(text))
+    cleaned = _URL_MALFORMED_USERINFO.sub(r"\g<scheme>***@", cleaned)
+    cleaned = _URL_QUERY.sub(_strip_url_query, cleaned)
     cleaned = _LIBPQ_QUOTED_TOKEN.sub(r'\1"***"', cleaned)
-    cleaned = _BARE_USERINFO.sub(r"\1:***@", cleaned)
+    cleaned = _BARE_USERINFO.sub(_mask_bare_userinfo, cleaned)
     cleaned = _AUTH_HEADER.sub(r"\1***", cleaned)
     cleaned = _ILLEGAL_HEADER_VALUE.sub(r"\1***\3", cleaned)
+    cleaned = _KEY_VALUE_QUOTED.sub(r"\1\2***\2", cleaned)
     cleaned = _KEY_VALUE.sub(r"\1***", cleaned)
     cleaned = _BARE_API_KEY.sub("***", cleaned)
     return cleaned
+
+
+def redacted_exc_text(exc: BaseException) -> str:
+    """异常对象 → 可安全写入日志的单段 traceback 文本（含 __cause__ 链）。
+
+    ``logger.…(..., exc_info=True)`` 会让日志 Formatter 从原始异常对象重新
+    格式化 traceback，绕过 :func:`redact_secret`；需要保留 traceback 的诊断
+    价值时，调用方改用本函数把脱敏后的文本作为普通参数记录。
+    """
+    import traceback
+
+    return redact_secret(
+        "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    )

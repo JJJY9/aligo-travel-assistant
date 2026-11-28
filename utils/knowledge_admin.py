@@ -2066,6 +2066,9 @@ def import_documents(
     # 组内出现无效成员（空内容 / 非字符串）时整组跳过：只剔除该成员会让
     # 分组校验看到「缺片」并拒绝整份备份，其它合法文档也一起导入失败
     invalid_groups: set[str] = set()
+    # 逐条 WARNING 在 2 万条坏数据的单请求里会刷出 2 万行（面板按 200 条/
+    # 批调用、CLI 可整份导入）：按原因累计，循环后打一条有界汇总
+    problem_counts: Counter[str] = Counter()
     for item in items:
         if not isinstance(item, dict):
             invalid += 1
@@ -2088,7 +2091,7 @@ def import_documents(
             if group:
                 invalid_groups.add(group)
             invalid += 1
-            logger.warning("导入内容%s，已跳过", problem)
+            problem_counts[problem] += 1
             continue
         # 还原标记是内部记账字段：用户 JSON 自带同名键时一律剥离，
         # 否则可以伪造标记绕过单条 / 文档大小上限
@@ -2122,6 +2125,15 @@ def import_documents(
                 sorted(invalid_groups)[:5],
             )
         valid = kept
+    if problem_counts:
+        logger.warning(
+            "导入内容含编码问题，已跳过 %d 条：%s",
+            sum(problem_counts.values()),
+            "；".join(
+                f"{reason} {count} 条"
+                for reason, count in problem_counts.most_common()
+            ),
+        )
     if not valid:
         payload: dict[str, Any] = {
             "imported": 0,
@@ -2381,6 +2393,11 @@ def import_documents(
         # 与 document_chunks 平行的还原组号（非还原文档为空串），用于识别
         # 「备份组与库内片段部分重合」的布局冲突
         document_groups: list[str] = []
+        # 逐条 WARNING 同上：按原因累计、循环后汇总（含最大字数便于定位）
+        over_limit_skipped = 0
+        empty_piece_skipped = 0
+        oversize_segmented = 0
+        oversize_max_chars = 0
         for item in merged_items:
             restored_group = str(item.pop("__restored_group__", "") or "")
             restored = bool(restored_group)
@@ -2404,9 +2421,7 @@ def import_documents(
                 # 静默截断（截断会悄悄丢掉后半段、用户以为已完整入库）；
                 # 单条坏数据也不该让整批导入失败
                 invalid += 1
-                logger.warning(
-                    "导入内容超过上限（%d 字 > %d），已跳过", len(content), limit
-                )
+                over_limit_skipped += 1
                 continue
             if restored:
                 restored_parts = item.pop("__restored_parts__", None)
@@ -2418,7 +2433,7 @@ def import_documents(
                 stored_size = sum(len(piece) for piece in pieces)
                 if not pieces:
                     invalid += 1
-                    logger.warning("备份中的文档没有可还原的分片，已跳过")
+                    empty_piece_skipped += 1
                     continue
                 if stored_size > DOC_MAX_CHARS or (
                     restored_size and restored_size > DOC_MAX_CHARS
@@ -2428,12 +2443,8 @@ def import_documents(
                     # DOC_MAX_CHARS 分段后照常切片入库，内容完整保留——分段
                     # 会改变分组边界，但备份恢复优先于分组保真
                     oversize = max(stored_size, restored_size)
-                    logger.warning(
-                        "备份中的文档超过单篇上限（%d 字 > %d），已按 %d 字分段导入",
-                        oversize,
-                        DOC_MAX_CHARS,
-                        DOC_MAX_CHARS,
-                    )
+                    oversize_segmented += 1
+                    oversize_max_chars = max(oversize_max_chars, oversize)
                     for offset in range(0, len(content), DOC_MAX_CHARS):
                         segment = content[offset : offset + DOC_MAX_CHARS]
                         document_chunks.append(
@@ -2466,6 +2477,25 @@ def import_documents(
                 chunks = _chunk_documents(content, sanitized_meta)
             document_chunks.append(chunks)
             document_groups.append(restored_group)
+
+        if over_limit_skipped:
+            logger.warning(
+                "导入内容超过单条上限（%d 字），已跳过 %d 条",
+                _IMPORT_CONTENT_MAX_CHARS,
+                over_limit_skipped,
+            )
+        if empty_piece_skipped:
+            logger.warning(
+                "备份中的文档没有可还原的分片，已跳过 %d 条", empty_piece_skipped
+            )
+        if oversize_segmented:
+            logger.warning(
+                "备份中的 %d 篇文档超过单篇上限（最大 %d 字 > %d），已按 %d 字分段导入",
+                oversize_segmented,
+                oversize_max_chars,
+                DOC_MAX_CHARS,
+                DOC_MAX_CHARS,
+            )
 
         unique: list[dict[str, Any]] = []
         for doc_chunks, restored_group in zip(document_chunks, document_groups):
