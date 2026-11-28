@@ -1204,6 +1204,12 @@ def test_user_backup_restore_reports_recovery_incomplete():
     assert emptied and emptied[-1].startswith("未恢复："), emptied
     assert all("已恢复" not in toast for toast in emptied), emptied
     assert "没有可恢复的数据" in emptied[-1], emptied
+    # 迟到回滚失败（消息已复活）：以「已写入：」开头并提示再次删除会话，
+    # 不能落入「未恢复：」（什么都没恢复）也无法声称「已恢复」
+    rollback = data["rollback_toasts"]
+    assert rollback and rollback[-1].startswith("已写入："), rollback
+    assert "回滚失败" in rollback[-1], rollback
+    assert "再次删除该会话" in rollback[-1], rollback
 
     # 408 = 请求体读取超时（服务端零写入）：不能提示「服务端可能仍在写入」
     timeouts = data["upload_timeout_toasts"]

@@ -308,6 +308,31 @@ def test_dispatch_strict(monkeypatch):
     print("✓ sessions-export 严格参数解析")
 
 
+def test_dispatch_rejects_bad_ids(monkeypatch):
+    """dispatch 层非法用户 / 会话 ID 是用法错误（退出码 2），不是执行失败 1。"""
+    calls = []
+
+    def fake(*args, **kwargs):
+        calls.append((args, kwargs))
+        return 0
+
+    monkeypatch.setattr(cli, "run_session_export_standalone", fake)
+    monkeypatch.setattr(cli, "run_sessions_export_standalone", fake)
+    for argv in (
+        ["cli.py", "session-export", "bad/id", "s1"],
+        ["cli.py", "session-export", "u1", "bad/id"],
+        ["cli.py", "sessions-export", "bad/id"],
+    ):
+        monkeypatch.setattr(sys, "argv", argv)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), pytest.raises(SystemExit) as exc:
+            cli.main()
+        assert exc.value.code == 2, argv
+        assert "用法" in out.getvalue(), argv
+    assert calls == [], "非法 ID 不能进入 run_* 实现"
+    print("✓ session(s)-export dispatch 非法 ID 退出码 2")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -322,6 +347,7 @@ if __name__ == "__main__":
         test_export_failures,
         test_export_rejects_bad_user_id,
         test_dispatch_strict,
+        test_dispatch_rejects_bad_ids,
         test_dispatch_option_before_positional,
         test_export_write_failure_reports,
         test_stdout_failure_writes_stderr,

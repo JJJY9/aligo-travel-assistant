@@ -78,6 +78,7 @@ from utils.access_log import (
 from utils.agent_names import canonical_agent_name
 from utils.daemon_executor import DaemonThreadPoolExecutor
 from utils.errors import (
+    AccountCapacityError,
     ImportVolumeError,
     MemoryPersistenceError,
     PartialImportError,
@@ -3890,6 +3891,16 @@ def _storage_failure(action: str, exc: Exception) -> HTTPException:
     return HTTPException(status_code=503, detail=f"{action}，请稍后再试")
 
 
+def _capacity_conflict(exc: Exception) -> HTTPException:
+    """账号 / 全局容量已达上限：409（删除数据后可重试）。
+
+    与实时写入路径（POST /api/trips、PUT /api/preferences）同口径；
+    400 只保留给请求内容非法（解析失败、字段非法）。
+    """
+    logger.warning("容量上限拒绝: %s", redact_paths(exc))
+    return HTTPException(status_code=409, detail=str(exc))
+
+
 _COLLECTION_MISSING_MARKERS = (
     "collection not found",
     "can't find collection",
@@ -5970,6 +5981,8 @@ def create_app(model: Any = None) -> FastAPI:
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             return add_document(payload.content, payload.metadata)
+        except AccountCapacityError as exc:
+            raise _capacity_conflict(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except FileNotFoundError as exc:
@@ -6021,6 +6034,8 @@ def create_app(model: Any = None) -> FastAPI:
                 detail=str(exc),
                 headers={"Retry-After": "1"},
             ) from exc
+        except AccountCapacityError as exc:
+            raise _capacity_conflict(exc) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except LookupError as exc:
@@ -6176,6 +6191,8 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=503, detail=f"{exc}（先运行初始化脚本）"
                 ) from exc
+            except AccountCapacityError as exc:
+                raise _capacity_conflict(exc) from exc
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except KnowledgeBusyError as exc:
@@ -6185,6 +6202,20 @@ def create_app(model: Any = None) -> FastAPI:
                     _refund_import_rate_limit, state, request
                 )
                 raise _knowledge_unavailable("导入失败", exc) from exc
+            except PartialImportError as exc:
+                # 此前批次已真实入库：如实报告已导入条数（重复导入按内容
+                # 去重，重试会跳过已导入部分）。已提交真实工作，不退还额度
+                logger.warning(
+                    "导入知识片段部分完成: 已提交 %s 条", exc.created
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"导入部分失败：已提交 {exc.created} 条知识片段；"
+                        "重试会跳过已导入内容"
+                        f"（请求 ID：{_request_id(request)}）"
+                    ),
+                ) from exc
             except Exception as exc:  # noqa: BLE001 - 导入失败统一提示
                 logger.warning("导入知识片段失败: %s", redact_paths(exc))
                 raise _knowledge_unavailable("导入失败", exc) from exc
@@ -7273,13 +7304,16 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(status_code=status, detail=detail) from exc
             except UserFacingError as exc:
                 # 该类异常的消息是给用户看的固定文案（流式路径同样原样返回），
-                # 不能吞成通用 500 丢失「重试」提示
+                # 不能吞成通用 500 丢失「重试」提示；它全部来自服务端 / 上游
+                # （解析失败、整轮预算耗尽），语义是 5xx 而不是「请求非法 400」
                 logger.warning(
                     "对话失败（%s）: %s", _request_id(request), exc
                 )
+                status = getattr(exc, "status_code", 502)
                 raise HTTPException(
-                    status_code=400,
+                    status_code=status,
                     detail=f"{exc}（请求 ID：{_request_id(request)}）",
+                    headers={"Retry-After": "5"} if status == 503 else None,
                 ) from exc
             except Exception as exc:  # noqa: BLE001 - 对外返回友好错误
                 logger.warning(
@@ -8080,6 +8114,10 @@ def create_app(model: Any = None) -> FastAPI:
                 # _open_long_term(strict=True) 的 503（存储暂时不可用）原样
                 # 上抛，不能再包一层「导入行程失败」把状态 / 文案改掉
                 raise
+            except AccountCapacityError as exc:
+                # 导入后总数越限与实时新增同口径：409（先清理再重试），
+                # 不能混进 400 的「请求内容非法」分类
+                raise _capacity_conflict(exc) from exc
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
             except PartialImportError as exc:
@@ -8436,14 +8474,18 @@ def create_app(model: Any = None) -> FastAPI:
                     store, plan["duplicate_entries"], plan.get("verify")
                 )
                 if failure is not None:
-                    # 部分删除已生效：如实报告已删除数，重试可继续清理剩余
+                    # 部分删除已生效：如实报告已删除数，重试可继续清理剩余。
+                    # 底层失败文本可能含 SQL 语句 / 表名，与 _storage_failure
+                    # 同口径只进日志，不回显给客户端
+                    logger.warning(
+                        "行程去重部分失败（%s，已删除 %d 条）：%s",
+                        user_id,
+                        removed,
+                        redact_paths(failure),
+                    )
                     raise HTTPException(
                         status_code=503,
-                        detail=(
-                            "删除过程中失败："
-                            f"{redact_paths(failure)}（已删除 {removed} 条，"
-                            "可重试）"
-                        ),
+                        detail=f"删除过程中失败，已删除 {removed} 条，可重试",
                     )
                 return _json_safe_value(
                     {
@@ -9117,6 +9159,7 @@ def create_app(model: Any = None) -> FastAPI:
                             ],
                         )
                         rolled_back_sessions: set[str] = set()
+                        rollback_failed_sessions: list[str] = []
                         for session_id in sorted(late_deleted):
                             try:
                                 removed = int(
@@ -9126,7 +9169,14 @@ def create_app(model: Any = None) -> FastAPI:
                                 logger.warning(
                                     "回滚恢复期间被删除的会话 %s 失败：%s",
                                     session_id,
-                                    exc,
+                                    redact_paths(exc),
+                                )
+                                # 回滚失败 = 被删会话的消息仍在库中（已复活）：
+                                # 必须让整体 ok=false，不能只留一条日志
+                                rollback_failed_sessions.append(str(session_id))
+                                errors.append(
+                                    f"会话 {session_id} 在恢复写入期间被删除，"
+                                    f"回滚失败：{redact_paths(exc)}"
                                 )
                                 continue
                             rolled_back_sessions.add(session_id)
@@ -9158,6 +9208,8 @@ def create_app(model: Any = None) -> FastAPI:
                                     int(counts.get(key) or 0)
                                     - len(rolled_back_sessions & applied_keys),
                                 )
+                        if rollback_failed_sessions:
+                            counts["rollback_failed"] = True
                         return counts
                     finally:
                         _close_long_term(store)
@@ -9217,6 +9269,10 @@ def create_app(model: Any = None) -> FastAPI:
                             f"{exc}（请求 ID：{_request_id(request)}）"
                         ),
                     ) from exc
+                except AccountCapacityError as exc:
+                    # 恢复后总量 / 类型数越限（消息、行程、偏好）与实时写入
+                    # 同口径：409 + 可行动文案；请求内容非法才是 400
+                    raise _capacity_conflict(exc) from exc
                 except ValueError as exc:
                     # 存量 + 备份越过导出上限等用户可修正的问题：明确 400，
                     # 不能吞成「稍后重试」的 503
@@ -9263,12 +9319,14 @@ def create_app(model: Any = None) -> FastAPI:
                         status_code=503, detail="恢复失败，请稍后重试"
                     ) from exc
             # 知识片段恢复失败 / 隔离账号未写回任何用户数据（主文件未
-            # 重建）/ 备份条目全部被墓碑期或保留字会话跳过都视为恢复未
-            # 完成（与 CLI ok=false/退出码 1 同口径）
+            # 重建）/ 备份条目全部被墓碑期或保留字会话跳过 / 迟到删除的
+            # 会话回滚失败（消息已复活）都视为恢复未完成（与 CLI
+            # ok=false/退出码 1 同口径）
             return {
                 "ok": not emptied_after_skip
                 and not counts.get("knowledge_error")
-                and not counts.get("recovery_incomplete"),
+                and not counts.get("recovery_incomplete")
+                and not counts.get("rollback_failed"),
                 "dry_run": dry_run,
                 **counts,
                 "skipped": errors,

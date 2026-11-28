@@ -242,10 +242,11 @@ def test_preferences_dispatch_strict(monkeypatch):
 class _WriteStore(_FakeStore):
     """支持 save_preference / delete_preference 的假存储。"""
 
-    def __init__(self, preferences=(), save_error=None, delete_error=None):
+    def __init__(self, preferences=(), save_error=None, delete_error=None, read_error=None):
         super().__init__(preferences)
         self.save_error = save_error
         self.delete_error = delete_error
+        self.read_error = read_error
         self.saved = []
         self.deleted = []
 
@@ -258,6 +259,10 @@ class _WriteStore(_FakeStore):
     def get_preference(self, pref_type=None):
         if self.fail:
             raise RuntimeError("db down")
+        # 上限预检是不带参数的读（pref_type=None）；写后读回带参数。
+        # read_error 只让写后读回失败，模拟「UPSERT 已提交、随后 SELECT 失败」
+        if self.read_error and pref_type is not None:
+            raise RuntimeError("PostgreSQL 操作失败：connection lost")
         if pref_type is None:
             return dict(self.preferences)
         return self.preferences.get(pref_type)
@@ -492,6 +497,12 @@ def test_pref_write_dispatch(monkeypatch):
         ["cli.py", "pref-delete"],
         ["cli.py", "pref-delete", "u1"],
         ["cli.py", "pref-delete", "u1", "home_location", "extra"],
+        # dispatch 层非法用户 / 偏好 ID：用法错误（2），--json 也输出用法错误
+        ["cli.py", "pref-set", "bad/id", "home_location", "上海"],
+        ["cli.py", "pref-delete", "bad/id", "home_location"],
+        ["cli.py", "pref-set", "u1", "bad/type", "上海"],
+        ["cli.py", "pref-delete", "u1", "bad/type"],
+        ["cli.py", "pref-set", "bad/id", "home_location", "上海", "--json"],
     ):
         monkeypatch.setattr(sys, "argv", argv)
         out = io.StringIO()
@@ -500,6 +511,24 @@ def test_pref_write_dispatch(monkeypatch):
         assert exc.value.code == 2, argv
         assert "用法" in out.getvalue()
     print("✓ pref-set / pref-delete dispatch")
+
+
+def test_pref_set_readback_failure_keeps_success(monkeypatch):
+    """写入已提交、写后读回失败：按提交值展示并返回 0，不能报「保存失败」。"""
+    store = _WriteStore({}, read_error=True)
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1", "home_location", "上海", as_json=True
+        )
+    assert code == 0, out.getvalue()
+    data = json.loads(out.getvalue())
+    assert data["value"] == "上海"
+    assert store.preferences["home_location"] == "上海"
+    print("✓ pref-set 写后读回失败按提交值展示")
 
 
 def test_pref_set_json_value_types(monkeypatch):
@@ -889,6 +918,7 @@ if __name__ == "__main__":
         test_preferences_dispatch_strict,
         test_preferences_dispatch_json_flexible,
         test_pref_set_text_and_json,
+        test_pref_set_readback_failure_keeps_success,
         test_pref_set_json_value_types,
         test_pref_set_json_value_rejects_empty_shapes,
         test_pref_set_rejects_reserved_type_and_nul,

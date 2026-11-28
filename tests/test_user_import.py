@@ -2247,6 +2247,47 @@ def test_runner_rolls_back_session_deleted_during_write(monkeypatch):
     print("✓ CLI 恢复回滚写入期间被删除的会话")
 
 
+def test_runner_rollback_failure_reports_failure(monkeypatch):
+    """迟到回滚失败：被删会话消息已复活，ok=false / 退出码 1。"""
+    from utils import tombstones
+    from utils import user_import as user_import_module
+
+    payload = {
+        "chat_history": [
+            {"role": "user", "content": "回滚会失败", "session_id": "s-late"}
+        ]
+    }
+    path = _write_json(payload)
+    store = _real_store("u-cli-rbfail")
+    flags = {"late": False}
+    original_import = user_import_module.import_user_data
+
+    def import_then_delete(store_obj, sections, **kwargs):
+        counts = original_import(store_obj, sections, **kwargs)
+        flags["late"] = True
+        return counts
+
+    monkeypatch.setattr(user_import_module, "import_user_data", import_then_delete)
+    monkeypatch.setattr(
+        tombstones,
+        "is_session_deleted",
+        lambda user_id, session_id: session_id == "s-late" and flags["late"],
+    )
+
+    def failing_delete(session_id):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(store, "delete_chat_session", failing_delete)
+    code, out = _run_import(monkeypatch, "u-cli-rbfail", path, store, as_json=True)
+    result = json.loads(out)
+    assert code == 1, out
+    assert result["ok"] is False, result
+    assert result["rollback_failed"] is True, result
+    assert any("回滚失败" in item for item in result["rollback_errors"]), result
+    assert not any("回滚失败" in item for item in result["skipped"]), result
+    print("✓ CLI 恢复回滚失败 → ok=false / 退出码 1")
+
+
 def test_cli_import_rollback_counts_only_applied_entries(monkeypatch):
     """CLI 迟到回滚按实际生效集合扣减（备份段会误减存活会话）。"""
     from utils import tombstones
@@ -4828,6 +4869,33 @@ def test_sections_limit_defers_knowledge_axis_to_merged(monkeypatch):
         module.sections_limit_problem(sections, existing=existing) is None
     )
     print("✓ 备份预检把知识轴交给合并复核")
+
+
+def test_import_merges_prior_commits_into_partial_error(monkeypatch):
+    """行程批 PartialImportError 只含本批条数：已提交的偏好必须合并上报。"""
+    from utils.errors import PartialImportError
+    from utils.user_import import import_user_data
+
+    store = _real_store("u-merge-partial")
+
+    def boom(trips, **kwargs):
+        raise PartialImportError("批量保存在第 9 条后失败", 9, 0)
+
+    monkeypatch.setattr(store, "save_trip_histories", boom)
+    sections = {
+        "preferences": {"home_location": "上海", "seat": "window"},
+        "trips": [
+            {"origin": "北京", "destination": "杭州", "start_date": "2026-12-01"}
+        ],
+        "messages": [],
+    }
+    with pytest.raises(PartialImportError) as info:
+        import_user_data(store, sections)
+    # 2 个偏好（已 autocommit）+ 行程批自报的 9 条
+    assert info.value.created == 11, info.value.created
+    assert info.value.updated == 0
+    assert store.get_preference("home_location") == "上海"
+    print("✓ PartialImportError 合并此前已提交段条数")
 
 
 def test_cli_import_reports_partial_commit(monkeypatch):

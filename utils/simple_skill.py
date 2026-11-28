@@ -26,7 +26,11 @@ from utils.json_parser import (
     repair_json_object_fragment,
 )
 from utils.json_safe import sanitize_json
-from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
+from utils.llm_resilience import (
+    is_permanent_llm_error,
+    is_retriable_error,
+    provider_error_from_completion_text,
+)
 from utils.log_redact import redact_paths
 from utils.user_query import extract_user_query
 
@@ -447,6 +451,13 @@ class SimplePromptSkill(AgentBase):
             text = self._unwrap_answer(str(text or "").strip())
             if not text:
                 raise ConnectionError("模型返回空响应")
+            # 200 + 错误体（网关把上游错误塞进内容）：不能当成功答案展示 /
+            # 落库，按普通上游失败走下面的 status=error 分支
+            provider_error = provider_error_from_completion_text(
+                text, self.result_key
+            )
+            if provider_error is not None:
+                raise provider_error
             result = {
                 "status": "success",
                 "skill": self.skill_name,

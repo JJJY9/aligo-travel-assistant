@@ -2385,12 +2385,17 @@ async function _runUserBackupImport(file, targetUser) {
     // ok=false 且非知识片段失败 = 备份条目全部被墓碑期 / 保留字会话
     // 跳过（什么都没恢复），同样不能用「已恢复」开头
     const emptied =
-      result.ok === false && !result.recovery_incomplete && !result.knowledge_error;
+      result.ok === false &&
+      !result.recovery_incomplete &&
+      !result.knowledge_error &&
+      !result.rollback_failed;
     const restorePrefix = result.recovery_incomplete
       ? "已写入："
-      : emptied
-        ? "未恢复："
-        : "已恢复：";
+      : result.rollback_failed
+        ? "已写入："
+        : emptied
+          ? "未恢复："
+          : "已恢复：";
     let restoreMessage =
       `${restorePrefix}偏好 ${result.preferences} 项，行程新增 ${result.trips_created} / ` +
       `更新 ${result.trips_updated} 条，消息 ${result.messages_added} 条` +
@@ -2405,6 +2410,11 @@ async function _runUserBackupImport(file, targetUser) {
       // 隔离账号 + 备份无可写回的用户数据：不能显示为恢复成功
       restoreMessage +=
         "；⚠ 用户数据未恢复：备份中没有可写回的用户数据，账号仍处于记忆隔离状态，请使用含偏好 / 行程 / 消息的备份重试";
+    }
+    if (result.rollback_failed) {
+      // 恢复写入期间被删除的会话回滚失败：其消息仍在库中（已复活）
+      restoreMessage +=
+        "；⚠ 有会话在恢复期间被删除但回滚失败，其消息仍在库中，请再次删除该会话";
     }
     if (emptied) {
       // 服务端已把「没有可恢复的数据」写进 skipped：原样展示第一条

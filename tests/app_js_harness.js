@@ -2920,6 +2920,20 @@ async function scenarioUserBackupRestore(source) {
   run("__toasts.length = 0;");
   await run("importUserBackup()");
   results.emptied_toasts = run("__toasts.slice()");
+  // ok=false + rollback_failed（迟到回滚失败，被删会话消息已复活）：
+  // 不能落入「未恢复：」，也不能声称「已恢复」
+  run(
+    `__importResult = ${JSON.stringify({
+      ...base,
+      ok: false,
+      messages_added: 1,
+      rollback_failed: true,
+      skipped: ["会话 s1 在恢复写入期间被删除，回滚失败：connection lost"],
+    })};`,
+  );
+  run("__toasts.length = 0;");
+  await run("importUserBackup()");
+  results.rollback_toasts = run("__toasts.slice()");
 
   // 错误分支：408（上传超时，零写入）/ 部分完成 503 / 普通失败 / 静默刷新
   run(`

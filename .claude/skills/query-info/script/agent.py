@@ -22,7 +22,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 from utils.access_log import _safe_log_text
 from utils.daemon_executor import DaemonThreadPoolExecutor
 from utils.json_parser import extract_json_from_async_response
-from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
+from utils.llm_resilience import (
+    is_permanent_llm_error,
+    is_retriable_error,
+    provider_error_from_completion_text,
+)
 from utils.log_redact import redact_paths
 from utils.user_query import extract_user_query
 
@@ -802,6 +806,10 @@ class InformationQueryAgent(AgentBase):
 
             # 获取响应文本（兼容非流式 ChatResponse / 流式生成器 / 测试 mock）
             text = await extract_json_from_async_response(response)
+            # 200 + 错误体：不能当搜索结果摘要（query_success=True）
+            provider_error = provider_error_from_completion_text(text)
+            if provider_error is not None:
+                raise provider_error
         except Exception as e:
             # 摘要模型超时 / 401 等不能伪装成 query_success=True 的空摘要：
             # 向上抛给 _web_search 标记失败，编排层才能按瞬时错误重试 / 计数

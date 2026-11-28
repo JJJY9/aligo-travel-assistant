@@ -19,6 +19,7 @@ from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
+from utils.errors import AccountCapacityError, PartialImportError
 from utils.knowledge_paths import COLLECTION_NAME, knowledge_db_path
 from utils.milvus_client import get_milvus_client
 from utils.text_chunker import split_text
@@ -719,7 +720,7 @@ def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[s
     # 越限明确拒绝而不是把知识库推过导出上限（此后备份只能省略知识段）
     problem = _knowledge_row_limit_problem(_collection_row_count(), len(documents))
     if problem:
-        raise ValueError(problem)
+        raise AccountCapacityError(problem)
 
     # 模型加载可能耗时数秒，放在锁外；锁只保护 id 生成 + 写入
     agent = _get_agent()
@@ -731,7 +732,7 @@ def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[s
             _collection_row_count(), len(documents)
         )
         if problem:
-            raise ValueError(problem)
+            raise AccountCapacityError(problem)
         result = agent.add_documents(documents)
     if result.get("status") != "success":
         raise RuntimeError(str(result.get("message") or "添加知识片段失败"))
@@ -1161,7 +1162,7 @@ def update_document(
             max(0, current_rows - (1 + len(old_ids))), len(documents)
         )
         if problem:
-            raise ValueError(problem)
+            raise AccountCapacityError(problem)
 
         def _delete_ids(
             ids: list[int], log_label: str
@@ -2006,6 +2007,21 @@ def _log_safe_group(value: object) -> str:
     return json.dumps(str(value or ""), ensure_ascii=False)
 
 
+def _raise_batch_failure(
+    batch_no: int, imported: list[int], reason: object
+) -> None:
+    """批次失败统一出口：已写入批次如实计入``created``（部分提交口径）。
+
+    此前的批次已真实入库，调用方（Web / CLI / 恢复流程）必须能区分
+    「一条没写」与「写了一半」，因此已导入非空时抛 ``PartialImportError``，
+    否则保持普通 RuntimeError（不制造「已导入 0 条」噪音）。
+    """
+    message = f"第 {batch_no} 批导入失败（已导入 {len(imported)} 条）：{reason}"
+    if imported:
+        raise PartialImportError(message, created=len(imported), updated=0)
+    raise RuntimeError(message)
+
+
 def import_documents(
     documents: list[dict[str, Any]],
     dry_run: bool = False,
@@ -2728,7 +2744,7 @@ def import_documents(
             len(existing), len(unique)
         )
         if export_limit_problem and not dry_run:
-            raise ValueError(export_limit_problem)
+            raise AccountCapacityError(export_limit_problem)
         if dry_run:
             # 预览：只做校验 / 去重，不加载嵌入模型、不写入
             payload = {
@@ -2769,13 +2785,12 @@ def import_documents(
             try:
                 result = agent.add_documents(batch)
             except Exception as exc:  # noqa: BLE001 - 保留已导入数量供上层展示
-                raise RuntimeError(
-                    f"第 {batch_no} 批导入失败（已导入 {len(imported)} 条）：{exc}"
-                ) from exc
+                _raise_batch_failure(batch_no, imported, exc)
             if result.get("status") != "success":
-                raise RuntimeError(
-                    f"第 {batch_no} 批导入失败（已导入 {len(imported)} 条）："
-                    f"{result.get('message') or '导入知识片段失败'}"
+                _raise_batch_failure(
+                    batch_no,
+                    imported,
+                    result.get("message") or "导入知识片段失败",
                 )
             imported.extend(int(doc_id) for doc_id in (result.get("ids") or []))
     result = {

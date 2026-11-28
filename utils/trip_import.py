@@ -14,6 +14,7 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from utils.errors import AccountCapacityError
 from utils.trip_export import (
     _MAX_ICS_X_ATTR_CHARS,
     _needs_quote_guard,
@@ -832,7 +833,7 @@ def import_trips_from_text(
         len(history) <= MAX_TOTAL_TRIPS
         and len(history) + planned_created > MAX_TOTAL_TRIPS
     ):
-        raise ValueError(
+        raise AccountCapacityError(
             f"导入后行程总数将超过上限 {MAX_TOTAL_TRIPS}"
             f"（现有 {len(history)} + 新增 {planned_created}），"
             "请先清理历史行程后重试"

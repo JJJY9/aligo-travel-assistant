@@ -535,6 +535,34 @@ def test_extra_skill_non_string_or_empty_answer_is_retriable():
     print("✓ 结构化 answer 取字段值，空 answer / 空信封按空响应上抛")
 
 
+def test_extra_skill_error_body_is_not_success_answer():
+    """200 + 错误体（网关把上游错误塞进内容）：不能当成功答案展示。"""
+    from utils.llm_resilience import ProviderResponseError
+
+    agent_class = _load("packing-list", "PackingListAgent")
+    # 无状态码的错误体：走 status=error（错误文本由编排层统一脱敏）
+    raw = '{"error": {"message": "upstream overloaded, please retry"}}'
+    agent = agent_class(model=_Model(response=raw))
+    out = asyncio.run(
+        agent.reply(Msg(name="orchestrator", content="行李清单", role="user"))
+    )
+    data = json.loads(out.content)
+    assert data["status"] == "error", data
+    assert "upstream overloaded" in data["message"]
+
+    # 带状态码的错误体：按可重试 / 永久分类上抛，交给编排层退避与熔断
+    raw401 = (
+        '{"error": {"code": 401, '
+        '"message": "Incorrect API key provided: sk-abcdefghijklmnop1234"}}'
+    )
+    agent = agent_class(model=_Model(response=raw401))
+    with pytest.raises(ProviderResponseError):
+        asyncio.run(
+            agent.reply(Msg(name="orchestrator", content="行李清单", role="user"))
+        )
+    print("✓ 简单技能识别 200 + 错误体（不再当成功答案）")
+
+
 def test_extra_skill_placeholder_result_key_yields_to_real_answer():
     """result_key 留在模板占位、真实建议在 answer / data.answer 时取真实值。"""
     agent_class = _load("trip-budget", "TripBudgetAgent")
@@ -675,6 +703,7 @@ if __name__ == "__main__":
     test_extra_skill_prefers_last_envelope_over_echoed_template()
     test_extra_skill_prompt_substitutes_result_key()
     test_extra_skill_non_string_or_empty_answer_is_retriable()
+    test_extra_skill_error_body_is_not_success_answer()
     test_extra_skill_placeholder_result_key_yields_to_real_answer()
     test_extra_skill_placeholder_only_triggers_retry()
     test_extra_skill_unwraps_multiple_bare_objects()

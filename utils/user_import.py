@@ -24,6 +24,7 @@ from typing import Any
 
 from utils.chat_import import filter_import_messages, prepare_import_messages
 from utils.errors import (
+    AccountCapacityError,
     ImportVolumeError,
     MemoryPersistenceError,
     PartialImportError,
@@ -2544,7 +2545,7 @@ def _enforce_import_limits(store: Any, sections: dict[str, Any]) -> None:
         if new_messages is None:
             new_messages = len(messages)
         if existing_messages + new_messages > _MAX_MESSAGES:
-            raise ValueError(
+            raise AccountCapacityError(
                 f"恢复后消息总数将超过上限 {_MAX_MESSAGES}"
                 f"（现有 {existing_messages} + 新增 {new_messages}；"
                 f"备份中 {len(messages) - new_messages} 条为重复或提问已存在轮次的回答），"
@@ -2564,7 +2565,7 @@ def _enforce_import_limits(store: Any, sections: dict[str, Any]) -> None:
         if new_trips is None:
             new_trips = len(trips)
         if existing_trips + new_trips > _MAX_TRIPS:
-            raise ValueError(
+            raise AccountCapacityError(
                 f"恢复后行程总数将超过上限 {_MAX_TRIPS}"
                 f"（现有 {existing_trips} + 新增 {new_trips}；"
                 f"备份中 {len(trips) - new_trips} 条与现有行程重复），"
@@ -2588,7 +2589,7 @@ def _enforce_import_limits(store: Any, sections: dict[str, Any]) -> None:
                     len(existing_preferences) <= _MAX_PREFERENCES
                     and len(merged) > _MAX_PREFERENCES
                 ):
-                    raise ValueError(
+                    raise AccountCapacityError(
                         f"恢复后偏好类型将超过上限 {_MAX_PREFERENCES}"
                         f"（现有 {len(existing_preferences)} + 备份 "
                         f"{len(incoming_preferences)}，合并后 {len(merged)}），"
@@ -2815,7 +2816,28 @@ def _import_user_data_locked(
                 result["archived"] = int(
                     store.set_sessions_archived(archived, True)
                 )
-    except PartialImportError:
+    except PartialImportError as exc:
+        # 行程批本来就是逐行提交：它抛出的条数只含本批。偏好段（以及
+        # 先于行程写入的其它段）此前已提交，必须合并进 created/updated，
+        # 否则调用方按「只提交了 N 条」判断重导范围，漏报已恢复的数据
+        prior_created = sum(
+            int(result.get(key) or 0)
+            for key in (
+                "preferences",
+                "trips_created",
+                "messages_added",
+                "titles",
+                "pinned",
+                "archived",
+            )
+        )
+        prior_updated = int(result.get("trips_updated") or 0)
+        if prior_created or prior_updated:
+            raise PartialImportError(
+                str(exc),
+                int(exc.created) + prior_created,
+                int(exc.updated) + prior_updated,
+            ) from exc
         raise
     except Exception as exc:  # noqa: BLE001 - 统一转部分提交口径
         # 后段失败时前段（偏好 / 行程 / 消息…）已经落库：必须如实报告已

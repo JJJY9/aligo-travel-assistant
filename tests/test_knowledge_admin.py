@@ -2868,11 +2868,17 @@ def test_import_failure_reports_partial_count(monkeypatch):
 
     agent = _FailSecondBatch()
     monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
-    with pytest.raises(RuntimeError, match="已导入 500 条"):
+    from utils.errors import PartialImportError
+
+    with pytest.raises(RuntimeError, match="已导入 500 条") as info:
         knowledge_admin.import_documents(
             [{"content": f"item-{i}"} for i in range(800)]
         )
-    print("✓ 分批导入失败时报告已导入数量")
+    # 已写入批次必须进入结构化条数（调用方据此报告部分提交），不能只
+    # 藏在异常文本里
+    assert isinstance(info.value, PartialImportError)
+    assert info.value.created == 500 and info.value.updated == 0
+    print("✓ 分批导入失败时报告已导入数量（PartialImportError.created）")
 
 
 def test_import_empty_and_missing_db(monkeypatch):

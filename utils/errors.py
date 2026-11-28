@@ -37,9 +37,25 @@ class ImportVolumeError(ValueError):
     """
 
 
+class AccountCapacityError(ValueError):
+    """账号 / 全局数据容量已达上限的永久、用户可修正状态。
+
+    与请求内容非法（400）不同：调用方应先删除数据再重试，Web 层统一
+    映射 409（与实时写入路径同口径），CLI 直接展示原因。继承
+    ``ValueError`` 以兼容既有的 ``except ValueError`` 消费方。
+    """
+
+
 class UserFacingError(RuntimeError):
     """消息本身就是给用户看的提示（固定文案，不含内部异常细节）。
 
     Web 层对未预期异常统一脱敏返回，只有这类异常的 ``str(exc)`` 可以原样
-    透出（例如「意图识别结果解析失败，请重试」）。
+    透出（例如「意图识别结果解析失败，请重试」）。``status_code`` 描述
+    这类失败在 HTTP 上的语义：默认 502（上游 / 模型返回了不可用响应，
+    客户端按原样重试即可），瞬时预算耗尽可传 503 + Retry-After——不能用
+    4xx（客户端改请求也不会消除，且与「请重试」文案矛盾）。
     """
+
+    def __init__(self, message: str, status_code: int = 502) -> None:
+        super().__init__(message)
+        self.status_code = status_code
