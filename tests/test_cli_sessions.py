@@ -334,8 +334,6 @@ def test_sessions_json_updated_at_normalized(monkeypatch):
 
 
 def test_archive_json_output(monkeypatch):
-    import json as _json
-
     fake = _sessions_store()
     monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
     buf = io.StringIO()
@@ -343,7 +341,7 @@ def test_archive_json_output(monkeypatch):
         code = cli.run_session_archive_standalone(
             "u1", "s-active", archived=True, as_json=True
         )
-    payload = _json.loads(buf.getvalue())
+    payload = json.loads(buf.getvalue())
     assert code == 0
     assert payload == {
         "ok": True,
@@ -357,7 +355,7 @@ def test_archive_json_output(monkeypatch):
         code = cli.run_session_archive_standalone(
             "u1", "s-missing", archived=False, as_json=True
         )
-    payload = _json.loads(buf.getvalue())
+    payload = json.loads(buf.getvalue())
     assert code == 1 and payload["ok"] is False
     assert "不存在或没有消息" in payload["error"]
     print("✓ session-archive --json 成功 / 错误输出")
@@ -1142,7 +1140,9 @@ def test_main_rejects_bad_usage(monkeypatch):
         # 非法 user / session ID 统一按用法错误（exit 2），与 stats / trips 同口径
         ["cli.py", "sessions", "bad!"],
         ["cli.py", "session-archive", "bad!", "s1"],
-        ["cli.py", "session-delete", "u1", "bad!"],
+        # session-delete 放宽为打捞入口：非法字符交给运行期拒绝（exit 1），
+        # 控制字符在 dispatch 层仍是用法错误
+        ["cli.py", "session-delete", "u1", "badid"],
         ["cli.py", "session-title", "bad!", "s1", "标题"],
         ["cli.py", "session-pin", "u1", "bad!"],
         ["cli.py", "session-show", "bad!", "s1"],
@@ -2165,3 +2165,62 @@ def test_session_show_json_timestamps_normalized(monkeypatch):
     assert code == 0
     assert data["messages"][0]["timestamp"] == "不是时间", "非法时间戳原样保留"
     print("✓ session-show --json 时间戳统一带偏移")
+
+
+def _run_list_json(user_id, include_all=False):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        code = cli.run_sessions_list_standalone(
+            user_id, include_all=include_all, as_json=True
+        )
+    return code, json.loads(buf.getvalue())
+
+
+def test_sessions_hides_unaddressable_ids(monkeypatch):
+    """列表与 Web 端点可寻址口径一致：含空格 / 超长 ID 不出现。"""
+    fake = _FakeStore(
+        [
+            _message("user", "正常", "s-ok"),
+            _message("assistant", "回答", "s-ok"),
+            _message("user", "坏", "bad id"),
+            _message("assistant", "坏答", "bad id"),
+            _message("user", "超长", "x" * 65),
+        ]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
+    code, payload = _run_list_json("u1")
+    assert code == 0
+    ids = [session["session_id"] for session in payload["sessions"]]
+    assert ids == ["s-ok"], ids
+    assert payload["total"] == 1
+    print("✓ sessions 隐藏不可寻址会话 ID")
+
+
+def test_session_delete_can_salvage_unaddressable_id(monkeypatch):
+    """session-delete 放宽为打捞入口：可精确删除含空格的旧导入会话。"""
+    fake = _FakeStore(
+        [
+            _message("user", "坏", "bad id"),
+            _message("assistant", "坏答", "bad id"),
+            _message("user", "正常", "s-ok"),
+        ]
+    )
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
+    monkeypatch.setattr(storage, "clear_short_term_session", lambda *a, **k: None)
+    code, out = _run_delete("u1", "bad id", as_json=True)
+    assert code == 0, out
+    payload = json.loads(out)
+    assert payload["deleted"] == 2
+    assert fake.deleted_sessions == ["bad id"]
+    assert any(m.get("session_id") == "s-ok" for m in fake.messages)
+    print("✓ session-delete 可打捞不可寻址会话")
+
+
+def test_session_delete_still_rejects_control_chars(monkeypatch):
+    """放宽有边界：控制字符 / 超长 ID 仍被拒绝。"""
+    fake = _FakeStore([])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
+    code, out = _run_delete("u1", "bad\nid")
+    assert code == 1
+    assert not fake.deleted_sessions
+    print("✓ session-delete 仍拒绝控制字符")

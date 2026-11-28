@@ -253,13 +253,30 @@ def _valid_session_id(value: object) -> bool:
     return is_valid_web_session_id(value)
 
 
+def _deletable_session_id(value: object) -> bool:
+    """``session-delete`` 的入参校验：普通寻址校验之上放宽，用于打捞清理。
+
+    旧版本导入可能写入含空格 / 超长 / 上标类字符的会话 ID：Web / CLI 列表
+    按端点可寻址口径隐藏后，它们仍需要一个清理入口。这里只要求非空、
+    不以 ``-`` 开头、长度 ≤512 且不含控制字符（日志 / Redis 键安全）；
+    删除仍走存储层的精确相等匹配（JSON/PG 均参数化），不会误删别的会话。
+    """
+    if not isinstance(value, str) or not value or value.startswith("-"):
+        return False
+    if len(value) > 512:
+        return False
+    return all(ord(ch) >= 0x20 and ord(ch) != 0x7F for ch in value)
+
+
 def _countable_session_id(value: object) -> str | None:
     """会话列表 / 统计同口径的会话 ID 归一；不计入返回 None。
 
     整数 0 是合法会话 ID（与 Web 列表 / PG 同口径）；None 与纯空白串不是
     会话。保留字（``export``）被 Web 静态导出路由遮蔽、面板永远打不开，
-    列表与统计同样不计入（直接寻址的 session-show / session-delete 仍可用，
-    作为清理 / 打捞入口）。
+    列表与统计同样不计入；端点不可寻址的 ID（含空格 / 超长 / 上标类
+    字符，旧版本导入可能写入）在列表里同样打不开、删不掉，与 Web
+    ``_addressable_session_id`` 同口径隐藏。两类都可经 session-delete
+    精确打捞清理。
     """
     from utils.session_ids import RESERVED_SESSION_IDS
 
@@ -267,6 +284,8 @@ def _countable_session_id(value: object) -> str | None:
         return None
     text = str(value)
     if not text.strip() or text in RESERVED_SESSION_IDS:
+        return None
+    if not is_valid_web_session_id(text):
         return None
     return text
 
@@ -5583,8 +5602,10 @@ def run_session_delete_standalone(
 
     if not _valid_web_id(user_id):
         return _fail("用户 ID 只能包含中文、字母、数字、下划线和短横线")
-    if not _valid_session_id(session_id):
-        return _fail("会话 ID 只能包含中文、字母、数字、下划线和短横线")
+    if not _deletable_session_id(session_id):
+        return _fail(
+            "会话 ID 不能为空、不能以短横线开头，长度不超过 512 且不含控制字符"
+        )
     try:
         store = _open_cli_store(user_id)
     except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
@@ -8869,7 +8890,7 @@ def _main_impl():
                 not valid
                 or len(positional) != 2
                 or not _valid_user_id(positional[0])
-                or not _valid_session_id(positional[1])
+                or not _deletable_session_id(positional[1])
             ):
                 _cli_fail(
                     "用法：python cli.py session-delete <user_id> <session_id> [--json]",

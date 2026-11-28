@@ -749,7 +749,12 @@ class LongTermMemory:
                         return entry.name
                     if (
                         fallback is None
-                        and entry.name.casefold() == name.casefold()
+                        # NFC/NFD 规范等价与大小写变体在 macOS APFS 上都
+                        # 指向同一文件：与 _owner_conflict_for_name /
+                        # _check_owner_case 同口径，只比 casefold 会漏掉
+                        # 规范等价拼写，隔离改名沿用错拼写后归属判定反锁
+                        and _id_identity_key(entry.name)
+                        == _id_identity_key(name)
                     ):
                         fallback = entry.name
         except OSError:
@@ -922,7 +927,19 @@ class LongTermMemory:
         expected = f"{self.user_id}{suffix}"
         if name.startswith(expected):
             return None
-        index = name.casefold().find(suffix.casefold())
+        # 在原始文件名里按「等长窗口折叠后比较」定位后缀：不能先 casefold
+        # 整个文件名再取下标——İ 等变长折叠字符会让折叠串下标与原文错位
+        # （``İX`` casefold 后变 2 个码点），切出的 owner 前缀不再等价于
+        # 磁盘拼写，归属守卫失效
+        folded_suffix = suffix.casefold()
+        index = next(
+            (
+                i
+                for i in range(1, len(name) - len(suffix) + 1)
+                if name[i : i + len(suffix)].casefold() == folded_suffix
+            ),
+            -1,
+        )
         if index <= 0:
             return None
         owner = name[:index]
@@ -3313,13 +3330,30 @@ class LongTermMemory:
                         and marker_actual_name.casefold()
                         == marker_expected_name.casefold()
                     ):
+                        # 原文里定位后缀：先 casefold 再取下标会被 İ 等
+                        # 变长折叠字符带偏，切出的 owner 不是磁盘拼写
+                        marker_suffix = ".json.quarantine"
+                        marker_index = next(
+                            (
+                                i
+                                for i in range(
+                                    1,
+                                    len(marker_actual_name)
+                                    - len(marker_suffix)
+                                    + 1,
+                                )
+                                if marker_actual_name[
+                                    i : i + len(marker_suffix)
+                                ].casefold()
+                                == marker_suffix.casefold()
+                            ),
+                            -1,
+                        )
                         raise MemoryPersistenceError(
                             _case_conflict_message(
-                                marker_actual_name[
-                                    : marker_actual_name.casefold().find(
-                                        ".json.quarantine"
-                                    )
-                                ]
+                                marker_actual_name[:marker_index]
+                                if marker_index > 0
+                                else marker_actual_name
                             )
                         )
                     # 删除墓碑先行：进程在「删主文件」与「写墓碑」之间被杀 /
