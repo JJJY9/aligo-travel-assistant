@@ -478,6 +478,18 @@ function escapeHtml(text) {
     .replace(/[\uE000\uE001]/g, "\uFFFD");
 }
 
+function queryTokenPattern(query) {
+  // 服务端把查询与正文的空白折叠后再匹配（双空格 / Tab 等价单空格）。
+  // 前端预览 / 高亮按同一口径把查询按空白拆词、以 \s+ 连接，否则服务端
+  // 命中的行在面板里既不预览关键词、也不产生 <mark> 高亮
+  const tokens = String(query || "")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((token) => token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  return tokens.join("\\s+");
+}
+
 function highlightSnippet(text, query) {
   const source = String(text ?? "");
   const needle = String(query || "").trim();
@@ -485,8 +497,7 @@ function highlightSnippet(text, query) {
 
   // 大小写不敏感匹配直接在原文上做：toLowerCase 可能改变字符串长度
   // （如 İ → i̇ 变成两个码点），用它算出的下标去切原文会错位
-  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const pattern = new RegExp(escaped, "gi");
+  const pattern = new RegExp(queryTokenPattern(needle), "gi");
   const parts = [];
   let cursor = 0;
   let match = pattern.exec(source);
@@ -6422,9 +6433,10 @@ function knowledgePreview(content, query) {
   }
   // 大小写不敏感匹配直接在原文上做：toLowerCase 可能改变字符串长度
   // （İ → i̇ 变成两个码点），用 lower 串的下标切原文会让窗口整体错位，
-  // 预览里既看不到关键词也没有高亮（与服务端 _ci_find 同一口径）
-  const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = new RegExp(escaped, "i").exec(text);
+  // 预览里既看不到关键词也没有高亮（与服务端 _ci_find 同一口径；
+  // 空白按词拆分匹配，覆盖服务端的空白折叠命中）
+  const pattern = queryTokenPattern(needle);
+  const match = new RegExp(pattern, "i").exec(text);
   if (!match) {
     return sliceCodePoints(text, 140);
   }

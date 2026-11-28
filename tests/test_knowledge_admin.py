@@ -97,6 +97,46 @@ class _FakeAgent:
         return self.result
 
 
+def test_list_documents_search_ignores_metadata_keys(monkeypatch):
+    """关键词搜索不能命中 metadata 的键名 / JSON 结构字符（会命中整库）。"""
+    rows = [
+        {
+            "id": 1,
+            "content": "正文不含标志词",
+            "metadata": '{"category": "住宿", "title": "标题A"}',
+        },
+        {"id": 2, "content": "另一条", "metadata": '{"category": "交通"}'},
+    ]
+    fake = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    for needle in ("category", "title", "{", ":"):
+        assert knowledge_admin.list_documents(query=needle)["total"] == 0, needle
+    assert knowledge_admin.list_documents(query="住宿")["total"] == 1
+    assert knowledge_admin.list_documents(query="正文")["total"] == 1
+    print("✓ 片段搜索只匹配正文与元数据值，不匹配键名")
+
+
+def test_cleanup_loads_collection_outside_write_lock(monkeypatch):
+    """真实清理先加载集合再进写锁：冷加载不能占写锁把读请求顶成 503。"""
+    fake = _FakeMilvusClient([])
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    states = {}
+
+    def fake_load(client, name):
+        states["load_writer"] = knowledge_admin._WRITE_LOCK._writer
+
+    def fake_scan(client):
+        states["scan_writer"] = knowledge_admin._WRITE_LOCK._writer
+        return []
+
+    monkeypatch.setattr(knowledge_admin, "_load_collection", fake_load)
+    monkeypatch.setattr(knowledge_admin, "_scan_duplicate_contents", fake_scan)
+    result = knowledge_admin.cleanup_duplicate_contents(dry_run=False)
+    assert states == {"load_writer": False, "scan_writer": True}, states
+    assert result["removed"] == 0
+    print("✓ 重复清理的集合加载在写锁外，扫描 / 删除仍在写锁内")
+
+
 def test_list_documents_parses_sorts_and_filters(monkeypatch):
     rows = [
         {"id": 3, "content": "住宿标准 600 元", "metadata": '{"category": "住宿"}'},
@@ -309,6 +349,46 @@ def test_update_document_rewrites_content(monkeypatch):
     with pytest.raises(ValueError):
         knowledge_admin.update_document(7, "   ")
     print("✓ 知识片段更新（存在性 / 内容清洗 / 缺省 id）")
+
+
+def test_update_allows_legacy_extra_metadata_keys(monkeypatch):
+    """历史 >10 键记录可原样保存 / 减少键，但不能借更新再加新键。"""
+    from pathlib import Path
+
+    legacy = {f"k{index}": "v" for index in range(11)}
+    rows = [
+        {
+            "id": 7,
+            "content": "旧内容",
+            "metadata": json.dumps(legacy, ensure_ascii=False),
+        }
+    ]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    class _UpdateAgent:
+        def __init__(self):
+            self.calls = []
+
+        def update_document(self, doc_id, content, metadata):
+            self.calls.append((doc_id, content, metadata))
+            return {"status": "success", "id": doc_id}
+
+    agent = _UpdateAgent()
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: agent)
+    result = knowledge_admin.update_document(7, "新内容", dict(legacy))
+    assert result["status"] == "success"
+    assert agent.calls and len(agent.calls[0][2]) == 11
+
+    with pytest.raises(ValueError, match="最多"):
+        knowledge_admin.update_document(
+            7, "再加一个键", {**legacy, "k11": "v"}
+        )
+    # 新增接口仍严格 10 键
+    with pytest.raises(ValueError, match="最多"):
+        knowledge_admin.add_document("新增内容", dict(legacy))
+    print("✓ 历史 >10 键记录可保存，新增键 / 新增文档仍受 10 键上限")
 
 
 def test_update_document_marks_edited_builtin_chunks(monkeypatch):
@@ -4328,6 +4408,9 @@ if __name__ == "__main__":
     test_bounded_metadata_keeps_internal_keys()
     for case in (
         test_list_documents_parses_sorts_and_filters,
+        test_list_documents_search_ignores_metadata_keys,
+        test_cleanup_loads_collection_outside_write_lock,
+        test_update_allows_legacy_extra_metadata_keys,
         test_list_documents_pages_full_scan,
         test_list_categories_counts,
         test_list_documents_two_phase_skips_content_without_query,

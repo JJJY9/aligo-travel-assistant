@@ -71,6 +71,51 @@ def test_list_prints_items(monkeypatch):
     print("✓ kb-list 输出总数、分类、分片序号与预览")
 
 
+def test_list_tolerates_non_finite_parts(monkeypatch):
+    """损坏行 metadata parts=Infinity 不能让 kb-list 崩（OverflowError 兜底）。"""
+    monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+    monkeypatch.setattr(
+        knowledge_admin,
+        "list_documents",
+        lambda limit, offset, query: {
+            "total": 3,
+            "items": [
+                {"id": 9, "content": "损坏行", "metadata": {"parts": float("inf")}},
+                {"id": 8, "content": "负无穷", "metadata": {"parts": float("-inf")}},
+                {"id": 7, "content": "字符串", "metadata": {"parts": "inf"}},
+            ],
+        },
+    )
+    code, out = _capture(cli.run_knowledge_list_standalone)
+    assert code == 0, out
+    assert "#9" in out and "#8" in out and "#7" in out, out
+    print("✓ kb-list 对损坏的 parts（Infinity）不崩溃")
+
+
+def test_add_update_precheck_file_size_before_read(monkeypatch):
+    """超大文件在读取前按体积拒绝，不整份读入内存（与 kb-import 同口径）。"""
+    import pathlib
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        doc = pathlib.Path(tmp) / "big.txt"
+        doc.write_text("x", encoding="utf-8")
+        monkeypatch.setattr(knowledge_stats, "knowledge_status", lambda: _status())
+        monkeypatch.setattr(cli, "_KB_FILE_MAX_BYTES", 0)
+
+        def _boom(self, *args, **kwargs):
+            raise AssertionError("超大文件不应被整份读取")
+
+        monkeypatch.setattr(pathlib.Path, "read_text", _boom)
+        code, out = _capture(cli.run_knowledge_add_standalone, str(doc))
+        assert code == 1 and "文件过大" in out, out
+        code, out = _capture(
+            cli.run_knowledge_update_standalone, 7, str(doc)
+        )
+        assert code == 1 and "文件过大" in out, out
+    print("✓ kb-add / kb-update 读取前按体积拒绝超大文件")
+
+
 def test_list_json_output(monkeypatch):
     import json as _json
 
@@ -1194,6 +1239,7 @@ if __name__ == "__main__":
     for case in (
         test_list_unavailable,
         test_list_prints_items,
+        test_list_tolerates_non_finite_parts,
         test_list_json_output,
         test_list_dispatch_json,
         test_list_error,
@@ -1228,6 +1274,7 @@ if __name__ == "__main__":
         test_delete_legacy_multi_part_message,
         test_kb_show_dispatch,
         test_add_from_file,
+        test_add_update_precheck_file_size_before_read,
         test_add_and_update_failures,
         test_update_merges_existing_metadata,
         test_update_passes_legacy_long_metadata_untruncated,

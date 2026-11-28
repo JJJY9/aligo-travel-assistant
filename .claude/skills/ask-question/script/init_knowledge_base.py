@@ -153,6 +153,16 @@ def load_documents_from_directory(directory_path: str) -> tuple[list[dict], list
 
             # --- 文档切分逻辑 ---
             chunks = split_text(content)
+            if not chunks:
+                # split_text 过滤不含字母数字的分片：纯破折号 / emoji /
+                # 标点文档会整体变空，此前被静默当作 0 片（✓ + 退出码 0）。
+                # 与 knowledge_admin 导入路径同口径按 400 字硬切，避免整篇
+                # 静默丢失
+                chunks = [
+                    content[index : index + 400]
+                    for index in range(0, len(content), 400)
+                    if content[index : index + 400].strip()
+                ] or [content]
             # 多分片文档带 group / part / parts 元数据：与知识管理导入路径
             # 一致，整组删除 / 备份还原 / 检索拼装都依赖这些标记
             group_id = uuid.uuid4().hex[:12] if len(chunks) > 1 else ""
@@ -713,9 +723,14 @@ def main(documents_dir: str | None = None) -> int:
         created_knowledge_dir = not knowledge_base_path.exists()
         knowledge_base_path.mkdir(parents=True, exist_ok=True)
         # 上一次清理失败留下的「待清理」标记：本次重新使用该目录建库，
-        # 清掉标记（本 run 若中止，discard 会重新写入）
+        # 清掉标记（本 run 若中止，discard 会重新写入）。标记存在说明该
+        # 目录是上次中止后未清理干净的空库，本 run 中止时同样要清理，
+        # 否则空库会被 default_knowledge_dir 当作已初始化来源、永久遮蔽
+        # 旧部署知识库
+        resuming_discard_pending = (knowledge_base_path / ".discard-pending").exists()
         with contextlib.suppress(OSError):
             (knowledge_base_path / ".discard-pending").unlink(missing_ok=True)
+        discard_on_abort = created_knowledge_dir or resuming_discard_pending
 
         # 3. 创建 RAG Agent：旧集合维度不一致时先「导出保留片段」再删旧集合
         print("3. 初始化RAG Agent...")
@@ -738,7 +753,7 @@ def main(documents_dir: str | None = None) -> int:
                 print(f"❌ 初始化失败：{exc}（知识库保持原样）{hint}")
                 # 本次运行新建的空库要清掉（或标记待清理）：否则下次运行
                 # 它会被 default_knowledge_dir 当成已初始化的来源
-                if created_knowledge_dir:
+                if discard_on_abort:
                     _discard_created_library(knowledge_base_path)
                 return 1
             print(f"   ⚠️  {exc}")
@@ -751,7 +766,7 @@ def main(documents_dir: str | None = None) -> int:
                 )
             except RuntimeError as export_error:
                 print(f"❌ {export_error}，已中止（知识库保持原样）")
-                if created_knowledge_dir:
+                if discard_on_abort:
                     _discard_created_library(knowledge_base_path)
                 return 1
             for warning in warnings:
@@ -771,7 +786,7 @@ def main(documents_dir: str | None = None) -> int:
                     f"❌ 保留片段备份写入失败：{backup_error}，"
                     "已中止（知识库保持原样）"
                 )
-                if created_knowledge_dir:
+                if discard_on_abort:
                     _discard_created_library(knowledge_base_path)
                 return 1
             print(
@@ -790,7 +805,7 @@ def main(documents_dir: str | None = None) -> int:
 
         if not rag_agent.initialized:
             print("❌ RAG Agent初始化失败")
-            if created_knowledge_dir:
+            if discard_on_abort:
                 _discard_created_library(knowledge_base_path)
             return 1
         print("✓ RAG Agent初始化成功")
@@ -843,7 +858,7 @@ def main(documents_dir: str | None = None) -> int:
                         collection_recovered = True
                     else:
                         print(f"❌ {export_error}，已中止（知识库保持原样）")
-                        if created_knowledge_dir:
+                        if discard_on_abort:
                             _discard_created_library(knowledge_base_path)
                         return 1
                 if not collection_recovered:
@@ -864,7 +879,7 @@ def main(documents_dir: str | None = None) -> int:
                             f"❌ 保留片段备份写入失败：{backup_error}，"
                             "已中止（知识库保持原样）"
                         )
-                        if created_knowledge_dir:
+                        if discard_on_abort:
                             _discard_created_library(knowledge_base_path)
                         return 1
                     if preserved:

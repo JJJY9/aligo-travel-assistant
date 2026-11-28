@@ -447,6 +447,11 @@ def list_documents(
         return _list_documents(client, limit, offset, query, category)
 
 
+def _search_fold(text: object) -> str:
+    """搜索文本归一：内部空白折叠为单空格并小写（查询 / 正文同口径）。"""
+    return " ".join(str(text or "").split()).lower()
+
+
 def _list_documents(
     client: Any, limit: int, offset: int, query: str, category: str
 ) -> dict[str, Any]:
@@ -470,11 +475,13 @@ def _list_documents(
         documents = [
             doc
             for doc in documents
-            if needle in " ".join(doc["content"].split()).lower()
+            # 元数据只匹配值、不匹配键名与 JSON 结构字符：json.dumps 会把
+            # title/source 等键名带进搜索文本，搜索这些词命中整库
+            if needle in _search_fold(doc["content"])
             or needle
-            in " ".join(
-                json.dumps(doc["metadata"], ensure_ascii=False).split()
-            ).lower()
+            in _search_fold(
+                " ".join(str(value) for value in doc["metadata"].values())
+            )
         ]
         if wanted_category:
             documents = [
@@ -608,12 +615,19 @@ def _restore_pieces(parts: Any, fallback: str) -> list[str]:
     return [piece for piece, _ in _restore_pieces_with_sources(parts, fallback)]
 
 
-def _validate_metadata_lengths(metadata: dict[str, Any]) -> None:
+def _validate_metadata_lengths(
+    metadata: dict[str, Any],
+    allowed_user_keys: set[str] | None = None,
+) -> None:
     """元数据键 / 值长度与键数上限，超限直接拒绝（不静默截断）。
 
     键数上限此前只在 Web schema 与导入截断上执行：CLI kb-update 合并库内
     元数据后可写出 11+ 键，该片段在面板随后每次保存都 422。内部键
     （分片标记 / user_edited）不占用户的 10 键额度。
+
+    ``allowed_user_keys`` 是库内已有的用户键集合（更新既有记录时传入）：
+    历史遗留的 >10 键记录原样保存不再被锁死，但不允许在此基础上再新增
+    键；新增 / 导入仍按严格上限执行。
     """
     user_keys = 0
     for meta_key, meta_value in metadata.items():
@@ -629,16 +643,27 @@ def _validate_metadata_lengths(metadata: dict[str, Any]) -> None:
         if key_text not in _INTERNAL_META_KEYS:
             user_keys += 1
     if user_keys > _METADATA_MAX_KEYS:
-        raise ValueError(
-            f"元数据最多 {_METADATA_MAX_KEYS} 个键（当前 {user_keys} 个），"
-            "请合并或删除多余字段"
-        )
+        new_keys = {
+            str(meta_key)
+            for meta_key in metadata
+            if str(meta_key) not in _INTERNAL_META_KEYS
+            and (
+                allowed_user_keys is None
+                or str(meta_key) not in allowed_user_keys
+            )
+        }
+        if new_keys:
+            raise ValueError(
+                f"元数据最多 {_METADATA_MAX_KEYS} 个键（当前 {user_keys} 个），"
+                "请合并或删除多余字段"
+            )
 
 
 def _chunk_documents(
     text: str,
     metadata: dict[str, str] | None,
     group_override: str = "",
+    allowed_user_keys: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """长内容按语义边界拆成 ≤400 字的片段（嵌入模型 512 token 截断）。
 
@@ -683,7 +708,7 @@ def _chunk_documents(
         for key, value in (metadata or {}).items()
         if key not in _DERIVED_CHUNK_KEYS
     }
-    _validate_metadata_lengths(base_meta)
+    _validate_metadata_lengths(base_meta, allowed_user_keys=allowed_user_keys)
     # 与 Web 写接口同口径：NUL / 孤立代理项入库后，面板每次保存（整份
     # metadata 随请求提交）都会被 422 拒绝，片段从此无法编辑
     problem = _encoding_problem(text)
@@ -1030,6 +1055,7 @@ def update_document(
     # 原样保存在读锁内先行判定：命中直接返回，不为一次 no-op 保存加载
     # （冷加载可能联网下载数十秒的）嵌入模型；未命中再走完整写路径，
     # 锁内仍以权威快照复核，判定不依赖这次读取的时效性
+    existing_user_keys: set[str] | None = None
     try:
         with _read_lock():
             parts, pre_group = _document_info(client, int(doc_id))
@@ -1043,19 +1069,27 @@ def update_document(
                 pre_snapshot = _locked_user_snapshot(
                     client, int(doc_id), pre_group
                 )
-                if pre_snapshot is not None and _edit_unchanged(pre_snapshot):
-                    return {
-                        "status": "success",
-                        "id": int(doc_id),
-                        "unchanged": True,
+                if pre_snapshot is not None:
+                    existing_user_keys = {
+                        str(key)
+                        for key in pre_snapshot[1]
+                        if str(key) not in _INTERNAL_META_KEYS
                     }
+                    if _edit_unchanged(pre_snapshot):
+                        return {
+                            "status": "success",
+                            "id": int(doc_id),
+                            "unchanged": True,
+                        }
     except LookupError:
         raise
     except Exception:  # noqa: BLE001 - 预检失败走完整流程
         logger.debug("原样保存预检失败，按完整流程处理", exc_info=True)
 
     agent = _get_agent()
-    documents = _chunk_documents(text, metadata)
+    documents = _chunk_documents(
+        text, metadata, allowed_user_keys=existing_user_keys
+    )
     if (
         isinstance(metadata, dict)
         and metadata.get("source")
@@ -1758,9 +1792,13 @@ def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
             "plan": plan,
         }
 
+    # 集合加载（首次冷启动可能耗时数百毫秒到数秒）放在写锁外：
+    # Milvus Lite 的 load_collection 会阻塞等待加载完成，不应占用写锁。
+    # 真实清理同样先加载再进写锁：冷进程首个请求加载可达数秒，持写锁
+    # 会把并发读全部顶到 0.5s 读锁预算之外（503「正在写入」）
+    client = _client()
+    _load_collection(client, COLLECTION_NAME)
     with _write_lock():
-        client = _client()
-        _load_collection(client, COLLECTION_NAME)
         _build_plan(client)
         removed = 0
         skipped: list[dict[str, Any]] = []

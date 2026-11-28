@@ -829,6 +829,58 @@ def test_discard_created_library_handles_directory_db(tmp_path):
     print("✓ 目录形态的 milvus_lite.db 被正确清理")
 
 
+def test_abort_cleans_resumed_discard_pending_library(monkeypatch):
+    """续跑上次待清理目录时中止：不得留下无标记空库（会永久遮蔽 legacy 库）。"""
+    module = _load_init_module()
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            self.initialized = False
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _prepare_dirs(module, tmp)
+        target = Path(tmp) / "skill" / "data" / "rag_knowledge"
+        target.mkdir(parents=True)
+        (target / "milvus_lite.db").mkdir()
+        (target / ".discard-pending").write_text("discard-pending", encoding="utf-8")
+        monkeypatch.setattr(module, "create_chat_model", lambda: None)
+        monkeypatch.setattr(module, "RAGKnowledgeAgent", FakeAgent)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = module.main()
+        assert code == 1
+        leftover_empty = (target / "milvus_lite.db").exists() and not (
+            target / ".discard-pending"
+        ).exists()
+        assert not leftover_empty, (
+            "中止后不得留下无标记的空库：下次启动会把它当作已初始化来源"
+        )
+    print("✓ 续跑待清理目录时中止同样清理 / 重新标记")
+
+
+def test_symbol_only_document_hard_split_not_dropped():
+    """纯符号 / emoji 文档按 400 字硬切入库，不能被静默当作 0 片。"""
+    module = _load_init_module()
+    with tempfile.TemporaryDirectory() as tmp:
+        documents = Path(tmp)
+        (documents / "01_normal.txt").write_text("正常中文内容。", encoding="utf-8")
+        (documents / "02_symbols.txt").write_text("😀🎉" * 100, encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            docs, failures = module.load_documents_from_directory(str(documents))
+        assert failures == [], failures
+        symbol_docs = [
+            doc
+            for doc in docs
+            if doc["metadata"].get("parent_doc") == "02_symbols.txt"
+        ]
+        assert symbol_docs, "纯符号文档不应被静默丢弃"
+        assert all(len(doc["content"]) <= 400 for doc in symbol_docs)
+        assert all(doc["content"].strip() for doc in symbol_docs)
+        assert "02_symbols.txt -> 0 chunks" not in out.getvalue()
+    print("✓ 纯符号 / emoji 文档按上限硬切而非静默丢弃")
+
+
 def test_missing_documents_override_returns_1(monkeypatch):
     """--documents 指向不存在的目录：在触碰知识库之前退出 1 并给出提示。"""
     module = _load_init_module()
@@ -1290,6 +1342,12 @@ if __name__ == "__main__":
     test_aligo_source_root_guard_skips_foreign_skill_trees(
         Path(tempfile.mkdtemp(prefix="chailv_skill_guard_"))
     )
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_abort_cleans_resumed_discard_pending_library(_mp)
+    finally:
+        _mp.undo()
+    test_symbol_only_document_hard_split_not_dropped()
     if _DIRECT_RUN_SKIP:
         print(f"直跑未纳入 {len(_DIRECT_RUN_SKIP)} 个用例（需 pytest 专用夹具或真实服务）")
     print("\n全部通过")

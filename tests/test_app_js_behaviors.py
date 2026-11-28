@@ -76,7 +76,13 @@ def test_knowledge_preview_locates_hits_in_original_text():
     assert results["meta_error"] is None, results["meta_error"]
     assert results["uppercase"]["contains"], "大小写不敏感匹配仍要生效"
     assert results["plain"]["contains"], results["plain"]
-    print("✓ 知识库预览原文定位（İ / emoji / 元字符）")
+    assert results["whitespace"]["contains"], (
+        "服务端折叠空白命中后，双空格查询的预览必须定位到关键词"
+    )
+    assert results["tabbed"]["contains"], (
+        "正文用 Tab 分隔时，单空格查询同样要定位到关键词"
+    )
+    print("✓ 知识库预览原文定位（İ / emoji / 元字符 / 空白折叠）")
 
 
 def test_frontend_render_helpers():
@@ -109,6 +115,9 @@ def test_frontend_render_helpers():
     assert results["highlight_plain"] == "no match here", "无命中时返回转义原文"
     assert results["highlight_meta"] == "<mark>a+b</mark> (x)", (
         "正则元字符按字面匹配，不能被当成模式"
+    )
+    assert results["highlight_whitespace"] == "<mark>住宿 标准</mark>说明", (
+        "双空格查询按空白拆分匹配正文（与服务端折叠口径一致）"
     )
 
     fence = results["fence_info"]

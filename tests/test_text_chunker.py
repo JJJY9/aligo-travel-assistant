@@ -272,6 +272,29 @@ def test_punctuation_only_chunks_dropped():
     print("✓ 纯标点分片被丢弃")
 
 
+def test_letter_and_circled_lists_are_body_not_title():
+    """字母 / 圈号短清单是正文：不能当标题块挂起到下一章节。"""
+    from utils.text_chunker import _is_title_block, split_text
+
+    assert not _is_title_block(
+        "a) 提前7天预订\nb) 选择协议航司\nc) 起飞前一天值机"
+    )
+    assert not _is_title_block("① 先值机\n② 再安检")
+    # 完整文档形态：短清单夹在两个章节之间，不能与下一章节粘成混主题块
+    body = "机票预订正文说明。" * 50
+    text = (
+        f"一、机票预订\n{body}\n\n"
+        "a) 提前7天预订\nb) 选择协议航司\nc) 起飞前一天值机\n\n"
+        "二、酒店预订\n酒店预订正文说明。"
+    )
+    chunks = split_text(text)
+    for chunk in chunks:
+        assert not (
+            "a) 提前7天预订" in chunk and "二、酒店预订" in chunk
+        ), chunk
+    print("✓ 字母 / 圈号短清单按正文切分，不与下一章节混块")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -294,6 +317,7 @@ if __name__ == "__main__":
     test_numbered_list_block_is_body_not_title()
     test_table_rows_are_body_not_title()
     test_punctuation_only_chunks_dropped()
+    test_letter_and_circled_lists_are_body_not_title()
     test_whitespace_only_chunks_dropped()
     test_merge_edge_branches()
     test_repo_documents_do_not_mix_sections()

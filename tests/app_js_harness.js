@@ -360,6 +360,15 @@ function scenarioPreview(source) {
   }
   const upper = run("Some NEEDLE here", "needle");
   const plain = run("前文 ".repeat(80) + "目标关键词" + "后文 ".repeat(80), "目标关键词");
+  // 服务端把查询与正文空白折叠后匹配：面板预览必须同样命中（双空格 / Tab）
+  const whitespace = run(
+    "前文 ".repeat(80) + "住宿 标准" + " 后文".repeat(80),
+    "住宿  标准"
+  );
+  const tabbed = run(
+    "前文 ".repeat(80) + "住宿\t标准说明" + " 后文".repeat(80),
+    "住宿 标准"
+  );
   return {
     dotted: { text: dotted, contains: dotted.includes("needle") },
     emoji: {
@@ -369,6 +378,8 @@ function scenarioPreview(source) {
     meta_error: metaError,
     uppercase: { text: upper, contains: upper.includes("NEEDLE") },
     plain: { contains: plain.includes("目标关键词") },
+    whitespace: { contains: whitespace.includes("住宿 标准") },
+    tabbed: { contains: tabbed.includes("住宿\t标准") },
   };
 }
 
@@ -383,6 +394,11 @@ function scenarioRender(source) {
     agent_display_unknown: invoke("agentDisplayName", "custom_agent"),
     highlight_plain: invoke("highlightSnippet", "no match here", "istanbul"),
     highlight_meta: invoke("highlightSnippet", "a+b (x)", "a+b"),
+    highlight_whitespace: invoke(
+      "highlightSnippet",
+      "住宿 标准说明",
+      "住宿  标准"
+    ),
     fence_info: invoke(
       "renderMarkdown",
       '```js title="a"\nconst x = "<>";\n```'

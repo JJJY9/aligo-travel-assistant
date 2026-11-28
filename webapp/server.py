@@ -1271,15 +1271,18 @@ class KnowledgeUpdatePayload(KnowledgeDocumentPayload):
     # 文档大小上限 20000 字（分片长度之和）；回填的拼接文本含分片间分隔符，
     # 上限略高（JOINED_MAX_CHARS），面板按 size 字段判断是否可编辑
     content: str = Field(min_length=1, max_length=JOINED_MAX_CHARS)
+    # 更新不在这里限键数：历史遗留的 >10 用户键记录（#553 之前旧 CLI 可
+    # 写出）必须能原样保存 / 编辑，否则面板永久 422。键数由
+    # knowledge_admin 按「库内已有键集合」判断：保留旧键放行、新增键超限
+    # 仍拒绝；新增接口（POST）保持严格的 10 键上限
+    metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] | None = None
     # 乐观并发：面板进入编辑时载入的正文 / 分片快照。服务端写锁内比对，
     # 不一致返回 409——并发编辑不会静默覆盖对方修改或删掉未见过的分片
     expect: str | None = Field(default=None, max_length=JOINED_MAX_CHARS)
     expect_parts: int | None = Field(default=None, ge=1, le=100000)
     expect_group: str | None = Field(default=None, max_length=200)
     # 元数据轴的乐观并发快照：另一会话只改分类 / 标题时同样返回 409
-    expect_metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] | None = Field(
-        default=None, max_length=10
-    )
+    expect_metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] | None = None
 
     @field_validator("metadata", "expect_metadata", mode="before")
     @classmethod
@@ -4083,6 +4086,26 @@ def _json_safe_value(value: Any) -> Any:
     return sanitize_json(value)
 
 
+def _estimated_export_bytes(
+    documents: list[dict[str, Any]], *, indent: int | None = None
+) -> int:
+    """逐条估算文档序列化后的 UTF-8 字节量（不物化整份大对象）。
+
+    ``len(json.dumps(...))`` 是字符数，中文内容按 UTF-8 会放大 2-3 倍：
+    与字节上限比较时必须先 ``encode("utf-8")``（知识导出曾据此放行面板
+    拒绝回导的超限文件）。``indent`` 给定时按该缩进逐条序列化，并补上
+    外层列表 / 对象带来的逐行缩进偏移，避免低估导出格式的膨胀。
+    """
+    total = 0
+    for document in documents:
+        serialized = json.dumps(document, ensure_ascii=False, indent=indent)
+        total += len(serialized.encode("utf-8"))
+        if indent:
+            # 外层 payload 缩进 2、列表项缩进 4：每行再多 4 个空格
+            total += 4 * (serialized.count("\n") + 1)
+    return total
+
+
 def _aware_timestamp_text(value: Any) -> Any:
     """把存储时间戳归一为带偏移的 ISO 文本。
 
@@ -5832,6 +5855,18 @@ def create_app(model: Any = None) -> FastAPI:
                     f"脚本重建：{knowledge_init_command()}"
                 ),
             }
+        if status.get("available") and int(status.get("documents") or 0) <= 0:
+            # 空集合能 load、检索却必然全空：芯片与 CLI kb / doctor 同口径
+            # 按不可用展示，避免「健康徽标 + 问答全空」；面板仍可写入第一条
+            status = {
+                **status,
+                "available": False,
+                "reason": (
+                    "知识集合为空，请运行初始化脚本写入内置知识："
+                    f"{knowledge_init_command()}"
+                ),
+                "empty": True,
+            }
         return status
 
     @app.get("/api/knowledge/documents", dependencies=[Depends(_cross_site_side_effect)])
@@ -5942,6 +5977,16 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=503,
                     detail=f"知识库不可用：{status.get('reason', '未知原因')}",
+                )
+            if int(status.get("documents") or 0) <= 0:
+                # 空集合跑 30 题必然 0%：白加载嵌入模型还会给出误导性的
+                # 「评测结果」，直接按状态不可用拒绝
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "知识集合为空，无法评测；请运行初始化脚本写入内置"
+                        f"知识：{knowledge_init_command()}"
+                    ),
                 )
             if status.get("dimension_mismatch"):
                 # 维度不一致时构造 Agent 必然失败：直接给出可执行的 503，
@@ -6196,6 +6241,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise _knowledge_unavailable("更新失败", exc) from exc
 
     @app.get("/api/knowledge/documents/{doc_id}/group", dependencies=[Depends(_cross_site_side_effect)])
+    @_kb_read_guard
     def knowledge_document_group(
         request: Request, response: Response, doc_id: int = ApiPath(..., ge=1, le=2**63 - 1)
     ) -> dict[str, Any]:
@@ -6274,10 +6320,7 @@ def create_app(model: Any = None) -> FastAPI:
         # 也无法经 /api/knowledge/import 或备份恢复导回）直接 413。
         from utils.user_import import MAX_BACKUP_BYTES
 
-        estimated_bytes = sum(
-            len(json.dumps(document, ensure_ascii=False))
-            for document in documents
-        )
+        estimated_bytes = _estimated_export_bytes(documents, indent=2)
         if estimated_bytes > MAX_BACKUP_BYTES:
             raise HTTPException(
                 status_code=413,
@@ -8853,9 +8896,8 @@ def create_app(model: Any = None) -> FastAPI:
             # 直接走下面「省略知识段」的同一下游分支
             from utils.user_import import MAX_BACKUP_BYTES
 
-            estimated_knowledge = sum(
-                len(json.dumps(document, ensure_ascii=False))
-                for document in backup["knowledge"]
+            estimated_knowledge = _estimated_export_bytes(
+                backup["knowledge"]
             )
             if estimated_knowledge > MAX_BACKUP_BYTES:
                 backup = {

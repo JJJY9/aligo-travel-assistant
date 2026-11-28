@@ -101,9 +101,16 @@ _COLLECTION_INIT_LOCK = threading.Lock()
 # 版本号：技能脚本可能以不同模块名被加载多次，各副本缓存互不可见，
 # 写入方 bump utils 里的进程级版本号即可让所有副本一起过期。
 _BM25_CACHE: dict[tuple[str, str], tuple[float, BM25Index, int]] = {}
-_BM25_FAILED_AT: dict[tuple[str, str], tuple[float, int]] = {}
+# 值：(失败时刻, 缓存版本, 退避秒数)。瞬时构建失败按 bm25_ttl_sec 退避；
+# 片段数超过 bm25_max_docs 是确定性失败，退避更长，避免每分钟在聊天线程
+# 里持读锁重扫整个上限（写操作 bump 版本号仍会让标记立即失效）
+_BM25_FAILED_AT: dict[tuple[str, str], tuple[float, int, float]] = {}
 _BM25_CACHE_LOCK = threading.Lock()
 _BM25_KEY_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+
+
+class _Bm25OverLimitError(RuntimeError):
+    """片段数超过 BM25 扫描上限：确定性失败，短期重试没有恢复价值。"""
 
 
 def _bm25_key_lock(key: tuple[str, str]) -> threading.Lock:
@@ -777,8 +784,12 @@ class RAGKnowledgeAgent(AgentBase):
 
             max_docs = int(RAG_CONFIG.get("bm25_max_docs", 20000) or 20000)
             ttl = max(0, int(RAG_CONFIG.get("bm25_ttl_sec", 60) or 0))
+            over_limit_ttl = max(
+                ttl,
+                int(RAG_CONFIG.get("bm25_over_limit_ttl_sec", 600) or 600),
+            )
         except Exception:  # noqa: BLE001 - 配置异常按默认值
-            max_docs, ttl = 20000, 60
+            max_docs, ttl, over_limit_ttl = 20000, 60, 600
 
         key = (str(self.knowledge_base_path), self.collection_name)
         now = time.monotonic()
@@ -793,8 +804,9 @@ class RAGKnowledgeAgent(AgentBase):
         ):
             return cached[1]
         # 退避标记记录当时的缓存版本：知识写入 / 修正后的新版本立即重试，
-        # 一次瞬时构建失败不再让聊天链路在 TTL 内一直退回纯向量
-        if failed and failed[1] == epoch and (now - failed[0]) <= ttl:
+        # 一次瞬时构建失败不再让聊天链路在 TTL 内一直退回纯向量；
+        # 超限等确定性失败使用更长的退避（见 _Bm25OverLimitError）
+        if failed and failed[1] == epoch and (now - failed[0]) <= failed[2]:
             return None
 
         with _bm25_key_lock(key):
@@ -811,7 +823,7 @@ class RAGKnowledgeAgent(AgentBase):
                 and (now - cached[0]) <= ttl
             ):
                 return cached[1]
-            if failed and failed[1] == epoch and (now - failed[0]) <= ttl:
+            if failed and failed[1] == epoch and (now - failed[0]) <= failed[2]:
                 return None
             # 全量扫描必须与整组替换 / 导入的写锁互斥：query_iterator 没有
             # 快照隔离，多步写入窗口内会同时读到同组的新旧两版分片。锁只
@@ -835,9 +847,16 @@ class RAGKnowledgeAgent(AgentBase):
                 if busy_types and isinstance(exc, busy_types):
                     logger.info("知识库正在写入，本次混合检索退回纯向量")
                     return None
-                logger.warning("BM25 索引构建失败，检索退回纯向量: %s", exc)
+                if isinstance(exc, _Bm25OverLimitError):
+                    # 超限是确定性失败：只有删除片段 / bump 版本号才会恢复，
+                    # 短 TTL 重试纯属每分钟重扫上限，退避拉长（有上限）
+                    logger.info("%s", exc)
+                    retry_after = over_limit_ttl
+                else:
+                    logger.warning("BM25 索引构建失败，检索退回纯向量: %s", exc)
+                    retry_after = ttl
                 with _BM25_CACHE_LOCK:
-                    _BM25_FAILED_AT[key] = (now, epoch)
+                    _BM25_FAILED_AT[key] = (now, epoch, retry_after)
                 return None
             # 扫描期间若发生知识写入 / 删除（版本号已变），这份快照可能
             # 读到整组替换的中间态：只服务本次请求，不能写入缓存覆盖新
@@ -879,7 +898,7 @@ class RAGKnowledgeAgent(AgentBase):
                     for row in batch
                 )
                 if len(rows) > max_docs:
-                    raise RuntimeError(
+                    raise _Bm25OverLimitError(
                         f"知识库片段数超过 BM25 上限 {max_docs}，"
                         "本次检索退回纯向量"
                     )
@@ -909,6 +928,10 @@ class RAGKnowledgeAgent(AgentBase):
                     for doc in docs
                     if float(doc.get("distance") or 0.0) >= min_distance
                 ]
+            # 回退路径同样执行可选精排：RAG_RERANK_MODEL 的语义是「对候选
+            # 精排」，与混合检索是否可用无关；只给已过门槛的候选排序，
+            # 不会把低于阈值的片段拉回结果
+            docs = self._rerank_documents(query, docs)
             return docs[:top_k]
 
         enabled, candidates = self._hybrid_settings()
