@@ -5190,10 +5190,13 @@ def test_preference_error_payload_is_redacted():
 
     class _Model:
         async def __call__(self, messages, **kwargs):
+            # 注意：不能带 authentication / invalid api key 等永久故障标记，
+            # 否则会按上游故障上抛（由 test_skill_agents_reject_provider_error_body
+            # 覆盖）；本用例验证的是「被吞成错误 JSON 时也要脱敏」
             raise ValueError(
                 r"失败 C:\Users\alice\secret\db.sqlite "
                 "https://gw.internal/v1?key=SECRET123 "
-                "Incorrect API key provided: sk-abcdefghijklmnop"
+                "gateway rejected: sk-abcdefghijklmnop"
             )
 
     agent = agent_class(
@@ -5387,6 +5390,37 @@ def test_rag_init_error_uses_install_mode_command(monkeypatch, tmp_path):
     )
     assert agent.init_error.endswith("init_knowledge_base.py"), agent.init_error
     print("✓ RAG 未初始化提示按安装形态给出可执行命令")
+
+
+def test_skill_agents_reject_provider_error_body():
+    """计划 / 事项收集 / 偏好技能同样识别 200 + 错误体并上抛分类。
+
+    这三处此前直接解析模型输出：错误体会被降级成「缺少结果」的普通失败，
+    401 / 配额等永久故障既不上抛也不计入熔断。
+    """
+    from utils.llm_resilience import ProviderResponseError
+
+    class ErrorModel:
+        async def __call__(self, messages, **kwargs):
+            class _Resp:
+                text = '{"error": {"code": 503, "message": "gateway timeout"}}'
+
+            return _Resp()
+
+    cases = (
+        ("plan-trip", "ItineraryPlanningAgent"),
+        ("event-collection", "EventCollectionAgent"),
+        ("preference", "PreferenceAgent"),
+    )
+    for skill, class_name in cases:
+        agent = _load_skill(skill, class_name)(model=ErrorModel())
+        with pytest.raises(ProviderResponseError):
+            asyncio.run(
+                agent.reply(
+                    Msg(name="Orchestrator", content="{}", role="user")
+                )
+            )
+    print("✓ 计划 / 事项收集 / 偏好技能识别 200 + 错误体")
 
 
 if __name__ == "__main__":

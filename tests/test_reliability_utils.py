@@ -1062,6 +1062,133 @@ def test_retry_budget_exhaustion_not_counted_against_circuit():
     print("✓ 预算耗尽不计入熔断并返回用户文案")
 
 
+def test_provider_error_envelope_variants_and_code_mapping():
+    """兼容错误信封与字符串错误码：分类不再滑成确定性失败。"""
+    from utils.llm_resilience import (
+        ProviderResponseError,
+        is_permanent_llm_error,
+        is_retriable_error,
+        provider_error_from_completion_text,
+    )
+
+    top = provider_error_from_completion_text(
+        '{"code": 503, "message": "gateway timeout"}'
+    )
+    assert isinstance(top, ProviderResponseError) and top.status_code == 503
+    assert is_retriable_error(top) is True
+
+    status_top = provider_error_from_completion_text(
+        '{"status": "error", "code": 401, "message": "invalid api key"}'
+    )
+    assert status_top is not None and status_top.status_code == 401
+    assert is_permanent_llm_error(status_top) is True
+
+    success_false = provider_error_from_completion_text(
+        '{"success": false, "code": 500, "message": "boom"}'
+    )
+    assert success_false is not None and success_false.status_code == 500
+
+    # 结构化错误码只有字符串形态（OpenAI 规范 / 网关归一）：必须映射状态码
+    code_name = provider_error_from_completion_text(
+        '{"error": {"code": "insufficient_quota", "message": "quota"}}'
+    )
+    assert code_name is not None and code_name.status_code == 402
+    assert is_retriable_error(code_name) is False
+    assert is_permanent_llm_error(code_name) is True
+
+    type_name = provider_error_from_completion_text(
+        '{"error": {"type": "server_error", "message": "server had an error"}}'
+    )
+    assert type_name is not None and type_name.status_code == 500
+    assert is_retriable_error(type_name) is True
+
+    # 状态码推断不出时，永久标记同样生效（此前 status is None 直接放弃）
+    message_only = provider_error_from_completion_text(
+        '{"error": {"message": "Incorrect API key provided"}}'
+    )
+    assert message_only is not None and message_only.status_code is None
+    assert is_permanent_llm_error(message_only) is True
+
+    # 正常数据对象不能误伤：回答字段 / 非法键集
+    assert (
+        provider_error_from_completion_text(
+            '{"code": 200, "message": "ok", "answer": "正常"}'
+        )
+        is None
+    )
+    assert (
+        provider_error_from_completion_text(
+            '{"code": 503, "message": "x", "items": [1]}'
+        )
+        is None
+    )
+    print("✓ 兼容错误信封与字符串错误码分类")
+
+
+def test_health_check_rejects_provider_error_body(monkeypatch):
+    """网关 200 + 错误体：健康检查必须判失败，且消息不含完整密钥。"""
+    class ErrorBodyReply:
+        content = [
+            {
+                "type": "text",
+                "text": '{"error": {"code": 401, "message": '
+                '"Incorrect API key provided: sk-live0123456789abcdef"}}',
+            }
+        ]
+
+    class FakeModel:
+        async def __call__(self, messages):
+            return ErrorBodyReply()
+
+    fake_module = types.ModuleType("config_agentscope")
+    fake_module.create_chat_model = lambda **kwargs: FakeModel()  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "config_agentscope", fake_module)
+
+    ok, message = asyncio.run(run_health_check("http://example", "key", "model"))
+    assert ok is False
+    assert "模型服务返回错误" in message
+    assert "sk-live0123456789abcdef" not in message
+    print("✓ 健康检查识别 200 + 错误体并脱敏")
+
+
+def test_retry_budget_too_short_for_backoff_fails_fast(monkeypatch):
+    """剩余预算不足一次退避：立即失败，不再先睡到截止时刻。"""
+    import utils.llm_resilience as lr
+
+    times = {"now": 100.0}
+    monkeypatch.setattr(
+        lr,
+        "time",
+        types.SimpleNamespace(monotonic=lambda: times["now"]),
+    )
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(lr.asyncio, "sleep", fake_sleep)
+    calls = {"n": 0}
+
+    async def factory():
+        calls["n"] += 1
+        raise ConnectionError("upstream down")
+
+    async def scenario():
+        with pytest.raises(ConnectionError):
+            await retry_with_backoff(
+                factory,
+                max_retries=3,
+                base_delay_sec=10.0,
+                jitter=False,
+                deadline_monotonic=104.0,
+            )
+
+    asyncio.run(scenario())
+    assert calls["n"] == 1, "预算不足一次退避时不应再发起尝试"
+    assert sleeps == [], "不应先睡到截止时刻"
+    print("✓ 剩余预算不足一次退避时立即失败")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -1220,4 +1347,15 @@ if __name__ == "__main__":
         _mp.undo()
     test_retry_budget_exhausted_uses_dedicated_marker()
     test_retry_budget_exhaustion_not_counted_against_circuit()
+    test_provider_error_envelope_variants_and_code_mapping()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_health_check_rejects_provider_error_body(_mp)
+    finally:
+        _mp.undo()
+    _mp = pytest.MonkeyPatch()
+    try:
+        test_retry_budget_too_short_for_backoff_fails_fast(_mp)
+    finally:
+        _mp.undo()
     print("\n全部通过")

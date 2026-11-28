@@ -120,6 +120,50 @@ def test_load_failure_is_remembered_with_cooldown(monkeypatch):
     print("✓ 加载失败在冷却窗口内快速失败")
 
 
+def test_loading_wait_is_bounded(monkeypatch):
+    """首次加载期间的第二调用方有界等待：超时抛「加载中」，不写失败冷却。"""
+    import threading
+    import time
+
+    embedding_model.reset_embedding_models()
+    monkeypatch.setattr(embedding_model, "_LOAD_WAIT_SEC", 0.05)
+    release = threading.Event()
+    started = threading.Event()
+
+    class Slow:
+        def __init__(self, key):
+            started.set()
+            release.wait(3.0)
+
+    fake_module = types.ModuleType("sentence_transformers")
+    fake_module.SentenceTransformer = Slow  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_module)
+    loaded: dict[str, object] = {}
+
+    def loader():
+        loaded["model"] = embedding_model.get_embedding_model("slow/model")
+
+    thread = threading.Thread(target=loader)
+    thread.start()
+    try:
+        assert started.wait(1.0), "加载线程应开始构造模型"
+        start = time.monotonic()
+        with pytest.raises(embedding_model.EmbeddingLoadingError) as excinfo:
+            embedding_model.get_embedding_model("slow/model")
+        elapsed = time.monotonic() - start
+        assert elapsed < 1.0, f"有界等待未生效：{elapsed:.2f}s"
+        assert "正在加载" in str(excinfo.value)
+        assert "slow/model" not in embedding_model._FAILURES, (
+            "加载中不是失败，不能写冷却"
+        )
+    finally:
+        release.set()
+        thread.join(3.0)
+        embedding_model.reset_embedding_models()
+    assert loaded.get("model") is not None
+    print("✓ 并发首载有界等待（超时按「加载中」快速失败）")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -139,4 +183,9 @@ if __name__ == "__main__":
         test_load_failure_is_remembered_with_cooldown(mp2)
     finally:
         mp2.undo()
+    mp3 = pytest.MonkeyPatch()
+    try:
+        test_loading_wait_is_bounded(mp3)
+    finally:
+        mp3.undo()
     print("\n全部通过")

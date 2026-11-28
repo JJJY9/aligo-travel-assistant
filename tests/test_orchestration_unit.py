@@ -140,6 +140,63 @@ def test_priority_parallel_and_sequential():
     print("✓ 同优先级并行、不同优先级串行")
 
 
+def test_turn_budget_stops_next_batch(monkeypatch):
+    """整轮预算耗尽后不再发起后续批次：第一个已成功、第二个零调用。"""
+    import agents.orchestration_agent as oa
+    from utils.llm_resilience import RetryBudgetExhausted
+
+    times = {"now": 100.0}
+    monkeypatch.setattr(oa.time, "monotonic", lambda: times["now"])
+
+    class First(_StubAgent):
+        async def reply(self, x):
+            self.calls += 1
+            # 批次 1 执行期间把时钟推过截止时刻
+            times["now"] = 200.0
+            return Msg(name=self.name, content="{}", role="assistant")
+
+    first = First("a")
+    second = First("b")
+    orchestrator = OrchestrationAgent(
+        agent_registry={"a": first, "b": second}
+    )
+    schedule = [
+        {"agent_name": "a", "priority": 1},
+        {"agent_name": "b", "priority": 2},
+    ]
+    with pytest.raises(RetryBudgetExhausted):
+        asyncio.run(
+            orchestrator.reply(_intent(schedule), retry_deadline=150.0)
+        )
+    assert first.calls == 1
+    assert second.calls == 0, "预算耗尽后不得再发起新批次"
+    print("✓ 整轮预算耗尽后停止后续编排批次")
+
+
+def test_run_agent_retry_respects_turn_deadline(monkeypatch):
+    """逐智能体重试同样受整轮预算约束：截止后不再发起第 2 次调用。"""
+    import agents.orchestration_agent as oa
+
+    times = {"now": 99.0}
+    monkeypatch.setattr(oa.time, "monotonic", lambda: times["now"])
+
+    class Flaky(_StubAgent):
+        async def reply(self, x):
+            self.calls += 1
+            times["now"] = 101.0  # 首次尝试已越过截止时刻
+            raise ConnectionError("upstream down")
+
+    flaky = Flaky("a")
+    orchestrator = OrchestrationAgent(agent_registry={"a": flaky})
+    schedule = [{"agent_name": "a", "priority": 1}]
+    with pytest.raises(ConnectionError):
+        asyncio.run(
+            orchestrator.reply(_intent(schedule), retry_deadline=100.0)
+        )
+    assert flaky.calls == 1, "预算耗尽后不应再发起逐智能体重试"
+    print("✓ 逐智能体重试受整轮预算约束")
+
+
 def test_checkpoint_reuses_successful_agents_across_instances(tmp_path):
     """持久化检查点：重启后的新编排器复用已成功智能体，只重跑失败者。"""
     from utils.execution_checkpoint import CheckpointStore

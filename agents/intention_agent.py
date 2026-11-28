@@ -157,7 +157,27 @@ _PERMANENT_ERROR_MARKERS = (
     ("insufficient_quota", 402),
     ("insufficient quota", 402),
     ("billing_hard_limit_reached", 402),
+    # OpenAI 规范配额错误 message（网关归一成只有 message 的 200 错误体时，
+    # 上面三个 marker 都命中不了；与 utils/llm_resilience 保持对齐）
+    ("exceeded your current quota", 402),
+    ("exceeded your quota", 402),
+    ("check your plan and billing details", 402),
     ("model_not_found", 404),
+)
+
+# 错误文本里的瞬时故障标记：不映射成 5xx/429 时 is_retriable_error 只按
+# timeout / rate limit 字样判断，多数 200 错误体的瞬时文案会被判成确定性
+# 失败、静默降级为默认 information_query
+_TRANSIENT_ERROR_MARKERS = (
+    ("the server had an error", 500),
+    ("server had an error", 500),
+    ("internal server error", 500),
+    ("overloaded", 503),
+    ("service temporarily unavailable", 503),
+    ("service unavailable", 503),
+    ("temporarily unavailable", 503),
+    ("rate limit", 429),
+    ("too many requests", 429),
 )
 
 
@@ -166,10 +186,14 @@ def _status_from_error_text(text: str) -> int | None:
 
     网关常见的 200 + ``{"error": "Incorrect API key provided..."}`` / 纯文本
     错误体没有结构化字段：映射为 401/402/403/404 后熔断器才能按永久故障
-    记账；否则会被判成确定性失败、静默降级为默认意图。
+    记账；瞬时文案映射成 5xx/429，才能走重试而不是被静默降级。只作用于
+    错误体文本（调用方已确认这是错误信封），不会误伤正常回答。
     """
     lowered = text.lower()
     for marker, code in _PERMANENT_ERROR_MARKERS:
+        if marker in lowered:
+            return code
+    for marker, code in _TRANSIENT_ERROR_MARKERS:
         if marker in lowered:
             return code
     return None
@@ -192,6 +216,36 @@ def _error_status_code(raw_code: Any, provider_error: dict) -> int | None:
                 return _PERMANENT_ERROR_CODES[text]
             if text in _TRANSIENT_ERROR_CODES:
                 return _TRANSIENT_ERROR_CODES[text]
+    return None
+
+
+def _error_envelope_payload(data: dict[str, Any]) -> Any:
+    """识别 200 响应里的错误信封；非错误信封返回 None。
+
+    除顶层 ``error`` 为真（既有形态）外，兼容网关归一成
+    ``{"status": "error", "code": 401, "message": …}`` /
+    ``{"success": false, "code": …}`` / ``{"code": 503, "message": …}``
+    的错误信封——只认 ``error`` 键时这些形态会滑进 JSON 解析失败分支、
+    被静默降级成默认 information_query。带 ``agent_schedule`` 的对象
+    永远是正常结果，不判错误。
+    """
+    if "agent_schedule" in data:
+        return None
+    error = data.get("error")
+    if error:
+        return error
+    if not any(key in data for key in ("code", "message", "msg")):
+        return None
+    status_text = str(data.get("status") or "").strip().lower()
+    if status_text in {"error", "failed", "fail"}:
+        return data
+    if data.get("success") is False:
+        return data
+    code = _error_status_code(data.get("code"), data)
+    if code is not None and 400 <= code < 600 and (
+        "message" in data or "msg" in data
+    ):
+        return data
     return None
 
 
@@ -645,23 +699,31 @@ class IntentionAgent(AgentBase):
             # 解析JSON（拒绝 NaN / Infinity；顶层必须是对象）
             try:
                 result = json.loads(text, parse_constant=reject_json_constant)
-                if (
-                    isinstance(result, dict)
-                    and "agent_schedule" not in result
-                    and "error" in result
-                ):
-                    # 网关 200 + 错误体（限流 / 鉴权失败等）：状态码交给
-                    # 熔断器分类（429/5xx 重试、4xx 记为永久故障）
-                    provider_error = result.get("error")
+                # 网关 200 + 错误体（限流 / 鉴权失败等）：状态码交给熔断器
+                # 分类（429/5xx 重试、4xx 记为永久故障）。除顶层 error 外，
+                # status/success/code 形态的兼容错误信封同样识别，不能再
+                # 滑进「缺 agent_schedule」被降级成默认意图
+                provider_error = (
+                    _error_envelope_payload(result)
+                    if isinstance(result, dict)
+                    else None
+                )
+                if provider_error is not None:
                     code: int | None = None
                     if isinstance(provider_error, dict):
                         raw_code = provider_error.get("code") or provider_error.get(
                             "status"
                         )
                         code = _error_status_code(raw_code, provider_error)
-                    if code is None:
-                        # 没有结构化 code / status（纯字符串错误体或只有
-                        # message 的 dict）：按错误文本识别永久故障
+                        if code is None:
+                            detail = (
+                                provider_error.get("message")
+                                or provider_error.get("msg")
+                                or str(provider_error)
+                            )
+                            code = _status_from_error_text(str(detail))
+                    else:
+                        # 纯字符串错误体：按错误文本识别永久 / 瞬时故障
                         code = _status_from_error_text(str(provider_error))
                     raise _ProviderError(
                         f"模型服务返回错误：{str(provider_error)[:200]}", code

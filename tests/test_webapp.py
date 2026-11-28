@@ -11677,6 +11677,11 @@ def test_breaker_open_does_not_consume_rate_limit():
                 },
             )
             assert response.status_code == 503, (path, response.text[:200])
+            # 熔断拒绝带退避提示：与用户锁 / 预算耗尽等瞬时 503 同口径
+            assert response.headers.get("Retry-After") == "5", (
+                path,
+                dict(response.headers),
+            )
         remaining, _ = state.rate_limiter.status(f"testclient:{user_id}")
         assert remaining == 5, f"熔断拒绝消耗了用户桶额度（剩 {remaining}）"
         ip_remaining, _ = state.ip_limiter.status("testclient")
@@ -18815,6 +18820,34 @@ def test_pending_usage_carry_merges_instead_of_overwrite():
         state.close_all()
         _cleanup(user)
     print("✓ 重复结转合并而非覆盖")
+
+
+def test_pending_usage_carry_seeds_live_rebuilt_session():
+    """重建先于结转：活着的同名会话必须直接并入账目，不能只写桶。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.max_sessions = 2
+    user = _unique_user("web_test_pending_live")
+    try:
+        first = state.get_session(user, "s-live")
+        # 模拟「重建方已插入、结转方才开始」：把旧实例移出缓存但不结转
+        with state._sessions_lock:
+            state.sessions.pop(state._session_key(user, "s-live"), None)
+        rebuilt = state.get_session(user, "s-live")
+        assert rebuilt is not first
+        first.runtime.seed_unsettled_usage({"calls": 1, "total_tokens": 7})
+        state._carry_pending_usage(first)
+        assert rebuilt.runtime.take_pending_usage() == {
+            "calls": 1,
+            "total_tokens": 7,
+        }, "活实例必须直接并入结转账目"
+        # 活实例存在时不再写桶（桶只留给下次重建）
+        assert user not in state._pending_usage, state._pending_usage.get(user)
+    finally:
+        first.close()
+        state.close_all()
+        _cleanup(user)
+    print("✓ 结转并入已重建的活会话")
 
 
 def test_weather_executor_threads_are_daemon_and_not_registered():

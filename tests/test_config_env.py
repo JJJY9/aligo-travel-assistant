@@ -622,6 +622,31 @@ def test_oversized_redis_ttl_clamped():
     print("✓ 超大 Redis TTL 钳制到 10 年上限")
 
 
+def test_system_config_only_has_consumed_keys():
+    """SYSTEM_CONFIG 只保留真正被消费的键：死配置会让排障误判已生效。"""
+    script = (
+        "import sys;"
+        f"sys.path.append(r'{project_root}');"
+        "import config;"
+        "print(sorted(config.SYSTEM_CONFIG));"
+        "print(config.RESILIENCE_CONFIG['max_retries'])"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        env=dict(os.environ),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.strip().splitlines()
+    assert lines[-2] == "['timeout']", lines
+    assert lines[-1] == "3", lines
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -651,4 +676,5 @@ if __name__ == "__main__":
     test_oversized_redis_ttl_clamped()
     test_resolved_timeout_rejects_non_finite()
     test_rag_config_env_overrides()
+    test_system_config_only_has_consumed_keys()
     print("\n全部通过")

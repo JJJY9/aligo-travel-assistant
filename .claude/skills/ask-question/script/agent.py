@@ -1493,13 +1493,16 @@ class RAGKnowledgeAgent(AgentBase):
                     if isinstance(answer, str)
                     else json.dumps(answer, ensure_ascii=False)
                 )
+                # 200 + 错误体（网关把上游错误塞进内容）：必须先于信封解包
+                # 判定——带 {"status": "error", "error": …} 的错误体会被解包
+                # 成空串，先撞上「空响应」可重试分支，401 / 配额等永久故障
+                # 被当成瞬时网络故障重试并绕开熔断分类
+                provider_error = provider_error_from_completion_text(answer_text)
+                if provider_error is not None:
+                    raise provider_error
                 answer = unwrap_answer_envelope(answer_text)
                 if not answer.strip():
                     raise ConnectionError("模型服务返回空响应")
-                # 200 + 错误体（网关把上游错误塞进内容）：不能当知识回答
-                provider_error = provider_error_from_completion_text(answer)
-                if provider_error is not None:
-                    raise provider_error
 
             except Exception as e:
                 if is_retriable_error(e) or is_permanent_llm_error(e):
