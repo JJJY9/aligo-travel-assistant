@@ -2,7 +2,7 @@
 # 与 CI 保持一致的 ruff 检查 + 基础文件卫生检查
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.17.3
+    rev: v0.17.5
     hooks:
       - id: ruff-check
   - repo: https://github.com/pre-commit/pre-commit-hooks

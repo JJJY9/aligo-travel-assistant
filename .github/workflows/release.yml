@@ -92,9 +92,17 @@ jobs:
           sdists = list(Path("dist").glob("*.tar.gz"))
           if not wheels or not sdists:
               sys.exit("构建产物缺失（wheel / sdist）")
-          expected = f"aligo_travel_assistant-{tag}-"
-          for path in wheels + sdists:
-              if not path.name.startswith(expected):
+          # wheel 名在版本后还有 ABI/py3-none-any 段（带连字符），sdist 名
+          # 是 <name>-<version>.tar.gz（版本后直接是 .tar.gz，没有连字符）：
+          # 两者不能用同一个带尾随连字符的前缀校验，否则 sdist 必然判不一致、
+          # 任何标签都发布失败
+          wheel_prefix = f"aligo_travel_assistant-{tag}-"
+          sdist_name = f"aligo_travel_assistant-{tag}.tar.gz"
+          for path in wheels:
+              if not path.name.startswith(wheel_prefix):
+                  sys.exit(f"产物 {path.name} 与标签版本 {tag} 不一致")
+          for path in sdists:
+              if path.name != sdist_name:
                   sys.exit(f"产物 {path.name} 与标签版本 {tag} 不一致")
           PY
 
