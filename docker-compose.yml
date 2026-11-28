@@ -7,9 +7,12 @@
 #   python cli.py            # 或 python -m webapp.server
 #
 # 说明：未配置这两个环境变量时，项目仍使用进程内短期记忆 + JSON 文件长期记忆。
-# 健康检查走 127.0.0.1 的 TCP + 账号 + 库名（pg_isready 不校验认证）；Redis
-# 开启 AOF 并挂卷——删除墓碑（TTL 1h）与会话纪元（TTL 24h）的跨实例保护
-# 依赖 Redis 数据在容器重启后仍然存在。
+# 健康检查走 127.0.0.1 的 TCP，只验证「5432 正在监听、服务器接受连接」——pg_isready
+# 不校验账号 / 密码，也不验证 aligo 库是否存在（服务器活着就返回 0）。POSTGRES_*
+# 只在首次 initdb 生效：改过账号 / 库名或复用旧 aligo_pgdata 卷后请 down -v 重建，
+# 否则 --wait 仍会报健康，应用却连不上并静默回退 JSON。Redis 开启 AOF 并挂卷——
+# 删除墓碑（TTL 1h）与会话纪元（TTL 24h）的跨实例保护依赖 Redis 数据在容器重启后
+# 仍然存在。
 services:
   redis:
     image: redis:7-alpine

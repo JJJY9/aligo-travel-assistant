@@ -373,6 +373,7 @@ pip install rich==15.0.0                    # CLI界面
 pip install fastapi==0.162.0 uvicorn==0.54.0  # Web 界面
 pip install tzdata==2026.6                  # Windows / 无系统时区库的容器：ICS 的 TZID 需要
 pip install ddgs==9.16.1                    # 网络搜索
+pip install redis==8.1.0 "psycopg[binary]==3.3.9"  # 生产存储后端（启用 REDIS_URL / DATABASE_URL 前安装）
 ```
 
 也可以直接安装 [Releases](https://github.com/JJJY9/aligo-travel-assistant/releases) 中的 wheel（已包含 Web 静态资源与 `.claude/skills` 技能代码，普通安装时技能位于虚拟环境根目录，`pip install --user` 时位于用户目录）。**注意**：Releases 上最新正式发布仍是 v1.6.0（6 个技能）；下文 v2.0 能力（12 技能、固定 DAG、行程约束校验等）已合入 main、尚未发布新 wheel，需要这些能力时请按上面的方式从源码安装，或从 main 自行构建 wheel：
@@ -421,7 +422,7 @@ $env:LLM_API_KEY="你的API密钥"
 - 网络代理：LLM / 天气 / 嵌入模型等 HTTP 客户端沿用标准 `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY`；网络搜索（ddgs）额外支持 `DDGS_PROXY`（优先于 `HTTPS_PROXY` / `ALL_PROXY`），只设 `ALL_PROXY` 时搜索也会走代理
 - 切换其他服务商（豆包 / OpenAI 等）：覆盖上面两个变量，或修改 `config.py` 中的默认值（文件内有示例）
 - `temperature` / `max_tokens`: 生成参数（0.7 / 8192）
-- 完整环境变量清单见根目录 [`.env.example`](.env.example)（含 Redis / PostgreSQL 与限流配置；项目不会自动加载 `.env`，请自行 export 或使用 `config_local.py`）
+- 主要环境变量清单与默认值见根目录 [`.env.example`](.env.example)（含 Redis / PostgreSQL、限流、RAG 调优、行程校验与数据目录等；项目不会自动加载 `.env`，请自行 export）。`config_local.py` 仅用于提供 `API_KEY`，其余环境变量写入该文件不会生效
 
 ### 3. 初始化知识库
 
@@ -881,7 +882,7 @@ aligo-travel-assistant/
 
 ### 数据存储
 - **默认（开箱即用）**：短期记忆为进程内滑动窗口，长期记忆为 JSON 文件（`data/memory/{user_id}.json`）
-- **生产模式（可选）**：设置 `REDIS_URL` 启用 Redis 短期记忆（List + 滑动窗口 + TTL）；设置 `DATABASE_URL` 启用 PostgreSQL 长期记忆（表结构首次连接自动创建）；未配置或连接失败时自动回退默认实现（失败后 60 秒冷却，不阻塞启动）
+- **生产模式（可选）**：设置 `REDIS_URL` 启用 Redis 短期记忆（List + 滑动窗口 + TTL）；设置 `DATABASE_URL` 启用 PostgreSQL 长期记忆（表结构首次连接自动创建）；未配置或连接失败时自动回退默认实现（失败后 60 秒冷却，不阻塞启动）。`requirements.txt` 已包含 `redis` 与 `psycopg`；按「手动安装核心依赖」的清单安装时也需补装这两项，否则后端会静默回退
 - **本地一键启动依赖**：`docker compose up -d --wait`（见 `docker-compose.yml`；`--wait` 要等 Redis / PostgreSQL 健康检查通过才返回，首次 initdb 未就绪时应用连接会触发 60 秒 JSON 回退、造成数据分叉），然后：
 
   ```bash
@@ -890,7 +891,7 @@ aligo-travel-assistant/
   python cli.py        # 或 python -m webapp.server
   ```
 
-  `docker-compose.yml` 中 Redis 已开启 AOF 并挂载 `aligo_redisdata` 卷：删除墓碑（TTL 1h）、会话纪元（TTL 24h）等跨实例保护在容器重启后仍然有效（`docker compose down -v` 会连同数据一起清空）；Redis **运行中**故障期间的删除仍只记录在进程内，恢复前进程退出则不再执行（见「已知限制」）。
+  `docker-compose.yml` 中 Redis 已开启 AOF 并挂载 `aligo_redisdata` 卷：删除墓碑（TTL 1h）、会话纪元（TTL 24h）等跨实例保护在容器重启后仍然有效（`docker compose down -v` 会连同数据一起清空）；Redis **运行中**故障期间的删除仍只记录在进程内，恢复前进程退出则不再执行（见「已知限制」）。PostgreSQL 的 `POSTGRES_USER/PASSWORD/DB` 只在首次 initdb 生效，且健康检查（`pg_isready`）只验证 TCP 监听与服务器接受连接、**不校验账号 / 密码 / 库是否存在**：修改过这组变量或复用旧 `aligo_pgdata` 卷后，请 `docker compose down -v` 重新初始化，否则应用会连不上并静默回退 JSON（回退期写入恢复后不合并）。
 
 ### 多实例部署（可选）
 

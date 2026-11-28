@@ -129,6 +129,47 @@ def test_readme_wheel_filename_not_stale():
     print("✓ README 不含过期 wheel 文件名")
 
 
+def test_ci_postgres_healthcheck_uses_tcp():
+    ci = _yaml(".github/workflows/ci.yml")
+    options = str(ci["jobs"]["quality"]["services"]["postgres"]["options"])
+    # 与 docker-compose 同口径：不带 -h 的 pg_isready 走 initdb 临时 socket，
+    # 服务真实监听 5432 前就会返回 0；不带 -d 也不校验目标库存在
+    assert "-h 127.0.0.1" in options, options
+    assert "-U aligo" in options and "-d aligo" in options, options
+    print("✓ CI Postgres 健康检查走 TCP + 账号 / 库（与 compose 一致）")
+
+
+def test_ci_wheel_check_runs_outside_checkout():
+    text = _read(".github/workflows/ci.yml")
+    # `python -c` 会把当前目录放进 sys.path[0]：在仓库根执行只会导入
+    # checkout 里的源码，wheel 缺 cli.py / static / 技能时仍然全绿
+    assert 'cd "$(mktemp -d)"' in text, "打包检查必须在仓库外目录导入安装产物"
+    assert "aligo --help" in text, "cli 入口需要在 CI 中执行一次"
+    print("✓ CI 打包检查在仓库外验证安装产物")
+
+
+def test_release_artifact_check_matches_sdist_name():
+    text = _read(".github/workflows/release.yml")
+    # sdist 名是 <name>-<version>.tar.gz（版本后直接 .tar.gz），与 wheel 的
+    # <name>-<version>-py3-none-any.whl 不能共用带尾随连字符的前缀
+    assert 'wheel_prefix = f"aligo_travel_assistant-{tag}-"' in text, text
+    assert 'sdist_name = f"aligo_travel_assistant-{tag}.tar.gz"' in text, text
+    print("✓ Release 产物校验区分 wheel / sdist 文件名")
+
+
+def test_readme_manual_block_covers_storage_backends():
+    readme = _read("README.md")
+    block = re.search(r"或者手动安装核心依赖(.*?)```", readme, re.S)
+    assert block is not None, "README 缺少手动安装核心依赖代码块"
+    assert "redis==8.1.0" in block.group(1), (
+        "手动安装清单缺 redis：启用 REDIS_URL 后会静默回退进程内实现"
+    )
+    assert "psycopg[binary]==3.3.9" in block.group(1), (
+        "手动安装清单缺 psycopg：启用 DATABASE_URL 后会静默回退 JSON"
+    )
+    print("✓ README 手动安装清单覆盖生产存储后端")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry

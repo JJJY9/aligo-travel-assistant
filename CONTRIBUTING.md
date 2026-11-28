@@ -12,7 +12,11 @@
 # 1. 安装运行依赖（含 RAG 重型依赖，首次安装较慢）
 pip install -r requirements.txt
 
-# 2. 配置大模型 API Key（二选一，密钥切勿提交到仓库）
+# 2. 安装检查与测试工具（ruff / mypy / pytest 等在 requirements-ci.txt，
+#    与 requirements.txt 叠加安装；二者重叠包版本一致）
+pip install -r requirements-ci.txt
+
+# 3. 配置大模型 API Key（二选一，密钥切勿提交到仓库）
 #    方式一：在项目根目录创建 config_local.py，内容为：API_KEY = "sk-..."
 #    方式二：设置环境变量 LLM_API_KEY
 ```
@@ -30,7 +34,7 @@ mypy .
 pytest tests/ -q
 ```
 
-如果不想安装 torch / pymilvus 等重型依赖，可以只安装轻量测试依赖（与 CI 环境一致）：
+如果不想安装 torch / pymilvus 等重型依赖，可以只安装轻量测试依赖（与 CI 环境一致）：已装运行依赖时叠加安装即可获得与 CI 相同的 ruff / mypy / pytest：
 
 ```bash
 pip install -r requirements-ci.txt

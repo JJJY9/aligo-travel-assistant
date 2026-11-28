@@ -16,3 +16,6 @@ global-exclude __pycache__ *.pyc
 
 # 测试脚本（脚本式测试，无需打包为包）
 recursive-include tests *.py
+# tests/test_app_js_behaviors.py 以 node 执行该夹具：漏打包会让 sdist
+# 解包后跑 pytest 在装有 node 的机器上确定性失败
+include tests/app_js_harness.js

@@ -523,8 +523,13 @@ def _test_client_host_allowed() -> bool:
     生产默认不信任该 Host：无点单标签名可被搜索后缀 / LLMNR-NBNS / hosts
     条目解析到本机，配合 DNS rebinding 绕过 Host 白名单与同源守卫。
     测试文件在导入时设置 ``ALIGO_TEST_CLIENT=1`` 启用。
+
+    走 ``config._env_bool``：去 BOM / 成对引号，接受 true/yes/on，非法值
+    告警——与 ALIGO_ENABLE_DOCS / TRUST_PROXY_HEADERS 等开关同口径
+    （裸 ``== "1"`` 会让 K8s ConfigMap / docker --env-file 注入的
+    ``"1"`` 静默失效，测试缝悄悄关闭且无提示）。
     """
-    return os.environ.get("ALIGO_TEST_CLIENT", "").strip() == "1"
+    return _env_bool("ALIGO_TEST_CLIENT", False)
 
 
 def _is_allowed_host(host: str) -> bool:

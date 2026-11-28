@@ -48,7 +48,7 @@ jobs:
         ports:
           - 5432:5432
         options: >-
-          --health-cmd "pg_isready -U aligo"
+          --health-cmd "pg_isready -h 127.0.0.1 -U aligo -d aligo"
           --health-interval 5s
           --health-timeout 3s
           --health-retries 20
@@ -91,5 +91,10 @@ jobs:
           # 安装构建产物并验证入口点 / 包内容：--no-deps 因为运行时依赖已由
           # requirements 安装，这一步只验证 wheel 本身可安装、可导入、入口可执行
           python -m pip install --no-deps --force-reinstall dist/*.whl
-          python -c "import webapp.server, cli, utils.paths"
+          # 必须离开仓库目录执行导入：`python -c` 会把当前目录放进 sys.path[0]，
+          # 在仓库根执行只会导入 checkout 里的源码，wheel 缺 cli.py / 静态资源 /
+          # 技能 data-files 时仍然全绿（本步骤声称的「验证包内容」不成立）
+          cd "$(mktemp -d)"
+          python -c "import importlib.resources as res; import cli, utils.paths, webapp.server; assert (res.files('webapp') / 'static' / 'index.html').is_file(), 'wheel 缺少 webapp/static'; from utils.skill_paths import skill_roots; assert any((root / 'ask-question' / 'SKILL.md').is_file() for root in skill_roots()), 'wheel 缺少技能 data-files'"
           aligo-web --help > /dev/null
+          aligo --help > /dev/null
