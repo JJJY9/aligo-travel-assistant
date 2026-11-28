@@ -1919,6 +1919,20 @@ def test_summary_trip_window_uses_newest_with_normalized_dates():
     assert _trip_sort_key({"start_date": "2026-3-5"})[0] == "2026-03-05"
     assert _trip_sort_key({"start_date": "2026/12/31"})[0] == "2026-12-31"
     assert _trip_sort_key({"start_date": "2026年1月5日"})[0] == "2026-01-05"
+    # 同一天、不同偏移的时间戳按绝对时刻排序：09:00+08:00（01:00Z）在
+    # 02:00+00:00（02:00Z）之前，原始字符串的字典序恰好相反
+    early = {
+        "start_date": "2026-11-28",
+        "timestamp": "2026-11-28T09:00:00+08:00",
+        "trip_id": "a",
+    }
+    late = {
+        "start_date": "2026-11-28",
+        "timestamp": "2026-11-28T02:00:00+00:00",
+        "trip_id": "b",
+    }
+    assert _trip_sort_key(early)[1] < _trip_sort_key(late)[1]
+    assert _trip_sort_key(early) < _trip_sort_key(late)
 
     prompts: list[str] = []
     trips = []

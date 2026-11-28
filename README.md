@@ -646,8 +646,8 @@ python -m webapp.server            # 安装后也可直接执行 aligo-web
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/api/chat` | 发送消息（一次性返回；`message` / `user_id` / `session_id`，`user_id` 必填（与其余数据接口同口径，缺省 422——不再回退固定账号，避免省略字段的不同调用方共读写同一份记忆），可选 `idempotency_key`（≤200 字，同用户 + 会话 + 键的重复提交直接回放上次成功响应，带 `X-Idempotent-Replay: 1`）；响应含 `persisted`，会话在其它进程被删除时整轮不落库并返回 `persisted: false`；客户端断开连接后服务端取消在途回合，不再继续消耗模型额度或写入历史） |
-| POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果；`done` 事件同样携带 `persisted`；可选 `idempotency_key`，重复提交只回放 `session` + `done` 并标记 `idempotent_replay`） |
+| POST | `/api/chat` | 发送消息（一次性返回；`message` / `user_id` / `session_id`，`user_id` 必填（与其余数据接口同口径，缺省 422——不再回退固定账号，避免省略字段的不同调用方共读写同一份记忆），可选 `idempotency_key`（≤200 字，同用户 + 会话 + 键的重复提交直接回放上次成功响应，带 `X-Idempotent-Replay: 1`，可选 `timezone`（IANA 时区，相对日期按该时区解释，缺省服务器本地））；响应含 `persisted`，会话在其它进程被删除时整轮不落库并返回 `persisted: false`；客户端断开连接后服务端取消在途回合，不再继续消耗模型额度或写入历史） |
+| POST | `/api/chat/stream` | 发送消息（SSE 流式返回执行进度，最后返回完整结果；`done` 事件同样携带 `persisted`；可选 `idempotency_key`，重复提交只回放 `session` + `done` 并标记 `idempotent_replay`；可选 `timezone`（IANA 时区，相对日期按该时区解释）） |
 | GET | `/api/health` | 服务版本 / 模型 / 技能数 / 存储与限流后端状态；熔断器打开或技能目录不可用（`skills.ok` 为 `false`）时 `status` 为 `degraded` 并附 `circuit_breaker` / `skills` |
 | GET | `/api/metrics` | 进程内 `/api` 请求指标（计数 / 状态分布 / Top 路径 / 平均、最大、P50、P95 耗时 / 熔断器状态 / SSE error 收尾计数 `sse_errors` / 偏好快照缓存 hits、misses、version_invalidations）与限流后端信息；Prometheus 文本端点（`/metrics`）另暴露 `aligo_preference_cache_hits_total` / `aligo_preference_cache_misses_total` / `aligo_preference_cache_version_invalidations_total`；SSE 长连接只计请求数、不计入延迟分位；首页、静态资源与抓取自身不计入 |
 | GET | `/metrics` | Prometheus 文本指标（请求计数 / 状态 / 方法 / 路径 / 耗时 / 熔断器 / 缓存会话 / 技能可用性（`aligo_skills_ok` / `aligo_skills_count`）/ 限流与存储后端降级 / 共享墓碑状态；多实例分别采集） |

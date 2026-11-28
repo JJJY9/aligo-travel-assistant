@@ -128,6 +128,59 @@ def test_date_only_and_naive_unchanged_by_normalization():
     print("✓ date-only / naive / 冒号偏移语义不变")
 
 
+def test_iso8601_no_separator_forms_parse_cross_version():
+    """ISO 8601 基本格式（无分隔符）在 3.10 上也应解析为同一时刻。"""
+    expected = datetime(2026, 11, 28, 10, 0, tzinfo=timezone.utc)
+    assert to_aware("20261128T100000Z") == expected
+    assert to_aware("20261128T100000+0800") == to_aware(
+        "2026-11-28T10:00:00+0800"
+    )
+    assert to_aware("20261128") == to_aware("2026-11-28")
+    assert chronological_key("20261128T100000Z") == chronological_key(
+        "2026-11-28T10:00:00Z"
+    )
+    # 10 位 epoch 数字串不能被当成日期展开
+    assert to_aware("1764331200") is None
+    print("✓ 无分隔符 ISO 基本格式跨运行时解析一致")
+
+
+def test_display_local_timestamp_converts_and_keeps_invalid():
+    """导出展示换算到本机时区；非法值保留原文。"""
+    from utils.timestamps import display_local_timestamp
+
+    aware = to_aware("2026-11-27T17:00:00+00:00")
+    assert display_local_timestamp("2026-11-27T17:00:00+00:00") == (
+        aware.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    )
+    # naive 本地时间换算后墙钟不变
+    assert display_local_timestamp("2026-11-05T10:01:00") == (
+        "2026-11-05 10:01:00"
+    )
+    assert display_local_timestamp("t1") == "t1"
+    assert display_local_timestamp("") == ""
+    print("✓ 展示时间戳换算本地时区且非法值保留原文")
+
+
+def test_clock_request_timezone_binding():
+    """请求时区绑定后 clock.now/today 按该时区解释，重置后回退本地。"""
+    from datetime import timedelta
+
+    from utils import clock
+
+    zone = timezone(timedelta(hours=9))
+    token = clock.use_timezone(zone)
+    try:
+        assert clock.now().utcoffset() == timedelta(hours=9)
+        assert clock.today() == clock.now().date()
+    finally:
+        clock.reset(token)
+    assert clock.current_timezone() is None
+    # 未绑定回退进程本地时间（naive，与既有 datetime.now() 同口径）
+    assert clock.now().tzinfo is None
+    assert clock.today() == datetime.now().date()
+    print("✓ 请求时区绑定与重置")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -142,4 +195,7 @@ if __name__ == "__main__":
     test_date_only_and_naive_unchanged_by_normalization()
     test_naive_uses_dst_offset_of_that_moment()
     test_chronological_key_extreme_years_do_not_raise()
+    test_iso8601_no_separator_forms_parse_cross_version()
+    test_display_local_timestamp_converts_and_keeps_invalid()
+    test_clock_request_timezone_binding()
     print("\n全部通过")

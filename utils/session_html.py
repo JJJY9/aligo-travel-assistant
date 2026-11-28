@@ -97,7 +97,7 @@ def render_session_html(
         title=_escape(title),
         user_id=_escape(user_id),
         session_id=_escape(session_id),
-        exported_at=_escape(datetime.now().isoformat(timespec="seconds")),
+        exported_at=_escape(datetime.now().astimezone().isoformat(timespec="seconds")),
         body="\n".join(blocks),
         extra_style="",
     )
@@ -161,7 +161,7 @@ def render_all_sessions_html(
             title=_escape("Aligo 会话导出"),
             user_id=_escape(user_id),
             session_id=_escape(f"全部会话（{len(sessions)} 个）"),
-            exported_at=_escape(datetime.now().isoformat(timespec="seconds")),
+            exported_at=_escape(datetime.now().astimezone().isoformat(timespec="seconds")),
             body=body,
             extra_style=_BUNDLE_STYLE,
         ),

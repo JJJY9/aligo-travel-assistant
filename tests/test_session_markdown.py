@@ -115,7 +115,7 @@ def test_group_sessions_uses_max_timestamp_within_session():
     )
     text, count = render_all_sessions_markdown("u1", messages)
     assert count == 2
-    assert "- 最近更新：2026-11-05T10:01:00" in text
+    assert "- 最近更新：2026-11-05 10:01:00" in text
     print("✓ 会话排序与最近更新取会话内最大时间戳")
 
 

@@ -6,7 +6,7 @@ from typing import Any
 from utils.console import strip_terminal_controls
 from utils.session_title import session_title_from_content
 from utils.stored_message import render_stored_message
-from utils.timestamps import chronological_key
+from utils.timestamps import chronological_key, display_local_timestamp
 
 _FENCE_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
 
@@ -337,7 +337,7 @@ def render_all_sessions_markdown(
     titles = titles or {}
     if sessions is None:
         sessions = group_sessions(messages)
-    exported_at = datetime.now().isoformat(timespec="seconds")
+    exported_at = datetime.now().astimezone().isoformat(timespec="seconds")
     lines = [
         "# Aligo 会话导出",
         "",
@@ -356,7 +356,7 @@ def render_all_sessions_markdown(
                 "",
                 f"- 会话：{sanitize_title(session_id)}",
                 f"- 消息数：{len(session_messages)}",
-                f"- 最近更新：{sanitize_title(_latest_timestamp(session_messages) or '—')}",
+                f"- 最近更新：{sanitize_title(display_local_timestamp(_latest_timestamp(session_messages)) or '—')}",
                 "",
             ]
         )

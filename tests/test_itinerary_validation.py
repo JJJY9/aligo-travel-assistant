@@ -642,6 +642,45 @@ def test_out_of_range_time_reported_invalid():
     print("✓ 越界时刻报 invalid_time_range")
 
 
+def test_cross_midnight_spill_compared_with_next_day():
+    """前一天 22:00-02:00 与次日 01:00 起的活动真实重叠，必须报冲突。"""
+    plan = {
+        "daily_plans": [
+            {
+                "day": 1,
+                "activities": [{"time": "22:00-02:00", "title": "夜班火车"}],
+            },
+            {
+                "day": 2,
+                "activities": [{"time": "01:00-03:00", "title": "接驳车"}],
+            },
+        ]
+    }
+    issues = validate_itinerary(plan, {})
+    assert any(
+        issue["code"] == "time_conflict" and "跨午夜" in issue["message"]
+        for issue in issues
+    )
+    # 次日 02:30 才开始：尾巴已结束，不报冲突
+    plan_ok = {
+        "daily_plans": [
+            {
+                "day": 1,
+                "activities": [{"time": "22:00-02:00", "title": "夜班火车"}],
+            },
+            {
+                "day": 2,
+                "activities": [{"time": "02:30-03:30", "title": "接驳车"}],
+            },
+        ]
+    }
+    assert not any(
+        issue["code"] == "time_conflict"
+        for issue in validate_itinerary(plan_ok, {})
+    )
+    print("✓ 跨午夜活动与次日比较")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -680,4 +719,5 @@ if __name__ == "__main__":
     test_long_must_see_enumeration_beyond_200_chars()
     test_extract_requirements_handles_numeric_overflow()
     test_out_of_range_time_reported_invalid()
+    test_cross_midnight_spill_compared_with_next_day()
     print("\n全部通过")

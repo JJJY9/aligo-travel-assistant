@@ -53,6 +53,10 @@ def normalize_city(value: object) -> str:
 
 
 def _parse_iso(text: str) -> str | None:
+    # 末尾紧跟数字的串（2026-11-100）是写错位的日期，不能盲截前 10 位
+    # 当成合法日期：那会把「100 日」静默改写成 10 号。
+    if len(text) > 10 and text[10].isdigit():
+        return None
     match = re.fullmatch(
         r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text[:10]
     )
@@ -172,7 +176,14 @@ def _normalize_event_range(
     if start_md is None or end_md is None:
         return None
     candidates: list[tuple[date, date]] = []
-    for start_year in (base.year, base.year + 1):
+    # 跨年区间（12月28日–1月3日）若今天落在 1 月 1 日到结束日之间，
+    # 「包含今天的区间」要从上一年起算；只生成今年/明年会把进行中的行程
+    # 推到约 11 个月后。非跨年区间不加上一年候选，避免 2 月 29 日之类
+    # 边界把「今年区间」兜底成过去的日期。
+    start_years: tuple[int, ...] = (base.year, base.year + 1)
+    if end_md < start_md:
+        start_years = (base.year - 1, base.year, base.year + 1)
+    for start_year in start_years:
         try:
             start = date(start_year, *start_md)
             end_year = start_year if end_md >= start_md else start_year + 1
@@ -197,7 +208,12 @@ def normalize_event_data(
     data: object, today: date | None = None
 ) -> dict[str, Any]:
     """归一事项收集结果里的 origin / destination / 起止日期（副本）。"""
-    base = today or date.today()
+    if today is None:
+        from utils.clock import today as clock_today
+
+        base = clock_today()
+    else:
+        base = today
     if not isinstance(data, dict):
         return {}
     result = dict(data)

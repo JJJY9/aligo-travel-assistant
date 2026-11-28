@@ -437,12 +437,25 @@ def render_trips_html(trips: list[dict[str, Any]], user_id: str) -> str:
     def esc(value: object) -> str:
         return _html.escape(_clean_trip_value(value))
 
-    def sort_key(trip: dict[str, Any]) -> tuple[str, str]:
+    def sort_key(
+        trip: dict[str, Any],
+    ) -> tuple[int, datetime, str]:
         # trip_id 是 "trip_N" 字符串：同一天内按 id 文本倒序即可，不能 int()。
         # 出发日期先归一再排序：未补零的历史日期（2026-1-5）按字典序会排到
-        # 2026-01-06 之后
+        # 2026-01-06 之后。备份恢复会保真保留无法解析的日期（「待定」/
+        # 「2026-02-30」）：这些值不能按原文参与字典序（中文排在 ASCII
+        # 之后，倒序后会顶到台账最上方、冒充最新行程），统一置于可解析
+        # 日期之后。
+        text = normalize_identity_date(trip.get("start_date"))
+        parsed = None
+        if text:
+            try:
+                parsed = datetime.strptime(text, "%Y-%m-%d")
+            except ValueError:
+                parsed = None
         return (
-            normalize_identity_date(trip.get("start_date")),
+            1 if parsed is not None else 0,
+            parsed or datetime.min,
             str(trip.get("trip_id") or ""),
         )
 
@@ -468,7 +481,9 @@ def render_trips_html(trips: list[dict[str, Any]], user_id: str) -> str:
         if rows
         else '<p class="empty">（暂无行程记录）</p>'
     )
-    exported_at = datetime.now().isoformat(timespec="seconds")
+    # 导出时间带偏移（容器常以 UTC 运行）：naive 串在分享给他人看时
+    # 无法判断是哪个时区的「导出于」
+    exported_at = datetime.now().astimezone().isoformat(timespec="seconds")
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>

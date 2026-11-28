@@ -1161,6 +1161,10 @@ class ChatRequest(BaseModel):
     # 幂等键（v2.0）：同一用户 + 同一会话 + 同一键的重复提交直接返回上次
     # 成功响应，不重复执行 Agent / 写记忆。前端网络重试时携带。
     idempotency_key: str | None = Field(default=None, max_length=200)
+    # 浏览器时区（IANA 名称）：提示词里的「今天 / 明天」按该时区解释，
+    # 否则容器 UTC 部署时东八区用户的相对日期整体早一天。非法 / 未知
+    # 时区回退服务器本地（与 /api/status、行程导入同一口径，不 422）。
+    timezone: str | None = Field(default=None, max_length=64)
 
     @field_validator("session_id")
     @classmethod
@@ -4023,6 +4027,34 @@ def _aware_timestamp_text(value: Any) -> Any:
     return aware.isoformat() if aware is not None else value
 
 
+def _aware_trip_view(trip: Any) -> Any:
+    """行程视图的 timestamp 归一为带偏移 ISO（与消息 / updated_at 同口径）。
+
+    JSON 后端的实时行程存 naive 服务器本地时间、PG 与恢复后的行程带偏移：
+    原样返回会让同一字段在不同后端 / 恢复前后出现两种形状。``conflicts``
+    子项是 ``{**trip}`` 副本，同样归一（只复制、不改存储行）。
+    """
+    if not isinstance(trip, dict):
+        return trip
+    view = dict(trip)
+    if "timestamp" in view:
+        view["timestamp"] = _aware_timestamp_text(view["timestamp"])
+    conflicts = view.get("conflicts")
+    if isinstance(conflicts, list):
+        view["conflicts"] = [
+            _aware_trip_view(item) if isinstance(item, dict) else item
+            for item in conflicts
+        ]
+    return view
+
+
+def _aware_trip_views(trips: Any) -> Any:
+    """把行程视图列表逐个归一（非列表原样返回）。"""
+    if not isinstance(trips, list):
+        return trips
+    return [_aware_trip_view(trip) for trip in trips]
+
+
 def _trim_validation_item(item: dict[str, Any]) -> dict[str, Any]:
     """422 错误条目：input 截断为 200 字符并转义无法编码的字符。
 
@@ -4859,7 +4891,7 @@ def _user_data_markdown(user_id: str, data: dict[str, Any]) -> str:
         "# Aligo 用户数据导出",
         "",
         f"- 用户：{_md_inline(user_id)}",
-        f"- 导出时间：{datetime.now().isoformat(timespec='seconds')}",
+        f"- 导出时间：{datetime.now().astimezone().isoformat(timespec='seconds')}",
         "",
     ]
 
@@ -6355,8 +6387,7 @@ def create_app(model: Any = None) -> FastAPI:
         # 最近 5 条行程附带与其它行程的日期重叠信息（列表用徽标提示）
         trips_view = _trips_with_conflicts(
             data["trip_history"][-5:], data["trip_history"], intervals=trip_intervals
-        )
-        # 历史 / 手写数据可能含孤立代理项：不清洗会让响应 UTF-8 编码
+        )        # 历史 / 手写数据可能含孤立代理项：不清洗会让响应 UTF-8 编码
         # 失败（该接口对用户永久 500），与会话接口统一出口清洗
         return _json_safe_value(
             {
@@ -6364,8 +6395,8 @@ def create_app(model: Any = None) -> FastAPI:
                 "preferences": preferences,
                 "trip_count": len(data["trip_history"]),
                 "travel_summary": travel_summary,
-                "trips": trips_view,
-                "next_trip": featured_trip,
+                "trips": _aware_trip_views(trips_view),
+                "next_trip": _aware_trip_view(featured_trip),
                 "chat_count": len(data["chat_history"]),
                 "archived_count": _archived_count(data),
                 "statistics": data["statistics"],
@@ -6817,7 +6848,7 @@ def create_app(model: Any = None) -> FastAPI:
             "",
             f"- 用户：{user_id}",
             f"- 会话：{session_id}",
-            f"- 导出时间：{datetime.now().isoformat(timespec='seconds')}",
+            f"- 导出时间：{datetime.now().astimezone().isoformat(timespec='seconds')}",
             "",
         ]
         for message in messages:
@@ -7287,7 +7318,9 @@ def create_app(model: Any = None) -> FastAPI:
             try:
                 result, disconnected = await _ask_cancellable_on_disconnect(
                     session.runtime.ask(
-                        payload.message, turn_id=payload.client_turn_id or ""
+                        payload.message,
+                        turn_id=payload.client_turn_id or "",
+                        timezone=_usage_zone(payload.timezone),
                     ),
                     request,
                     runtime=session.runtime,
@@ -7726,6 +7759,7 @@ def create_app(model: Any = None) -> FastAPI:
                             payload.message,
                             on_event=queue.put_nowait,
                             turn_id=payload.client_turn_id or "",
+                            timezone=_usage_zone(payload.timezone),
                         )
                         done_event = {
                             "type": "done",
@@ -7966,8 +8000,10 @@ def create_app(model: Any = None) -> FastAPI:
         }
         return _json_safe_value(
             {
-                "trips": _trips_with_conflicts(
-                    page, all_trips, intervals=trip_intervals
+                "trips": _aware_trip_views(
+                    _trips_with_conflicts(
+                        page, all_trips, intervals=trip_intervals
+                    )
                 ),
                 "total": total,
                 "offset": offset,
@@ -8079,7 +8115,7 @@ def create_app(model: Any = None) -> FastAPI:
                 "trip_id": trip_id,
                 "saved": True,
                 "created": created,
-                "conflicts": conflicts,
+                "conflicts": _aware_trip_views(conflicts),
             }
         )
 
@@ -8291,8 +8327,8 @@ def create_app(model: Any = None) -> FastAPI:
             {
                 "trip_id": trip_id,
                 "saved": True,
-                "trip": saved,
-                "conflicts": conflicts,
+                "trip": _aware_trip_view(saved),
+                "conflicts": _aware_trip_views(conflicts),
             }
         )
 

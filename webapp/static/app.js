@@ -4010,6 +4010,12 @@ async function sendMessage(text, options = {}) {
         session_id: state.sessionId,
         client_turn_id: turnId,
         idempotency_key: idempotencyKey,
+        // 相对日期按浏览器时区解释：服务端在容器里常是 UTC，不带时区
+        // 会让「明天 / 今天」在本地 0-8 点整体早一天
+        timezone:
+          typeof Intl !== "undefined" && Intl.DateTimeFormat
+            ? Intl.DateTimeFormat().resolvedOptions().timeZone
+            : undefined,
       }),
       signal: state.controller.signal,
     });

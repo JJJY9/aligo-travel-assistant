@@ -388,6 +388,10 @@ def _iso_date(value: object) -> _date | None:
     text = str(value or "").strip()
     if len(text) < 10:
         return None
+    # 末尾紧跟数字（2026-11-100）是写错位的日期：盲截前 10 位会把「100 日」
+    # 静默算成 10 号，行程天数 / 冲突检测随之用错日期。
+    if len(text) > 10 and text[10].isdigit():
+        return None
     try:
         return _date.fromisoformat(text[:10])
     except ValueError:
@@ -773,6 +777,9 @@ def validate_itinerary(
         )
 
     # 2) 时间冲突 / 非法时间
+    # carry: 前一天跨午夜活动落到当天时间轴上的尾巴（绝对分钟已减 1440）。
+    # 反向区间最多 12 小时，尾巴不会越过次日全天，一步传递足够。
+    carry: list[tuple[int, str, int]] = []
     for day_index, plan in enumerate(plans, 1):
         intervals: list[tuple[int, int, str]] = []
         for activity in _activities(plan):
@@ -827,6 +834,25 @@ def validate_itinerary(
                         ),
                     }
                 )
+        # 与前一天跨午夜活动的尾巴比较：只在当天与前一天之间，日期间
+        # 不连续（plan 缺天）时同样成立——尾巴本来就是按日历次日算的
+        for carried_end, carried_label, carried_day in carry:
+            for start, _end, label in intervals:
+                if start < carried_end:
+                    issues.append(
+                        {
+                            "code": "time_conflict",
+                            "message": (
+                                f"第 {carried_day} 天「{carried_label}」与"
+                                f"第 {day_index} 天「{label}」时间重叠（跨午夜）"
+                            ),
+                        }
+                    )
+        carry = [
+            (end - 1440, label, day_index)
+            for _start, end, label in intervals
+            if end > 1440
+        ]
 
     # 3) + 5) 费用复核：逐项合法性、合计与申报预算一致性
     costs: list[float] = []

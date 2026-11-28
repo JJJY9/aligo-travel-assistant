@@ -2463,7 +2463,7 @@ def test_chat_stream_task_without_terminal_emits_error(monkeypatch):
     class _Fatal(BaseException):
         pass
 
-    async def _fatal(self, message, on_event=None, turn_id=""):
+    async def _fatal(self, message, on_event=None, turn_id="", **_kwargs):
         raise _Fatal("boom")
 
     monkeypatch.setattr(ConversationRuntime, "ask", _fatal)
@@ -2572,7 +2572,7 @@ def test_stream_and_chat_sanitize_model_surrogates(monkeypatch):
 
     lonely = chr(0xD800)
 
-    async def _fake_ask(self, message, on_event=None, turn_id=""):
+    async def _fake_ask(self, message, on_event=None, turn_id="", **_kwargs):
         if on_event:
             on_event(
                 {
@@ -2845,7 +2845,7 @@ def test_stream_and_chat_report_unpersisted_turn(monkeypatch):
     """墓碑否决的回合：done / 响应必须带 persisted=false，不能伪装成功。"""
     from agents.conversation import ConversationRuntime
 
-    async def _vetoed_ask(self, message, on_event=None, turn_id=""):
+    async def _vetoed_ask(self, message, on_event=None, turn_id="", **_kwargs):
         return {
             "reply": "回答",
             "agents": [],
@@ -3009,6 +3009,45 @@ def test_aware_timestamp_text_normalizes_backends():
     assert _aware_timestamp_text("t") == "t"
     assert _aware_timestamp_text(None) is None
     print("✓ 会话时间戳归一为 aware ISO")
+
+
+def test_aware_trip_view_normalizes_timestamp_and_conflicts():
+    """行程视图（含 conflicts 子项）的 timestamp 与消息同口径归一。"""
+    from datetime import datetime
+
+    from webapp.server import _aware_trip_view, _aware_trip_views
+
+    trip = {
+        "trip_id": "t1",
+        "start_date": "2026-11-28",
+        "timestamp": "2026-11-28T11:00:00",
+        "conflicts": [
+            {"trip_id": "t2", "timestamp": "2026-11-28T12:00:00"}
+        ],
+    }
+    view = _aware_trip_view(trip)
+    assert view["timestamp"] != "2026-11-28T11:00:00"
+    assert datetime.fromisoformat(view["timestamp"]).tzinfo is not None
+    conflict = view["conflicts"][0]
+    assert datetime.fromisoformat(conflict["timestamp"]).tzinfo is not None
+    # 只复制视图，不改存储行
+    assert trip["timestamp"] == "2026-11-28T11:00:00"
+    assert _aware_trip_views([trip])[0]["trip_id"] == "t1"
+    assert _aware_trip_views(None) is None
+    print("✓ 行程视图时间戳归一（含冲突子项）")
+
+
+def test_chat_request_accepts_browser_timezone():
+    """ChatRequest 接受可选时区（相对日期按浏览器时区解释的入口）。"""
+    from webapp.server import ChatRequest
+
+    assert (
+        ChatRequest(message="明天去上海", user_id="u1", timezone="Asia/Shanghai")
+        .timezone
+        == "Asia/Shanghai"
+    )
+    assert ChatRequest(message="hi", user_id="u1").timezone is None
+    print("✓ 对话请求携带浏览器时区")
 
 
 def test_session_updated_at_uses_max_timestamp():
@@ -3309,7 +3348,7 @@ def _stream_error_message(monkeypatch, exc):
     state = app.state.aligo
 
     class _Runtime:
-        async def ask(self, message, on_event=None, turn_id=""):
+        async def ask(self, message, on_event=None, turn_id="", **_kwargs):
             raise exc
 
     class _Session:
@@ -6515,7 +6554,7 @@ def test_chat_maps_circuit_open_and_storage_errors(monkeypatch):
     client = _client()
     user_id = _unique_user("web_test_chat_errors")
 
-    async def open_ask(self, message, on_event=None, turn_id=""):
+    async def open_ask(self, message, on_event=None, turn_id="", **_kwargs):
         raise CircuitOpenError()
 
     monkeypatch.setattr(server_module.ConversationRuntime, "ask", open_ask)
@@ -6525,7 +6564,7 @@ def test_chat_maps_circuit_open_and_storage_errors(monkeypatch):
     assert response.status_code == 503
     assert "服务暂时不可用" in response.json()["detail"]
 
-    async def broken_ask(self, message, on_event=None, turn_id=""):
+    async def broken_ask(self, message, on_event=None, turn_id="", **_kwargs):
         raise MemoryPersistenceError("disk full")
 
     monkeypatch.setattr(server_module.ConversationRuntime, "ask", broken_ask)
@@ -6545,7 +6584,7 @@ def test_chat_quarantine_error_detail_mentions_recovery(monkeypatch):
     client = _client()
     user_id = _unique_user("web_test_chat_quarantine")
 
-    async def broken_ask(self, message, on_event=None, turn_id=""):
+    async def broken_ask(self, message, on_event=None, turn_id="", **_kwargs):
         raise MemoryPersistenceError(
             "记忆文件损坏并已隔离备份（data/memory/u1.json.corrupt-1）"
         )
@@ -15713,7 +15752,7 @@ def test_chat_maps_user_facing_error_to_502(monkeypatch):
     from utils.errors import UserFacingError
     from webapp import server as server_module
 
-    async def broken_ask(self, message, on_event=None, turn_id=""):
+    async def broken_ask(self, message, on_event=None, turn_id="", **_kwargs):
         raise UserFacingError("意图识别结果解析失败，请重试")
 
     monkeypatch.setattr(
@@ -15740,7 +15779,7 @@ def test_chat_maps_budget_exhausted_to_503_with_retry_after(monkeypatch):
     from utils.errors import UserFacingError
     from webapp import server as server_module
 
-    async def broken_ask(self, message, on_event=None, turn_id=""):
+    async def broken_ask(self, message, on_event=None, turn_id="", **_kwargs):
         raise UserFacingError("本轮处理时间超出预算，请重试", status_code=503)
 
     monkeypatch.setattr(
@@ -18384,7 +18423,7 @@ def test_chat_circuit_open_in_ask_refunds_rate_limit(monkeypatch):
     user_id = _unique_user("web_test_refund_in_ask")
     refunded: list[str] = []
 
-    async def open_ask(self, message, on_event=None, turn_id=""):
+    async def open_ask(self, message, on_event=None, turn_id="", **_kwargs):
         raise CircuitOpenError()
 
     monkeypatch.setattr(server_module.ConversationRuntime, "ask", open_ask)

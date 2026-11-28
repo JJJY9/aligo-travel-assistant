@@ -25,7 +25,7 @@ from utils.preference_values import (
     has_preference_value,
     is_manageable_pref_type,
 )
-from utils.timestamps import to_aware
+from utils.timestamps import chronological_key, to_aware
 from utils.turn_meta import strip_turn_meta
 
 logger = logging.getLogger(__name__)
@@ -98,10 +98,15 @@ def _normalized_date_key(value: object) -> str:
 
 
 def _trip_sort_key(trip: dict) -> tuple[str, str, str]:
-    """按出发日期排序（缺失 / 非法日期排最前），最近行程取窗口尾部。"""
+    """按出发日期排序（缺失 / 非法日期排最前），最近行程取窗口尾部。
+
+    第二键用归一后的时间序：JSON 后端实时写入 naive 本地时间，备份恢复 /
+    同身份更新写入带偏移的 aware 串，两种格式混存时原始字符串的字典序
+    不是时间序，同日行程的入选与提示词顺序会错。
+    """
     return (
         _normalized_date_key(trip.get("start_date")),
-        str(trip.get("timestamp") or ""),
+        chronological_key(trip.get("timestamp")),
         str(trip.get("trip_id") or ""),
     )
 
