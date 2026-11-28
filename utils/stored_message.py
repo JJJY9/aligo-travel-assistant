@@ -9,7 +9,6 @@ Markdown；用户消息原样返回。Web API 与 CLI 导出共用本模块，�
 消息重渲染一遍（实测约 2.4s，其中过半是渲染）。这里用有界 LRU 缓存按内容
 记忆化，搜索换关键字仍按内容命中，无需失效。
 """
-import hashlib
 import json
 import threading
 from collections import OrderedDict
@@ -19,45 +18,49 @@ from utils.json_safe import sanitize_json
 from utils.result_formatter import result_to_markdown
 from utils.turn_meta import META_KEY, extract_turn_meta
 
-# 以已缓存渲染文本的字符总数为预算（≈ 48M 字符，UTF-8 中文约占 144MB；
-# 实际账号历史 12 万条、渲染后约 90M 字符，单条平均 1KB 级，逐出按 LRU）。
+# 以「渲染文本 + 常驻的原文」字符总数为预算（≈ 48M 字符，UTF-8 中文约占
+# 144MB；实际账号历史 12 万条、渲染后约 90M 字符，单条平均 1KB 级，逐出按
+# LRU）。命中缓存时原文也要常驻（键就是原文），必须一并计入预算，否则
+# 缓存会在渲染文本之外再钉住约同样体量的消息内容
 _CACHE_BUDGET_CHARS = 48_000_000
-# 单条超过预算 1/8 的大消息不入缓存，避免一条巨消息冲掉整批常用条目
+# 单条渲染结果超过预算 1/8 的大消息不入缓存，避免一条巨消息冲掉整批常用条目
 _CACHE_MAX_ENTRY_CHARS = _CACHE_BUDGET_CHARS // 8
 
-_CACHE: "OrderedDict[tuple[str, bytes], str]" = OrderedDict()
+# 键直接用 (role, content)：命中路径不必为每条消息先 encode + blake2b——
+# 90M 字符的账号每次搜索光是算摘要就要多付约 200ms；字典按字符串相等性
+# 判定，无哈希碰撞。值为 (渲染文本, 原文长度)，供逐出时按两份内存记账
+_CACHE: "OrderedDict[tuple[str, str], tuple[str, int]]" = OrderedDict()
 _CACHE_CHARS = 0
 _CACHE_LOCK = threading.Lock()
 
 
-def _cache_key(role: str, content: str) -> tuple[str, bytes]:
-    digest = hashlib.blake2b(
-        content.encode("utf-8", "surrogatepass"), digest_size=16
-    ).digest()
-    return role, digest
+def _cache_key(role: str, content: str) -> tuple[str, str]:
+    return role, content
 
 
-def _cache_get(key: tuple[str, bytes]) -> str | None:
+def _cache_get(key: tuple[str, str]) -> str | None:
     with _CACHE_LOCK:
-        value = _CACHE.get(key)
-        if value is not None:
+        entry = _CACHE.get(key)
+        if entry is not None:
             _CACHE.move_to_end(key)
-        return value
+            return entry[0]
+        return None
 
 
-def _cache_put(key: tuple[str, bytes], value: str) -> None:
+def _cache_put(key: tuple[str, str], value: str) -> None:
     global _CACHE_CHARS
     if len(value) > _CACHE_MAX_ENTRY_CHARS:
         return
+    content_chars = len(key[1])
     with _CACHE_LOCK:
         previous = _CACHE.pop(key, None)
         if previous is not None:
-            _CACHE_CHARS -= len(previous)
-        _CACHE[key] = value
-        _CACHE_CHARS += len(value)
+            _CACHE_CHARS -= len(previous[0]) + previous[1]
+        _CACHE[key] = (value, content_chars)
+        _CACHE_CHARS += len(value) + content_chars
         while _CACHE_CHARS > _CACHE_BUDGET_CHARS and _CACHE:
             _, evicted = _CACHE.popitem(last=False)
-            _CACHE_CHARS -= len(evicted)
+            _CACHE_CHARS -= len(evicted[0]) + evicted[1]
 
 
 def _safe_output(text: str) -> str:

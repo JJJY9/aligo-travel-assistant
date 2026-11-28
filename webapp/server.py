@@ -193,6 +193,9 @@ MAX_DUPLICATE_GROUPS_FULL = 2000
 # 「删除最后一轮」等待用户锁的上限：长回合（单智能体上限 300 秒）期间
 # 无限排队会让前端超时后仍被迟到的删除改掉历史
 _DELETE_LOCK_TIMEOUT_SEC = 10.0
+# 每用户恢复纪元映射的容量上限：用户 ID 来自请求参数，映射必须有界；
+# 万级远大于单实例同时在途导出涉及的用户数
+_IMPORT_EPOCH_MAX = 10_000
 
 # 对话入口等待同一用户锁的上限：排队期间响应头尚未发出、SSE 心跳也没
 # 开始，反向代理读超时（nginx 默认 60s）会把仍在排队的请求变成 504，
@@ -1926,11 +1929,14 @@ class AligoWebApp:
         # 入口与读完快照时都检查该标记，命中返回 409。执行器线程写标记，
         # 事件循环 / 线程池读，需要独立互斥
         self._importing_users: set[str] = set()
-        # 每用户恢复纪元（只增不减）：导出读取开始时取号、读完比对。只查
-        # 「当前是否在恢复」会漏掉「读取期间开始并结束」的恢复——读到的
-        # 快照可能定格在写入中途（PG REPEATABLE READ / JSON 打开时快照），
-        # 读完时标记已清除，必须靠纪元变化识别
-        self._import_epochs: dict[str, int] = {}
+        # 每用户恢复纪元（全局单调、有界 LRU）：导出读取开始时取号、读完
+        # 比对。只查「当前是否在恢复」会漏掉「读取期间开始并结束」的恢复
+        # ——读到的快照可能定格在写入中途（PG REPEATABLE READ / JSON 打开
+        # 时快照），读完时标记已清除，必须靠纪元变化识别。用户 ID 来自
+        # 请求参数，映射必须有界：超限逐出最久未恢复的用户；纪元取自全局
+        # 计数器，淘汰后重建不会与旧号撞值
+        self._import_seq = 0
+        self._import_epochs: OrderedDict[str, int] = OrderedDict()
         self._importing_users_lock = threading.Lock()
         # 知识库批量导入同样可能一次编码上万条分片并长时间持有写锁：放专用
         # 单 worker 执行器，避免 40 个并发导入占满 Starlette 共享线程池后把
@@ -2850,9 +2856,13 @@ class AligoWebApp:
         """标记该用户开始恢复备份并推进恢复纪元（写入前调用）。"""
         with self._importing_users_lock:
             self._importing_users.add(user_id)
-            self._import_epochs[user_id] = (
-                self._import_epochs.get(user_id, 0) + 1
-            )
+            # 纪元由全局单调计数器分配（不是按用户自增）：淘汰后重建的
+            # 条目不会与旧纪元撞值，导出端「取号 ≠ 复核」仍能可靠识别
+            self._import_seq += 1
+            self._import_epochs[user_id] = self._import_seq
+            self._import_epochs.move_to_end(user_id)
+            while len(self._import_epochs) > _IMPORT_EPOCH_MAX:
+                self._import_epochs.popitem(last=False)
 
     def end_user_import(self, user_id: str) -> None:
         """恢复结束（成功 / 失败）后解除标记；纪元保持不变。"""
@@ -3824,6 +3834,10 @@ def _quarantined_memory_backup(
     return str(backups[-1]) if backups else None
 
 
+class _SessionExistenceCheckError(RuntimeError):
+    """delete_session 的存在性检查阶段失败（与删除失败区分归类与回滚口径）。"""
+
+
 def _open_long_term(
     user_id: str, strict: bool = False, allow_quarantined: bool = False
 ) -> Any:
@@ -4428,6 +4442,12 @@ def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
         # 查询或原文内部空白不一致（双空格 / Tab）：两侧都折叠空白后再找。
         # 直接判空会让本已命中的会话被整条过滤，与行程搜索按空白拆词的口径
         # 也不一致；片段从折叠后的文本截取（与下面的空白归一 fallback 同义）
+        if not any(ch.isspace() for ch in needle):
+            # 无空白查询词折叠后仍是自身，而折叠原文只会把空白「变少」
+            # （成段空白缩成一个空格，非空白字符顺序不变）：原文不含该
+            # 连续子串时折叠后也不可能命中。大消息（单条可达数 MB）不再
+            # 为此整条 split+join
+            return ""
         needle = " ".join(needle.split())
         if not needle:
             return ""
@@ -4500,6 +4520,16 @@ def _cached_chronological_key(
     tz_epoch: tuple[int, int, int, tuple[str, str]], timestamp: str
 ) -> str:
     return chronological_key(timestamp)
+
+
+# 会话列表输出前的「补偏移 ISO」对每条会话的最新时间戳做一次 fromisoformat：
+# 大账号一次刷新数万次解析，而同一会话在翻页 / 重命名后的每次刷新都会命中
+# 同一批时间戳串。与 chronological_key 同口径按 (时区世代, 时间戳) 记忆化
+@functools.lru_cache(maxsize=1 << 16)
+def _cached_aware_timestamp_text(
+    tz_epoch: tuple[int, int, int, tuple[str, str]], value: str
+) -> str:
+    return _aware_timestamp_text(value)
 
 
 def _group_sessions(
@@ -4585,7 +4615,9 @@ def _group_sessions(
     # 解释 naive 串，服务器与浏览器时区不同时日期分组整体偏移
     for entry in grouped.values():
         if entry["updated_at"]:
-            entry["updated_at"] = _aware_timestamp_text(entry["updated_at"])
+            entry["updated_at"] = _cached_aware_timestamp_text(
+                tz_epoch, entry["updated_at"]
+            )
 
     sessions = sorted(
         grouped.values(),
@@ -4890,11 +4922,22 @@ def _usage_summary_for_user(
 # O(1) 的首尾消息与元数据——会话标题 / 置顶 / 归档 / 历史条数或末条变化
 # 都会自然失效（编辑与删除只发生在末轮或改变条数）。缓存值为纯数据，
 # 出参仍经 sanitize_json 深拷贝，不会被下游改写。
-_SESSIONS_BASE_CACHE: dict[
-    str, tuple[tuple[Any, ...], list[dict[str, Any]], int]
-] = {}
+# 条目值：(指纹, 会话列表, 归档计数, 写入时刻 monotonic, 估算字节)。按
+# 总字节预算 + 空闲 TTL + LRU 逐出：只按用户数封顶时，32 个大型账号的
+# 聚合结果可常驻 GB 级内存（单个 4 万会话账号约 16-60MB），长期闲置账号
+# 也永不回收
+_SESSIONS_BASE_CACHE: "OrderedDict[str, tuple[tuple[Any, ...], list[dict[str, Any]], int, float, int]]" = (
+    OrderedDict()
+)
 _SESSIONS_BASE_CACHE_MAX = 32
+_SESSIONS_BASE_CACHE_BUDGET_BYTES = 128 * 1024 * 1024
+_SESSIONS_BASE_CACHE_TTL_SEC = 30 * 60.0
 _sessions_base_cache_lock = threading.Lock()
+
+
+def _sessions_base_entry_bytes(sessions: list[dict[str, Any]]) -> int:
+    """缓存条目内存粗估：每会话 dict 约 400B（无需精确 sys.getsizeof）。"""
+    return 256 + len(sessions) * 400
 
 
 def _sessions_base_fingerprint(
@@ -4923,10 +4966,19 @@ def _sessions_base_for_user(
 ) -> tuple[list[dict[str, Any]], int]:
     """带缓存的会话聚合（/api/sessions 无查询词路径专用）。"""
     fingerprint = _sessions_base_fingerprint(data, archived_mode)
+    now = time.monotonic()
     with _sessions_base_cache_lock:
         cached = _SESSIONS_BASE_CACHE.get(user_id)
-        if cached is not None and cached[0] == fingerprint:
+        if (
+            cached is not None
+            and cached[0] == fingerprint
+            and now - cached[3] <= _SESSIONS_BASE_CACHE_TTL_SEC
+        ):
+            _SESSIONS_BASE_CACHE.move_to_end(user_id)
             return cached[1], cached[2]
+        if cached is not None:
+            # 指纹不符 / 空闲过期：旧条目随本次重算替换
+            del _SESSIONS_BASE_CACHE[user_id]
     live_ids: set[str] = set()
     sessions = _group_sessions(
         data["chat_history"],
@@ -4939,14 +4991,25 @@ def _sessions_base_for_user(
         live_session_ids=live_ids,
     )
     archived_count = _archived_count(data, live_ids)
+    entry_bytes = _sessions_base_entry_bytes(sessions)
     with _sessions_base_cache_lock:
-        if (
-            user_id not in _SESSIONS_BASE_CACHE
-            and len(_SESSIONS_BASE_CACHE) >= _SESSIONS_BASE_CACHE_MAX
+        _SESSIONS_BASE_CACHE.pop(user_id, None)
+        _SESSIONS_BASE_CACHE[user_id] = (
+            fingerprint,
+            sessions,
+            archived_count,
+            time.monotonic(),
+            entry_bytes,
+        )
+        # 总预算 / 用户数封顶，从最久未访问（LRU 头）逐出；至少保留刚写入
+        # 的条目（单条超过总预算时宁可短暂超预算，也避免每次请求都重算
+        # 数十秒的聚合）。条目数 ≤ 32，逐出时现算总字节即可
+        while len(_SESSIONS_BASE_CACHE) > 1 and (
+            len(_SESSIONS_BASE_CACHE) > _SESSIONS_BASE_CACHE_MAX
+            or sum(entry[4] for entry in _SESSIONS_BASE_CACHE.values())
+            > _SESSIONS_BASE_CACHE_BUDGET_BYTES
         ):
-            # 用户 ID 来自请求参数：缓存必须封顶，不能随访问过的用户增长
-            _SESSIONS_BASE_CACHE.pop(next(iter(_SESSIONS_BASE_CACHE)), None)
-        _SESSIONS_BASE_CACHE[user_id] = (fingerprint, sessions, archived_count)
+            _SESSIONS_BASE_CACHE.popitem(last=False)
     return sessions, archived_count
 
 
@@ -4959,6 +5022,21 @@ def _invalidate_sessions_base_cache(user_id: str) -> None:
     """
     with _sessions_base_cache_lock:
         _SESSIONS_BASE_CACHE.pop(str(user_id), None)
+
+
+def _cached_archived_count(user_id: str, data: dict[str, Any]) -> int:
+    """status 的归档会话计数：会话聚合缓存命中时复用其已算结果。
+
+    未命中（或指纹不符）回退原来的全量扫描——只有存在归档标记时才会
+    扫描，输出整数与 ``_archived_count(data)`` 逐项一致。归档视图缓存
+    （``archived_mode="only"``）的指纹不同，只会少命中、不会错值。
+    """
+    fingerprint = _sessions_base_fingerprint(data, "exclude")
+    with _sessions_base_cache_lock:
+        cached = _SESSIONS_BASE_CACHE.get(user_id)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[2]
+    return _archived_count(data)
 
 
 def _md_inline(value: object) -> str:
@@ -6307,14 +6385,15 @@ def create_app(model: Any = None) -> FastAPI:
         except Exception as exc:  # noqa: BLE001 - 导出失败统一提示
             logger.warning("导出知识片段失败: %s", redact_paths(exc))
             raise _knowledge_unavailable("导出失败", exc) from exc
-        from utils.json_safe import strip_nul
+        from utils.json_safe import sanitize_json
 
         # 元数据里的 NaN / Infinity 会让产物不是合法 JSON（标准解析器
         # 无法回读，kb-import 也拒绝）：与用户备份同口径清洗后再写出。
         # sanitize_json 不处理 NUL，而导入端把含 NUL 的条目标为无效：
         # 专用导出是「备份 / 换机」用途，必须与用户备份的 knowledge 段
-        # 一样剥离 NUL，否则导出→导入会静默丢片段
-        documents = strip_nul(_json_safe_value(documents))
+        # 一样剥离 NUL，否则导出→导入会静默丢片段。单遍清洗（strip_nuls）
+        # 与「先 sanitize 再整树 strip_nul」逐字节等价，省一份全量深拷贝
+        documents = sanitize_json(documents, strip_nuls=True)
         # 知识库合法上限约 5 万行 ×（400 字正文 + 10×200 字元数据）：整库
         # indent=2 序列化会在内存里同时驻留整串 str 与完整 bytes（实测
         # 5000 行峰值 ~66MB，线性外推单请求 ~0.9GB），两个导出槽并发即可
@@ -6531,7 +6610,7 @@ def create_app(model: Any = None) -> FastAPI:
                 "trips": _aware_trip_views(trips_view),
                 "next_trip": _aware_trip_view(featured_trip),
                 "chat_count": len(data["chat_history"]),
-                "archived_count": _archived_count(data),
+                "archived_count": _cached_archived_count(user_id, data),
                 "statistics": data["statistics"],
                 "storage": describe_backends(wait_for_create=False),
                 "usage": _usage_summary_for_user(user_id, data["chat_history"], tz),
@@ -6584,19 +6663,35 @@ def create_app(model: Any = None) -> FastAPI:
             shadow_type = shadow_keys[0] if shadow_keys else None
             # 面板永远看不到的空值 / 不可寻址条目（旧备份导入 / 旧版本写入 /
             # PG 存量脏键）不渲染、也无法从面板删除，却占用类型上限名额：
-            # 写入偏好时顺带释放，409 只在真实可见条目达到上限时出现
-            for hidden in [
+            # 写入偏好时顺带释放，409 只在真实可见条目达到上限时出现。
+            # 批量删除：JSON 后端逐键删除会让每个键整份重写记忆文件（上限
+            # 200 个隐形键即 200 次全量落盘），PG 每键一条 DELETE
+            hidden_keys = [
                 key
                 for key, value in existing.items()
                 if not is_manageable_pref_type(key)
                 or not has_preference_value(value)
-            ]:
+            ]
+            if hidden_keys:
+                delete_many = getattr(store, "delete_preferences", None)
                 try:
-                    if store.delete_preference(hidden):
-                        existing.pop(hidden, None)
-                        logger.info("清理空值偏好条目: %s", hidden)
+                    if callable(delete_many):
+                        removed_hidden = delete_many(hidden_keys)
+                    else:
+                        # 兼容没有批量接口的存储实现（测试替身等）
+                        removed_hidden = {
+                            key
+                            for key in hidden_keys
+                            if store.delete_preference(key)
+                        }
                 except Exception:  # noqa: BLE001 - 清理失败不阻断本次写入
-                    logger.warning("清理空值偏好失败: %s", hidden)
+                    logger.warning(
+                        "清理空值偏好失败（%d 条）", len(hidden_keys)
+                    )
+                    removed_hidden = set()
+                for hidden in sorted(removed_hidden, key=str):
+                    existing.pop(hidden, None)
+                    logger.info("清理空值偏好条目: %s", hidden)
             # 只拦「恰好在上限、本次新增类型」：已越限的历史账号（上限
             # 上线前的存量）继续可用，与存储写层 / 导入基线豁免同口径
             if (
@@ -7056,8 +7151,30 @@ def create_app(model: Any = None) -> FastAPI:
                 state.mark_deleted, user_id, session_id
             )
 
+            outcome: dict[str, bool] = {}
+
+            def _exists_then_delete() -> tuple[bool, int]:
+                # 同一请求只打开一次 store：JSON 后端每次打开都要整份解析
+                # 记忆文件，此前存在性检查与删除各解析一遍。检查阶段的失败
+                # 用独立异常归类（回滚口径与日志文案保持原样）
+                store = _open_long_term(user_id, strict=True)
+                try:
+                    try:
+                        existed_now = bool(
+                            store.get_chat_history(session_id=session_id)
+                        )
+                    except Exception as exc:  # noqa: BLE001 - 归类为检查失败
+                        raise _SessionExistenceCheckError(exc) from exc
+                    outcome["existed"] = existed_now
+                    return existed_now, store.delete_chat_session(session_id)
+                finally:
+                    _close_long_term(store)
+
             try:
-                existed = await asyncio.to_thread(_exists)
+                # PostgreSQL / JSON 的打开、存在性检查与删除都是阻塞 IO，
+                # 放到线程池，慢库不能让整个事件循环（其它会话的 SSE 心跳）
+                # 停住
+                existed, removed = await asyncio.to_thread(_exists_then_delete)
             except HTTPException:
                 # 422（user_id 非法）/ 记忆损坏的 503 恢复指引不能被重包成
                 # 通用「删除失败」：语义与操作指引都会丢失
@@ -7066,7 +7183,7 @@ def create_app(model: Any = None) -> FastAPI:
                         state.unmark_deleted, user_id, session_id, token
                     )
                 raise
-            except Exception as exc:  # noqa: BLE001 - 读失败统一提示
+            except _SessionExistenceCheckError as exc:
                 if not already_marked:
                     # 没读到存在性：撤销本请求的墓碑（允许该 id 继续使用），
                     # 若共享墓碑属于其它实例，token 不匹配会保留对方的保护
@@ -7075,29 +7192,6 @@ def create_app(model: Any = None) -> FastAPI:
                     )
                 logger.warning("检查会话是否存在失败: %s", redact_paths(exc))
                 raise _storage_failure("删除失败", exc) from exc
-
-            def _delete() -> int:
-                store = _open_long_term(user_id, strict=True)
-                try:
-                    return store.delete_chat_session(session_id)
-                finally:
-                    _close_long_term(store)
-
-            try:
-                # PostgreSQL / JSON 的打开与删除是阻塞 IO，放到线程池，
-                # 慢库不能让整个事件循环（其它会话的 SSE 心跳）停住
-                removed = await asyncio.to_thread(_delete)
-            except HTTPException:
-                if not already_marked:
-                    try:
-                        still_exists = await asyncio.to_thread(_exists)
-                    except Exception:  # noqa: BLE001 - 查询失败：保守保留墓碑
-                        still_exists = None
-                    if still_exists is not False:
-                        await asyncio.to_thread(
-                            state.unmark_deleted, user_id, session_id, token
-                        )
-                raise
             except Exception as exc:  # noqa: BLE001 - 删除失败统一提示
                 if not already_marked:
                     try:
@@ -7109,7 +7203,7 @@ def create_app(model: Any = None) -> FastAPI:
                         await asyncio.to_thread(
                             state.unmark_deleted, user_id, session_id, token
                         )
-                    elif still_exists is False and not existed:
+                    elif still_exists is False and outcome.get("existed") is False:
                         # 读到了「确实不存在」且删除前也不存在（从未存在的 id）：
                         # 撤销本请求的墓碑，允许该 id 新开对话；属于其它实例
                         # 的共享墓碑因 token 不匹配而保留
@@ -9180,18 +9274,23 @@ def create_app(model: Any = None) -> FastAPI:
             # 其 knowledge_skipped 恒为 0；解析器回填丢弃行数，响应里并入
             # 同一计数（README 承诺这些行「恢复时计入 knowledge_skipped」）
             parse_stats: dict[str, int] = {}
+            parse_backup = functools.partial(
+                parse_user_export_data, payload.backup, stats_out=parse_stats
+            )
             try:
                 sections, errors = await loop.run_in_executor(
-                    state.import_executor,
-                    lambda: parse_user_export_data(
-                        payload.backup, stats_out=parse_stats
-                    ),
+                    state.import_executor, parse_backup
                 )
             except Exception as exc:  # noqa: BLE001 - 边界年份 / 畸形条目等解析异常
                 logger.warning("备份解析失败：%s", redact_paths(exc))
                 raise HTTPException(
                     status_code=400, detail=f"备份解析失败：{exc}"
                 ) from exc
+            # 恢复可能持续数十秒：此后不再使用解码文本、校验模型与解析
+            # 部分绑定（解析结果 sections 自带容器），及时释放可省约
+            # 1.7× 请求体的 str 数据。raw_body 的字节仍被 Starlette 的
+            # request._body 引用，del 只缩短本函数帧，不触碰其私有属性
+            del backup_text, payload, parse_backup
             if not sections:
                 detail = "；".join(errors[:3]) or "没有可恢复的数据"
                 raise HTTPException(status_code=400, detail=f"无法恢复：{detail}")

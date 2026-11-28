@@ -808,9 +808,14 @@ def _document_info(client: Any, doc_id: int) -> tuple[int, str]:
         output_fields=["metadata"],
         limit=1,
     )
-    if not rows:
+    return _document_info_from_row(rows[0] if rows else None)
+
+
+def _document_info_from_row(row: dict[str, Any] | None) -> tuple[int, str]:
+    """分片信息解析（供已批量取回的行复用，口径同 :func:`_document_info`）。"""
+    if row is None:
         return 0, ""
-    meta = _parse_metadata(rows[0].get("metadata"))
+    meta = _parse_metadata(row.get("metadata"))
     try:
         parts = max(1, _meta_int(meta.get("parts"), 1))
     except (TypeError, ValueError):
@@ -853,7 +858,8 @@ def _group_member_ids(client: Any, group: str) -> list[int]:
     if not group:
         return []
     members: list[int] = []
-    for row in _iter_all_rows(client):
+    # 只需要 id + metadata：不投影会顺带把整库正文拉进内存（仅扫描元数据）
+    for row in _iter_all_rows(client, output_fields=["id", "metadata"]):
         meta = _parse_metadata(row.get("metadata"))
         if str(meta.get("group") or "") == group:
             members.append(int(row.get("id", 0) or 0))
@@ -1759,19 +1765,6 @@ def _collection_row_count() -> int:
         return 0
 
 
-def _row_content(client: Any, doc_id: int) -> str | None:
-    """按 id 读取片段内容（不存在返回 None）。"""
-    rows = client.query(
-        collection_name=COLLECTION_NAME,
-        filter=f"id == {int(doc_id)}",
-        output_fields=["content"],
-        limit=1,
-    )
-    if not rows:
-        return None
-    return str(rows[0].get("content", ""))
-
-
 def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
     """扫描并（可选）删除内容完全相同的独立片段，每组保留最小 id。
 
@@ -1838,13 +1831,23 @@ def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
                     failed.append({"id": doc_id, "error": aborted})
                 continue
             expected = item["content"].strip()
+            # 组内各行一次批量取回（分块 ``id in [...]``）：此前保留项与
+            # 每条待删项各发一次 query（实测约 3.5 RPC/删除行），万级重复
+            # 行要在写锁内跑数十秒，期间全部知识库读按锁预算 503。写锁内
+            # 的一次性快照与逐行「删除前瞬时复核」等价——锁内没有并发写者
             try:
-                keep_content = _row_content(client, item["keep"])
+                rows_by_id = _rows_by_ids(
+                    client, [int(item["keep"]), *item["remove"]]
+                )
             except Exception as exc:  # noqa: BLE001 - 查询失败按组记入 failed
                 aborted = f"存储查询失败：{exc}"
                 for doc_id in item["remove"]:
                     failed.append({"id": doc_id, "error": aborted})
                 continue
+            keep_row = rows_by_id.get(int(item["keep"]))
+            keep_content = (
+                None if keep_row is None else str(keep_row.get("content", ""))
+            )
             if keep_content is None or keep_content.strip() != expected:
                 for doc_id in item["remove"]:
                     skipped.append(
@@ -1855,12 +1858,8 @@ def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
                 if aborted is not None:
                     failed.append({"id": doc_id, "error": aborted})
                     continue
-                try:
-                    current = _row_content(client, doc_id)
-                except Exception as exc:  # noqa: BLE001 - 同上
-                    aborted = f"存储查询失败：{exc}"
-                    failed.append({"id": doc_id, "error": aborted})
-                    continue
+                row = rows_by_id.get(int(doc_id))
+                current = None if row is None else str(row.get("content", ""))
                 if current is None:
                     skipped.append({"id": doc_id, "reason": "片段不存在或已被删除"})
                     continue
@@ -1868,7 +1867,7 @@ def cleanup_duplicate_contents(dry_run: bool = True) -> dict[str, Any]:
                     skipped.append({"id": doc_id, "reason": "内容已被修改，已跳过"})
                     continue
                 try:
-                    parts, group = _document_info(client, doc_id)
+                    parts, group = _document_info_from_row(row)
                     if group or parts > 1:
                         skipped.append(
                             {"id": doc_id, "reason": "已变为多分片记录，已跳过"}

@@ -436,6 +436,28 @@ def test_unparsable_start_warns_once(caplog):
     print("✓ 非法出发日期按无日期处理且同值只告警一次")
 
 
+def test_warn_once_bounded_eviction_keeps_recent(monkeypatch, caplog):
+    """警告去重集合到上限时逐出最早条目（而不是整体清空后重刷屏）。"""
+    import logging
+
+    from utils import trip_conflicts as module
+
+    module._WARNED_TRIP_ISSUES.clear()
+    monkeypatch.setattr(module, "_WARNED_TRIP_ISSUES_MAX", 2)
+    try:
+        with caplog.at_level(logging.WARNING, logger="utils.trip_conflicts"):
+            module._warn_trip_issue_once("k", "v1", "警告 %s", "v1")
+            module._warn_trip_issue_once("k", "v2", "警告 %s", "v2")
+            module._warn_trip_issue_once("k", "v3", "警告 %s", "v3")  # 逐出 v1
+            module._warn_trip_issue_once("k", "v2", "警告 %s", "v2")  # 仍去重
+            module._warn_trip_issue_once("k", "v1", "警告 %s", "v1")  # 重新告警
+        messages = [record.getMessage() for record in caplog.records]
+        assert messages == ["警告 v1", "警告 v2", "警告 v3", "警告 v1"], messages
+    finally:
+        module._WARNED_TRIP_ISSUES.clear()
+    print("✓ 警告去重集合超限逐出最早条目，不整体清空")
+
+
 def test_iso_date_parse_cache_reuses_normalized_text():
     """归一后同一日期串只 strptime 一次（/api/status 三遍解析的公共热点）。"""
     from utils import trip_conflicts
@@ -528,6 +550,13 @@ if __name__ == "__main__":
         # 此前漏登记：同一文件的另一个日志用例在直跑时从未执行
         test_trip_interval_warns_once_per_bad_value(_shim)
         test_unparsable_start_warns_once(_shim)
+        import pytest as _pytest
+
+        _mp_warn = _pytest.MonkeyPatch()
+        try:
+            test_warn_once_bounded_eviction_keeps_recent(_mp_warn, _shim)
+        finally:
+            _mp_warn.undo()
     finally:
         _shim.close()
     print("\n全部通过")

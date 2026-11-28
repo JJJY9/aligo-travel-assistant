@@ -149,6 +149,40 @@ def test_render_falls_back_without_caching_failure(monkeypatch):
     print("✓ 渲染异常回退不缓存，恢复后正常渲染")
 
 
+def test_render_cache_key_holds_content_and_counts_budget():
+    """缓存键直接用原文（不再先算摘要），预算同时计入常驻的原文长度。"""
+    import utils.stored_message as stored_module
+
+    content = json.dumps(
+        {"status": "no_agents", "results": []}, ensure_ascii=False
+    )
+    stored_module._CACHE.clear()
+    stored_module._CACHE_CHARS = 0
+    try:
+        rendered = stored_module.render_stored_message(
+            {"role": "assistant", "content": content}
+        )
+        key = ("assistant", content)
+        assert key in stored_module._CACHE, "缓存键应为 (role, 原文)"
+        cached_value, content_chars = stored_module._CACHE[key]
+        assert cached_value == rendered
+        assert content_chars == len(content)
+        assert stored_module._CACHE_CHARS == len(rendered) + len(content), (
+            "预算需按渲染文本 + 常驻原文记账"
+        )
+        # 同内容再次渲染命中缓存
+        assert (
+            stored_module.render_stored_message(
+                {"role": "assistant", "content": content}
+            )
+            == rendered
+        )
+    finally:
+        stored_module._CACHE.clear()
+        stored_module._CACHE_CHARS = 0
+    print("✓ 渲染缓存键为原文且预算计入原文长度")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -176,4 +210,5 @@ if __name__ == "__main__":
         test_render_failure_falls_back_to_raw_content(_mp_render)
     finally:
         _mp_render.undo()
+    test_render_cache_key_holds_content_and_counts_budget()
     print("\n全部通过")

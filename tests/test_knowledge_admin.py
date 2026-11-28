@@ -1501,6 +1501,12 @@ def test_cleanup_partial_storage_failure_returns_plan(monkeypatch):
             self.fail_ids = set(fail_ids)
 
         def query(self, collection_name, filter="", output_fields=None, limit=10, offset=0):
+            if filter.startswith("id in"):
+                # 组内批量预取（id in [...]）同样注入故障：该组整体记 failed
+                ids_part = filter.split("[", 1)[1].split("]", 1)[0]
+                wanted = {int(item) for item in ids_part.split(",") if item.strip()}
+                if wanted & self.fail_ids:
+                    raise RuntimeError("storage unavailable")
             if filter.startswith("id =="):
                 doc_id = int(filter.split("==")[1])
                 if doc_id in self.fail_ids:
@@ -1527,6 +1533,34 @@ def test_cleanup_partial_storage_failure_returns_plan(monkeypatch):
     assert set(errors) == {4}, result["failed"]
     assert all("storage unavailable" in text for text in errors.values())
     print("✓ 删除开始后的存储故障记入 failed，计划与计数照常返回")
+
+
+def test_cleanup_prefetches_group_rows_without_per_row_queries(monkeypatch):
+    """删除复核按组一次批量预取（id in），不再逐行 query（约 3.5 RPC/行）。"""
+    fake = _FakeMilvusClient(
+        [
+            {"id": 1, "content": "A", "metadata": "{}"},
+            {"id": 2, "content": "A", "metadata": "{}"},
+            {"id": 3, "content": "B", "metadata": "{}"},
+            {"id": 4, "content": "B", "metadata": "{}"},
+            {"id": 5, "content": "C", "metadata": "{}"},
+        ]
+    )
+    filters: list[str] = []
+    real_query = fake.query
+
+    def counting_query(collection_name, filter="", output_fields=None, limit=10, offset=0):
+        filters.append(filter)
+        return real_query(collection_name, filter, output_fields, limit, offset)
+
+    fake.query = counting_query
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake)
+    result = knowledge_admin.cleanup_duplicate_contents(dry_run=False)
+    assert result["removed"] == 2, result
+    per_row = [item for item in filters if item.startswith("id ==")]
+    assert per_row == [], f"逐行查询应被组内批量预取替代：{per_row}"
+    assert sum(1 for item in filters if item.startswith("id in")) == 2, filters
+    print("✓ 重复清理按组批量预取，无逐行查询")
 
 
 def test_import_skips_group_with_non_finite_part_metadata(monkeypatch):
@@ -4510,6 +4544,7 @@ if __name__ == "__main__":
         test_cleanup_duplicate_contents_deletes_verified_only,
         test_cleanup_duplicate_contents_deletes_and_reports_failure,
         test_cleanup_partial_storage_failure_returns_plan,
+        test_cleanup_prefetches_group_rows_without_per_row_queries,
         test_write_agent_cached_with_create_if_missing,
         test_add_document_rejects_missing_collection,
         test_get_document_reads_single_row,

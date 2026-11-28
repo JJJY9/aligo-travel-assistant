@@ -1,5 +1,6 @@
 """行程日期解析、重叠判断与状态标签（Web / CLI 共用）。"""
 import functools
+import hashlib
 import heapq
 import logging
 import re
@@ -61,9 +62,12 @@ def _start_sort_value(trip: dict[str, Any]) -> tuple[datetime, str]:
     return _start_sort_key(str(trip.get("start_date") or ""))
 
 
-_WARNED_TRIP_ISSUES: set[tuple[str, str]] = set()
-# 去重集合上限：脏值种类有界，超过后整体清空重新计数，避免长期运行无界增长
-_WARNED_TRIP_ISSUES_MAX = 256
+# 去重集合：定长哈希 token 的有序集合（插入顺序即淘汰顺序）。上限必须
+# 显著大于单账号行程上限（utils.trip_import.MAX_TOTAL_TRIPS = 5000，每条
+# 行程每轮最多产生一个 token）——此前到 256 就整体 clear()，脏值种类超过
+# 上限时在「清空 → 重新刷屏」间循环，去重失效
+_WARNED_TRIP_ISSUES: dict[bytes, None] = {}
+_WARNED_TRIP_ISSUES_MAX = 8192
 
 
 def _warn_trip_issue_once(
@@ -75,12 +79,17 @@ def _warn_trip_issue_once(
     保留的坏日期此前每次面板刷新都会放大成数万条 WARNING，把有价值的日志
     全部冲掉（截断 / 早于出发仍按原语义处理，只是不再逐次记录）。
     """
-    token = (kind, repr(raw_value))
+    token = hashlib.blake2b(
+        repr((kind, raw_value)).encode("utf-8", "backslashreplace"),
+        digest_size=16,
+    ).digest()
     if token in _WARNED_TRIP_ISSUES:
         return
     if len(_WARNED_TRIP_ISSUES) >= _WARNED_TRIP_ISSUES_MAX:
-        _WARNED_TRIP_ISSUES.clear()
-    _WARNED_TRIP_ISSUES.add(token)
+        # 逐出最早插入的一条（而不是整体清空）：工作集大于上限时顺序扫描
+        # 仍能维持有界去重，不会每次刷新都把整批警告重打一遍
+        _WARNED_TRIP_ISSUES.pop(next(iter(_WARNED_TRIP_ISSUES)))
+    _WARNED_TRIP_ISSUES[token] = None
     logger.warning(message, *args)
 
 
