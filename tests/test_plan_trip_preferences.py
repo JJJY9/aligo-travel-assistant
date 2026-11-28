@@ -68,6 +68,35 @@ def test_string_preferences_in_prompt():
     print("✓ 行程规划 prompt 中字符串偏好保持完整")
 
 
+def test_oversized_preferences_budgeted_in_prompt():
+    """已知类型偏好的值进入规划 prompt 前按 500 字符截断。
+
+    偏好单值上限 10000 字符：4 个已知类型可让每次规划额外注入约 4 万字符。
+    """
+    agent_class = _load_agent_class()
+    model = _CaptureModel()
+    agent = agent_class(name="ItineraryPlanningAgent", model=model)
+    payload = json.dumps(
+        {
+            "context": {
+                "rewritten_query": "从北京去上海出差",
+                "user_preferences": {
+                    "home_location": "北" * 1200,
+                    "hotel_brands": "汉庭" * 2000,
+                },
+            },
+            "previous_results": [],
+        },
+        ensure_ascii=False,
+    )
+    asyncio.run(agent.reply(Msg(name="Orchestrator", content=payload, role="user")))
+    prompt = model.prompts[0]
+    assert "北" * 501 not in prompt, "偏好单值必须截断到 500 字符"
+    assert "北" * 500 + "…" in prompt
+    assert "汉庭" * 1000 not in prompt
+    print("✓ 行程规划偏好值按 500 字符预算截断")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -75,4 +104,5 @@ if __name__ == "__main__":
     _stdio.ensure_utf8()
     _tmp_registry.install()
     test_string_preferences_in_prompt()
+    test_oversized_preferences_budgeted_in_prompt()
     print("\n全部通过")

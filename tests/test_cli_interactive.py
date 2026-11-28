@@ -490,6 +490,37 @@ def test_summary_budgets_preferences():
     print("✓ 偏好摘要按单值 / 总量预算截断")
 
 
+def test_summary_hides_unmanageable_preferences():
+    """意图摘要的偏好按可见口径过滤（PG 脏键 / 空值不进入 prompt）。"""
+    import asyncio
+
+    agent = cli.AligoCLI()
+
+    class _LongTerm:
+        def get_preference(self):
+            return {
+                "airlines": "东航",
+                "bad/key": "注入",
+                "home_location": None,
+            }
+
+        def get_trip_history(self, limit=None):
+            return []
+
+    class _Manager:
+        long_term = _LongTerm()
+
+        async def get_long_term_summary_async(self, max_messages=50):
+            return ""
+
+    agent.memory_manager = _Manager()
+    text = asyncio.run(agent._get_long_term_summary(""))
+    assert "东航" in text
+    assert "bad/key" not in text and "注入" not in text
+    assert "None" not in text
+    print("✓ 偏好摘要按可见口径过滤")
+
+
 def test_summary_reads_long_term_off_loop_thread():
     """存储读取放线程池：PostgreSQL 同步网络往返不能卡住事件循环与 Ctrl-C。"""
     import asyncio
@@ -933,6 +964,41 @@ def test_process_query_filters_malformed_recent_context():
     assert "有效消息" in contents and "本轮提问" in contents
     assert all("有效消息" in c or "本轮提问" in c for c in contents)
     print("✓ 非法短期条目被过滤后组装意图上下文")
+
+
+def test_process_query_strips_assistant_turn_meta():
+    """助手消息的 _meta 不进入 CLI 的意图上下文（与 Web 的 _build_context 同口径）。"""
+    from utils.turn_meta import attach_turn_meta
+
+    agent, _ = _make_cli_stub()
+    captured = {}
+    assistant = json.dumps(
+        attach_turn_meta(
+            {"answer": "已改到周五"},
+            {"client_turn_id": "t-hist", "usage": {"input_tokens": 12345}},
+        ),
+        ensure_ascii=False,
+    )
+
+    class _CaptureIntention:
+        async def reply(self, context):
+            captured["context"] = list(context)
+            return _TextMessage(json.dumps({"agent_schedule": []}))
+
+    agent.intention_agent = _CaptureIntention()
+    agent.memory_manager.get_recent_context = lambda n_turns=5: [
+        {"role": "user", "content": "把行程改到周五"},
+        {"role": "assistant", "content": assistant},
+    ]
+    asyncio.run(agent.process_query("那住宿呢"))
+    assistant_msgs = [
+        msg for msg in captured["context"] if msg.role == "assistant"
+    ]
+    assert assistant_msgs, captured["context"]
+    content = assistant_msgs[-1].content
+    assert "_meta" not in content and "input_tokens" not in content, content
+    assert "已改到周五" in content
+    print("✓ CLI 意图上下文剥离助手 _meta")
 
 
 def test_process_query_unparsable_intention_returns():
@@ -1688,6 +1754,7 @@ if __name__ == "__main__":
     test_read_commands_reload_snapshot()
     test_summary_tolerates_legacy_nested_preference_and_trip_fields()
     test_summary_budgets_preferences()
+    test_summary_hides_unmanageable_preferences()
     test_summary_reads_long_term_off_loop_thread()
     test_process_query_reloads_long_term_each_turn()
     test_process_query_stages_user_message_before_orchestration()
@@ -1771,6 +1838,7 @@ if __name__ == "__main__":
         _mp.undo()
     test_process_query_counts_generic_orchestration_failure()
     test_process_query_filters_malformed_recent_context()
+    test_process_query_strips_assistant_turn_meta()
     test_process_query_open_breaker_returns_quickly()
     test_process_query_unparsable_intention_returns()
     _mp = pytest.MonkeyPatch()

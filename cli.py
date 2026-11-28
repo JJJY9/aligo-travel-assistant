@@ -40,6 +40,7 @@ from utils.paths import default_data_root
 from utils.llm_resilience import RetryBudgetExhausted, retry_with_backoff
 from utils.llm_resilience import run_health_check as check_llm_health
 from utils.preference_values import (
+    EXPLANATORY_PREF_KEYS,
     has_preference_value,
     is_blank_pref_item,
     is_manageable_pref_type,
@@ -56,7 +57,7 @@ from utils.session_title import (
 )
 from utils.timestamps import chronological_key
 from utils.text_search import ci_find as _ci_find
-from utils.turn_meta import attach_turn_meta, build_turn_meta
+from utils.turn_meta import attach_turn_meta, build_turn_meta, strip_turn_meta
 from utils.usage import add_usage
 from utils.version import APP_VERSION
 
@@ -722,6 +723,11 @@ class AligoCLI:
                         continue
                     if not isinstance(content, str):
                         continue
+                    if role == "assistant":
+                        # 助手消息是带 _meta 的整轮编排 JSON：_meta 只服务
+                        # 历史回看，送进意图模型既浪费 token 也暴露内部
+                        # 账目（与 Web 的 _build_context 同一口径）
+                        content = strip_turn_meta(content)
                     context_messages.append(Msg(name=role, content=content, role=role))
                 context_messages.append(Msg(name="user", content=user_input, role="user"))
 
@@ -1132,11 +1138,9 @@ class AligoCLI:
             self.memory_manager.long_term.get_preference
         )
         if isinstance(prefs, dict) and prefs:
-            visible = {
-                key: value
-                for key, value in prefs.items()
-                if has_preference_value(value)  # 0 / False 也是合法偏好
-            }
+            # 与面板 / 导出 / Web 会话同一可见口径：PG 存量脏键与空值行
+            # 不进 CLI 意图摘要（0 / False 仍是合法偏好）
+            visible = visible_preferences(prefs)
             if visible:
                 # 单值 / 总量预算与 Web 会话上下文同口径（500 / 4000）：
                 # 偏好合法上限 200 类型 × 10000 字符，全量原样拼接约 2MB，
@@ -1406,6 +1410,12 @@ class AligoCLI:
                     for item in prefs_list
                     if isinstance(item, dict)
                     and is_manageable_pref_type(item.get("type"))
+                    # 说明性键（note / status / message 等）不会落库：
+                    # 与落库路径 / Web 渲染器同一口径，不能回显「已更新」
+                    and str(item.get("type") or "").strip()
+                    not in EXPLANATORY_PREF_KEYS
+                    # 空值 = 未设置，不会被写入（清空请用删除）
+                    and has_preference_value(item.get("value"))
                     # 与落库路径 / Web 渲染器同口径：超限 / 畸形的值不会
                     # 真正写入，不能先回显「已更新」
                     and preference_value_problem(item.get("value")) is None
@@ -1837,14 +1847,14 @@ class AligoCLI:
         table.add_column("类型", style="cyan")
         table.add_column("值", style="white")
 
-        for key, value in prefs.items():
+        for key, value in visible_preferences(prefs).items():
             # 0 / False 是合法偏好值（预算为 0、不要靠窗）：真值判断会把
-            # 整行藏掉，与 standalone preferences 和 Web 面板不一致
-            if has_preference_value(value):
-                table.add_row(
-                    _table_cell(key),
-                    _table_cell(self._format_result_value(value)),
-                )
+            # 整行藏掉，与 standalone preferences 和 Web 面板不一致；
+            # PG 存量不可寻址脏键同样不渲染（与面板同一可见口径）
+            table.add_row(
+                _table_cell(key),
+                _table_cell(self._format_result_value(value)),
+            )
 
         self.console.print(table)
 
@@ -3792,15 +3802,12 @@ def run_stats_standalone(user_id: str, as_json: bool = False) -> int:
     # 重复条目（整数 42 与字符串 "42" 并存）按字符串去重只计一次
     archived_alive = {str(sid) for sid in archived if str(sid) in session_ids}
     travel = summarize_travel(trips)
-    # 与面板 / 状态接口同口径：null / 空白 / 全空列表不计入偏好条数
-    visible_preferences = {
-        key: value
-        for key, value in preferences.items()
-        if has_preference_value(value)
-    }
+    # 与面板 / 状态接口同口径：null / 空白 / 全空列表与不可寻址脏键
+    # 不计入偏好条数（与 webapp 的 /api/status 同一函数）
+    visible = visible_preferences(preferences)
     payload: dict[str, Any] = {
         "user_id": user_id,
-        "preferences": len(visible_preferences),
+        "preferences": len(visible),
         "travel": travel,
         "sessions": {
             "total": len(session_ids),
@@ -7584,13 +7591,9 @@ def run_preferences_list_standalone(user_id: str, as_json: bool = False) -> int:
         if callable(close):
             close()
 
-    # 与面板 / has_preference_value 同口径：null / 空白 / 全空列表不列出，
-    # 列表内的 null 与空白项逐项剔除（此前渲染成「东航、None」）
-    visible = {
-        key: value
-        for key, value in preferences.items()
-        if has_preference_value(value)
-    }
+    # 与面板 / 导出同一可见口径：null / 空白 / 全空列表与不可寻址脏键
+    # 不列出，列表内的 null 与空白项逐项剔除（此前渲染成「东航、None」）
+    visible = visible_preferences(preferences)
 
     def _list_items(value: list) -> list[str]:
         return [
@@ -7751,7 +7754,10 @@ def run_preference_set_standalone(
         # 与导入端 / 加载端同口径直接拒绝；pref-delete 仍放行，保留清理
         # 历史脏行的入口
         return _fail("偏好类型不能是 . 或 ..（面板路径无法寻址）")
-    saved_value: Any = value.strip()
+    # 值按原样保存（与 Web PUT / --json-value 同口径）：此前文本模式先
+    # strip，同一偏好经 CLI 与面板得到不同存储值，合并去重会把「汉庭」
+    # 与「 汉庭 」当成两项；纯空白仍由下面的空值校验拒绝
+    saved_value: Any = value
     if not has_preference_value(saved_value):
         return _fail("偏好值不能为空（清空请使用 pref-delete）")
     if json_value:
@@ -7905,7 +7911,25 @@ def run_preference_delete_standalone(
         return _fail(f"打开长期记忆失败：{exc}")
     try:
         try:
+            try:
+                existing = store.get_preference()
+            except Exception:  # noqa: BLE001 - 读不到就只删精确键
+                existing = None
             removed = store.delete_preference(pref_type)
+            # 删除规范键后同时清理首尾空白影子行（best-effort）：否则被删
+            # 偏好仍以「 home_location」形态回显并占用类型名额
+            if removed and isinstance(existing, dict):
+                shadows = shadow_preference_types(existing, pref_type)
+                if shadows:
+                    delete_many = getattr(store, "delete_preferences", None)
+                    try:
+                        if callable(delete_many):
+                            delete_many(shadows)
+                        else:
+                            for shadow in shadows:
+                                store.delete_preference(shadow)
+                    except Exception:  # noqa: BLE001 - 清理失败不阻断删除
+                        pass
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"删除偏好失败：{exc}")
     finally:

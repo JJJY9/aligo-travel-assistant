@@ -542,9 +542,19 @@ def _store_export_snapshot(store: Any) -> dict[str, Any] | None:
     try:
         if callable(getattr(store, "export_snapshot", None)):
             snapshot = store.export_snapshot() or {}
-            return snapshot if isinstance(snapshot, dict) else None
+            if not isinstance(snapshot, dict):
+                return None
+            # PG 读取期不清洗不可管理键 / 空值脏行：这些行面板不可见、导出
+            # 端也会过滤，计入 200 类型上限会让合法备份被误拒（JSON 后端
+            # 在加载期已丢弃同类行，两后端口径必须一致）
+            if isinstance(snapshot.get("preferences"), dict):
+                snapshot = {
+                    **snapshot,
+                    "preferences": visible_preferences(snapshot["preferences"]),
+                }
+            return snapshot
         return {
-            "preferences": store.get_preference() or {},
+            "preferences": visible_preferences(store.get_preference() or {}),
             "trip_history": store.get_trip_history(limit=None) or [],
             "chat_history": store.get_chat_history() or [],
             "session_titles": store.get_session_titles() or {},
@@ -1641,6 +1651,50 @@ def parse_user_export(
     return parse_user_export_data(data, stats_out=stats_out)
 
 
+def _expand_legacy_preference_wrapper(value: Any) -> list[tuple[str, Any]] | None:
+    """展开旧版 ``{"preferences": [{"type": ..., "value": ...}]}`` 包裹层。
+
+    历史版本把包裹层当成一条偏好类型写入（JSON 加载时会自动展开，PG
+    读取期不展开）：备份往返时该行会被导入端按保留类型整条跳过，嵌套
+    偏好全部丢失。返回去重后的 ``(type, value)`` 列表（同类型保留最后
+    一条，与加载端口径一致）；值不是列表时返回 None，调用方维持旧行为。
+    """
+    if not isinstance(value, list):
+        return None
+    entries: dict[str, Any] = {}
+    for item in value:
+        if not isinstance(item, dict) or "value" not in item:
+            continue
+        pref_type = item.get("type")
+        if not isinstance(pref_type, str):
+            continue
+        if (
+            not (0 < len(pref_type) <= 64)
+            or not is_manageable_pref_type(pref_type)
+            or pref_type == "preferences"
+        ):
+            continue
+        nested_value = item["value"]
+        if _text_problem(pref_type) or _bad_text_in_value(nested_value):
+            continue
+        if not has_preference_value(nested_value):
+            continue
+        if _content_beyond_export_depth(nested_value, _PREFERENCE_EXPORT_DEPTH):
+            continue
+        try:
+            size = len(
+                json.dumps(
+                    nested_value, ensure_ascii=False, separators=(",", ":")
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+        if size > PREFERENCE_VALUE_MAX_CHARS:
+            continue
+        entries[pref_type] = nested_value
+    return list(entries.items())
+
+
 def parse_user_export_data(
     data: Any, *, stats_out: dict[str, int] | None = None
 ) -> tuple[dict[str, Any], list[str]]:
@@ -1690,12 +1744,43 @@ def parse_user_export_data(
             errors.append(f"跳过第 {index} 个偏好：键名非法")
             continue
         if name == "preferences":
-            # 保留类型：存储层加载时把该类型的列表值展开成独立偏好类型
-            # （并丢弃 / 覆盖同名条目），恢复后类型数可远超上限、账号
-            # 永久无法导出；与 Web PUT / CLI pref-set 的拒绝口径一致
-            errors.append(
-                f"跳过第 {index} 个偏好：preferences 是保留的偏好类型"
+            # 保留类型：但历史版本写入的是旧版包裹层（嵌套偏好列表）。
+            # 展开为独立偏好类型（显式顶层键优先、同类型保留最后一条），
+            # 否则导出保留该行、恢复时又被整条跳过，备份往返丢偏好
+            expanded = _expand_legacy_preference_wrapper(value)
+            if not expanded:
+                # 与 Web PUT / CLI pref-set 的拒绝口径一致：dict / 标量
+                # 包裹层与旧的「整条跳过」行为保持不变
+                errors.append(
+                    f"跳过第 {index} 个偏好：preferences 是保留的偏好类型"
+                )
+                continue
+            explicit = {
+                str(key)
+                for key in preferences
+                if str(key) != "preferences"
+            }
+            candidates = [
+                (nested_type, nested_value)
+                for nested_type, nested_value in expanded
+                if nested_type not in explicit
+            ]
+            resulting = (
+                set(cleaned_preferences)
+                | {nested_type for nested_type, _ in candidates}
+                | explicit
             )
+            if len(resulting) > _MAX_PREFERENCES:
+                # 展开会推过类型上限：维持旧行为整条跳过并报错
+                errors.append(
+                    f"跳过第 {index} 个偏好：展开后偏好超过 "
+                    f"{_MAX_PREFERENCES} 个"
+                )
+                continue
+            for nested_type, nested_value in candidates:
+                if nested_type in cleaned_preferences:
+                    continue
+                cleaned_preferences[nested_type] = nested_value
             continue
         problem = _text_problem(name) or _bad_text_in_value(value)
         if problem:

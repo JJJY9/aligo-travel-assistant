@@ -4490,6 +4490,46 @@ def test_delete_session_clears_execution_checkpoints(monkeypatch):
     print("✓ 删除会话清理执行检查点")
 
 
+def test_delete_session_and_last_turn_invalidate_summary_caches(monkeypatch):
+    """删除会话 / 末轮后摘要缓存失效：失败冷却期旧摘要不得回放已删内容。"""
+    from context.memory_manager import MemoryManager
+    from context.storage import create_long_term_memory
+
+    called: list[str] = []
+    monkeypatch.setattr(
+        MemoryManager,
+        "invalidate_all_summary_caches",
+        classmethod(lambda cls: called.append("summary")),
+    )
+    client = _client()
+    user_id = _unique_user("web_test_summary_invalidate")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.add_chat_turn("你好", "在", "s-summary")
+            store.add_chat_turn("再问", "再答", "s-summary")
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        last_turn = client.delete(
+            "/api/sessions/s-summary/last-turn", params={"user_id": user_id}
+        )
+        assert last_turn.status_code == 200, last_turn.text
+        assert last_turn.json()["removed"] >= 1, last_turn.text
+        assert called, "删除末轮后必须失效摘要缓存"
+
+        called.clear()
+        deletion = client.delete(
+            "/api/sessions/s-summary", params={"user_id": user_id}
+        )
+        assert deletion.status_code == 200, deletion.text
+        assert called, "删除会话后必须失效摘要缓存"
+    finally:
+        _cleanup(user_id)
+    print("✓ 删除会话 / 末轮失效摘要缓存")
+
+
 def test_session_markdown_export():
     client = _client()
     user_id = _unique_user("web_test_export")
@@ -5116,11 +5156,21 @@ def test_preference_put_cleans_hidden_blank_entries():
     try:
         store = create_long_term_memory(user_id, str(MEMORY_DIR))
         try:
-            store.save_preference("ghost_type", None)
+            # 存储写入口已拒绝空值：直接写历史脏数据（与旧版本落库的
+            # 空值行同形），验证面板写入时顺带清理的口径
+            store.save_preference("home_location", "北京")
         finally:
             close = getattr(store, "close", None)
             if callable(close):
                 close()
+        memory_file = Path(MEMORY_DIR) / f"{user_id}.json"
+        raw = json.loads(memory_file.read_text(encoding="utf-8"))
+        raw.setdefault("preferences", []).append(
+            {"type": "ghost_type", "value": None}
+        )
+        memory_file.write_text(
+            json.dumps(raw, ensure_ascii=False), encoding="utf-8"
+        )
         response = client.put(
             "/api/preferences/home_location",
             json={"user_id": user_id, "value": "上海"},
@@ -7698,6 +7748,53 @@ def test_preference_storage_failure_maps_503(monkeypatch):
     assert deleted.status_code == 503
     assert "删除失败" in deleted.json()["detail"]
     print("✓ 偏好写入 / 删除失败映射 503")
+
+
+def test_preference_put_readback_failure_returns_success(monkeypatch):
+    """写入已提交、读回失败只降级为 warning（不报 503），且缓存必须失效。"""
+    from utils.errors import MemoryPersistenceError
+    from webapp import server as server_module
+
+    invalidations: list[bool] = []
+
+    class _FlakyStore:
+        def __init__(self):
+            self.saved: dict[str, object] = {}
+
+        def get_preference(self, pref_type=None):
+            if pref_type is not None:
+                raise MemoryPersistenceError("读超时")
+            return dict(self.saved)
+
+        def save_preference(self, pref_type, value):
+            self.saved[pref_type] = value
+
+        def close(self):
+            pass
+
+    store = _FlakyStore()
+    monkeypatch.setattr(
+        server_module,
+        "_open_long_term",
+        lambda user_id, strict=False, **kwargs: store,
+    )
+    monkeypatch.setattr(
+        server_module,
+        "_invalidate_preference_caches",
+        lambda: invalidations.append(True),
+    )
+    client = _client()
+    response = client.put(
+        "/api/preferences/home_location",
+        json={"user_id": "pref-readback", "value": "北京"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["value"] == "北京"
+    assert "warning" in body, body
+    assert store.saved == {"home_location": "北京"}
+    assert invalidations, "写入提交后必须失效偏好缓存"
+    print("✓ 偏好写后读回失败按成功 + warning 返回")
 
 
 def test_status_trips():

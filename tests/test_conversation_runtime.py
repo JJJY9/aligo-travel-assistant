@@ -1522,7 +1522,9 @@ def test_empty_short_term_backfills_current_session_history():
         def get_chat_history(
             self, limit=None, session_id=None, exclude_session_id=None
         ):
-            assert limit == 10
+            # 回填深度 = 短期容量轮数 × 2（默认 20 条 = 10 轮），与最近
+            # 摘要窗口一致；只补 10 条会让摘要覆盖范围减半
+            assert limit == 20
             assert session_id == runtime.session_id
             self.history_reads += 1
             assistant = json.dumps(
@@ -1559,6 +1561,45 @@ def test_empty_short_term_backfills_current_session_history():
     second_context = "\n".join(m.content for m in runtime.intention_agent.context)
     assert "帮我把行程改到周五" in second_context, second_context
     print("✓ 短期记忆为空时从长期记忆回填本会话上下文并写回")
+
+
+def test_backfill_window_follows_short_term_capacity_and_drops_orphan():
+    """回填深度跟随短期容量（max_turns×2），奇数历史的孤立助手消息丢弃。"""
+    runtime, memory = _make_runtime()
+    seen_limits: list[int] = []
+
+    class _EmptyShortTerm:
+        max_turns = 12
+
+        def get_recent_context(self, n_turns=5):
+            return []
+
+        def add_message(self, role, content, metadata=None, timestamp=None):
+            pass
+
+    class _LongTerm:
+        def get_preference(self):
+            return {}
+
+        def get_chat_history(
+            self, limit=None, session_id=None, exclude_session_id=None
+        ):
+            seen_limits.append(limit)
+            # 奇数条历史：开头是没有提问的孤立助手消息
+            return [
+                {"role": "assistant", "content": "孤立回答"},
+                {"role": "user", "content": "真实问题"},
+                {"role": "assistant", "content": "真实回答"},
+            ]
+
+    memory.short_term = _EmptyShortTerm()
+    memory.long_term = _LongTerm()
+    asyncio.run(runtime.ask("追问"))
+    assert seen_limits == [24], "回填条数应为 max_turns×2"
+    contents = "\n".join(m.content for m in runtime.intention_agent.context)
+    assert "真实问题" in contents
+    assert "孤立回答" not in contents, "孤立助手消息应对齐回合边界丢弃"
+    print("✓ 回填深度跟随短期容量且丢弃孤立助手消息")
 
 
 def test_non_empty_short_term_skips_long_term_backfill():
@@ -2178,6 +2219,7 @@ if __name__ == "__main__":
     test_summary_failure_degrades_to_empty()
     test_orchestration_results_object_yields_agents_list()
     test_empty_short_term_backfills_current_session_history()
+    test_backfill_window_follows_short_term_capacity_and_drops_orphan()
     test_non_empty_short_term_skips_long_term_backfill()
     test_rollback_failure_does_not_mask_original_error()
     test_rollback_carries_turn_id()

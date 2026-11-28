@@ -4069,9 +4069,10 @@ def test_import_rechecks_volume_under_import_lock(monkeypatch):
 
 
 def test_parse_rejects_reserved_preferences_pref_type():
-    """「preferences」是保留偏好类型：存储层加载时把该类型的列表值
-    展开成独立类型（并覆盖同名条目），恢复后类型数可远超上限；解析
-    直接拒绝，与 Web PUT / CLI pref-set 同口径。"""
+    """「preferences」是保留偏好类型：旧版包裹层（嵌套列表）按加载端口径
+    展开为独立偏好类型（显式顶层键优先），展开后超过类型上限仍整条跳过
+    并报错；非列表包裹层（dict / 标量）维持拒绝，与 Web PUT / CLI
+    pref-set 同口径。"""
     payload = {
         "preferences": {
             "preferences": [
@@ -4084,8 +4085,97 @@ def test_parse_rejects_reserved_preferences_pref_type():
         json.dumps(payload, ensure_ascii=False)
     )
     assert sections["preferences"] == {"home_location": "北京"}, sections
+    assert any("展开后偏好超过" in item for item in errors), errors
+
+    payload = {"preferences": {"preferences": {"home_location": "北京"}}}
+    sections, errors = parse_user_export(
+        json.dumps(payload, ensure_ascii=False)
+    )
+    # 整份备份没有任何可恢复段：解析返回空 dict
+    assert sections == {}, sections
     assert any("保留的偏好类型" in item for item in errors), errors
-    print("✓ 导入拒绝保留偏好类型 preferences")
+    print("✓ 导入拒绝 / 展开保留偏好类型 preferences")
+
+
+def test_merged_limit_ignores_invisible_pg_preference_rows():
+    """PG 存量不可见行（不可寻址键）不能计入恢复后的 200 类型上限。
+
+    导出口径本来就会过滤这些行：把它们计入预检会让「199 可见 + 1 脏行」
+    的账号恢复一个只新增 1 个类型的合法备份时被误拒 409/413。
+    """
+    from utils import user_import as module
+
+    visible = {f"pref_{index}": f"v{index}" for index in range(199)}
+
+    def _store(preferences: dict) -> object:
+        class _Store:
+            snapshot_based = False
+            user_id = "u1"
+
+            def export_snapshot(self):
+                return {
+                    "preferences": dict(preferences),
+                    "trip_history": [],
+                    "chat_history": [],
+                    "session_titles": {},
+                    "pinned_sessions": [],
+                    "archived_sessions": [],
+                }
+
+        return _Store()
+
+    dirty = dict(visible)
+    dirty["bad/key"] = "脏行"
+    sections = {"preferences": {"new_type": "v"}}
+    assert module.merged_backup_limit_problem(_store(dirty), sections) is None
+
+    # 200 个真实可见 + 脏行 + 新类型：越过上限必须拒绝（防 fail-open）
+    full = {f"pref_{index}": f"v{index}" for index in range(200)}
+    full["bad/key"] = "脏行"
+    problem = module.merged_backup_limit_problem(_store(full), sections)
+    assert problem and "上限" in problem, problem
+    print("✓ 合并上限按可见偏好计数（PG 脏行不占名额）")
+
+
+def test_import_restores_legacy_preferences_wrapper():
+    """PG 导出的旧版 preferences 包裹层经 /api/import 恢复为独立偏好。
+
+    显式顶层键优先、同类型嵌套保留最后一条；否则导出保留该行、恢复
+    整条跳过，备份往返丢偏好。
+    """
+    from utils import user_import as module
+
+    store = LongTermMemory("u-wrapper", tempfile.mkdtemp())
+    try:
+        payload = {
+            "preferences": {
+                "preferences": [
+                    {"type": "home_location", "value": "北京"},
+                    {"type": "airlines", "value": "东航"},
+                    {"type": "airlines", "value": "国航"},
+                    {"type": "bad/key", "value": "注入"},
+                    {"type": "seat", "value": None},
+                ],
+                "home_location": "上海",
+            }
+        }
+        sections, errors = parse_user_export(
+            json.dumps(payload, ensure_ascii=False)
+        )
+        assert sections["preferences"] == {
+            "home_location": "上海",
+            "airlines": "国航",
+        }, sections
+        assert not any("保留的偏好类型" in item for item in errors), errors
+        module.import_user_data(store, sections)
+        assert store.get_preference("home_location") == "上海"
+        assert store.get_preference("airlines") == "国航"
+        assert "bad/key" not in store.get_preference()
+        print("✓ 旧版 preferences 包裹层恢复为独立偏好")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
 
 
 def test_import_user_data_survives_knowledge_outage(monkeypatch):

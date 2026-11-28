@@ -102,6 +102,10 @@ def test_stats_counts_only_visible_preferences(monkeypatch):
             "blank": "   ",
             "null_list": [None],
             "budget_level": 0,
+            # PG 存量不可寻址脏键：与面板 / 导出同一可见口径，不计数
+            "bad/key": "脏行",
+            ".": "脏行",
+            "k" * 65: "脏行",
         },
         trips=[],
         history=[],

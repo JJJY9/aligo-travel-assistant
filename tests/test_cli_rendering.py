@@ -134,6 +134,45 @@ def test_preference_rendering_skips_unmanageable_types():
     print("✓ 偏好回显过滤含 / 与超长 type")
 
 
+def test_preference_rendering_skips_explanatory_and_blank():
+    """说明键（note/status）与空值不会落库，回显不能宣称「已更新」。"""
+    instance = _new_cli()
+    handled = instance._generate_human_response(
+        [
+            {
+                "agent_name": "preference",
+                "status": "success",
+                "data": {
+                    "preferences": [
+                        {"type": "note", "value": "用户喜欢靠窗"},
+                        {"type": "status", "value": "已记录"},
+                        {"type": "seat_preference", "value": "靠窗"},
+                        {"type": "meal_preference", "value": None},
+                    ]
+                },
+            }
+        ]
+    )
+    output = instance._buffer.getvalue()
+    assert handled is True
+    assert "座位偏好" in output and "靠窗" in output
+    assert "用户喜欢靠窗" not in output, "说明性条目不能回显为偏好"
+    assert "meal_preference" not in output, "空值偏好不能被宣称已保存"
+
+    solo = _new_cli()
+    solo._generate_human_response(
+        [
+            {
+                "agent_name": "preference",
+                "status": "success",
+                "data": {"preferences": [{"type": "note", "value": "仅说明"}]},
+            }
+        ]
+    )
+    assert "已更新您的偏好设置" not in solo._buffer.getvalue()
+    print("✓ 偏好回显跳过说明键与空值")
+
+
 def test_preference_rendering_skips_oversized_value():
     """超限偏好值不会落库：回显不能先宣称「已更新」。"""
     instance = _new_cli()
@@ -621,6 +660,7 @@ if __name__ == "__main__":
         mp.undo()
     test_preference_rendering_robust_and_consistent()
     test_preference_rendering_skips_unmanageable_types()
+    test_preference_rendering_skips_explanatory_and_blank()
     test_preference_rendering_skips_oversized_value()
     test_preference_legacy_dict_and_nested_shapes()
     test_local_timestamp_text_tolerates_extreme_years()

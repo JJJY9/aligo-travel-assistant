@@ -1895,6 +1895,45 @@ def test_outage_truncate_without_expect_replays(monkeypatch):
     print("✓ 无 expect 的故障期删除在恢复后补删")
 
 
+def test_expired_truncate_op_not_replayed(monkeypatch):
+    """一次性标记过期后不能再重放截断：expect=None 时无法区分「未执行」
+    与「已执行但响应丢失」，重放会多删一轮并写墓碑。"""
+    import time as _time
+
+    from context import short_term_memory as module
+
+    monkeypatch.setattr(module, "_redis_degraded_until", 0.0)
+    client = _FlakyRedis()
+    client.data = [
+        _message("user", "Q1", "2000-01-01T00:00:00"),
+        _message("assistant", "A1", "2000-01-01T00:00:01"),
+    ]
+    memory = module.RedisShortTermMemory(client, "s-expired-op", max_turns=5, user_id="u1")
+    old = _time.monotonic() - module._OP_MARKER_TTL_SEC - 60
+    with module._pending_journal(memory.key) as journal:
+        journal.started_at = old
+        journal.ops.append(
+            ("truncate", (None, "op-expired", "", None, old))
+        )
+    contents = [item["content"] for item in memory.get_recent_context()]
+    assert contents == ["Q1", "A1"], "超窗截断重放不能误删消息"
+    assert client.tomb == {}, "被丢弃的重放不能写墓碑"
+    assert memory._pending_ops == []
+    print("✓ 标记过期的截断重放被丢弃，不误删")
+
+    # 未超窗的截断仍照常重放（保留「故障期未执行」的补删语义）
+    memory2 = module.RedisShortTermMemory(
+        client, "s-fresh-op", max_turns=5, user_id="u1"
+    )
+    fresh = _time.monotonic()
+    with module._pending_journal(memory2.key) as journal:
+        journal.started_at = fresh
+        journal.ops.append(("truncate", (None, "op-fresh", "", None, fresh)))
+    contents = [item["content"] for item in memory2.get_recent_context()]
+    assert contents == [], "未超窗的截断应正常补删"
+    print("✓ 未超窗截断重放保持原语义")
+
+
 def test_unconditional_truncate_replay_respects_cutoff(monkeypatch):
     """无条件删除的重放同样受 cutoff 保护：不误删故障期新写入的轮次。"""
     from context import short_term_memory as module

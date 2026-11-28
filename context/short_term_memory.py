@@ -30,11 +30,13 @@ _redis_degraded_until = 0.0
 # 没成功过），健康接口必须看真实结果，否则 Redis 仍不可用时上报健康
 _redis_available = True
 
-# 截断脚本一次性标记的存活时间：标记要覆盖「脚本已执行、响应丢失、故障期
-# 操作日志排队等待重放」的整段时间。故障期日志在超过 _PENDING_MAX_AGE_SEC
-# （= 共享墓碑 TTL，1 小时）后整体丢弃、不再重放，因此标记只需活过「入队
-# 后 1 小时」再加一倍余量：取 2 小时。标记不会再被重放使用后残留的计数
-# 会在 2 小时内自动过期（旧值 30 天让会话删除后依旧留下成批的标记键）。
+# 截断脚本一次性标记的存活时间：标记覆盖「脚本已执行、响应丢失、故障期
+# 操作日志排队等待重放」的整段时间。新增类日志在超过 _PENDING_MAX_AGE_SEC
+# （= 共享墓碑 TTL，1 小时）后丢弃，删除类操作仍保留重放；没有内容校验的
+# truncate 重放只能靠标记识别「已执行」，标记过期后重放会多删一轮并写墓碑
+# ——因此 truncate 操作的保留窗口与标记存活期对齐（2 小时），超窗丢弃。
+# 标记不会再被重放使用后残留的计数会在 2 小时内自动过期（旧值 30 天让
+# 会话删除后依旧留下成批的标记键）。
 _OP_MARKER_TTL_SEC = int(2 * DEFAULT_TOMBSTONE_TTL_SEC)
 
 # 第三方 SDK（redis-py）的连接 / 超时异常不是内置 ConnectionError /
@@ -270,8 +272,9 @@ local cutoff = ARGV[4]
 -- 未删除」的中间态。删除明细（含消息原文）存在短 TTL 的 ``<标记>:del``
 -- 旁键里（排队重放窗口），重放据此补写 :tomb 墓碑——响应丢失后调用方拿
 -- 不到删除内容，而删空分支已在脚本内清掉 seen，不补写墓碑会让跨实例排队
--- 重放把已删除问答写回窗口。标记本身只存计数（30 天）：既保持「重放不再
--- 删一次」的语义，又不会让已删除的用户内容滞留整个标记生命周期。
+-- 重放把已删除问答写回窗口。标记本身只存计数（存活 2 小时，与重放窗口
+-- 对齐）：既保持「重放不再删一次」的语义，又不会让已删除的用户内容滞留
+-- 整个标记生命周期。
 local marker_payload = '{"count":-1,"deleted":[]}'
 if marker then
   local prior = redis.call('GET', marker)
@@ -1233,6 +1236,12 @@ class RedisShortTermMemory:
             # journal.started_at 就会被钉在过去，超窗判断不能只看它，
             # 否则冷却窗口内刚入队的新消息也会被一并丢弃
             payload = tuple(payload) + (time.monotonic(),)
+        elif kind == "truncate":
+            # 截断重放的无内容校验分支依赖一次性标记识别「已执行」：
+            # 标记过期后重放会多删一轮。记录入队时刻，重放时与标记存活期
+            # （_OP_MARKER_TTL_SEC）对齐丢弃超窗操作（追加在末尾，
+            # _replay_head 的 ``expect, op_id, cutoff, *rest`` 解包兼容）
+            payload = tuple(payload) + (time.monotonic(),)
         journal.ops.append((kind, payload))
         cap = max(64, self.max_turns * 8)
         add_indexes = [
@@ -1263,6 +1272,35 @@ class RedisShortTermMemory:
     def _replay_ops(self, journal: _PendingJournal) -> None:
         ops = journal.ops
         window = self.max_turns * 2
+        # 截断操作的无内容校验重放只能靠一次性标记识别「已执行但响应
+        # 丢失」：标记已过期后重放无法区分「未执行」与「已执行」，expect
+        # 为空时会无条件多删当前尾部一轮并写墓碑。超窗截断直接丢弃
+        # （长期记忆里的删除已完成，短期键通常也已过期）
+        now = time.monotonic()
+        expired_truncates: list[int] = []
+        for index, (kind, payload) in enumerate(ops):
+            if kind != "truncate" or not isinstance(payload, tuple):
+                continue
+            if len(payload) <= 4:
+                continue
+            enqueued = payload[4]
+            if (
+                isinstance(enqueued, (int, float))
+                and now - enqueued > _OP_MARKER_TTL_SEC
+            ):
+                expired_truncates.append(index)
+        if expired_truncates:
+            for index in reversed(expired_truncates):
+                del ops[index]
+            logger.warning(
+                "丢弃 %d 条超窗截断重放（一次性标记已过期）：%s",
+                len(expired_truncates),
+                self.key,
+            )
+            if not ops:
+                journal.started_at = None
+                journal.stuck = ("", 0)
+                return
         if ops and journal.started_at is not None:
             age = time.monotonic() - journal.started_at
             if age > _PENDING_MAX_AGE_SEC:

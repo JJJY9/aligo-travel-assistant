@@ -27,9 +27,15 @@ from utils.chat_import import (
 )
 from utils.errors import MemoryPersistenceError, PartialImportError
 from utils.log_redact import redact_secret
-from utils.preference_values import merge_preference_value, preference_value_problem
+from utils.preference_values import (
+    has_preference_value,
+    is_manageable_pref_type,
+    merge_preference_value,
+    preference_value_problem,
+)
 from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_export import normalized_uid_token
+from utils.trip_sort import trip_sort_key
 from utils.turn_meta import extract_turn_meta
 
 
@@ -816,6 +822,14 @@ class PostgresLongTermMemory:
             # 保留类型：JSON 存储层加载时会把列表值展开成独立偏好类型，
             # 两个后端口径一致；Web PUT / CLI pref-set / 导入解析均已拒绝
             raise ValueError("preferences 是保留的偏好类型，请使用具体类型名")
+        # 存储层是直连调用方的最后一道守卫：不可寻址类型在 PG 会留下
+        # 面板改不掉也删不掉的脏行（JSON 后端则「保存成功」后静默丢弃）
+        if not is_manageable_pref_type(pref_type):
+            raise ValueError(
+                "偏好类型不合法（不能为 . / ..，不能含 / 或控制字符，最长 64 字符）"
+            )
+        if not has_preference_value(value):
+            raise ValueError("偏好值不能为空（清空请使用 delete_preference）")
         # 与 JSON 后端 / Web / CLI / 备份恢复同一口径：超限值落库后该偏好
         # 永远无法在面板 / CLI 编辑，还会持续撑大每轮意图 prompt
         problem = preference_value_problem(value)
@@ -976,6 +990,9 @@ class PostgresLongTermMemory:
             # 已追加同类型偏好，按旧值合并会覆盖别人的更新
             self._abort_if_generation_changed(generation)
             merged = merge_preference_value(current, value)
+            if not has_preference_value(merged):
+                # 空值 append 是 no-op（不落库、不抛错），与 JSON 后端一致
+                return merged
             # 写入全程（含 save 内再次加锁）的连接代次必须与读取时一致
             self.save_preference(
                 pref_type,
@@ -998,6 +1015,9 @@ class PostgresLongTermMemory:
             )
             if item not in values:
                 values.append(item)
+            if not values:
+                # 空白项不落库（空值 = 未设置）：与 append_preference 同口径
+                return
             self.save_preference(
                 pref_type,
                 values,
@@ -2638,6 +2658,68 @@ class PostgresLongTermMemory:
                 record["uid_token"] = token
             result.append(record)
         return result
+
+    def get_recent_trips_by_date(self, limit: int = 20) -> list[dict[str, Any]]:
+        """按出发日期取最近 ``limit`` 条行程。
+
+        存储按插入序保存（``ORDER BY id``），备份恢复会把旧行程追加到表
+        尾：先按插入序截取再排序，恢复超过取数池容量的旧行程后近期行程
+        会被挤出。先按 ISO 出发日期取头部候选（覆盖常规数据），不足时补
+        插入序尾部候选，再在 Python 侧用与 JSON 后端同一的归一排序键
+        （兼容 ``2026/03/12`` 等旧格式日期）复排取最近窗口。
+        """
+        if not limit or limit <= 0:
+            return self.get_trip_history(limit=None)
+        self._ensure_trip_uid_column()
+        base = (
+            "SELECT id, trip_id, origin, destination, start_date, end_date, "
+            "purpose, session_id, uid_token, created_at "
+            "FROM aligo_trips WHERE user_id = %s"
+        )
+        rows = self._fetchall(
+            base
+            + " AND start_date ~ '^\\d{4}-\\d{2}-\\d{2}'"
+            + " ORDER BY start_date DESC, id DESC LIMIT %s",
+            (self.user_id, limit),
+        )
+        if len(rows) < limit:
+            # 无 ISO 日期 / 候选不足（旧格式日期、恢复前数据）：补一段
+            # 插入序尾部，受 limit 的有界倍数约束
+            extra = self._fetchall(
+                base + " ORDER BY id DESC LIMIT %s",
+                (self.user_id, max(limit * 10, 200)),
+            )
+            seen = {row[0] for row in rows}
+            rows.extend(row for row in extra if row[0] not in seen)
+
+        records: list[dict[str, Any]] = []
+        for (
+            _row_id,
+            trip_id,
+            origin,
+            destination,
+            start_date,
+            end_date,
+            purpose,
+            session_id,
+            uid_token,
+            created_at,
+        ) in rows:
+            record: dict[str, Any] = {
+                "trip_id": trip_id,
+                "origin": origin,
+                "destination": destination,
+                "start_date": start_date,
+                "end_date": end_date,
+                "purpose": purpose,
+                "session_id": session_id,
+                "timestamp": created_at.isoformat(),
+            }
+            token = normalized_uid_token(uid_token)
+            if token:
+                record["uid_token"] = token
+            records.append(record)
+        return sorted(records, key=trip_sort_key)[-limit:]
 
     def _frequent_destination_counts(self) -> dict[str, int]:
         """常去目的地计数：只统计出发日期可解析的行程。

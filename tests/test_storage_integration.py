@@ -967,6 +967,44 @@ def test_json_add_brand_rejects_oversized_merge():
     print("✓ add_hotel_brand 合并后校验单值上限")
 
 
+def test_json_write_entry_rejects_unmanageable_type_and_blank_value():
+    """存储写入口是直连调用方的最后一道守卫：不可寻址类型 / 空值直接拒绝。
+
+    此前 JSON 后端「写入成功」后在下次加载静默丢弃（生成迁移备份），
+    PG 后端则留下永久脏键——调用方看到成功、偏好实际不存在或无法管理。
+    """
+    import tempfile
+
+    from context.long_term_memory import LongTermMemory
+
+    directory = tempfile.mkdtemp()
+    user_id = f"json-pref-guard-{uuid.uuid4().hex[:8]}"
+    store = LongTermMemory(user_id, directory)
+    for pref_type, value in (
+        ("bad/key", "x"),
+        (".", "x"),
+        ("k" * 65, "x"),
+        ("home_location", ""),
+        ("home_location", []),
+        ("home_location", None),
+    ):
+        with pytest.raises(ValueError):
+            store.save_preference(pref_type, value)
+    with pytest.raises(ValueError):
+        store.append_preference("bad/key", "x")
+    # 空白值 append 是 no-op（与既有「空列表追加为零操作」一致），不落库
+    assert store.append_preference("home_location", "   ") == []
+    assert store.get_preference() == {}
+    assert not os.path.exists(
+        os.path.join(directory, f"{user_id}.json.migrate-backup")
+    ), "拒绝的写入不能落盘触发迁移备份"
+    # 向既有列表追加空值是 no-op（不抛错、不新增假值）
+    store.save_preference("airlines", "东航")
+    store.append_preference("airlines", "  ")
+    assert store.get_preference("airlines") == ["东航"]
+    print("✓ JSON 存储写入口拒绝不可寻址类型 / 空值")
+
+
 def test_json_migration_drops_blank_preference_values():
     """历史文件里的空值偏好（null / 空白串）在加载时丢弃。
 

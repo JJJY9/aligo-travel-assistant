@@ -687,6 +687,18 @@ def _format_pref_value(value) -> str:
     return str(value)
 
 
+_PREF_VALUE_PROMPT_MAX_CHARS = 500
+
+
+def _budget_pref_value(value) -> str:
+    """进入 preferences_info 的偏好值：单值预算（与 preference_prompt_lines
+    同一 500 字符口径，避免 4 个已知类型各带 10000 字符撑爆规划 prompt）。"""
+    text = _format_pref_value(value)
+    if len(text) > _PREF_VALUE_PROMPT_MAX_CHARS:
+        text = text[:_PREF_VALUE_PROMPT_MAX_CHARS] + "…"
+    return text
+
+
 def _neutralize_boundaries(value):
     """递归中和第三方内容里的数据块分隔符与全角方括号。
 
@@ -1002,13 +1014,13 @@ class ItineraryPlanningAgent(AgentBase):
         if user_preferences:
             pref_parts = ["【用户偏好】（规划时优先考虑）"]
             if user_preferences.get("home_location"):
-                pref_parts.append(f"• 家庭住址: {_format_pref_value(user_preferences['home_location'])}")
+                pref_parts.append(f"• 家庭住址: {_budget_pref_value(user_preferences['home_location'])}")
             if user_preferences.get("hotel_brands"):
-                pref_parts.append(f"• 酒店偏好: {_format_pref_value(user_preferences['hotel_brands'])}")
+                pref_parts.append(f"• 酒店偏好: {_budget_pref_value(user_preferences['hotel_brands'])}")
             if user_preferences.get("airlines"):
-                pref_parts.append(f"• 航空偏好: {_format_pref_value(user_preferences['airlines'])}")
+                pref_parts.append(f"• 航空偏好: {_budget_pref_value(user_preferences['airlines'])}")
             if user_preferences.get("seat_preference"):
-                pref_parts.append(f"• 座位偏好: {_format_pref_value(user_preferences['seat_preference'])}")
+                pref_parts.append(f"• 座位偏好: {_budget_pref_value(user_preferences['seat_preference'])}")
 
             if len(pref_parts) > 1:
                 preferences_info = "\n".join(pref_parts) + "\n\n"

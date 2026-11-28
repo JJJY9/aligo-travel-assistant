@@ -910,6 +910,65 @@ def test_preferences_objects_render_as_json(monkeypatch):
     print("✓ 偏好对象项按 JSON 显示")
 
 
+def test_pref_set_preserves_text_value_whitespace(monkeypatch):
+    """文本模式按原样保存（与 Web PUT / --json-value 同口径），纯空白仍拒绝。"""
+    store = _WriteStore({})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", "home_location", "  上海  ")
+    assert code == 0, out.getvalue()
+    assert store.saved == [("home_location", "  上海  ")], store.saved
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone(
+            "u1", "hotel_brands", '" 靠窗 "', json_value=True
+        )
+    assert code == 0, out.getvalue()
+    assert store.saved[-1] == ("hotel_brands", " 靠窗 "), store.saved
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", "home_location", "   ")
+    assert code == 1, out.getvalue()
+    print("✓ pref-set 文本值保留首尾空白")
+
+
+def test_pref_delete_cleans_shadow_keys(monkeypatch):
+    """删除规范键后同时清理首尾空白影子行（否则被删偏好仍回显）。"""
+    store = _WriteStore({" home_location": "北京", "home_location": "上海"})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_delete_standalone("u1", "home_location")
+    assert code == 0, out.getvalue()
+    assert " home_location" not in store.preferences, store.preferences
+    print("✓ pref-delete 清理影子偏好行")
+
+
+def test_preferences_list_hides_unmanageable_keys(monkeypatch):
+    """PG 存量不可寻址脏键不在 pref-list 计数与列表里出现（与面板同口径）。"""
+    store = _FakeStore(
+        {"home_location": "北京", "bad/key": "脏行", "note\n": "脏行"}
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preferences_list_standalone("u-prefs", as_json=True)
+    assert code == 0
+    data = json.loads(out.getvalue())
+    assert data["count"] == 1, data
+    assert set(data["preferences"]) == {"home_location"}, data
+    print("✓ pref-list 按可见口径隐藏不可寻址键")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -947,6 +1006,9 @@ if __name__ == "__main__":
         test_preferences_json_filters_blank_list_items,
         test_pref_delete_text_and_json,
         test_pref_delete_allows_legacy_container,
+        test_pref_set_preserves_text_value_whitespace,
+        test_pref_delete_cleans_shadow_keys,
+        test_preferences_list_hides_unmanageable_keys,
         test_pref_write_validation_and_failures,
         test_pref_write_dispatch,
         test_pref_set_rejects_oversized_value,

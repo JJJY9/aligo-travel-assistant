@@ -1491,6 +1491,80 @@ def test_memory_update_preference_and_trip():
     print("✓ 偏好覆盖/追加与行程写入正常")
 
 
+def test_memory_update_strips_legacy_keys_and_cleans_shadows():
+    """旧字典格式的键先 strip 再落库，写规范键后清理首尾空白影子行。"""
+
+    class _LongTerm:
+        def __init__(self):
+            self.preferences: dict[str, object] = {" home_location": "北京"}
+            self.deleted: list[str] = []
+
+        def get_preference(self, pref_type=None):
+            if pref_type is None:
+                return dict(self.preferences)
+            return self.preferences.get(pref_type)
+
+        def save_preference(self, pref_type, value):
+            self.preferences[pref_type] = value
+
+        def delete_preference(self, pref_type):
+            if pref_type in self.preferences:
+                del self.preferences[pref_type]
+                self.deleted.append(pref_type)
+                return True
+            return False
+
+    memory = _StubMemory()
+    memory.long_term = _LongTerm()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    orchestrator._update_memory(
+        {},
+        [
+            {
+                "agent_name": "preference",
+                "priority": 1,
+                "result": {
+                    "status": "success",
+                    "data": {
+                        "preferences": {
+                            " hotel_brands ": ["如家"],
+                            "home_location": "上海",
+                        }
+                    },
+                },
+            }
+        ],
+    )
+    prefs = memory.long_term.get_preference()
+    assert prefs.get("hotel_brands") == ["如家"], prefs
+    assert " hotel_brands " not in prefs
+    assert prefs.get("home_location") == "上海"
+    assert " home_location" not in prefs, "规范键写入后影子行必须清理"
+    assert memory.long_term.deleted == [" home_location"]
+    print("✓ 对话写入 strip 旧格式键并清理影子偏好")
+
+
+def test_prepare_context_filters_unmanageable_preferences():
+    """PG 存量不可寻址键 / 空值偏好不下发给子智能体提示词。"""
+
+    class _LongTerm:
+        def get_preference(self, pref_type=None):
+            return {
+                "airlines": "东航",
+                "home_location": None,
+                "bad/key": "注入",
+                "line\nbreak": "注入",
+            }
+
+    memory = _StubMemory()
+    memory.long_term = _LongTerm()
+    context = OrchestrationAgent(
+        agent_registry={}, memory_manager=memory
+    )._prepare_context({})
+    assert context["user_preferences"] == {"airlines": "东航"}
+    print("✓ 编排上下文偏好按可见口径下发")
+
+
 def test_memory_update_legacy_preferences_and_custom_backend():
     """旧字典格式偏好，以及后端没有原子追加时的兜底合并。"""
 
