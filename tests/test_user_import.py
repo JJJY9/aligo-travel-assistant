@@ -6029,6 +6029,8 @@ def test_parse_rejects_unmanageable_preference_keys():
                 "   ": "v",
                 ".": "x",
                 "..": "y",
+                " .": "z",
+                ".. ": "w",
                 " home": "北京",
                 "home": "上海",
             }
@@ -6036,8 +6038,9 @@ def test_parse_rejects_unmanageable_preference_keys():
     )
     prefs = sections.get("preferences", {})
     assert "   " not in prefs and "." not in prefs and ".." not in prefs, prefs
+    assert " ." not in prefs and ".. " not in prefs, "strip 后的 . / .. 同样拒绝"
     assert prefs.get(" home") == "北京" and prefs.get("home") == "上海"
-    assert sum("键名非法" in error for error in errors) == 3, errors
+    assert sum("键名非法" in error for error in errors) == 5, errors
     print("✓ 恢复拒绝纯空白与 . / .. 偏好键（可寻址性口径）")
 
 

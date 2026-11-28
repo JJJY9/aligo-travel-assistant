@@ -531,6 +531,22 @@ def test_pref_set_readback_failure_keeps_success(monkeypatch):
     print("✓ pref-set 写后读回失败按提交值展示")
 
 
+def test_pref_set_clears_shadow_keys(monkeypatch):
+    """写规范键时清理仅差首尾空白的影子行（历史备份导入保留键）。"""
+    store = _WriteStore({" home_location": "北京", "home_location": "上海"})
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_preference_set_standalone("u1", "home_location", "杭州")
+    assert code == 0, out.getvalue()
+    assert " home_location" not in store.preferences
+    assert store.deleted == [" home_location"]
+    assert store.preferences["home_location"] == "杭州"
+    print("✓ pref-set 写规范键时清理影子偏好")
+
+
 def test_pref_set_json_value_types(monkeypatch):
     """--json-value 写入带类型值（列表 / 数字 / 布尔），非法 JSON 拒绝。"""
     store = _WriteStore({})
@@ -918,6 +934,7 @@ if __name__ == "__main__":
         test_preferences_dispatch_strict,
         test_preferences_dispatch_json_flexible,
         test_pref_set_text_and_json,
+        test_pref_set_clears_shadow_keys,
         test_pref_set_readback_failure_keeps_success,
         test_pref_set_json_value_types,
         test_pref_set_json_value_rejects_empty_shapes,

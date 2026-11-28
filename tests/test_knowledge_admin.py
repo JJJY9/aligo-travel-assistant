@@ -3257,6 +3257,38 @@ def test_update_compensation_failure_reported(monkeypatch):
     print("✓ 补偿删除失败的残留分片随异常报出")
 
 
+def test_add_document_rejects_missing_collection(monkeypatch):
+    """半初始化（库文件在、集合缺失）：单条新增与 CLI / README 一致拒绝。
+
+    不能走 _get_agent 的 create_if_missing 静默建一个只含本条的空集合，
+    把「集合不存在」的健康状态翻成可用；批量导入仍是恢复路径，不受限。
+    """
+    from pathlib import Path
+
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+    monkeypatch.setattr(knowledge_admin, "_collection_exists", lambda: False)
+
+    def _must_not_load():
+        raise AssertionError("半初始化时不应加载嵌入模型")
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", _must_not_load)
+    with pytest.raises(FileNotFoundError, match="集合不存在"):
+        knowledge_admin.add_document("新内容")
+
+    # 集合存在但为空（0 片段）仍放行：面板可写入第一条
+    monkeypatch.setattr(knowledge_admin, "_collection_exists", lambda: True)
+    monkeypatch.setattr(knowledge_admin, "_collection_row_count", lambda: 0)
+
+    class _Agent:
+        def add_documents(self, documents):
+            return {"status": "success", "ids": [1], "total_count": 1}
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    result = knowledge_admin.add_document("新内容")
+    assert result["status"] == "success", result
+    print("✓ 集合缺失时 add_document 拒绝（空集合仍可写第一条）")
+
+
 def test_write_agent_cached_with_create_if_missing(monkeypatch):
     """写入 Agent 懒加载后复用，构造时 create_if_missing=True。"""
     import agents.rag_knowledge_agent as rag_module
@@ -4479,6 +4511,7 @@ if __name__ == "__main__":
         test_cleanup_duplicate_contents_deletes_and_reports_failure,
         test_cleanup_partial_storage_failure_returns_plan,
         test_write_agent_cached_with_create_if_missing,
+        test_add_document_rejects_missing_collection,
         test_get_document_reads_single_row,
         test_existing_group_layout_tolerates_bad_numbers,
         test_import_empty_documents_short_circuits,

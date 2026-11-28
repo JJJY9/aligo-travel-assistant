@@ -969,6 +969,31 @@ def test_trip_update_fields_and_json(monkeypatch):
     print("✓ trip-update 字段更新 / JSON")
 
 
+def test_trip_update_can_clear_end_date(monkeypatch):
+    """--end "" 等价 Web PUT 的 end_date:null：多日行程改回单日。"""
+    store = _UpdateStore(
+        [_trip("上海", "2026-12-01", "2026-12-03", trip_id="trip_1")]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    code, out = _run_trip_update("u1", "trip_1", {"end": ""}, as_json=True)
+    assert code == 0, out
+    # 与 Web 同形落 None（JSON 后端 null / PG NULL），不写空串
+    assert store.updates[-1] == ("trip_1", {"end_date": None})
+    data = json.loads(out)
+    assert data["updated"] is True and data["end_date"] == ""
+
+    # 存量出发日期缺失 / 脏数据不应阻断「清空返程日期」（Web 允许）
+    dateless = _UpdateStore([{"trip_id": "trip_1", "destination": "上海"}])
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: dateless
+    )
+    code, out = _run_trip_update("u1", "trip_1", {"end": ""})
+    assert code == 0 and dateless.updates[-1] == ("trip_1", {"end_date": None})
+    print("✓ trip-update 可清空返程日期（与 Web PUT 同语义）")
+
+
 def test_trip_update_validation_errors(monkeypatch):
     store = _UpdateStore([_trip("上海", "2026-12-01", "2026-12-03", trip_id="trip_1")])
     monkeypatch.setattr(
@@ -1066,8 +1091,8 @@ def test_trip_update_args_and_dispatch(monkeypatch):
         cli._parse_trip_update_args(["u1", "trip_1", "--purpose", "--json"])
         is None
     ), "以 - 开头的值必须拒绝，避免把 --json 存成 purpose"
-    # 与 Web PUT 一致：origin / purpose 允许空串（清空字段），
-    # 目的地 / 日期为空仍拒绝
+    # 与 Web PUT 一致：origin / purpose / end 允许空串（清空字段），
+    # 目的地 / 出发日期为空仍拒绝
     parsed_clear = cli._parse_trip_update_args(
         ["u1", "trip_1", "--origin", "", "--purpose", ""]
     )
@@ -1077,6 +1102,11 @@ def test_trip_update_args_and_dispatch(monkeypatch):
         is None
     )
     assert cli._parse_trip_update_args(["u1", "trip_1", "--start", ""]) is None
+    # --end "" 与 Web end_date:null 同义（清空返程日期）
+    parsed_clear_end = cli._parse_trip_update_args(
+        ["u1", "trip_1", "--end", ""]
+    )
+    assert parsed_clear_end["values"] == {"end": ""}, parsed_clear_end
     parsed = cli._parse_trip_update_args(
         ["u1", "trip_1", "--purpose=会议", "--start", "2026-12-01", "--json"]
     )
@@ -1470,6 +1500,7 @@ if __name__ == "__main__":
         test_trip_delete_failures,
         test_trip_delete_args_and_dispatch,
         test_trip_update_fields_and_json,
+        test_trip_update_can_clear_end_date,
         test_trip_update_validation_errors,
         test_trip_update_legacy_unpadded_dates,
         test_trip_update_rejects_oversized_fields,

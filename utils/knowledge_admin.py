@@ -757,6 +757,12 @@ def add_document(content: str, metadata: dict[str, str] | None = None) -> dict[s
         )
     if not knowledge_db_path().exists():
         raise FileNotFoundError("知识库未初始化")
+    # 库文件存在但集合缺失（半初始化）：单条新增不能走 _get_agent 的
+    # create_if_missing 静默建一个只含本条的空集合，把「集合不存在」的
+    # 健康状态翻成可用；与 CLI kb-add/kb-update 及 README 的
+    # 「先重新初始化」口径一致。批量导入仍是刻意的恢复路径，不受此限。
+    if not _collection_exists():
+        raise FileNotFoundError("知识库集合不存在（请先重新初始化）")
     documents = _chunk_documents(text, metadata)
 
     # 全局上限预检放在模型加载前：统计失败按 0 放行（导出端有降级兜底），

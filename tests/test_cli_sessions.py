@@ -161,6 +161,18 @@ def test_list_filters_by_query(monkeypatch):
     print("✓ sessions --query 按标题 / 内容过滤并附带片段")
 
 
+def test_list_query_uses_casefold_safe_ci_find(monkeypatch):
+    """CLI 与 Web 共用 ci_find：İ 小写后长度变化也不漏命中。"""
+    fake = _FakeStore([_message("user", "İstanbul 出差计划", "s-tr")])
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
+    code, out = _run_list("u1", query="istanbul", as_json=True)
+    assert code == 0, out
+    data = json.loads(out)
+    assert [item["session_id"] for item in data["sessions"]] == ["s-tr"], data
+    assert "İstanbul" in data["sessions"][0]["snippet"]
+    print("✓ sessions --query 与 Web 同口径（大小写长度变化的 İ 等字符）")
+
+
 def test_list_json_output(monkeypatch):
     """--json 输出会话摘要（含命中片段），空结果也是合法 JSON。"""
     fake = _sessions_store()
@@ -416,6 +428,42 @@ def test_session_delete_clears_trip_links_for_empty_session(monkeypatch):
     assert fake.trips[0]["session_id"] is None
     assert fake.trips[1]["session_id"] == "s-active", "其它会话的链接不受影响"
     print("✓ session-delete 可清理仅被行程引用的空会话链接")
+
+
+def test_session_delete_trip_only_ghost_revokes_tombstone(monkeypatch):
+    """仅被行程引用的空会话没有内容可保护：删除后撤销本进程墓碑（与 Web 一致）。"""
+    fake = _sessions_store()
+    fake.trips = [
+        {"trip_id": "trip_1", "session_id": "s-empty", "origin": "北京",
+         "destination": "上海"},
+    ]
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
+    monkeypatch.setattr(storage, "clear_short_term_session", lambda sid, uid="": None)
+    from utils import tombstones
+
+    calls = []
+    monkeypatch.setattr(
+        tombstones,
+        "mark_session_deleted",
+        lambda *a, **k: calls.append(("mark", a, k)) or True,
+    )
+    monkeypatch.setattr(
+        tombstones,
+        "unmark_session_deleted",
+        lambda *a, **k: calls.append(("unmark", a, k)) or True,
+    )
+    monkeypatch.setattr(
+        tombstones,
+        "reassert_session_deleted",
+        lambda *a, **k: calls.append(("reassert", a, k)) or True,
+    )
+    code, out = _run_delete("u1", "s-empty", as_json=True)
+    assert code == 0, out
+    labels = [item[0] for item in calls]
+    assert "mark" in labels and "unmark" in labels, calls
+    assert "reassert" not in labels, calls
+    assert json.loads(out)["shared_tombstone"] is False
+    print("✓ session-delete 行程幽灵删除后撤销墓碑（ID 可立即复用）")
 
 
 def test_session_delete_writes_shared_tombstone(monkeypatch):
@@ -1144,6 +1192,22 @@ def _run_export(
             html=html,
         )
     return code, buf.getvalue()
+
+
+def test_session_export_markdown_time_has_offset(monkeypatch):
+    """单会话 Markdown 导出时间与 Web / 合集 / HTML 导出同一时区口径。"""
+    from datetime import datetime
+
+    fake = _sessions_store()
+    monkeypatch.setattr(storage, "create_long_term_memory", lambda *args, **kwargs: fake)
+    code, out = _run_export("u1", "s-active", to_stdout=True)
+    assert code == 0, out
+    line = next(
+        item for item in out.splitlines() if item.startswith("- 导出时间：")
+    )
+    parsed = datetime.fromisoformat(line.split("：", 1)[1])
+    assert parsed.tzinfo is not None, line
+    print("✓ 单会话 Markdown 导出时间带本地时区偏移")
 
 
 def test_main_accepts_query_flag(monkeypatch):

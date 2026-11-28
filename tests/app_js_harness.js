@@ -2686,6 +2686,38 @@ function scenarioKbImportSummary(source) {
   };
 }
 
+async function scenarioKbImportAllInvalid(source) {
+  // 无预览（文件 > 2MB）+ 全部条目无效：与 CLI 同结论「备份未能恢复」，
+  // 不能与「全部已存在」的正常幂等结果共用「已导入 0 条」文案
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    __toasts.length = 0;
+    globalThis.__importCalls = 0;
+    confirm = () => true;
+    state.kbImporting = false;
+    els.kbImport = { disabled: false, textContent: "", addEventListener() {} };
+    els.kbImportFile = {
+      value: "",
+      files: [{
+        size: 3 * 1024 * 1024,
+        arrayBuffer: async () =>
+          new TextEncoder().encode('{"documents":[{"content":"x"}]}').buffer,
+      }],
+    };
+    getJSON = async (url) => {
+      if (url.startsWith("/api/knowledge/import")) {
+        __importCalls += 1;
+        return { imported: 0, skipped: 2, skipped_invalid: 2,
+          skipped_duplicate: 0, skipped_conflict: 0 };
+      }
+      return { available: true, total: 0, items: [], categories: [] };
+    };
+  `);
+  await run("importKnowledgeFile()");
+  return run("({ toasts: __toasts.slice(), imports: __importCalls })");
+}
+
 async function scenarioKbDelete(source) {
   const env = buildEnv(source);
   const run = (code) => runIn(env, code);
@@ -7009,6 +7041,8 @@ async function main() {
     payload = scenarioChatPersisted(source);
   } else if (scenario === "kbImportSummary") {
     payload = scenarioKbImportSummary(source);
+  } else if (scenario === "kbImportAllInvalid") {
+    payload = await scenarioKbImportAllInvalid(source);
   } else if (scenario === "kbDelete") {
     payload = await scenarioKbDelete(source);
   } else if (scenario === "kbDeleteGroupGhost") {

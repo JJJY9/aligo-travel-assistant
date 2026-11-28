@@ -122,6 +122,32 @@ def test_user_export_writes_json_and_markdown(monkeypatch):
     print("✓ user-export 写出 JSON + Markdown")
 
 
+def test_user_export_filters_invisible_preferences(monkeypatch):
+    """与 Web /api/export 同一可见口径：不可寻址 / 空值偏好不导出。
+
+    否则含隐形行的账号会因「原始行数超 200」中止备份，而同账号从面板
+    导出成功；即使未超限，导出的偏好也会在恢复时被导入端跳过。
+    """
+    store = _FakeStore()
+    store.get_preference = lambda: {
+        **{f"bad/key{i}": "x" for i in range(201)},
+        "empty_value": "",
+        "home_location": "北京",
+    }
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    out_dir = Path(tempfile.mkdtemp())
+    code, out = _run("u-invisible", str(out_dir))
+    assert code == 0, out
+    json_path = next(
+        path for path in out_dir.iterdir() if path.suffix == ".json"
+    )
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    assert data["preferences"] == {"home_location": "北京"}, data["preferences"]
+    print("✓ user-export 按可见偏好口径导出（隐形行不计上限）")
+
+
 def test_user_export_default_dir_and_failures(monkeypatch):
     import tempfile
 
@@ -497,6 +523,11 @@ if __name__ == "__main__":
     mp = pytest.MonkeyPatch()
     try:
         test_user_export_writes_json_and_markdown(mp)
+    finally:
+        mp.undo()
+    mp = pytest.MonkeyPatch()
+    try:
+        test_user_export_filters_invisible_preferences(mp)
     finally:
         mp.undo()
     mp = pytest.MonkeyPatch()
