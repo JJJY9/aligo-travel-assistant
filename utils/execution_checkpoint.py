@@ -38,6 +38,23 @@ from utils.paths import default_data_root, package_root
 logger = logging.getLogger(__name__)
 
 DEFAULT_TTL_SEC = 3600.0
+# mtime 落在未来超过该容差的文件视为不可信时间戳（改用 TTL 视为过期）：
+# 写入主机时钟超前 / 备份同步工具保留未来 mtime 时，now - mtime 为负，
+# 按差值判断的 TTL 永远不命中，过期检查点会被当成有效状态复用。容差
+# 覆盖 FAT/SMB 的粗粒度时间戳向上取整与轻微时钟抖动，避免把刚写入的
+# 有效检查点误删（代价只是一次重复的子智能体调用）。
+FUTURE_MTIME_TOLERANCE_SEC = 120.0
+
+
+def _checkpoint_expired(
+    mtime: float, now: float, ttl_sec: float
+) -> bool:
+    """检查点是否过期：超过 TTL 或 mtime 落在未来容差之外。"""
+    if ttl_sec <= 0:
+        return False
+    if mtime - now > FUTURE_MTIME_TOLERANCE_SEC:
+        return True
+    return (now - mtime) > ttl_sec
 DEFAULT_MAX_ENTRIES = 256
 
 # 检查点文件名 = SHA-256(key) 的 64 位十六进制 + .json；临时文件是同目录
@@ -165,9 +182,7 @@ class CheckpointStore:
             if stat_result is None:
                 # 暂时 stat 不到：不按过期删除，也不参与淘汰
                 continue
-            if self.ttl_sec > 0 and (
-                now - stat_result.st_mtime
-            ) > self.ttl_sec:
+            if _checkpoint_expired(stat_result.st_mtime, now, self.ttl_sec):
                 if self._unlink_if_unchanged(path, stat_result):
                     self._owner_cache.pop(path.name, None)
                 continue
@@ -366,9 +381,7 @@ class CheckpointStore:
         except OSError:
             # 暂时 stat 不到不等于不存在：保留哨兵让写路径放弃覆盖
             return _UNREADABLE
-        if self.ttl_sec > 0 and (
-            time.time() - stat_result.st_mtime
-        ) > self.ttl_sec:
+        if _checkpoint_expired(stat_result.st_mtime, time.time(), self.ttl_sec):
             # 按 stat 身份复核后再删：多实例可能在读取前后用新文件替换
             self._unlink_if_unchanged(path, stat_result)
             return None

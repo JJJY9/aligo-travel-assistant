@@ -227,11 +227,11 @@ class MemoryQueryAgent(AgentBase):
         if not skill_instruction:
             skill_instruction = "请基于用户的历史记忆回答问题，如无相关记录请诚实说明。"
 
-        # 构建 prompt：带上当前日期，规划层会提前把未来行程写入历史，
-        # 没有日期模型无法区分「已去过」与「计划中的行程」
-        from datetime import datetime
+        # 构建 prompt：带上当前日期（请求时区），规划层会提前把未来行程
+        # 写入历史，没有日期模型无法区分「已去过」与「计划中的行程」
+        from utils.clock import now as clock_now
 
-        current_date = datetime.now().strftime("%Y-%m-%d")
+        current_date = clock_now().strftime("%Y-%m-%d")
         prompt = f"""你是一个个人记忆助手，请基于用户的历史记忆回答问题。
 
 【当前日期】

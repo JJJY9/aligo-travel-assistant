@@ -157,6 +157,46 @@ def test_event_date_range_is_consistent_across_year_boundary():
     print("✓ 起止日期区间跨年一致")
 
 
+def test_event_range_containing_today_across_new_year():
+    """今天在跨年行程进行中（1 月 1–3 日）时不再被推到约 11 个月后。"""
+    from datetime import date
+
+    from utils.entity_normalize import _normalize_event_range
+
+    assert _normalize_event_range(
+        "12月28日", "1月3日", date(2027, 1, 2)
+    ) == ("2026-12-28", "2027-01-03")
+    assert _normalize_event_range(
+        "12月28日", "1月3日", date(2027, 1, 1)
+    ) == ("2026-12-28", "2027-01-03")
+    # 已经结束：仍按最近的未来区间（今年年末到明年初）
+    assert _normalize_event_range(
+        "12月28日", "1月3日", date(2027, 1, 4)
+    ) == ("2027-12-28", "2028-01-03")
+    # 非跨年区间的语义不变
+    assert _normalize_event_range(
+        "3月1日", "3月5日", date(2027, 1, 2)
+    ) == ("2027-03-01", "2027-03-05")
+    print("✓ 跨年区间「包含今天」优先")
+
+
+def test_truncated_iso_dates_are_rejected_not_folded():
+    """2026-11-100 不能盲截成 2026-11-10（写成 100 日的日期被静默改写）。"""
+    from utils.entity_normalize import _parse_iso, normalize_event_data
+
+    assert _parse_iso("2026-11-100") is None
+    assert _parse_iso("2026-11-10") == "2026-11-10"
+    # 带尾注的展示形态仍按日期前缀解析（既有行为不变）
+    assert _parse_iso("2026-11-10（周一）") == "2026-11-10"
+    data = normalize_event_data(
+        {"start_date": "2026-11-100", "end_date": "2026-11-10"},
+        today=date(2026, 11, 1),
+    )
+    assert "start_date" not in data
+    assert data["end_date"] == "2026-11-10"
+    print("✓ 截断造成的伪合法日期被拒绝")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -171,4 +211,6 @@ if __name__ == "__main__":
     test_invalid_event_dates_are_dropped()
     test_extract_requirements_ignores_unparseable_dates()
     test_event_date_range_is_consistent_across_year_boundary()
+    test_event_range_containing_today_across_new_year()
+    test_truncated_iso_dates_are_rejected_not_folded()
     print("\n全部通过")

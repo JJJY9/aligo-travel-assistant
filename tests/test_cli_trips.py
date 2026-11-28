@@ -45,6 +45,9 @@ def test_trips_list_json(monkeypatch):
         _trip("上海", "2020-01-01", "2020-01-02", trip_id="trip_a"),
         _trip("上海", "2020-01-02", "2020-01-03", trip_id="trip_b"),
     ]
+    # JSON 后端写入的 naive 本地时间：--json 输出必须补偏移（与 sessions 同口径）
+    trips[0]["timestamp"] = "2026-11-28T11:00:00"
+    trips[1]["timestamp"] = "2026-11-28T12:00:00"
     store = _FakeStore(trips)
     monkeypatch.setattr(
         storage, "create_long_term_memory", lambda *args, **kwargs: store
@@ -59,6 +62,16 @@ def test_trips_list_json(monkeypatch):
     assert first["destination"] == "上海"
     assert first["state"] == "已结束"
     assert first.get("conflicts"), "重叠行程应带冲突列表"
+    from datetime import datetime as _dt
+
+    assert _dt.fromisoformat(first["timestamp"]).tzinfo is not None, (
+        "trips --json 的 timestamp 必须带偏移，与 sessions --json 同口径"
+    )
+    assert all(
+        _dt.fromisoformat(item["timestamp"]).tzinfo is not None
+        for item in first["conflicts"]
+        if item.get("timestamp")
+    )
 
     empty = _FakeStore([])
     monkeypatch.setattr(

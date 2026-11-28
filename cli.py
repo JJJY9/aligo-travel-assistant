@@ -5127,6 +5127,28 @@ def _json_timestamp_text(value: str) -> str:
     return aware.isoformat() if aware is not None else text
 
 
+def _json_trip_view(trip: dict) -> dict:
+    """``trips --json`` 的行程视图：timestamp（含 conflicts 子项）归一。
+
+    与 sessions --json 同口径：JSON 后端存 naive 本地时间、PG 存带偏移
+    时间，原样输出会让脚本在迁移后端后解析失败 / 按字符串比较错序。
+    """
+    from utils.trip_conflicts import trip_state_label
+
+    view = {"state": trip_state_label(trip), **trip}
+    if "timestamp" in view:
+        view["timestamp"] = _json_timestamp_text(
+            str(view.get("timestamp") or "")
+        )
+    conflicts = view.get("conflicts")
+    if isinstance(conflicts, list):
+        view["conflicts"] = [
+            _json_trip_view(item) if isinstance(item, dict) else item
+            for item in conflicts
+        ]
+    return view
+
+
 def _session_summaries(store, *, needle: str = "") -> list[dict]:
     """聚合会话摘要（标题 / 消息数 / 最近时间 / 置顶 / 归档），按更新时间倒序。
 
@@ -7358,10 +7380,7 @@ def run_trips_list_standalone(
                         "query": query.strip(),
                         "status": status_label,
                         "count": len(views),
-                        "trips": [
-                            {"state": trip_state_label(trip), **trip}
-                            for trip in views
-                        ],
+                        "trips": [_json_trip_view(trip) for trip in views],
                     }
                 ),
                 ensure_ascii=False,

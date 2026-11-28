@@ -503,17 +503,18 @@ def _restored_end_from_props(props: dict[str, str]) -> str | None:
 
 def _ics_event_row(
     props: dict[str, str], user_tz: str | None = None
-) -> tuple[dict[str, Any] | None, str | None]:
-    """把一个 VEVENT 的属性映射为行程行；无法使用时返回 (None, 原因)。"""
+) -> tuple[dict[str, Any] | None, str | None, str | None]:
+    """把一个 VEVENT 的属性映射为行程行；无法使用时返回 (None, 原因, 告警)。"""
     start_parsed = _ics_local_datetime(
         props.get("DTSTART", ""), props.get("DTSTART_TZID", ""), user_tz
     )
     if start_parsed is None:
-        return None, "缺少或非法的 DTSTART"
+        return None, "缺少或非法的 DTSTART", None
     start_dt, _start_has_time = start_parsed
     start_day = start_dt.date()
     start_date = start_dt.strftime("%Y-%m-%d")
     end_date = ""
+    dtend_raw = props.get("DTEND", "").strip()
     end_parsed = _ics_local_datetime(
         props.get("DTEND", ""), props.get("DTEND_TZID", ""), user_tz
     )
@@ -595,14 +596,21 @@ def _ics_event_row(
         else:
             destination = summary[:400]
     if not destination.strip():
-        return None, "缺少目的地（SUMMARY 为空）"
+        return None, "缺少目的地（SUMMARY 为空）", None
     for field, value in (
         ("origin", origin),
         ("destination", destination),
         ("purpose", purpose),
     ):
         if len(str(value or "").strip()) > _MAX_TRIP_FIELD_CHARS:
-            return None, f"字段 {field} 超过 {_MAX_TRIP_FIELD_CHARS} 字"
+            return None, f"字段 {field} 超过 {_MAX_TRIP_FIELD_CHARS} 字", None
+    # DTEND 写了但无法解析（非法日历日 / 越界换算）：事件仍按单日导入，
+    # 但不能像缺 DTEND 一样静默——多日行程的返程日期被截掉，用户与
+    # 导入报告都看不到任何异常。走 warnings 只提示不拒绝（CSV 口径是
+    # 非法返程整行拒绝，两种格式的严格度差异在文档中说明）。
+    warning = None
+    if dtend_raw and end_parsed is None and end_date == "":
+        warning = "DTEND 无法解析，返程日期按单日导入"
     return {
         "origin": origin if origin.strip() else "",
         "destination": destination,
@@ -611,7 +619,7 @@ def _ics_event_row(
         # 未提供目的时保留 None：去重更新时存储层保留原值，不会把用户
         # 手动改过的目的覆盖成默认「出差」
         "purpose": purpose if purpose.strip() else None,
-    }, None
+    }, None, warning
 
 
 def _split_ics_property(line: str) -> tuple[str, str]:
@@ -644,6 +652,7 @@ def parse_trips_ics(
     props: dict[str, str] = {}
     rows: list[dict[str, Any]] = []
     errors = _BoundedErrors()
+    warnings = _BoundedErrors()
     in_event = False
     in_alarm = False
     index = 0
@@ -674,12 +683,14 @@ def parse_trips_ics(
             in_event = False
             in_alarm = False
             index += 1
-            row, reason = _ics_event_row(props, user_tz)
+            row, reason, warning = _ics_event_row(props, user_tz)
             props = {}
             if reason:
                 errors.add((index, reason))
             elif row is not None:
                 rows.append(row)
+                if warning:
+                    warnings.add((index, warning))
                 if max_rows is not None and len(rows) > max_rows:
                     raise ValueError(
                         f"单次最多导入 {max_rows} 条行程，请拆分文件后再导入"
@@ -723,6 +734,7 @@ def parse_trips_ics(
         errors.add((index, "缺少 END:VEVENT，事件被跳过"))
     if not rows and not errors:
         return [], [(0, "未找到 VEVENT 事件")]
+    errors.warnings = warnings  # type: ignore[attr-defined]
     return rows, errors
 
 

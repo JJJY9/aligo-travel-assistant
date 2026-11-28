@@ -450,6 +450,47 @@ def test_iso_date_parse_cache_reuses_normalized_text():
     print("✓ 行程日期解析按归一文本缓存")
 
 
+def test_placeholder_query_interval_not_reported_as_overlap():
+    """保存 / 编辑响应用原始 9999 返程查询时也不能误报全民重叠。"""
+    from datetime import datetime
+
+    from utils.trip_conflicts import trip_conflicts
+
+    placeholder = {
+        "trip_id": "t-9999",
+        "destination": "上海",
+        "start_date": "2020-01-01",
+        "end_date": "9999-12-31",
+    }
+    future = {
+        "trip_id": "t-future",
+        "destination": "杭州",
+        "start_date": "2026-12-01",
+        "end_date": "2026-12-03",
+    }
+    # 与写侧调用方同形：end 是原始解析值 9999-12-31
+    assert (
+        trip_conflicts(
+            [placeholder, future],
+            datetime(2020, 1, 1),
+            datetime(9999, 12, 31),
+            exclude_trip=placeholder,
+        )
+        == []
+    )
+    # 倒置区间按单日：12-03 与 12-05 起的行程不重叠
+    later = {
+        "trip_id": "t-later",
+        "destination": "南京",
+        "start_date": "2026-12-05",
+        "end_date": "2026-12-06",
+    }
+    assert trip_conflicts(
+        [later], datetime(2026, 12, 3), datetime(2026, 12, 1)
+    ) == []
+    print("✓ 占位 / 倒置查询区间不误报冲突")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -474,6 +515,7 @@ if __name__ == "__main__":
     test_find_saved_trip_distinguishes_origin()
     test_trip_interval_parses_identity_dates()
     test_placeholder_end_counts_as_single_day()
+    test_placeholder_query_interval_not_reported_as_overlap()
     test_slash_dates_overlap_detected()
     test_conflict_order_uses_parsed_slash_dates()
     test_iso_date_parse_cache_reuses_normalized_text()

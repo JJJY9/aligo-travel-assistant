@@ -15,6 +15,7 @@ from utils.console import strip_terminal_controls
 from utils.json_safe import sanitize_json
 from utils.session_markdown import sanitize_body
 from utils.stored_message import render_stored_message
+from utils.timestamps import display_local_timestamp
 
 _CELL_BREAK = re.compile(r"[\r\n]+")
 
@@ -154,8 +155,11 @@ def render_markdown(data: dict[str, Any]) -> str:
             # 正文放进引用块：消息里的多行标题 / 列表 / 分隔线 / 未闭合
             # 代码围栏不能改写整份导出文档的结构；sanitize_body 同时负责
             # 尖括号 / 链接转义与围栏平衡（与会话导出同一实现）
+            # 时间戳换算到本机时区展示：PostgreSQL 返回带时区的 UTC，
+            # 原样输出会让东八区用户在导出里看到前一天的 UTC 钟点，
+            # 与 CLI sessions / 面板的本地时间口径不一致
             lines.append(
-                f"- **{role}**（{_md_cell(message.get('timestamp', ''))}）："
+                f"- **{role}**（{_md_cell(display_local_timestamp(message.get('timestamp', '')))}）："
             )
             for body_line in sanitize_body(content).split("\n"):
                 lines.append(f"  {body_line}" if body_line else "  >")

@@ -25,6 +25,7 @@ from agents.intention_agent import IntentionAgent
 from agents.lazy_agent_registry import LazyAgentRegistry
 from agents.orchestration_agent import OrchestrationAgent
 from utils.agent_names import canonical_agent_name
+from utils import clock
 from config import RESILIENCE_CONFIG
 from context.memory_manager import MemoryManager
 from context.short_term_memory import (
@@ -150,6 +151,7 @@ class ConversationRuntime:
         user_input: str,
         on_event: ProgressCallback | None = None,
         turn_id: str = "",
+        timezone: Any | None = None,
     ) -> dict[str, Any]:
         """处理一条用户消息。
 
@@ -159,6 +161,8 @@ class ConversationRuntime:
                 phase / plan / agent_start / agent_done
             turn_id: 客户端回合标识（可选）：写入助手消息的 _meta，供前端
                 在停止 / 断网后精确对账「这一轮是否已落库」
+            timezone: 请求方时区（可选）：提示词里的「今天 / 明天」按该
+                时区解释；缺省用服务器本地时间（CLI / 旧客户端不变）
 
         Returns:
             {"reply": Markdown 文本, "agents": [{name, status}],
@@ -185,6 +189,10 @@ class ConversationRuntime:
         # drain、意图调用等）由这里兜底记账——否则下一轮 usage_before 快照
         # 会把它们永久减掉，面板与趋势少记
         settlement = {"done": False}
+        # 绑定请求时区后再进入回合：意图 / 事项收集 / 行程规划的提示词
+        # 都从 utils.clock 取「现在」，容器 UTC 部署时东八区用户的
+        # 「明天」不会整体早一天。绑定失败不影响回合（回退服务器本地）。
+        clock_token = clock.use_timezone(timezone)
         try:
             return await self._execute_turn(
                 user_input, on_event, rc, start, usage_before, turn_id, settlement
@@ -194,6 +202,7 @@ class ConversationRuntime:
                 self._accumulate_unsettled_usage(self._usage_delta(usage_before))
             raise
         finally:
+            clock.reset(clock_token)
             if self.circuit_breaker and not self._probe_recorded:
                 self.circuit_breaker.release_probe()
 

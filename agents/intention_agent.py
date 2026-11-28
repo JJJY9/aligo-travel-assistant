@@ -497,10 +497,12 @@ class IntentionAgent(AgentBase):
 
         context_str = "\n".join(context_parts) if context_parts else "无历史对话"
 
-        # 获取当前时间
-        from datetime import datetime
-        current_time = datetime.now().strftime("%Y年%m月%d日 %H:%M")
-        weekday = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][datetime.now().weekday()]
+        # 获取当前时间（请求时区：Web 面板的「明天 / 今天」按浏览器本地）
+        from utils.clock import now as clock_now
+
+        current = clock_now()
+        current_time = current.strftime("%Y年%m月%d日 %H:%M")
+        weekday = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][current.weekday()]
 
         # 动态获取 Skills 描述
         skill_mapping = self._skill_mapping

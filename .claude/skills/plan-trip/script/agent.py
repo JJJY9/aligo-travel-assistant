@@ -1009,14 +1009,15 @@ class ItineraryPlanningAgent(AgentBase):
             if len(pref_parts) > 1:
                 preferences_info = "\n".join(pref_parts) + "\n\n"
 
-        # 获取当前时间
-        from datetime import datetime
-        current_date = datetime.now().strftime("%Y年%m月%d日")
-        current_month = datetime.now().month
+        # 获取当前时间（请求时区：Web 面板的「明天 / 今天」按浏览器本地）
+        from utils.clock import now as clock_now
+        current = clock_now()
+        current_date = current.strftime("%Y年%m月%d日")
+        current_month = current.month
         current_season = "冬季" if current_month in [12, 1, 2] else \
                         "春季" if current_month in [3, 4, 5] else \
                         "夏季" if current_month in [6, 7, 8] else "秋季"
-        weekday = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][datetime.now().weekday()]
+        weekday = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][current.weekday()]
 
         # 尝试从 SKILL.md 动态读取详细指令 (Progressive Disclosure)
         skill_instruction = self.skill_loader.get_skill_content("plan-trip")

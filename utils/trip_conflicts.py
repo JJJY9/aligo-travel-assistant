@@ -196,6 +196,11 @@ def trip_conflicts(
     其它同名记录的真实重叠）。
     """
     id_counts: Counter[str] | None = None
+    # 查询区间与 trip_interval 同一口径：9999-12-31 是「返程未定」占位、
+    # 倒置区间按单日。调用方（Web 新增 / 编辑、CLI trip-add / trip-edit）
+    # 传的是原始解析值，不归一会让占位行程与之后所有行程误报重叠。
+    if end < start or end.year == 9999:
+        end = start
     conflicts = []
     for trip in trips:
         if exclude_trip is not None and trip is exclude_trip:

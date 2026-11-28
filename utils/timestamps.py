@@ -26,10 +26,42 @@ _OFFSET_DT = re.compile(
 _FRACTION = re.compile(r"\.(\d+)(?=[+-]\d{2}|$)")
 
 
+_BASIC_ISO = re.compile(
+    r"^(?P<y>\d{4})(?P<mo>\d{2})(?P<d>\d{2})"
+    r"(?:[T ](?P<h>\d{2})(?P<mi>\d{2})?(?P<s>\d{2})?"
+    r"(?P<frac>[.,]\d+)?(?P<off>Z|[+-]\d{2}(?::?\d{2})?)?)?$"
+)
+
+
+def _expand_basic_iso(text: str) -> str:
+    """把 ISO 8601 基本格式（20261128T100000+0800）展开为扩展格式。
+
+    3.11 起 ``fromisoformat`` 才接受无分隔符写法；同一份备份在 3.10 上
+    会解析失败（排序键为空、导入丢时间、恢复时时间戳被替换）。只展开
+    整串都是 4+2+2 位日期（可选时间/偏移）的形态，避免误伤 10 位 epoch
+    数字串与已经是扩展格式的文本。
+    """
+    match = _BASIC_ISO.fullmatch(text)
+    if match is None:
+        return text
+    expanded = f"{match.group('y')}-{match.group('mo')}-{match.group('d')}"
+    hour = match.group("h")
+    if hour is not None:
+        expanded += f"T{hour}:{match.group('mi') or '00'}"
+        if match.group("s") is not None:
+            expanded += f":{match.group('s')}"
+        if match.group("frac") is not None:
+            expanded += match.group("frac")
+        if match.group("off") is not None:
+            expanded += match.group("off")
+    return expanded
+
+
 def _normalize_iso(text: str) -> str:
     """把 3.11+ 才接受的 ISO 8601 写法归一到 3.10 也能解析的形式。"""
     # 逗号小数 → 点小数（只替换数字之间的逗号，避免误伤任意文本）
     text = re.sub(r"(?<=\d),(?=\d)", ".", text)
+    text = _expand_basic_iso(text)
     match = _OFFSET_DT.match(text)
     if match is not None:
         offset = match.group("off")
@@ -88,6 +120,26 @@ def to_aware(value: Any) -> "datetime | None":
     if parsed is not None and parsed.tzinfo is None:
         parsed = localize_naive(parsed)
     return parsed
+
+
+def display_local_timestamp(
+    value: Any, fmt: str = "%Y-%m-%d %H:%M:%S"
+) -> str:
+    """时间戳的本地展示文本（导出 / 列表同一口径）。
+
+    PostgreSQL 读回带时区的 UTC、JSON 后端存 naive 本地时间：原样输出会让
+    东八区用户在导出的 Markdown 里看到前一天的 UTC 钟点。这里统一换算到
+    本机时区展示；非法 / 缺失值保留原文（不丢数据）。
+    """
+    text = str(value if value is not None else "")
+    aware = to_aware(text)
+    if aware is None:
+        return text
+    try:
+        return aware.astimezone().strftime(fmt)
+    except (OverflowError, OSError, ValueError):
+        # 极端年份（0001/9999 带偏移）换算本地时区会越界：保留原文
+        return text
 
 
 def chronological_key(value: Any) -> str:

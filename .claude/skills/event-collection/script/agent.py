@@ -819,10 +819,11 @@ class EventCollectionAgent(AgentBase):
             if len(bg_parts) > 1:
                 background_info = "\n".join(bg_parts) + "\n\n"
 
-        # 获取当前时间
-        from datetime import datetime
-        current_date = datetime.now().strftime("%Y年%m月%d日")
-        weekday = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][datetime.now().weekday()]
+        # 获取当前时间（请求时区：Web 面板的「明天 / 今天」按浏览器本地）
+        from utils.clock import now as clock_now
+        current = clock_now()
+        current_date = current.strftime("%Y年%m月%d日")
+        weekday = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][current.weekday()]
 
         prompt = f"""你是事项收集专家，负责提取旅行的基础信息。
 

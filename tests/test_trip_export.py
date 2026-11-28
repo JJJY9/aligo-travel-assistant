@@ -538,6 +538,29 @@ def test_export_strips_unicode_line_separators_and_counts_events():
     print("✓ 导出清洗 U+2028/U+2029，事件计数不受行分隔符影响")
 
 
+def test_trips_html_unparsable_dates_sort_below_real_ones():
+    """无法解析的历史日期（待定 / 2026-02-30）不能顶到台账最上方。"""
+    from utils.trip_export import render_trips_html
+
+    html = render_trips_html(
+        [
+            {"trip_id": "t1", "destination": "真实行程", "start_date": "2026-11-10"},
+            {"trip_id": "t2", "destination": "待定行程", "start_date": "待定"},
+            {"trip_id": "t3", "destination": "脏日期", "start_date": "2026-02-30"},
+        ],
+        "u1",
+    )
+    assert html.index("真实行程") < html.index("待定行程")
+    assert html.index("真实行程") < html.index("脏日期")
+    # 「导出于」带偏移，跨时区分享时不再是无时区的 naive 串
+    import re as _re
+
+    assert _re.search(
+        r"导出于 \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}", html
+    )
+    print("✓ 台账无法解析日期置底且导出时间带偏移")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -566,6 +589,7 @@ if __name__ == "__main__":
     test_many_leading_quotes_do_not_recurse()
     test_unpadded_dates_normalized_in_exports()
     test_trips_html_normalizes_unpadded_dates()
+    test_trips_html_unparsable_dates_sort_below_real_ones()
     test_render_strips_controls_and_surrogates()
     test_html_table_wraps_long_unbroken_fields()
     test_count_ics_events_unfolds_before_counting()

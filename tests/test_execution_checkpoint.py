@@ -61,6 +61,24 @@ def test_ttl_expiry_removes_file():
         shutil.rmtree(root, ignore_errors=True)
 
 
+def test_future_mtime_ttl_still_expires():
+    """mtime 落在未来（时钟超前 / 同步工具）时 TTL 也要生效。"""
+    store, root = _store(ttl_sec=3600)
+    try:
+        store.save("k", {"status": "ok"})
+        path = next(Path(root).glob("*.json"))
+        future = time.time() + 86400
+        os.utime(path, (future, future))
+        assert store.load("k") is None, "未来 mtime 不能绕过 TTL"
+        assert not path.exists()
+        # 正常新写入的检查点不受影响
+        store.save("k2", {"status": "ok"})
+        assert store.load("k2")["status"] == "ok"
+        print("✓ 未来 mtime 的检查点按过期清理")
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 def test_corrupted_file_is_cleaned():
     store, root = _store()
     try:
@@ -486,6 +504,7 @@ if __name__ == "__main__":
     _stdio.ensure_utf8()
     test_save_load_roundtrip_and_step_merge()
     test_ttl_expiry_removes_file()
+    test_future_mtime_ttl_still_expires()
     test_corrupted_file_is_cleaned()
     test_max_entries_prunes_oldest()
     test_max_entries_prunes_per_owner()

@@ -1778,6 +1778,31 @@ def test_trip_export_import_limit_levels():
     print("✓ 行程导出导入上限级别判定")
 
 
+def test_ics_unparsable_dtend_warns_instead_of_silent_drop():
+    """DTEND 写了但无法解析：仍按单日导入，但经 warnings 提示返程被截。"""
+    text = (
+        "BEGIN:VCALENDAR\nVERSION:2.0\n"
+        "BEGIN:VEVENT\n"
+        "DTSTART;VALUE=DATE:20261110\n"
+        "DTEND;VALUE=DATE:20260231\n"
+        "SUMMARY:北京 → 上海（出差）\n"
+        "END:VEVENT\n"
+        "END:VCALENDAR\n"
+    )
+    rows, errors = parse_trips_ics(text)
+    assert len(rows) == 1
+    assert rows[0]["start_date"] == "2026-11-10"
+    assert rows[0]["end_date"] == ""
+    warnings = getattr(errors, "warnings", [])
+    assert len(warnings) == 1 and "DTEND" in warnings[0][1]
+    # 没有 DTEND 的合法单日事件不产生告警
+    plain = text.replace("DTEND;VALUE=DATE:20260231\n", "")
+    rows, errors = parse_trips_ics(plain)
+    assert len(rows) == 1
+    assert not getattr(errors, "warnings", [])
+    print("✓ ICS 非法 DTEND 告警而不静默截断")
+
+
 if __name__ == "__main__":
     import _stdio
     import _tmp_registry
@@ -1794,6 +1819,7 @@ if __name__ == "__main__":
     test_ics_unfold_and_lf_only()
     test_ics_unfold_long_line_is_linear()
     test_ics_collects_invalid_events()
+    test_ics_unparsable_dtend_warns_instead_of_silent_drop()
     test_ics_external_summary_fallback()
     test_ics_summary_balanced_full_width_parens()
     test_ics_unescape_preserves_unknown_escapes()
