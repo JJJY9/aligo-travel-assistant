@@ -4816,6 +4816,17 @@ def _sessions_base_for_user(
     return sessions, archived_count
 
 
+def _invalidate_sessions_base_cache(user_id: str) -> None:
+    """丢弃用户的 /api/sessions 无查询词聚合缓存。
+
+    导入 + 迟到删除回滚的净条数可能抵消（N==M），指纹首尾 / 条数不变，
+    缓存会继续返回导入前的列表；导入路径没有任何自然的失效入口，必须
+    在写库与回滚结束后显式失效。
+    """
+    with _sessions_base_cache_lock:
+        _SESSIONS_BASE_CACHE.pop(str(user_id), None)
+
+
 def _md_inline(value: object) -> str:
     """导出 Markdown 的单行内联文本：折叠空白 + 尖括号 / 右方括号转义。
 
@@ -8651,6 +8662,14 @@ def create_app(model: Any = None) -> FastAPI:
         # 与 CLI user-export 同一清洗：助手 JSON 文本里的 NaN / 消息里的
         # NUL 若不处理，备份能导出却会在 /api/import 恢复时被整条拒绝
         data = sanitize_backup_data(data)
+        # 偏好可见口径与面板 / JSON 后端加载清洗一致：PostgreSQL 后端不做
+        # 加载期清洗，历史脏行（不可寻址键 / 空值）若进入备份，会让导入端
+        # 的类型计数自检把本可恢复的账号判成 413
+        raw_preferences = data.get("preferences")
+        if isinstance(raw_preferences, dict):
+            visible_preferences = _visible_preferences(raw_preferences)
+            if visible_preferences != raw_preferences:
+                data = {**data, "preferences": visible_preferences}
         if format == "md":
             return Response(
                 content=_user_data_markdown(user_id, data),
@@ -9226,6 +9245,9 @@ def create_app(model: Any = None) -> FastAPI:
                         return counts
                     finally:
                         _close_long_term(store)
+                        # 导入 / 迟到回滚都可能让「条数 + 首尾」指纹回到
+                        # 原值（净零），必须显式丢弃会话聚合缓存
+                        _invalidate_sessions_base_cache(user_id)
 
                 emptied_after_skip = False
                 try:

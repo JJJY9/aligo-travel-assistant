@@ -21,7 +21,10 @@ from utils.json_parser import extract_json_from_async_response
 from utils.json_safe import sanitize_json
 from utils.log_redact import redact_secret
 from utils.metrics import REQUEST_METRICS
-from utils.preference_values import has_preference_value
+from utils.preference_values import (
+    has_preference_value,
+    is_manageable_pref_type,
+)
 from utils.timestamps import to_aware
 from utils.turn_meta import strip_turn_meta
 
@@ -674,11 +677,14 @@ class MemoryManager:
 
         # 用户偏好
         prefs = self.get_preferences()
-        has_prefs = any(has_preference_value(v) for v in prefs.values())
+        has_prefs = any(
+            has_preference_value(v) and is_manageable_pref_type(k)
+            for k, v in prefs.items()
+        )
         if has_prefs:
             lines.append("【用户偏好】")
             for key, value in prefs.items():
-                if has_preference_value(value):
+                if has_preference_value(value) and is_manageable_pref_type(key):
                     lines.append(f"- {key}: {value}")
             lines.append("")
 

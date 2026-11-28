@@ -19387,3 +19387,46 @@ if __name__ == "__main__":
         )
     else:
         print(f"\n全部通过（{ran}/{total} 个用例）")
+
+
+def test_sessions_base_cache_invalidated_after_import():
+    """导入后显式失效 /api/sessions 聚合缓存（净零指纹也不会命中旧列表）。"""
+    from webapp import server as server_module
+
+    user_id = "u-cache-invalidate"
+    data = {
+        "chat_history": [
+            {
+                "role": "user",
+                "content": "甲",
+                "timestamp": "2026-01-01T00:00:00",
+                "session_id": "s1",
+            },
+            {
+                "role": "assistant",
+                "content": "乙",
+                "timestamp": "2026-01-01T00:00:01",
+                "session_id": "s1",
+            },
+        ],
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [],
+    }
+    server_module._SESSIONS_BASE_CACHE.clear()
+    try:
+        first, _count = server_module._sessions_base_for_user(
+            user_id, data, "exclude"
+        )
+        again, _count = server_module._sessions_base_for_user(
+            user_id, data, "exclude"
+        )
+        assert again is first, "同指纹应命中缓存"
+        server_module._invalidate_sessions_base_cache(user_id)
+        fresh, _count = server_module._sessions_base_for_user(
+            user_id, data, "exclude"
+        )
+        assert fresh is not first, "失效后必须重新聚合"
+    finally:
+        server_module._SESSIONS_BASE_CACHE.clear()
+    print("✓ /api/sessions 聚合缓存在导入后失效")

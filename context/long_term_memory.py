@@ -1899,9 +1899,14 @@ class LongTermMemory:
         preferences = self.data["preferences"]
 
         if pref_type is None:
-            # 返回字典格式，方便调用方使用
+            # 返回字典格式，方便调用方使用。按类型升序（Python 码点序，
+            # 与 PG 后端的 ORDER BY pref_type COLLATE "C" 同口径）：
+            # 插入序会让面板行序 / 偏好 prompt 的预算截断集合随后端变化
             result = {}
-            for pref in preferences:
+            for pref in sorted(
+                preferences,
+                key=lambda item: str((item or {}).get("type") or ""),
+            ):
                 result[pref.get("type")] = pref.get("value")
             return result
         else:

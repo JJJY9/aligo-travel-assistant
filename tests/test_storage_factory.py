@@ -1748,6 +1748,9 @@ def test_pg_clear_and_delete_all_use_single_transaction():
         "aligo:session_meta:u-pg-clear",
         "aligo:chat_messages:u-pg-clear",
     ], "advisory 锁序必须与删除路径一致（session_meta → chat_messages）"
+    assert "aligo-trip-u-pg-clear" in state["locks"], (
+        "清空必须与行程写者持有同一把 aligo-trip 锁（否则并发保存可在清空后落回）"
+    )
     deletes = [s for s in state["statements"] if s.startswith("DELETE FROM ")]
     assert any("aligo_chat_messages" in s for s in deletes)
     assert any("aligo_session_titles" in s for s in deletes)
@@ -1894,14 +1897,15 @@ def test_pg_save_preference_holds_user_cap_lock_before_count():
     store._preference_cap_lock = fake_cap_lock
 
     def fake_fetchone(sql, params=None):
-        text = " ".join(str(sql).split())
-        if "COUNT(*)" in text:
-            order.append("count")
-            return (0,)
         order.append("exists")
         return None
 
+    def fake_fetchall(sql, params=None):
+        order.append("count")
+        return []
+
     store._fetchone = fake_fetchone
+    store._fetchall = fake_fetchall
     store._execute = (
         lambda sql, params=None, replay_safe=True: order.append("insert")
     )
@@ -3092,7 +3096,7 @@ def test_pg_delete_duplicate_trip_keeps_last_copy():
     store._advisory_lock = lambda name: contextlib.nullcontext()
     executed: list[tuple[str, object]] = []
 
-    def rowcount(sql, params=None):
+    def rowcount(sql, params=None, **kwargs):
         executed.append((sql, params))
         return 1
 
@@ -3104,7 +3108,7 @@ def test_pg_delete_duplicate_trip_keeps_last_copy():
     assert delete_params == ("u1", "u1", "trip_9", "u1", "trip_9")
 
     executed.clear()
-    store._execute_rowcount = lambda sql, params=None: (
+    store._execute_rowcount = lambda sql, params=None, **kwargs: (
         executed.append((sql, params)) or 0
     )
     assert store.delete_duplicate_trip("trip_9") is False
@@ -5602,7 +5606,8 @@ def test_pg_batch_session_meta_single_roundtrip():
     assert len(fetches) == 1, "整批只做一次存在性查询"
     assert len(executes) == 1, "整批只写一条 upsert"
     assert "unnest" in executes[0][0]
-    assert executes[0][1][1:] == (["s1"], ["标题"])
+    assert "EXISTS" in executes[0][0], "重放时按写入时刻的存在性过滤"
+    assert executes[0][1][1:] == (["s1"], ["标题"], "u-bulk-meta")
 
     applied.clear()
     fetches.clear()
@@ -5614,7 +5619,8 @@ def test_pg_batch_session_meta_single_roundtrip():
     assert count == 3 and applied == {"s1", "s2"}
     assert len(fetches) == 1 and len(executes) == 1
     assert "WITH ORDINALITY" in executes[0][0]
-    assert executes[0][1] == ("u-bulk-meta", ["s1", "s2"])
+    assert "EXISTS" in executes[0][0]
+    assert executes[0][1] == ("u-bulk-meta", ["s1", "s2"], "u-bulk-meta")
 
     applied.clear()
     executes.clear()
@@ -6714,9 +6720,9 @@ def test_pg_save_trip_histories_batches_with_one_index():
             return (next_id[0],)
         raise AssertionError(sql)
 
-    def execute(sql, params=None):
+    def execute(sql, params=None, replay_safe=True):
         assert state["locked"] is True, "写入必须在锁内"
-        executed.append((" ".join(sql.split()), params))
+        executed.append((" ".join(sql.split()), params, replay_safe))
 
     store._fetchall = fetchall
     store._fetchone = fetchone
@@ -6745,10 +6751,12 @@ def test_pg_save_trip_histories_batches_with_one_index():
     ]
     assert store.save_trip_histories(trips) == (1, 2)
     updates = [
-        params for sql, params in executed if sql.startswith("UPDATE aligo_trips")
+        (params, replay_safe)
+        for sql, params, replay_safe in executed
+        if sql.startswith("UPDATE aligo_trips")
     ]
-    assert updates[0] == (None, None, 1), "缺省目的 / 会话不更新，时间按恢复时刻刷新"
-    assert updates[1] == (None, None, 11), "批内重复命中刚插入的行"
+    assert updates[0] == ((None, None, 1), False), "缺省目的 / 会话不更新，且禁止重放"
+    assert updates[1] == ((None, None, 11), False), "批内重复命中刚插入的行"
     inserts = inserted_params
     assert len(inserts) == 1
     assert inserts[0][1] == "trip_3"
@@ -6759,7 +6767,7 @@ def test_pg_save_trip_histories_batches_with_one_index():
     assert _normalized_token(inserts[0][8]) == inserts[0][8], "新行必须发放 uid_token"
     counters = [
         params
-        for sql, params in executed
+        for sql, params, _replay_safe in executed
         if sql.startswith("INSERT INTO aligo_trip_counters")
     ]
     assert counters == [("u-pg-bulk", 3)], "编号水位一次写入"
@@ -8158,3 +8166,205 @@ if __name__ == "__main__":
         )
     else:
         print(f"\n全部通过（{ran}/{total} 个用例）")
+
+
+def test_pg_schema_second_duplicate_race_skips_without_cooldown():
+    """第一次目录竞争后重试又撞上重复：跳过 DDL，不能冒到构造函数触发冷却。"""
+    import psycopg
+
+    from context import postgres_long_term_memory as pg_module
+
+    dsn = "postgresql://schema-race-twice/test"
+    pg_module._SCHEMA_READY.discard(dsn)
+    calls = {"ddl": 0, "unlock": 0}
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def execute(self, sql, params=None):
+            text = " ".join(str(sql).split())
+            if text.startswith("CREATE TABLE"):
+                calls["ddl"] += 1
+                if calls["ddl"] == 1:
+                    raise psycopg.errors.DuplicateTable("duplicate table")
+                raise psycopg.errors.UniqueViolation("duplicate key")
+            if "pg_advisory_unlock" in text:
+                calls["unlock"] += 1
+
+    class _Conn:
+        def cursor(self):
+            return _Cursor()
+
+    store = object.__new__(pg_module.PostgresLongTermMemory)
+    store.dsn = dsn
+    store._conn = _Conn()
+    try:
+        store._ensure_schema()  # 不得抛出（否则工厂会冷却健康库 60 秒）
+        assert dsn not in pg_module._SCHEMA_READY
+        assert pg_module._SCHEMA_SKIP_UNTIL.get(dsn, 0.0) > 0, (
+            "跳过 DDL 应进入退避窗口，下次构造重试"
+        )
+    finally:
+        pg_module._SCHEMA_READY.discard(dsn)
+        pg_module._SCHEMA_SKIP_UNTIL.pop(dsn, None)
+    assert calls["ddl"] == 2, "应重试一次"
+    assert calls["unlock"] == 1, "DDL 锁必须释放"
+    print("✓ 第二次建表竞争跳过 DDL 而不是让健康库冷却")
+
+
+def test_pg_single_flight_follower_degrades_when_leader_stalls(monkeypatch):
+    """leader 超出等待窗口仍未结束：等待者直接降级，不再各自发起连接。"""
+    dsn = "postgresql://u:p@127.0.0.1:1/slow-leader"
+    monkeypatch.setitem(storage.STORAGE_CONFIG, "postgres_dsn", dsn)
+    storage.reset_failure_cache()
+    monkeypatch.setattr(storage, "_PG_CREATE_WAIT_SEC", 0.15)
+    calls = []
+    started = threading.Event()
+    release = threading.Event()
+
+    class _SlowFail:
+        def __init__(self, *args, **kwargs):
+            calls.append(1)
+            started.set()
+            release.wait(5)
+            raise ConnectionError("db down")
+
+    monkeypatch.setattr(storage, "PostgresLongTermMemory", _SlowFail)
+    results = []
+
+    def worker():
+        try:
+            store = storage.create_long_term_memory(
+                "u-pg-slow", tempfile.mkdtemp()
+            )
+            results.append(type(store).__name__)
+        except Exception as exc:  # noqa: BLE001 - 断言错误类型
+            results.append(type(exc).__name__)
+
+    try:
+        leader = threading.Thread(target=worker)
+        leader.start()
+        assert started.wait(3)
+        followers = [threading.Thread(target=worker) for _ in range(4)]
+        for thread in followers:
+            thread.start()
+        for thread in followers:
+            thread.join(5)
+        assert len(calls) == 1, f"leader 未结束时等待者不得再连接：{len(calls)}"
+        assert results == ["LongTermMemory"] * 4, results
+    finally:
+        release.set()
+        if "leader" in locals():
+            leader.join(5)
+        storage.reset_failure_cache()
+    print("✓ PG 单飞等待窗口耗尽后等待者直接降级")
+
+
+def test_describe_reprobes_enabled_postgres_after_interval(monkeypatch):
+    """已启用的 PG 也要按节流复验：运行中停机不能被纯健康轮询一直报绿。"""
+    import time as time_module
+
+    _set("redis_url", "")
+    dsn = "postgresql://user:pass@127.0.0.1:1/reprobe"
+    _set("postgres_dsn", dsn)
+    storage.reset_failure_cache()
+    try:
+        storage._ACTUAL_BACKEND["long_term"] = "postgres"
+        storage._pg_last_verify[dsn] = time_module.monotonic()
+        probed = []
+
+        def _must_not_probe(candidate):
+            probed.append(candidate)
+            raise AssertionError("节流窗口内不应复验")
+
+        monkeypatch.setattr(storage, "_probe_postgres_backend", _must_not_probe)
+        info = storage.describe_backends(wait_for_create=False)
+        assert info["long_term"] == "postgres" and not probed
+
+        storage._pg_last_verify[dsn] = (
+            time_module.monotonic() - storage._PG_VERIFY_INTERVAL_SEC - 1
+        )
+        monkeypatch.setattr(
+            storage, "_probe_postgres_backend", lambda candidate: False
+        )
+        info = storage.describe_backends(wait_for_create=False)
+        assert info["long_term"] == "json", "复验失败应改报回退后端"
+        assert info["long_term_degraded"] is True
+        assert storage._ACTUAL_BACKEND.get("long_term") == "json"
+    finally:
+        _restore_local()
+        storage.reset_failure_cache()
+    print("✓ describe_backends 对已启用 PG 节流复验")
+
+
+def test_pg_delete_duplicate_trip_is_not_replayed():
+    """去重删除的 COUNT 守卫不能重放：提交确认丢失时按失败上报。"""
+    import contextlib
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-dedupe-replay"
+    calls: list[bool] = []
+
+    def fake_retry(op, replay_safe=True):
+        calls.append(replay_safe)
+        return 1
+
+    memory._run_with_retry = fake_retry  # type: ignore[method-assign]
+    memory._advisory_lock = lambda name: contextlib.nullcontext()
+    assert memory.delete_duplicate_trip("trip_1") is True
+    assert calls == [False], "delete_duplicate_trip 不能自动重放"
+    print("✓ PG 去重删除禁止自动重放")
+
+
+def test_pg_preference_cap_ignores_hidden_rows(monkeypatch):
+    """PG 偏好上限按面板可见口径计数：历史脏行不占名额且被清理。"""
+    import utils.user_import as ui_module
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-pref-cap"
+    executed: list[str] = []
+    rows = [("home_location", "北京"), ("bad/key", "x")]
+    memory._fetchone = lambda sql, params=None: None
+    memory._fetchall = lambda sql, params=None: list(rows)
+    memory._execute = lambda sql, params=None, replay_safe=True: executed.append(
+        " ".join(sql.split())
+    )
+    monkeypatch.setattr(ui_module, "_MAX_PREFERENCES", 2)
+    memory._enforce_preference_cap("airlines")  # 1 个可见 + 1 个脏行：不越限
+    assert any("DELETE FROM aligo_preferences" in sql for sql in executed), (
+        "不可管理 / 空值的历史行应被清理"
+    )
+
+    rows = [("home_location", "北京"), ("airlines", ["国航"])]
+    executed.clear()
+    try:
+        memory._enforce_preference_cap("seat")
+    except ValueError as exc:
+        assert "偏好条目已达上限" in str(exc)
+    else:
+        raise AssertionError("恰好在上限时应拒绝新类型")
+    assert not executed, "全部可见时不产生清理写"
+    print("✓ PG 偏好上限按可见口径计数并清理脏行")
+
+
+def test_json_preference_enumeration_sorted_like_pg():
+    """JSON get_preference(None) 按类型升序，与 PG 的 COLLATE "C" 排序一致。"""
+    from context.long_term_memory import LongTermMemory
+
+    memory = LongTermMemory("u-pref-order", tempfile.mkdtemp())
+    memory.save_preference("seat", "靠窗")
+    memory.save_preference("airlines", ["国航"])
+    memory.save_preference("home_location", "北京")
+    assert list(memory.get_preference()) == [
+        "airlines",
+        "home_location",
+        "seat",
+    ]
+    print("✓ JSON 偏好枚举按类型升序（与 PG 同口径）")
