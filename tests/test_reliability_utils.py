@@ -899,6 +899,10 @@ def test_provider_error_body_detection():
     )
     assert isinstance(plain, ProviderResponseError)
     assert plain.status_code is None
+    status_error = provider_error_from_completion_text(
+        '{"status": "error", "error": {"message": "boom"}}'
+    )
+    assert isinstance(status_error, ProviderResponseError)
     coded = provider_error_from_completion_text(
         '{"error": {"code": 503, "message": "gateway timeout"}}'
     )

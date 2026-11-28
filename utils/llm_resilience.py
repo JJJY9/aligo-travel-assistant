@@ -134,7 +134,11 @@ def provider_error_from_completion_text(
         return None
     if result_key and result_key in data:
         return None
-    if any(key in data for key in _ANSWER_ENVELOPE_KEYS):
+    # status 单独判断：``{"status": "error", "error": …}`` 仍是错误体，
+    # 只有显式 success 的 status 才算回答信封
+    if any(key in data for key in _ANSWER_ENVELOPE_KEYS - {"status"}):
+        return None
+    if data.get("status") == "success":
         return None
 
     error = data.get("error")
