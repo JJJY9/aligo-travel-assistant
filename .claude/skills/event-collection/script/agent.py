@@ -20,7 +20,11 @@ from agentscope.message import Msg
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../..")))
 
 from utils.access_log import _safe_log_text
-from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
+from utils.llm_resilience import (
+    is_permanent_llm_error,
+    is_retriable_error,
+    provider_error_from_completion_text,
+)
 from utils.log_redact import redact_paths
 from utils.user_query import extract_user_query
 from utils.json_parser import (
@@ -881,6 +885,11 @@ class EventCollectionAgent(AgentBase):
             text = await extract_json_from_async_response(response)
             if not text or not str(text).strip():
                 raise ConnectionError("模型返回空响应")
+            # 200 + 错误体：不能降级成「缺少所有信息」的普通失败，否则
+            # 401 / 配额等永久故障既不上抛也不计入熔断
+            provider_error = provider_error_from_completion_text(text)
+            if provider_error is not None:
+                raise provider_error
 
             # 清理文本，移除markdown代码块标记
             text = text.strip()

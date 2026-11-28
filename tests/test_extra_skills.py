@@ -560,7 +560,36 @@ def test_extra_skill_error_body_is_not_success_answer():
         asyncio.run(
             agent.reply(Msg(name="orchestrator", content="行李清单", role="user"))
         )
+
+    # 带 status 键的错误信封必须先于信封解包识别：否则会被解包成空串、
+    # 先撞上「空响应」可重试分支，401 被当成瞬时网络故障重跑整轮
+    status401 = (
+        '{"status": "error", "error": {"code": 401, '
+        '"message": "invalid api key"}}'
+    )
+    agent = agent_class(model=_Model(response=status401))
+    with pytest.raises(ProviderResponseError) as info:
+        asyncio.run(
+            agent.reply(Msg(name="orchestrator", content="行李清单", role="user"))
+        )
+    assert info.value.status_code == 401
     print("✓ 简单技能识别 200 + 错误体（不再当成功答案）")
+
+
+def test_extra_skill_truncated_envelope_is_empty_response():
+    """max_tokens 截断的信封：按空响应触发重试，不能原样当成功答案。"""
+    agent_class = _load("trip-budget", "TripBudgetAgent")
+    agent = agent_class(model=None)
+    truncated = (
+        '{"status": "success", "budget_advice": "交通：高铁约 500 元，住宿：'
+    )
+    assert agent._unwrap_answer(truncated) == ""
+    fenced = '```json\n{"status": "success", "budget_advice": "交通：'
+    assert agent._unwrap_answer(fenced) == ""
+    # 说明文字里的普通花括号不能被当成截断结果
+    prose = "预算公式 {x 是集合"
+    assert agent._unwrap_answer(prose) == prose
+    print("✓ 截断信封按空响应处理（说明文字不误伤）")
 
 
 def test_extra_skill_placeholder_result_key_yields_to_real_answer():
@@ -704,6 +733,7 @@ if __name__ == "__main__":
     test_extra_skill_prompt_substitutes_result_key()
     test_extra_skill_non_string_or_empty_answer_is_retriable()
     test_extra_skill_error_body_is_not_success_answer()
+    test_extra_skill_truncated_envelope_is_empty_response()
     test_extra_skill_placeholder_result_key_yields_to_real_answer()
     test_extra_skill_placeholder_only_triggers_retry()
     test_extra_skill_unwraps_multiple_bare_objects()

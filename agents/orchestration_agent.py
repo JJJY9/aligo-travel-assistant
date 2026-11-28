@@ -36,6 +36,7 @@ from utils.entity_normalize import normalize_city
 from utils.json_safe import sanitize_json, strip_nul
 from utils.log_redact import redact_paths
 from utils.llm_resilience import (
+    RetryBudgetExhausted,
     is_permanent_llm_error,
     is_retriable_error,
     retry_with_backoff,
@@ -446,6 +447,7 @@ class OrchestrationAgent(AgentBase):
         retry_cache: dict[str, dict[str, Any]] | None = None,
         checkpoint_key: str | None = None,
         checkpoint_scope: str | None = None,
+        retry_deadline: float | None = None,
     ) -> Msg:
         """
         协调执行流程
@@ -457,6 +459,10 @@ class OrchestrationAgent(AgentBase):
                 子智能体结果落盘，同一键的重试 / 重启复用这些结果。
             checkpoint_scope: 检查点作用域（``user:session``，可选）。
                 只保存哈希，供会话删除时定向清理检查点。
+            retry_deadline: 整轮重试预算的截止时刻（``time.monotonic()``，
+                可选）。编排内的逐智能体重试与串行批次都受它约束：预算
+                耗尽后不再发起新的尝试（已成功步骤由检查点 / 重试缓存
+                保留），避免单回合远超宣称的 ``turn_retry_budget_sec``。
 
         Returns:
             Msg: 执行结果
@@ -468,6 +474,7 @@ class OrchestrationAgent(AgentBase):
         self._checkpoint_scope = (
             str(checkpoint_scope).strip() if checkpoint_scope else None
         )
+        self._retry_deadline = retry_deadline
         # 上一轮失败 / 取消 / 空调度遗留的暂存负载不能带入本轮：只有本轮
         # 成功落库后的 commit 才应写库；遗留负载会变成没有对话支撑的幽灵
         # 行程与偏好（no_agents / 非法意图早退路径同样要先清空）
@@ -635,6 +642,7 @@ class OrchestrationAgent(AgentBase):
             if current_priority is not None and priority != current_priority:
                 # 并行执行当前优先级的所有任务
                 if parallel_tasks:
+                    self._check_turn_budget()
                     batch_results = await self._execute_parallel_agents(
                         parallel_tasks,
                         self._context_with_previous_preferences(context, results),
@@ -650,6 +658,7 @@ class OrchestrationAgent(AgentBase):
 
         # 执行最后一批
         if parallel_tasks:
+            self._check_turn_budget()
             batch_results = await self._execute_parallel_agents(
                 parallel_tasks,
                 self._context_with_previous_preferences(context, results),
@@ -944,6 +953,19 @@ class OrchestrationAgent(AgentBase):
                 str(task.get("expected_output", "")),
             )
         )
+
+    def _check_turn_budget(self) -> None:
+        """整轮重试预算耗尽后不再发起新的批次。
+
+        外层整轮重试只限制「再发起新的尝试」，单次在途尝试此前可把串行
+        多批全部跑完（每批每智能体 300 秒上限，最坏十几分钟），用户会话
+        锁与半开试探名额被长时间占住。批次边界是最安全的截断点：已成功
+        的步骤已由执行检查点 / 重试缓存保留，重试可从断点继续。
+        """
+        deadline = getattr(self, "_retry_deadline", None)
+        if deadline is not None and time.monotonic() >= deadline:
+            logger.warning("整轮重试预算已耗尽，停止发起新的编排批次")
+            raise RetryBudgetExhausted("本轮处理时间超出预算，请重试")
 
     async def _execute_parallel_agents(
         self,
@@ -1438,6 +1460,11 @@ class OrchestrationAgent(AgentBase):
                     max_retries=_AGENT_RETRY_MAX,
                     base_delay_sec=_AGENT_RETRY_BASE_DELAY,
                     max_delay_sec=_AGENT_RETRY_MAX_DELAY,
+                    # 逐智能体重试同样受整轮预算约束：批内失败退避后预算
+                    # 已过就不再发起新的模型调用（不打断在途调用）
+                    deadline_monotonic=getattr(
+                        self, "_retry_deadline", None
+                    ),
                 )
 
             # 用 shield + 完成状态区分两种超时：wait_for 上限触发（技能仍
@@ -1520,6 +1547,10 @@ class OrchestrationAgent(AgentBase):
                 "data": result
             }
 
+        except RetryBudgetExhausted:
+            # 整轮预算耗尽不是单个技能失败：继续把剩余批次跑完只会放大
+            # 耗时与计费，直接上抛由外层映射 503 / 退出码
+            raise
         except _AgentTimeoutInternal:
             logger.error("Agent execution timed out: %s", agent_name)
             # 标记为超时结果：整轮回退重试时不再重新跑满上限（见 _execute_task）

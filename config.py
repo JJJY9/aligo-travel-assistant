@@ -169,9 +169,6 @@ class LLMConfig(TypedDict):
 
 
 class SystemConfig(TypedDict):
-    enable_llm: bool
-    log_level: str
-    max_retries: int
     timeout: int
 
 
@@ -249,10 +246,11 @@ LLM_CONFIG: LLMConfig = {
 }
 
 # System Configuration
+# 这里只保留真正被运行时消费的键：重试次数统一由 RESILIENCE_CONFIG
+# ["max_retries"] 管（config_agentscope / 应用层重试共用该口径）；曾有的
+# enable_llm / log_level / max_retries 没有任何消费者，改它们对行为零效果，
+# 只会让排障误以为配置已生效
 SYSTEM_CONFIG: SystemConfig = {
-    "enable_llm": True,  # Set to True to use LLM (recommended), False for rule-based
-    "log_level": "INFO",
-    "max_retries": 3,
     # 非流式请求的 read 超时兜住整段生成时间：max_tokens=8192 在长行程 /
     # 大历史下可能超过 60s，60s 会让正常请求 ReadTimeout 并被应用层整轮
     # 重试（重复计费）。默认 120s，可用 LLM_REQUEST_TIMEOUT_SEC 调整。
@@ -354,7 +352,7 @@ if _redis_ttl_sec > _MAX_REDIS_TTL_SEC:
 
 # 连接与可用性：重试、熔断、健康检查
 RESILIENCE_CONFIG: ResilienceConfig = {
-    "max_retries": 3,              # 单次请求最大重试次数（与 SYSTEM_CONFIG 对齐）
+    "max_retries": 3,              # 单次请求最大重试次数（应用层重试的唯一口径）
     "retry_base_delay_sec": 1.0,   # 重试退避基数（秒）
     "retry_max_delay_sec": 30.0,   # 重试退避上限（秒）
     # 整个回合（意图 + 编排两段外层重试）的重试总预算（秒，0 表示不限）：

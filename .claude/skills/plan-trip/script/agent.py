@@ -15,7 +15,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 # project_root = Path(__file__).parent.parent # Removed old logic
 # sys.path.insert(0, str(project_root))
 
-from utils.llm_resilience import is_permanent_llm_error, is_retriable_error
+from utils.llm_resilience import (
+    is_permanent_llm_error,
+    is_retriable_error,
+    provider_error_from_completion_text,
+)
 from utils.access_log import MAX_LOG_TEXT, _safe_log_text
 from utils.log_redact import redact_secret
 from utils.preference_values import preference_prompt_lines
@@ -1098,6 +1102,11 @@ class ItineraryPlanningAgent(AgentBase):
                 # 网关 200 空 choices / 纯空白：按可重试错误上抛，交给编排
                 # 层重试与熔断记账，不能伪装成一次「空规划成功」
                 raise ConnectionError("模型返回空响应")
+            # 200 + 错误体：不能当缺结果降级成普通失败（顺带绕开重试与
+            # 熔断分类）；result_key 防止合法行程里带 error 注释时误伤
+            provider_error = provider_error_from_completion_text(text, "itinerary")
+            if provider_error is not None:
+                raise provider_error
 
             # 解析模型输出（标准 JSON / 尾随文本 / data 包装 / 裸行程）
             result = _parse_plan_text(text)

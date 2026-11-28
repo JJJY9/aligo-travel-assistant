@@ -2056,6 +2056,22 @@ class AligoWebApp:
         if not pending:
             return
         with self._sessions_lock:
+            # 淘汰方在释放 _sessions_lock 后才结转，重建方可能已在锁内新建
+            # 同名会话并 _pop_pending_usage_locked 取到空值——此时只写桶，
+            # 活着的实例终身不会读它（桶只在下次重建时消费），旧账要等到
+            # 该会话再被淘汰、再重建一次才并入。发现同名活实例就直接并入
+            live = self.sessions.get(
+                self._session_key(session.user_id, session.session_id)
+            )
+            if live is not None and live is not session:
+                seed = getattr(
+                    getattr(live, "runtime", None),
+                    "seed_unsettled_usage",
+                    None,
+                )
+                if callable(seed):
+                    seed(pending)
+                    return
             bucket = self._pending_usage.get(session.user_id)
             if bucket is None:
                 bucket = self._pending_usage[session.user_id] = OrderedDict()
@@ -7191,6 +7207,9 @@ def create_app(model: Any = None) -> FastAPI:
                     "服务暂时不可用，请稍后再试"
                     f"（请求 ID：{_request_id(request)}）"
                 ),
+                # 熔断恢复依赖真实探测试验：告知客户端短暂退避，与用户锁
+                # / 预算耗尽等瞬时 503 的 Retry-After 口径一致
+                headers={"Retry-After": "5"},
             )
         rate_headers = await asyncio.to_thread(
             _enforce_rate_limit, state, payload.user_id, request
@@ -7244,6 +7263,7 @@ def create_app(model: Any = None) -> FastAPI:
                         "服务暂时不可用，请稍后再试"
                         f"（请求 ID：{_request_id(request)}）"
                     ),
+                    headers={"Retry-After": "5"},
                 )
             if cached is not None:
                 cached_session_id = str(
@@ -7349,6 +7369,7 @@ def create_app(model: Any = None) -> FastAPI:
                 raise HTTPException(
                     status_code=503,
                     detail=f"服务暂时不可用，请稍后再试（请求 ID：{_request_id(request)}）",
+                    headers={"Retry-After": "5"},
                 ) from exc
             except MemoryPersistenceError as exc:
                 # 与流式路径同口径：异常文本含绝对存储路径与底层 OSError
@@ -7478,6 +7499,9 @@ def create_app(model: Any = None) -> FastAPI:
                     "服务暂时不可用，请稍后再试"
                     f"（请求 ID：{_request_id(request)}）"
                 ),
+                # 熔断恢复依赖真实探测试验：告知客户端短暂退避，与用户锁
+                # / 预算耗尽等瞬时 503 的 Retry-After 口径一致
+                headers={"Retry-After": "5"},
             )
         rate_headers = await asyncio.to_thread(
             _enforce_rate_limit, state, payload.user_id, request
@@ -7550,6 +7574,7 @@ def create_app(model: Any = None) -> FastAPI:
                         "服务暂时不可用，请稍后再试"
                         f"（请求 ID：{_request_id(request)}）"
                     ),
+                    headers={"Retry-After": "5"},
                 )
             if idem_key is not None:
                 if cached is not None:

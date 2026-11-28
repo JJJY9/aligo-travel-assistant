@@ -124,9 +124,14 @@ def unwrap_answer_envelope(text: str, result_key: str = "answer") -> str:
     ]
     # 逐个顶层对象而不是「首个 { 到末个 }」的整段：模型先回显模板信封、
     # 再给出未加围栏的正式结果时，整段解析必然失败、正式结果永远丢
-    for start, value, end, _looks in iter_json_object_spans_with_repair(stripped):
+    truncated_result = False
+    for start, value, end, looks in iter_json_object_spans_with_repair(stripped):
         if value is not None and end is not None:
             candidates.append((start, stripped[start:end]))
+        elif looks:
+            # 看起来是结果对象、却没有任何闭合 / 可修复的结尾：max_tokens
+            # 截断。不能把残缺 JSON 原样当成功答案展示并落库
+            truncated_result = True
     candidates.append((0, stripped))
     candidates.sort(key=lambda item: item[0])
 
@@ -161,8 +166,9 @@ def unwrap_answer_envelope(text: str, result_key: str = "answer") -> str:
         matched.sort(key=lambda item: item[0])
 
     if not matched:
-        if envelope_spans:
-            # 信封形状但没有任何正文：按空响应处理触发重试
+        if envelope_spans or truncated_result:
+            # 信封形状但没有任何正文（或正文被 max_tokens 截断）：按空响应
+            # 处理触发重试，不能把残缺 JSON 当成功答案
             return ""
         return text
 
@@ -447,17 +453,21 @@ class SimplePromptSkill(AgentBase):
             response = await self.model(
                 [{"role": "user", "content": prompt}]
             )
-            text = await extract_json_from_async_response(response)
-            text = self._unwrap_answer(str(text or "").strip())
-            if not text:
-                raise ConnectionError("模型返回空响应")
-            # 200 + 错误体（网关把上游错误塞进内容）：不能当成功答案展示 /
-            # 落库，按普通上游失败走下面的 status=error 分支
+            raw_text = str(
+                await extract_json_from_async_response(response) or ""
+            ).strip()
+            # 200 + 错误体（网关把上游错误塞进内容）必须在校验前先识别：
+            # {"status": "error", "error": {...}} 会被信封解包成空串，先撞上
+            # 「空响应」可重试分支，401 / 配额等永久故障被当成瞬时网络故障
+            # 重跑整轮、绕开熔断分类
             provider_error = provider_error_from_completion_text(
-                text, self.result_key
+                raw_text, self.result_key
             )
             if provider_error is not None:
                 raise provider_error
+            text = self._unwrap_answer(raw_text)
+            if not text:
+                raise ConnectionError("模型返回空响应")
             result = {
                 "status": "success",
                 "skill": self.skill_name,

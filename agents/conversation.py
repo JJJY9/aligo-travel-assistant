@@ -367,6 +367,7 @@ class ConversationRuntime:
             checkpoint_supported = False
             checkpoint_scope_supported = False
             defer_epoch_supported = False
+            retry_deadline_supported = False
             if defer_supported:
                 parameters: Iterable[inspect.Parameter]
                 try:
@@ -400,6 +401,11 @@ class ConversationRuntime:
                     or parameter.kind == inspect.Parameter.VAR_KEYWORD
                     for parameter in parameters
                 )
+                retry_deadline_supported = any(
+                    parameter.name == "retry_deadline"
+                    or parameter.kind == inspect.Parameter.VAR_KEYWORD
+                    for parameter in parameters
+                )
             # 整轮重试缓存：外层 retry_with_backoff 会重跑整个编排，缓存让
             # 重试跳过首轮已成功的智能体（一次 429/5xx 曾让同批已完成的
             # 智能体重复调用模型、放大账单与耗时）
@@ -411,6 +417,10 @@ class ConversationRuntime:
                     reply_options["defer_epoch"] = deferred_epoch
             if retry_cache_supported:
                 reply_options["retry_cache"] = orchestration_retry_cache
+            if retry_deadline_supported and retry_deadline is not None:
+                # 编排内的逐智能体重试 / 串行批次共享整轮预算截止时刻：
+                # 只约束外层重试时，单次在途尝试仍可跑满十几分钟
+                reply_options["retry_deadline"] = retry_deadline
             if checkpoint_supported and turn_id:
                 # v2.0 持久化执行：同一 user + session + turn 的重试 / 重启
                 # 复用已成功的子智能体结果（client_turn_id 由前端生成）。

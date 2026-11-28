@@ -92,9 +92,45 @@ _ANSWER_ENVELOPE_KEYS = frozenset(
     }
 )
 
+# 「没有 error 键」的兼容错误信封允许出现的键（全为错误元信息）：键集
+# 超出该集合说明更像正常数据对象，不能凭一个 code 字段判成错误体
+_ERROR_ENVELOPE_META_KEYS = frozenset(
+    {"code", "message", "msg", "status", "success", "request_id", "trace_id"}
+)
+
+
+# 200 错误体里的字符串错误码（OpenAI / 兼容网关）：与数字状态码同等对待。
+# 只认数字时 {"error": {"code": "server_error"}} / {"type": "insufficient_quota"}
+# 这类规范错误体会得到 status=None，可重试与永久故障分类双双返回 False，
+# 技能层于是把它当普通确定性失败吞掉，重试与熔断都不记账。
+_ERROR_CODE_STATUSES = {
+    # 永久故障（鉴权 / 权限 / 配额 / 模型不存在）
+    "invalid_api_key": 401,
+    "incorrect_api_key": 401,
+    "authentication_error": 401,
+    "unauthorized": 401,
+    "permission_error": 403,
+    "insufficient_quota": 402,
+    "billing_hard_limit_reached": 402,
+    "model_not_found": 404,
+    "invalid_request_error": 400,
+    "context_length_exceeded": 400,
+    # 瞬时故障（上游抖动 / 限流）
+    "server_error": 500,
+    "internal_server_error": 500,
+    "api_error": 500,
+    "service_unavailable": 503,
+    "server_unavailable": 503,
+    "overloaded_error": 503,
+    "overloaded": 503,
+    "rate_limit_exceeded": 429,
+    "rate_limit_error": 429,
+    "too_many_requests": 429,
+}
+
 
 def _coerce_http_status(value: object) -> int | None:
-    """把错误体里的 code / status 转成 HTTP 状态码；非 3 位数字返回 None。"""
+    """把错误体里的 code / status 转成 HTTP 状态码；无法识别返回 None。"""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
@@ -103,18 +139,22 @@ def _coerce_http_status(value: object) -> int | None:
         text = value.strip()
         if text.isdigit() and 100 <= int(text) < 600:
             return int(text)
+        return _ERROR_CODE_STATUSES.get(text.lower())
     return None
 
 
 def provider_error_from_completion_text(
     text: object, result_key: str | None = None
 ) -> ProviderResponseError | None:
-    """识别 ``{"error": {...}}`` 形态的 completion 文本。
+    """识别 ``{"error": {...}}`` 等形态的 completion 文本。
 
-    仅当解析结果是 dict、``error`` 为真、且不含任何回答信封键时判定为
+    仅当解析结果是 dict、命中错误信封、且不含任何回答信封键时判定为
     错误体（``result_key`` 存在同样按正常答案处理）；否则返回 None。
-    返回的异常消息仅保留上游 message（截断），是否重试 / 计熔断由
-    调用方按既有分类处理。
+    错误信封包括：``error`` 键为真；顶层 ``status`` 为 error / failed /
+    fail；顶层 ``success`` 为 false；顶层 ``code`` 为 4xx/5xx 且键集严格
+    限于错误元信息（``code`` / ``message`` / ``msg`` / ``status`` /
+    ``success`` / ``request_id`` / ``trace_id``）。返回的异常消息仅保留
+    上游 message（截断），是否重试 / 计熔断由调用方按既有分类处理。
     """
     raw = str(text or "").strip()
     if raw.startswith("```"):
@@ -130,7 +170,7 @@ def provider_error_from_completion_text(
         data = json.loads(raw)
     except (TypeError, ValueError):
         return None
-    if not isinstance(data, dict) or not data.get("error"):
+    if not isinstance(data, dict):
         return None
     if result_key and result_key in data:
         return None
@@ -142,10 +182,37 @@ def provider_error_from_completion_text(
         return None
 
     error = data.get("error")
+    if not error:
+        # 没有 error 键的兼容错误信封（部分网关 / 中转直接返回
+        # {"code":…, "message":…} 或 {"status": "error", …}）：键集必须
+        # 严格限于错误元信息，避免误伤「回答内容本身是一段 JSON」的
+        # 正常输出（含 answer / content 等键时上面的检查已放行）
+        keys = {str(key).lower() for key in data}
+        detail_keys = keys & {"code", "message", "msg"}
+        status_text = str(data.get("status") or "").strip().lower()
+        status_is_error = status_text in {"error", "failed", "fail"}
+        success_false = data.get("success") is False
+        code_status = _coerce_http_status(data.get("code"))
+        code_is_error = code_status is not None and 400 <= code_status < 600
+        if status_is_error and detail_keys:
+            error = data
+        elif success_false and detail_keys:
+            error = data
+        elif (
+            code_is_error
+            and keys <= _ERROR_ENVELOPE_META_KEYS
+            and keys & {"message", "msg"}
+        ):
+            error = data
+        else:
+            return None
+
     status: int | None = None
     code_text = ""
     if isinstance(error, dict):
-        for key in ("code", "status", "status_code"):
+        # 字符串错误码（server_error / insufficient_quota 等）与数字状态码
+        # 同样要落到 status 上，否则重试与熔断分类都拿不到信号
+        for key in ("code", "type", "status", "status_code"):
             status = _coerce_http_status(error.get(key))
             if status is not None:
                 break
@@ -304,25 +371,34 @@ _PERMANENT_LLM_MARKERS = (
 
 
 def is_permanent_llm_error(exc: BaseException) -> bool:
-    """上游模型不可用的不可重试失败（401/402/403/404，或带鉴权标记的 4xx）。
+    """上游模型不可用的不可重试失败（401/402/403/404，或带鉴权 / 配额标记的失败）。
 
     这类错误意味着模型服务整体不可用，调用方必须上抛让熔断器记账，不能
     吞成默认意图 / 空结果后由外层把本轮记为成功——否则 LLM 彻底不可用时
     熔断器永远不会打开。注意请求级 4xx（400 context_length_exceeded /
     408 / 409 / 413 / 422）**不在此列**：模型服务本身健康，任意用户连续
     超长请求不能打开全站熔断；它们按「确定性失败」处理（不重试、不记账）。
+    推断不出状态码的 200 错误体（``{"error": {"code": "insufficient_quota"}}``
+    或只有 message 的配额错误）同样按标记识别为永久故障。
     """
     if is_retriable_error(exc):
         return False
-    status = _status_code(exc)
-    if status is None:
+    # 本地存储失败与 LLM 服务无关，即使正文含 authentication / unauthorized
+    # 之类的字眼（数据库鉴权失败），也不能打开全站 LLM 熔断
+    if isinstance(exc, MemoryPersistenceError):
         return False
-    if status in _PERMANENT_LLM_STATUSES:
-        return True
-    if 400 <= status < 500:
-        text = str(exc).lower()
-        return any(marker in text for marker in _PERMANENT_LLM_MARKERS)
-    return False
+    status = _status_code(exc)
+    if status is not None:
+        if status in _PERMANENT_LLM_STATUSES:
+            return True
+        if 400 <= status < 500:
+            text = str(exc).lower()
+            return any(marker in text for marker in _PERMANENT_LLM_MARKERS)
+        return False
+    # 状态码未知（ProviderResponseError 只从错误体推出 message 等）：鉴权 /
+    # 配额标记仍足以判定上游永久不可用，不能让它滑成「确定性失败」
+    text = str(exc).lower()
+    return any(marker in text for marker in _PERMANENT_LLM_MARKERS)
 
 
 async def retry_with_backoff(
@@ -390,6 +466,16 @@ async def retry_with_backoff(
             if deadline_monotonic is not None:
                 remaining = deadline_monotonic - time.monotonic()
                 if remaining <= 0:
+                    raise
+                # 剩余预算不足一次退避：睡到截止时刻后必然直接抛错，只会
+                # 白占用户回合锁与半开试探名额，立即按最后一次真实异常失败
+                if remaining <= delay:
+                    logger.warning(
+                        "整轮重试预算不足一次退避（剩余 %.1fs < 退避 %.1fs），"
+                        "停止重试",
+                        remaining,
+                        delay,
+                    )
                     raise
                 # 退避睡眠同样受预算约束：睡完再判断会白白占用锁与额度
                 delay = min(delay, remaining)
@@ -461,8 +547,15 @@ async def run_health_check(
         reply = await asyncio.wait_for(
             model([{"role": "user", "content": "1"}]), timeout=timeout_sec
         )
-        if not _response_text(reply).strip():
+        text = _response_text(reply).strip()
+        if not text:
             return False, "模型返回空响应（请检查密钥 / 网关日志）"
+        # 网关也可能把错误对象塞进 HTTP 200 的 completion 内容（与技能层
+        # 同一形态）：非空错误体同样代表上游不可用，不能给 doctor / 就绪
+        # 探针一个假绿。消息已由分类器截断，回显前仍按密钥口径脱敏
+        provider_error = provider_error_from_completion_text(text)
+        if provider_error is not None:
+            return False, redact_secret(str(provider_error))
         return True, "ok"
     except asyncio.TimeoutError:
         return False, f"健康检查超时（{timeout_sec:.1f}s）"

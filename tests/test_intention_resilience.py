@@ -116,6 +116,41 @@ def test_http_200_error_body_is_llm_error():
         ({"error": "Incorrect API key provided: sk-***"}, False, True),
         ({"error": {"message": "Authentication failed"}}, False, True),
         ({"error": "insufficient_quota: quota exceeded"}, False, True),
+        # OpenAI 规范配额文案（只有 message）：永久故障，不能吞成默认意图
+        (
+            {
+                "error": {
+                    "message": "You exceeded your current quota, please "
+                    "check your plan and billing details."
+                }
+            },
+            False,
+            True,
+        ),
+        # message-only 瞬时文案：按可重试处理（此前无 timeout / rate limit
+        # 字样会被判成确定性失败、静默降级）
+        (
+            {"error": {"message": "The server had an error while processing your request"}},
+            True,
+            False,
+        ),
+        (
+            {"error": {"message": "Service temporarily unavailable, please try again"}},
+            True,
+            False,
+        ),
+        # 没有 error 键的兼容错误信封：status / success / 顶层 code 形态
+        (
+            {
+                "status": "error",
+                "code": 401,
+                "message": "Incorrect API key provided: sk-***",
+            },
+            False,
+            True,
+        ),
+        ({"code": 503, "message": "gateway timeout"}, True, False),
+        ({"success": False, "code": 500, "message": "boom"}, True, False),
     ]
     for body, retriable, permanent in cases:
         agent = IntentionAgent(

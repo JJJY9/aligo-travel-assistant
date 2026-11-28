@@ -781,6 +781,7 @@ class AligoCLI:
             # 按签名探测后再传。
             defer_supported = False
             retry_cache_supported = False
+            retry_deadline_supported = False
             try:
                 parameters = inspect.signature(
                     self.orchestrator.reply
@@ -795,9 +796,14 @@ class AligoCLI:
                 retry_cache_supported = (
                     "retry_cache" in parameters or accepts_var_kwargs
                 )
+                # 编排内的逐智能体重试 / 串行批次共享整轮预算截止时刻
+                retry_deadline_supported = (
+                    "retry_deadline" in parameters or accepts_var_kwargs
+                )
             except (TypeError, ValueError):
                 defer_supported = False
                 retry_cache_supported = False
+                retry_deadline_supported = False
             orchestration_retry_cache: dict[str, dict[str, Any]] = {}
             try:
                 with self.console.status("正在调度智能体…", spinner="dots") as orchestration_status:
@@ -813,6 +819,8 @@ class AligoCLI:
                             options["defer_memory"] = True
                         if retry_cache_supported:
                             options["retry_cache"] = orchestration_retry_cache
+                        if retry_deadline_supported and retry_deadline is not None:
+                            options["retry_deadline"] = retry_deadline
                         return self.orchestrator.reply(intention_result, **options)
 
                     orchestration_result = await retry_with_backoff(

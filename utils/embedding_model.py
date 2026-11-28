@@ -19,7 +19,19 @@ _MODELS: dict[str, Any] = {}
 # 冷却窗口内直接按上次的失败快速报错
 _FAILURES: dict[str, tuple[float, Exception]] = {}
 _LOAD_FAILURE_COOLDOWN_SEC = 30.0
+# 等待其它线程完成首次加载的上限：嵌入模型是 RAG 的必需依赖（不能像
+# 重排模型那样降级继续），所以给足正常加载时间；但无界等锁会把请求线程
+# 钉在分钟级下载上，超过该窗口按「加载中」快速失败（可重试的忙时 503）
+_LOAD_WAIT_SEC = 60.0
 _LOCK = threading.Lock()
+
+
+class EmbeddingLoadingError(RuntimeError):
+    """另一个线程正在加载同一嵌入模型，有限等待内未完成。
+
+    瞬时状态：调用方按「知识库正在加载」快速失败即可，不应计入加载
+    失败冷却，也不应让调用方永久放弃嵌入。
+    """
 
 
 def embedding_dimension(model: Any) -> int | None:
@@ -165,13 +177,20 @@ def get_embedding_model(model_path: str) -> Any:
     """返回共享的 SentenceTransformer（首次调用时加载并缓存）。
 
     加载失败在冷却窗口（30 秒）内直接按上次错误快速失败，避免每个请求
-    都重跑一次完整的加载 / 下载。
+    都重跑一次完整的加载 / 下载。并发首载的其它线程最多排队
+    ``_LOAD_WAIT_SEC`` 秒：超时抛 :class:`EmbeddingLoadingError`（瞬时
+    「加载中」，不写失败冷却），避免把唯一 RAG 加载 worker 与请求线程
+    无界钉在分钟级下载上。
     """
     key = str(model_path)
     model = _MODELS.get(key)
     if model is not None:
         return model
-    with _LOCK:
+    if not _LOCK.acquire(timeout=_LOAD_WAIT_SEC):
+        raise EmbeddingLoadingError(
+            "知识库正在加载（首次使用需加载嵌入模型），请稍后重试"
+        )
+    try:
         model = _MODELS.get(key)
         if model is None:
             failed = _FAILURES.get(key)
@@ -192,6 +211,8 @@ def get_embedding_model(model_path: str) -> Any:
                 raise
             _MODELS[key] = model
         return model
+    finally:
+        _LOCK.release()
 
 
 def reset_embedding_models() -> None:
