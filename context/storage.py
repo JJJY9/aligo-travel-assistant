@@ -94,6 +94,12 @@ _ACTUAL_BACKEND: dict[str, str] = {}
 # 单飞 + 失败冷却：探测成功写入 _ACTUAL_BACKEND 后不再重复连接。
 _pg_probe_lock = threading.Lock()
 _PG_PROBE_TIMEOUT_SEC = 2.0
+# describe_backends 对「已启用 PG」的节流复验：一次成功建连后
+# _ACTUAL_BACKEND 会一直停留 postgres，数据库运行中停机不会被纯健康 /
+# 指标轮询发现（只有下一次 store 创建失败才会纠正）。每 30 秒最多复用
+# _probe_postgres_backend 复验一次（单飞 + 失败冷却，不放大连接）。
+_PG_VERIFY_INTERVAL_SEC = 30.0
+_pg_last_verify: dict[str, float] = {}
 
 
 def _failed_recently(key: str) -> bool:
@@ -383,9 +389,28 @@ def create_long_term_memory(
                     allow_quarantined=allow_quarantined,
                     pg_fallback=True,
                 )
+            with _pg_lock:
+                leader_in_flight = _pg_creating.get(dsn) is gate
+            if leader_in_flight:
+                # leader 的连接 / 首次建表超过等待窗口（冷 DNS、DDL 慢）：
+                # 等待者不能再各自发起连接（单飞在最需要它的场景下反而
+                # 放大成连接风暴），按暂不可用降级。leader 稍后成功会把
+                # _ACTUAL_BACKEND 切回 postgres。
+                _ACTUAL_BACKEND["long_term"] = "json"
+                if strict:
+                    raise MemoryPersistenceError(
+                        "PostgreSQL 初始化仍在进行，操作暂不可用，请稍后再试"
+                    )
+                return LongTermMemory(
+                    user_id,
+                    storage_path,
+                    allow_quarantined=allow_quarantined,
+                    pg_fallback=True,
+                )
         try:
             memory = _create_postgres_memory(user_id, dsn)
             _ACTUAL_BACKEND["long_term"] = "postgres"
+            _pg_last_verify[dsn] = time.monotonic()
             _clear_json_quarantine_marker(user_id, storage_path)
             logger.info("PostgreSQL 长期记忆已启用")
             return memory
@@ -434,6 +459,7 @@ def reset_failure_cache() -> None:
         _FAILED_UNTIL.clear()
         _redis_clients.clear()
         _ACTUAL_BACKEND.clear()
+        _pg_last_verify.clear()
         # 在途创建完成时按代数丢弃结果，reset 之后旧客户端不会写回缓存
         _redis_generation += 1
     reset_redis_degraded()
@@ -467,6 +493,7 @@ def _probe_postgres_backend(dsn: str) -> bool:
             )
             return False
         _ACTUAL_BACKEND["long_term"] = "postgres"
+        _pg_last_verify[dsn] = time.monotonic()
         return True
 
 
@@ -491,6 +518,21 @@ def describe_backends(wait_for_create: bool = True) -> dict[str, Any]:
     )
     short_term = "redis" if url and redis_client is not None else "memory"
     long_term = _ACTUAL_BACKEND.get("long_term")
+    if (
+        long_term == "postgres"
+        and dsn
+        and not _failed_recently(f"postgres:{dsn}")
+        and time.monotonic() - _pg_last_verify.get(dsn, 0.0)
+        >= _PG_VERIFY_INTERVAL_SEC
+    ):
+        # 已启用的 PG 也要定期复验：纯健康 / 指标轮询不会创建 store，
+        # 数据库运行中停机后 _ACTUAL_BACKEND 会永远停在 postgres，与
+        # doctor 的真连结论相反。复用只读探测（单飞 + 失败冷却）。
+        if _probe_postgres_backend(dsn):
+            long_term = "postgres"
+        else:
+            _ACTUAL_BACKEND["long_term"] = "json"
+            long_term = "json"
     if long_term is None:
         # 本进程还没创建过长期记忆：不能只凭配置推断 postgres——数据库
         # 不可达的新实例会一直报「已降级=false」，与 doctor 的连通性检查

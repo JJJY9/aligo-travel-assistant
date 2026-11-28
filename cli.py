@@ -5785,6 +5785,19 @@ def run_session_show_standalone(
     if as_json:
         from utils.json_safe import sanitize_json
 
+        # 与 `sessions --json` 同口径：存储里可能混有 PG 的带偏移时间与
+        # JSON 后端的 naive 本地时间，原样输出会让脚本按 tz-aware 解析失败
+        normalized_messages = []
+        for message in messages:
+            if isinstance(message, dict) and "timestamp" in message:
+                message = {
+                    **message,
+                    "timestamp": _json_timestamp_text(
+                        message.get("timestamp") or ""
+                    ),
+                }
+            normalized_messages.append(message)
+
         print(
             json.dumps(
                 sanitize_json(
@@ -5795,7 +5808,7 @@ def run_session_show_standalone(
                         "title": title,
                         "pinned": pinned,
                         "archived": archived,
-                        "messages": messages,
+                        "messages": normalized_messages,
                     }
                 ),
                 ensure_ascii=False,

@@ -2062,3 +2062,42 @@ if __name__ == "__main__":
         )
     else:
         print(f"\n全部通过（{ran}/{total} 个用例）")
+
+
+def test_session_show_json_timestamps_normalized(monkeypatch):
+    """session-show --json 与 sessions --json 同口径：时间戳统一带偏移。"""
+    import json as _json
+
+    from utils.timestamps import to_aware
+
+    store = _FakeStore(
+        [
+            _message("user", "甲", "s-naive2", "2026-03-02T01:05:00"),
+            _message("user", "乙", "s-aware2", "2026-03-01T23:40:00+00:00"),
+            _message("user", "丙", "s-bad2", "不是时间"),
+        ]
+    )
+    monkeypatch.setattr(
+        storage, "create_long_term_memory", lambda *args, **kwargs: store
+    )
+    for session_id, expected_prefix in (
+        ("s-naive2", "2026-03-02T01:05:00"),
+        ("s-aware2", "2026-03-01T23:40:00"),
+    ):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cli.run_session_show_standalone("u1", session_id, as_json=True)
+        data = _json.loads(out.getvalue())
+        assert code == 0
+        text = data["messages"][0]["timestamp"]
+        assert text.startswith(expected_prefix), text
+        aware = to_aware(text)
+        assert aware is not None and aware.utcoffset() is not None
+        assert "+" in text
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = cli.run_session_show_standalone("u1", "s-bad2", as_json=True)
+    data = _json.loads(out.getvalue())
+    assert code == 0
+    assert data["messages"][0]["timestamp"] == "不是时间", "非法时间戳原样保留"
+    print("✓ session-show --json 时间戳统一带偏移")

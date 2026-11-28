@@ -2621,7 +2621,24 @@ def _import_exclusion(store: Any):
                 ) from exc
             yield
     elif callable(advisory):
-        with advisory(f"aligo-import!{user_id}"):
+        with contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(advisory(f"aligo-import!{user_id}"))
+            except MemoryPersistenceError as exc:
+                # PG 等锁 30s 超时（55P03）与 JSON 文件锁超时同义：是
+                # 「另一个导入正在进行」，不是存储故障。只转换获锁阶段
+                # 的错误，锁体内的持久化失败保持原样（不能被误标成导入占用）
+                cause = exc.__cause__
+                sqlstate = getattr(cause, "sqlstate", None)
+                if sqlstate is None:
+                    sqlstate = getattr(
+                        getattr(cause, "diag", None), "sqlstate", None
+                    )
+                if sqlstate == "55P03" or "lock timeout" in str(exc).lower():
+                    raise MemoryPersistenceError(
+                        f"另一个导入正在进行，请稍后重试：{exc}"
+                    ) from exc
+                raise
             yield
     else:
         yield

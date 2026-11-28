@@ -403,9 +403,13 @@ class PostgresLongTermMemory:
                             logger.info("表结构已被并发创建，重试剩余 DDL")
                             try:
                                 cursor.execute(_SCHEMA_SQL)
-                            except contention_errors:
+                            except duplicate_errors + contention_errors:
+                                # 重试窗口内又撞上其它实例的目录竞争（或等锁
+                                # 超时）：连接本身健康，跳过本次 DDL、不标记
+                                # schema 完成，下次构造重试；不能让异常冒到
+                                # 构造函数被工厂当作连接故障冷却 60 秒
                                 logger.warning(
-                                    "表结构 DDL 等待锁超时，跳过本次初始化"
+                                    "表结构并发创建 / 等待锁超时，跳过本次初始化"
                                     "（下次构造重试）"
                                 )
                                 return False
@@ -500,7 +504,9 @@ class PostgresLongTermMemory:
 
         self._run_with_retry(run, replay_safe=replay_safe)
 
-    def _execute_rowcount(self, sql: str, params: tuple | None = None) -> int:
+    def _execute_rowcount(
+        self, sql: str, params: tuple | None = None, replay_safe: bool = True
+    ) -> int:
         """执行写语句并返回受影响行数（重连重放语义与 _execute 一致）。"""
 
         def run() -> int:
@@ -508,7 +514,7 @@ class PostgresLongTermMemory:
                 cursor.execute(sql, params)
                 return int(cursor.rowcount)
 
-        return self._run_with_retry(run)
+        return self._run_with_retry(run, replay_safe=replay_safe)
 
     def _fetchall(self, sql: str, params: tuple | None = None) -> list[tuple]:
         def run() -> list[tuple]:
@@ -843,11 +849,32 @@ class PostgresLongTermMemory:
         )
         if row is not None:
             return
-        count_row = self._fetchone(
-            "SELECT COUNT(*) FROM aligo_preferences WHERE user_id = %s",
+        rows = self._fetchall(
+            "SELECT pref_type, value FROM aligo_preferences WHERE user_id = %s",
             (self.user_id,),
         )
-        current = int(count_row[0] or 0) if count_row else 0
+        from utils.preference_values import (
+            has_preference_value,
+            is_manageable_pref_type,
+        )
+
+        hidden = [
+            str(pref_type_value[0])
+            for pref_type_value in rows
+            if not is_manageable_pref_type(pref_type_value[0])
+            or not has_preference_value(pref_type_value[1])
+        ]
+        if hidden:
+            # 与 JSON 后端的加载期清洗、Web PUT 的「写入时顺带释放名额」
+            # 同口径：面板 / 提示词不可见的历史脏行不占类型上限，否则
+            # 同一逻辑数据在 PG 下会被不可见行挤到 409
+            self._execute(
+                "DELETE FROM aligo_preferences"
+                " WHERE user_id = %s AND pref_type = ANY(%s)",
+                (self.user_id, hidden),
+                replay_safe=False,
+            )
+        current = len(rows) - len(hidden)
         # 只拦「导入前未越限、本次新增会推过上限」：已越限的历史账号
         # 不再被永久拒绝，与导入侧按轴基线豁免一致
         if current == _MAX_PREFERENCES:
@@ -858,11 +885,12 @@ class PostgresLongTermMemory:
     def get_preference(self, pref_type: str | None = None) -> Any:
         if pref_type is None:
             # ORDER BY：无排序时行序未定义（UPDATE 会挪行版本），面板行序
-            # 每次编辑后跳动、备份 diff 出噪声；按 pref_type 排序命中主键
-            # 索引且编辑不变，顺序稳定（JSON 后端为稳定的插入序）
+            # 每次编辑后跳动、备份 diff 出噪声；COLLATE "C" 让排序按 UTF-8
+            # 字节序，与 JSON 后端 get_preference 的 Python 码点升序逐项
+            # 一致（默认 locale 排序对非 ASCII 键会分叉）
             rows = self._fetchall(
-                "SELECT pref_type, value FROM aligo_preferences"
-                " WHERE user_id = %s ORDER BY pref_type",
+                'SELECT pref_type, value FROM aligo_preferences'
+                ' WHERE user_id = %s ORDER BY pref_type COLLATE "C"',
                 (self.user_id,),
             )
             return {row[0]: row[1] for row in rows}
@@ -1670,6 +1698,10 @@ class PostgresLongTermMemory:
                                 )
                                 + token_params
                                 + (existing_id,),
+                                # 目标 id 来自重连前的索引快照：重放的写随后
+                                # 会被 _abort_if_reconnected 判定无效，但已经
+                                # 落库值会覆盖空档里其它实例的并发编辑
+                                replay_safe=False,
                             )
                         else:
                             self._execute(
@@ -1681,6 +1713,7 @@ class PostgresLongTermMemory:
                                 (trip.get("purpose"), updated_at)
                                 + token_params
                                 + (existing_id,),
+                                replay_safe=False,
                             )
                         _abort_if_reconnected()
                         updated += 1
@@ -1776,7 +1809,11 @@ class PostgresLongTermMemory:
         self._execute(
             """
             INSERT INTO aligo_session_titles (user_id, session_id, title)
-            SELECT %s, s, t FROM unnest(%s::text[], %s::text[]) AS x(s, t)
+            SELECT %s, x.s, x.t FROM unnest(%s::text[], %s::text[]) AS x(s, t)
+            WHERE EXISTS (
+                SELECT 1 FROM aligo_chat_messages m
+                WHERE m.user_id = %s AND m.session_id = x.s
+            )
             ON CONFLICT (user_id, session_id)
             DO UPDATE SET title = EXCLUDED.title, updated_at = now()
             """,
@@ -1784,6 +1821,9 @@ class PostgresLongTermMemory:
                 self.user_id,
                 [session_id for session_id, _ in rows],
                 [title for _, title in rows],
+                # 存在性过滤必须跟着写语句一起重放：重连空档里被删除的
+                # 会话不应再写回标题（幽灵元数据）
+                self.user_id,
             ),
         )
         if applied_out is not None:
@@ -1816,11 +1856,15 @@ class PostgresLongTermMemory:
             self._execute(
                 """
                 INSERT INTO aligo_pinned_sessions (user_id, session_id, pinned_at)
-                SELECT %s, s, now() + (ord - 1) * interval '1 microsecond'
+                SELECT %s, x.s, now() + (ord - 1) * interval '1 microsecond'
                 FROM unnest(%s::text[]) WITH ORDINALITY AS x(s, ord)
+                WHERE EXISTS (
+                    SELECT 1 FROM aligo_chat_messages m
+                    WHERE m.user_id = %s AND m.session_id = x.s
+                )
                 ON CONFLICT DO NOTHING
                 """,
-                (self.user_id, unique_ids),
+                (self.user_id, unique_ids, self.user_id),
             )
         else:
             self._execute(
@@ -1857,11 +1901,15 @@ class PostgresLongTermMemory:
             self._execute(
                 """
                 INSERT INTO aligo_archived_sessions (user_id, session_id, archived_at)
-                SELECT %s, s, now() + (ord - 1) * interval '1 microsecond'
+                SELECT %s, x.s, now() + (ord - 1) * interval '1 microsecond'
                 FROM unnest(%s::text[]) WITH ORDINALITY AS x(s, ord)
+                WHERE EXISTS (
+                    SELECT 1 FROM aligo_chat_messages m
+                    WHERE m.user_id = %s AND m.session_id = x.s
+                )
                 ON CONFLICT DO NOTHING
                 """,
-                (self.user_id, unique_ids),
+                (self.user_id, unique_ids, self.user_id),
             )
         else:
             self._execute(
@@ -2285,6 +2333,11 @@ class PostgresLongTermMemory:
         会重连并重放这条语句，计数子查询在重放时重新求值——先用 COUNT 读
         出计数、再 SELECT/DELETE 的写法会在重连空档里用过期计数删掉并发
         去重实例刚留下的保留行（同一 trip_id 全部消失）。
+
+        但整条语句本身**不重放**（replay_safe=False）：提交确认丢失时若
+        重放，COUNT 会按已删除后的行数重新求值，2 条副本时返回 0（少报且
+        与已提交事实不符），3 条时还会多删一条。歧义提交按持久化失败上报，
+        由 apply_trip_dedupe 的「结果未知按失败」口径承接。
         """
         with self._advisory_lock(f"aligo-trip-{self.user_id}"):
             deleted = self._execute_rowcount(
@@ -2296,6 +2349,7 @@ class PostgresLongTermMemory:
                 "    WHERE user_id = %s AND trip_id = %s"
                 ") >= 2",
                 (self.user_id, self.user_id, trip_id, self.user_id, trip_id),
+                replay_safe=False,
             )
             return deleted > 0
 
@@ -2702,7 +2756,7 @@ class PostgresLongTermMemory:
     # ---------- 清理 ----------
 
     def _delete_user_rows(self, tables: tuple[str, ...]) -> None:
-        """在单事务内清空用户在这些表的行（session_meta → chat_messages 锁序）。
+        """在单事务内清空用户在这些表的行（session_meta → chat_messages → trip 锁序）。
 
         逐表 autocommit 删除在中途失败 / 与其它实例并发写入交错时会留下
         半清空账号（消息已删、会话元数据还在，或反之）；与 add_chat_turn /
@@ -2720,6 +2774,15 @@ class PostgresLongTermMemory:
                 cursor.execute(
                     "SELECT pg_advisory_xact_lock(hashtext(%s))",
                     (f"aligo:chat_messages:{self.user_id}",),
+                )
+                # 行程写者持有 aligo-trip-<user> 会话级锁（与事务级锁共享
+                # 同一锁空间）：不取这把锁时，清空与「取号后 INSERT」交错
+                # 会在删除提交后残留一条 trip_*，与 JSON 后端的全串行语义
+                # 不一致。锁序 session_meta → chat_messages → trip 不会
+                # ABBA：持 trip 锁的方法不再获取前两把锁。
+                cursor.execute(
+                    "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"aligo-trip-{self.user_id}",),
                 )
                 for table in tables:
                     cursor.execute(

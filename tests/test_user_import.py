@@ -6365,3 +6365,55 @@ if __name__ == "__main__":
         )
     else:
         print(f"\n全部通过（{ran}/{total} 个用例）")
+
+
+def test_import_exclusion_pg_lock_timeout_reports_busy():
+    """PG 导入互斥等锁超时（55P03）与 JSON 文件锁同义：报「另一个导入正在进行」。"""
+    from utils import user_import
+    from utils.errors import MemoryPersistenceError
+
+    class _Busy:
+        def __enter__(self):
+            cause = type("_PgBusy", (Exception,), {"sqlstate": "55P03"})()
+            raise MemoryPersistenceError(
+                "PostgreSQL 操作失败：canceling statement due to lock timeout"
+            ) from cause
+
+        def __exit__(self, *args):
+            return False
+
+    class _Store:
+        user_id = "u1"
+
+        def _advisory_lock(self, name):
+            return _Busy()
+
+    try:
+        with user_import._import_exclusion(_Store()):
+            pass
+    except MemoryPersistenceError as exc:
+        assert str(exc).startswith("另一个导入正在进行"), str(exc)
+    else:
+        raise AssertionError("等锁超时必须报导入占用")
+
+    class _Down:
+        def __enter__(self):
+            raise MemoryPersistenceError("PostgreSQL 操作失败：connection refused")
+
+        def __exit__(self, *args):
+            return False
+
+    class _DownStore:
+        user_id = "u1"
+
+        def _advisory_lock(self, name):
+            return _Down()
+
+    try:
+        with user_import._import_exclusion(_DownStore()):
+            pass
+    except MemoryPersistenceError as exc:
+        assert "另一个导入" not in str(exc), "存储故障不能被误标成导入占用"
+    else:
+        raise AssertionError("存储故障必须上抛")
+    print("✓ PG 导入互斥只有等锁超时才报导入占用")

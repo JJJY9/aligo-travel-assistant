@@ -38,7 +38,11 @@ from utils.json_safe import sanitize_json
 from utils.llm_resilience import RetryBudgetExhausted, retry_with_backoff
 from utils.log_redact import redact_secret
 from utils.paths import default_data_root
-from utils.preference_values import has_preference_value, preference_prompt_lines
+from utils.preference_values import (
+    has_preference_value,
+    is_manageable_pref_type,
+    preference_prompt_lines,
+)
 from utils.result_formatter import normalize_results, result_to_markdown
 from utils.turn_meta import attach_turn_meta, build_turn_meta, strip_turn_meta
 from utils.usage import add_usage
@@ -1064,7 +1068,7 @@ class ConversationRuntime:
         preferences = {
             key: value
             for key, value in preferences_raw.items()
-            if has_preference_value(value)
+            if has_preference_value(value) and is_manageable_pref_type(key)
         }
         if preferences:
             # 单值 / 总量预算：200 类型 × 10000 字符的合法偏好全量拼进
