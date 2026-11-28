@@ -265,18 +265,26 @@ class MemoryManager:
             self._preference_cache = None
 
     @classmethod
-    def invalidate_all_preference_caches(cls) -> None:
-        """清空本进程所有实例的偏好快照缓存。
+    def invalidate_all_preference_caches(
+        cls, user_id: str | None = None
+    ) -> None:
+        """清空本进程各实例的偏好快照缓存。
 
         面板 PUT/DELETE 偏好与备份导入经独立 store 直接写库，不经过各
         会话的 MemoryManager；不全局失效时，PostgreSQL 后端下会话最多
         5 秒内仍按旧偏好规划。
+
+        ``user_id`` 给定时只失效该用户的实例：Web 端的面板 / 导入写入
+        只影响本用户，全进程失效会让任一用户的写操作清掉所有用户的缓存，
+        高并发下相互拖慢。省略时维持「全部实例」语义供 CLI / 旧调用点使用。
         """
         # 锁内只做快照：会话构造线程同时在 add，直接迭代 WeakSet 会抛
         # 「Set changed size during iteration」；逐实例失效在锁外执行
         with cls._preference_cache_instances_lock:
             instances = list(cls._preference_cache_instances)
         for instance in instances:
+            if user_id is not None and getattr(instance, "user_id", None) != user_id:
+                continue
             try:
                 instance.invalidate_preference_cache()
             except Exception:  # noqa: BLE001 - 单个实例失败不影响其它
@@ -295,11 +303,17 @@ class MemoryManager:
         self._recent_summary_failure_until = 0.0
 
     @classmethod
-    def invalidate_all_summary_caches(cls) -> None:
-        """清空本进程所有实例的摘要缓存（删除会话 / 导入恢复后调用）。"""
+    def invalidate_all_summary_caches(cls, user_id: str | None = None) -> None:
+        """清空本进程各实例的摘要缓存（删除会话 / 导入恢复后调用）。
+
+        ``user_id`` 给定时只失效该用户的实例（Web 端删除 / 恢复只影响
+        本用户，不必清掉所有用户的摘要缓存）。省略时清空全部实例。
+        """
         with cls._preference_cache_instances_lock:
             instances = list(cls._preference_cache_instances)
         for instance in instances:
+            if user_id is not None and getattr(instance, "user_id", None) != user_id:
+                continue
             try:
                 instance.invalidate_summary_cache()
             except Exception:  # noqa: BLE001 - 单个实例失败不影响其它

@@ -88,7 +88,7 @@ from utils.execution_checkpoint import clear_session_checkpoints
 from utils.circuit_breaker import CircuitBreaker, CircuitOpenError
 from utils.console import configure_stdio, strip_terminal_controls
 from utils.doctor import STATUS_FAIL, STATUS_OK, STATUS_WARN, CheckResult, run_doctor
-from utils.identifiers import is_valid_web_id
+from utils.identifiers import is_valid_web_id, is_valid_web_session_id
 from utils.idempotency import IdempotencyCache, make_key
 from utils.knowledge_admin import (
     JOINED_MAX_CHARS,
@@ -1876,7 +1876,10 @@ class AligoWebApp:
         # 结转给下次新建的同名会话。分桶保证一个用户的流量不会把另一
         # 用户较早结转的账目挤出；外层桶数另有全局上限（进程内、有界；
         # 进程重启后仍会丢失，见 README 用量口径）
-        self._pending_usage: dict[str, OrderedDict[str, dict[str, Any]]] = {}
+        # 外层按「最久未触碰」淘汰，需要 move_to_end 保持顺序
+        self._pending_usage: OrderedDict[str, OrderedDict[str, dict[str, Any]]] = (
+            OrderedDict()
+        )
         # 结转表最多保留的用户桶数：大量一次性用户 ID 各留一笔账目也不
         # 能让进程内表无界增长，超过时淘汰最早建桶的用户
         self.max_pending_usage_users = 1000
@@ -2114,18 +2117,36 @@ class AligoWebApp:
         只在新建分支淘汰时，并发首请求或命中路径会把缓存推过上限后永不回收。
         """
         while len(self.sessions) > self.max_sessions:
-            victim = next(
-                (
-                    candidate_key
-                    for candidate_key, item in self.sessions.items()
-                    if candidate_key != keep_key
-                    and (
-                        not item.in_use()
-                        or item.long_in_use(self.session_turn_leak_sec)
-                    )
-                ),
-                None,
+            # 按用户公平淘汰：纯全局 LRU 下，一个用户轮换自己的会话就能把
+            # 其它用户的空闲会话挤出缓存，下一回合被迫重建运行时（重连
+            # PostgreSQL 等）。先淘汰会话数最多的用户自己的最旧空闲条目；
+            # 同条目数时按全局最旧条目的用户决胜，单用户仍是 FIFO。
+            counts: dict[str, int] = {}
+            first_index: dict[str, int] = {}
+            for position, candidate_key in enumerate(self.sessions):
+                owner = str(candidate_key).split("\n", 1)[0]
+                counts[owner] = counts.get(owner, 0) + 1
+                first_index.setdefault(owner, position)
+            order = sorted(
+                counts, key=lambda owner: (-counts[owner], first_index[owner])
             )
+            victim = None
+            for owner in order:
+                victim = next(
+                    (
+                        candidate_key
+                        for candidate_key, item in self.sessions.items()
+                        if candidate_key != keep_key
+                        and str(candidate_key).split("\n", 1)[0] == owner
+                        and (
+                            not item.in_use()
+                            or item.long_in_use(self.session_turn_leak_sec)
+                        )
+                    ),
+                    None,
+                )
+                if victim is not None:
+                    break
             if victim is None:
                 break
             evicted.append(self.sessions.pop(victim))
@@ -2177,6 +2198,10 @@ class AligoWebApp:
             # 别人的结转账目挤出，被挤出者的用量永久少记
             while len(bucket) > self.max_sessions:
                 bucket.popitem(last=False)
+            # 外层用户桶按「最久未触碰」淘汰：只按建桶顺序删会把一次性
+            # ID 的流量留在表里、先淘汰仍在活跃写账的用户；触碰后移到
+            # 表尾，victim 取表头（仍是另一个用户，本用户桶保留）
+            self._pending_usage.move_to_end(session.user_id)
             while len(self._pending_usage) > self.max_pending_usage_users:
                 victim = next(
                     (user for user in self._pending_usage if user != session.user_id),
@@ -2184,7 +2209,12 @@ class AligoWebApp:
                 )
                 if victim is None:
                     break
-                del self._pending_usage[victim]
+                dropped = self._pending_usage.pop(victim)
+                logger.warning(
+                    "结转用量用户桶超限，丢弃最久未触碰的用户 %s 的 %d 个会话",
+                    victim,
+                    len(dropped),
+                )
 
     def _pop_pending_usage_locked(
         self, user_id: str, session_id: str
@@ -2591,6 +2621,20 @@ class AligoWebApp:
         with self._tombstone_lock:
             self._deleted_sessions[key] = (now, token)
             self._deleted_sessions.move_to_end(key)
+            # 与 mark_deleted 同口径维护容量不变量：重新主张走覆盖写入，
+            # 不裁剪的话表可短暂超过 max_tombstones，破坏淘汰前提
+            expired = [
+                candidate
+                for candidate, at in self._deleted_sessions.items()
+                if now - at[0] > self.tombstone_ttl_sec
+            ]
+            for candidate in expired:
+                del self._deleted_sessions[candidate]
+            self._evict_user_fair_locked(
+                self._deleted_sessions,
+                self.max_tombstones,
+                lambda candidate: candidate.split("\n", 1)[0],
+            )
         client = self._shared_tombstones(force=True)
         if client is None:
             self._remember_pending_tombstone(user_id, session_id, token)
@@ -3838,6 +3882,21 @@ class _SessionExistenceCheckError(RuntimeError):
     """delete_session 的存在性检查阶段失败（与删除失败区分归类与回滚口径）。"""
 
 
+def _require_valid_web_user_id(user_id: str) -> None:
+    """Web 入口的 user_id 强校验（字符集之外的设备保留名 / 字节上限）。
+
+    读体 / 排队 / 解析成本高的入口（备份恢复、导入）应在这些前置工作之前
+    调用：pydantic 的 ``_ID_PATTERN`` 只约束字符集，``is_valid_web_id`` 还
+    拒绝 Windows 设备保留名与超长 ID，放到 ``_open_long_term`` 里意味着
+    读完 64MB 请求体、占用全局导入槽之后才 422。
+    """
+    if not is_valid_web_id(user_id):
+        # Web 的 pydantic 模式（Rust 正则，无 lookaround）只能校验字符集；
+        # Windows 设备保留名（NUL / COM1 …）会拼成记忆库文件名并指向设备，
+        # 为 JSON 后端在这里统一拒绝，避免写入静默丢失。
+        raise HTTPException(status_code=422, detail="user_id 非法")
+
+
 def _open_long_term(
     user_id: str, strict: bool = False, allow_quarantined: bool = False
 ) -> Any:
@@ -3853,11 +3912,7 @@ def _open_long_term(
     统一映射为可重试的 503，避免所有调用点都抛裸 500。调用点仍负责关闭
     返回的 store。
     """
-    if not is_valid_web_id(user_id):
-        # Web 的 pydantic 模式（Rust 正则，无 lookaround）只能校验字符集；
-        # Windows 设备保留名（NUL / COM1 …）会拼成记忆库文件名并指向设备，
-        # 为 JSON 后端在这里统一拒绝，避免写入静默丢失。
-        raise HTTPException(status_code=422, detail="user_id 非法")
+    _require_valid_web_user_id(user_id)
     try:
         store = create_long_term_memory(
             user_id,
@@ -4097,26 +4152,27 @@ def _close_long_term(store: Any) -> None:
             close()
 
 
-def _invalidate_preference_caches() -> None:
-    """面板 / 导入直写偏好后清空各会话的偏好快照缓存（失败不影响写入）。"""
+def _invalidate_preference_caches(user_id: str) -> None:
+    """面板 / 导入直写偏好后清空该用户会话的偏好快照缓存（失败不影响写入）。"""
     try:
         from context.memory_manager import MemoryManager
 
-        MemoryManager.invalidate_all_preference_caches()
+        MemoryManager.invalidate_all_preference_caches(user_id)
     except Exception:  # noqa: BLE001 - 缓存清理失败由 5 秒 TTL 兜底
         logger.debug("清理偏好快照缓存失败", exc_info=True)
 
 
-def _invalidate_summary_caches() -> None:
-    """删除会话 / 末轮 / 导入恢复后清空各会话的摘要缓存（失败不阻断操作）。
+def _invalidate_summary_caches(user_id: str) -> None:
+    """删除会话 / 末轮 / 导入恢复后清空该用户的摘要缓存（失败不阻断操作）。
 
     摘要失败冷却期内会原样返回旧摘要、不校验窗口：不清理的话，已删除
-    会话的内容仍会进入其它会话的意图上下文与记忆查询。
+    会话的内容仍会进入其它会话的意图上下文与记忆查询。只清本用户的
+    实例：Web 请求只影响自己的数据，全进程清空会让高并发用户相互拖慢。
     """
     try:
         from context.memory_manager import MemoryManager
 
-        MemoryManager.invalidate_all_summary_caches()
+        MemoryManager.invalidate_all_summary_caches(user_id)
     except Exception:  # noqa: BLE001 - 缓存清理失败由下次重算兜底
         logger.debug("清理摘要缓存失败", exc_info=True)
 
@@ -4307,23 +4363,41 @@ def _load_user_data(user_id: str, strict: bool = False) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="读取用户数据失败，请稍后重试") from exc
 
 
+def _addressable_session_id(value: object) -> str | None:
+    """会话列表 / 统计可见的会话 ID；不可寻址（面板打不开也删不掉）返回 None。
+
+    所有会话端点都用 ``_ID_PATTERN`` 校验路径参数，旧版本导入可能写入
+    含空格 / 超长 / 上标类字符的会话 ID：它们能出现在列表里，却打不开、
+    删不掉（CLI session-delete 也按同一字符集校验），形成面板坏行与虚高
+    的 total / archived_count。列表与统计统一按端点可寻址口径过滤；完整
+    备份导出走 ``session_markdown.group_sessions`` 保留全部会话，不丢数据。
+
+    整数 0 是合法会话 ID：必须先 ``str()`` 再交给
+    ``is_valid_web_session_id``（其内部 ``str(value or "")`` 会把 0 折成
+    空串）。
+    """
+    if value is None:
+        return None
+    text = str(value)
+    if not text.strip() or text in RESERVED_SESSION_IDS:
+        return None
+    if not is_valid_web_session_id(text):
+        return None
+    return text
+
+
 def _visible_session_ids(history: list[dict[str, Any]]) -> set[str]:
     """列表里可见的会话 ID 集合（与 ``_group_sessions`` 的归组谓词一致）。
 
-    跳过无归属（None）与纯空白字符串、跳过保留字会话，其余按字符串归一
-    （整数 0 是合法会话，``"0"`` 必须计入）；与归档 / 置顶标记同口径。
+    跳过无归属（None）与纯空白字符串、跳过保留字会话与端点不可寻址的
+    ID，其余按字符串归一（整数 0 是合法会话，``"0"`` 必须计入）；与归档 /
+    置顶标记同口径。
     """
     result: set[str] = set()
     for message in history:
-        session_id = message.get("session_id")
-        if session_id is None or (
-            isinstance(session_id, str) and not session_id.strip()
-        ):
-            continue
-        text = str(session_id)
-        if text in RESERVED_SESSION_IDS:
-            continue
-        result.add(text)
+        session_id = _addressable_session_id(message.get("session_id"))
+        if session_id is not None:
+            result.add(session_id)
     return result
 
 
@@ -4581,13 +4655,11 @@ def _group_sessions(
     updated_keys: dict[str, Any] = {}
     for message in history:
         session_id = message.get("session_id")
-        # 旧数据里会话 ID 可能是整数（0 也是合法值）：只跳过 None / 空白串
-        if session_id is None or (
-            isinstance(session_id, str) and not session_id.strip()
-        ):
-            continue
-        if str(session_id) in RESERVED_SESSION_IDS:
-            # 保留字会话被静态导出路由遮蔽、永远打不开：列表里不出现
+        # 旧数据里会话 ID 可能是整数（0 也是合法值）：只跳过 None / 空白串；
+        # 保留字会话被静态导出路由遮蔽、永远打不开，与端点不可寻址的 ID
+        # （含空格 / 超长 / 上标类字符）一起从列表里过滤
+        addressable = _addressable_session_id(session_id)
+        if addressable is None:
             continue
         entry = grouped.setdefault(
             str(session_id),
@@ -6724,7 +6796,7 @@ def create_app(model: Any = None) -> FastAPI:
             store.save_preference(pref_type, payload.value)
             # 写入已提交：立即失效本进程各会话的偏好快照，读回失败也不能
             # 让旧偏好继续服务（此前失效在异常路径被整体跳过）
-            _invalidate_preference_caches()
+            _invalidate_preference_caches(payload.user_id)
             try:
                 value = store.get_preference(pref_type)
             except Exception as exc:  # noqa: BLE001 - 写后读回失败≠保存失败
@@ -6755,7 +6827,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise _storage_failure("保存失败", exc) from exc
         finally:
             _close_long_term(store)
-        _invalidate_preference_caches()
+        _invalidate_preference_caches(payload.user_id)
         result: dict[str, Any] = {"type": pref_type, "value": value}
         if read_warning:
             result["warning"] = read_warning
@@ -6800,7 +6872,7 @@ def create_app(model: Any = None) -> FastAPI:
             raise _storage_failure("删除失败", exc) from exc
         finally:
             _close_long_term(store)
-        _invalidate_preference_caches()
+        _invalidate_preference_caches(user_id)
         return {"type": pref_type, "deleted": removed}
 
     @app.get("/api/sessions", dependencies=[Depends(_cross_site_side_effect)])
@@ -7287,7 +7359,7 @@ def create_app(model: Any = None) -> FastAPI:
             )
             # 摘要缓存可能仍含已删除会话的内容：不失效会在失败冷却期内
             # 继续注入其它会话的意图上下文与记忆查询
-            _invalidate_summary_caches()
+            _invalidate_summary_caches(user_id)
         finally:
             lock.release()
         return {"session_id": session_id, "deleted": removed}
@@ -7364,7 +7436,7 @@ def create_app(model: Any = None) -> FastAPI:
                     state.idempotency.discard_session, user_id, session_id
                 )
                 # 被删除轮次仍可能留在摘要缓存里（冷却期不校验窗口）
-                _invalidate_summary_caches()
+                _invalidate_summary_caches(user_id)
 
                 def _truncate_short_term() -> None:
                     # 短期记忆只是上下文缓存：清理失败不影响已完成的长期记忆删除。
@@ -8429,6 +8501,9 @@ def create_app(model: Any = None) -> FastAPI:
         解析与批量写入在导入专用执行器里执行（单 worker + 背压），批量
         保存是 O(N²) 且持用户锁：不能占用共享线程池，也不能并发跑多份。
         """
+        # 与 /api/import 同口径：非法 user_id 在占导入槽 / 执行器排队之前
+        # 就 422，而不是进 work() 后才经 _open_long_term 拒绝
+        _require_valid_web_user_id(user_id)
         response.headers.update(_enforce_import_rate_limit(state, request))
         # 同一来源的并发导入上限为 1：两个慢速上传就能占满全局槽位到读体
         # 超时，期间所有用户的导入都 503
@@ -9212,6 +9287,11 @@ def create_app(model: Any = None) -> FastAPI:
                 headers={"Connection": "close"},
             )
 
+        # user_id 强校验（设备保留名 / 字节上限）放到读体、占导入槽与解析
+        # 之前：此前要等 _run_import 里 _open_long_term 才 422，非法 ID 也会
+        # 先读完 64MB 请求体、占用全局导入槽，与普通对话入口的即时 422 不一致
+        _require_valid_web_user_id(user_id)
+
         # 限流先于解析，而且都走线程池：请求体可达 64MB，Pydantic body 参数
         # 会让 FastAPI 在事件循环上同步 json.loads（实测 64MB 约 3 秒），
         # 所有 SSE 与请求一起停摆；超限的风暴请求也不该先付出解析代价
@@ -9561,9 +9641,9 @@ def create_app(model: Any = None) -> FastAPI:
                         finally:
                             state.end_user_import(user_id)
                         # 导入可能覆盖 / 删除偏好：清掉已建会话的 5 秒快照
-                        _invalidate_preference_caches()
+                        _invalidate_preference_caches(user_id)
                         # 恢复可能覆盖 / 丢弃会话：旧摘要不能再注入其它会话
-                        _invalidate_summary_caches()
+                        _invalidate_summary_caches(user_id)
                         # 写库期间（大备份可能数十秒）其它实例 / CLI 可能删除
                         # 某个会话：最后再查一次墓碑并整会话回滚，避免迟到的
                         # 删除被恢复写回。若删除发生在本次检查之后，它自己的

@@ -8517,3 +8517,53 @@ def test_pg_delete_preferences_batches_delete():
     assert len(executed) == 1, executed
     assert bumps == [1]
     print("✓ PG 批量删除偏好单条 DELETE 并推进版本")
+
+
+def test_owner_conflict_expanding_casefold_index():
+    """İ 等变长折叠字符不能让归属守卫切片错位（下标按原文窗口定位）。"""
+    import unicodedata
+
+    store = object.__new__(LongTermMemory)
+    # 小写 i + 组合点：与 "İ" 的 casefold 等价（NFC 后同一身份）
+    store.user_id = unicodedata.normalize("NFC", "i̇")
+    owner = store._owner_conflict_for_name(
+        "İ.json.corrupt-20260101", ".json.corrupt-"
+    )
+    assert owner == "İ", owner
+    # 同一账号的精确拼写不报冲突
+    assert (
+        store._owner_conflict_for_name(
+            f"{store.user_id}.json.corrupt-1", ".json.corrupt-"
+        )
+        is None
+    )
+    print("✓ 变长折叠字符下归属守卫切片正确")
+
+
+def test_actual_filename_normalization_alias(monkeypatch):
+    """规范等价（NFC/NFD）别名与大小写别名同口径，经 samefile 确认后采用。"""
+    import unicodedata
+
+    from config import STORAGE_CONFIG
+
+    monkeypatch.setitem(STORAGE_CONFIG, "postgres_dsn", "")
+    storage_dir = tempfile.mkdtemp()
+    nfc_name = unicodedata.normalize("NFC", "José.json")
+    nfd_name = unicodedata.normalize("NFD", "José.json")
+    assert nfc_name != nfd_name
+    (Path(storage_dir) / nfd_name).write_text("{}", encoding="utf-8")
+    store = object.__new__(LongTermMemory)
+    store.user_id = nfc_name[: -len(".json")]
+    store.db_path = os.path.join(storage_dir, nfc_name)
+    monkeypatch.setattr(
+        "context.long_term_memory.os.path.samefile",
+        lambda left, right: True,
+    )
+    assert store._actual_memory_filename(nfc_name) == nfd_name
+
+    monkeypatch.setattr(
+        "context.long_term_memory.os.path.samefile",
+        lambda left, right: False,
+    )
+    assert store._actual_memory_filename(nfc_name) == nfc_name
+    print("✓ 规范等价别名的真实文件名回退")

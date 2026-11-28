@@ -170,6 +170,32 @@ def test_eviction_tie_targets_most_entries_owner():
     print("✓ 幂等缓存条目并列时按全局最旧淘汰（尽力而为）")
 
 
+def test_eviction_spares_incomplete_markers():
+    """断连回合的 __incomplete__ 标记排最后淘汰：先清普通完成响应。"""
+    cache = IdempotencyCache(max_entries=3, ttl_sec=600)
+    marker = make_key("alice", "s", "mark")
+    done = make_key("alice", "s", "done")
+    cache.put(marker, {"__incomplete__": True})
+    cache.put(done, {"ok": True})
+    cache.put(make_key("bob", "s", "done"), {"ok": True})
+    cache.put(make_key("carol", "s", "done"), {"ok": True})
+    assert cache.get(marker) is not None, "标记被普通条目挤掉了"
+    assert cache.get(done) is None, "应优先淘汰同一用户的普通完成响应"
+    print("✓ 幂等缓存淘汰先清普通条目、保留 __incomplete__ 标记")
+
+
+def test_eviction_falls_back_to_oldest_marker():
+    """缓存全为标记时仍能收敛：淘汰最旧标记而不是死循环。"""
+    cache = IdempotencyCache(max_entries=2, ttl_sec=600)
+    first = make_key("u1", "s", "m1")
+    cache.put(first, {"__incomplete__": True})
+    cache.put(make_key("u2", "s", "m2"), {"__incomplete__": True})
+    cache.put(make_key("u3", "s", "m3"), {"__incomplete__": True})
+    assert len(cache) == 2
+    assert cache.get(first) is None
+    print("✓ 全标记时淘汰最旧标记")
+
+
 if __name__ == "__main__":
     import _stdio
 
@@ -193,4 +219,6 @@ if __name__ == "__main__":
     test_key_binds_endpoint_and_message()
     test_discard_session_clears_all_forms()
     test_eviction_tie_targets_most_entries_owner()
+    test_eviction_spares_incomplete_markers()
+    test_eviction_falls_back_to_oldest_marker()
     print("\n全部通过")

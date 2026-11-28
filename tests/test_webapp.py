@@ -4499,7 +4499,7 @@ def test_delete_session_and_last_turn_invalidate_summary_caches(monkeypatch):
     monkeypatch.setattr(
         MemoryManager,
         "invalidate_all_summary_caches",
-        classmethod(lambda cls: called.append("summary")),
+        classmethod(lambda cls, user_id=None: called.append("summary")),
     )
     client = _client()
     user_id = _unique_user("web_test_summary_invalidate")
@@ -6340,7 +6340,7 @@ def test_preference_writes_invalidate_all_caches(monkeypatch):
     monkeypatch.setattr(
         server_module,
         "_invalidate_preference_caches",
-        lambda: calls.append(1),
+        lambda user_id: calls.append(1),
     )
     client = _client()
     user_id = _unique_user("web_test_pref_cache")
@@ -7781,7 +7781,7 @@ def test_preference_put_readback_failure_returns_success(monkeypatch):
     monkeypatch.setattr(
         server_module,
         "_invalidate_preference_caches",
-        lambda: invalidations.append(True),
+        lambda user_id: invalidations.append(True),
     )
     client = _client()
     response = client.put(
@@ -20360,3 +20360,137 @@ def test_import_epochs_bounded_and_monotonic(monkeypatch):
     assert state.export_start_epoch("u2") != old_epoch, "重建纪元不得与旧值相同"
     assert state.export_start_epoch("u-evicted") == 0
     print("✓ 恢复纪元映射有界且全局单调")
+
+
+def test_import_rejects_invalid_user_id_before_body_parse(monkeypatch):
+    """非法 user_id 在读体 / 解析 / 占导入槽之前就 422（与对话入口同口径）。"""
+
+    def _sentinel(*_args, **_kwargs):
+        raise AssertionError("非法 user_id 不应进入解析阶段")
+
+    monkeypatch.setattr(
+        "utils.user_import.parse_user_export_data", _sentinel
+    )
+    client = _client()
+    for bad in ("NUL", "nul", "CON", "60x"):
+        user_id = "\U00010400" * 60 if bad == "60x" else bad
+        response = client.post(
+            f"/api/import?user_id={user_id}",
+            content=b'{"backup": {"preferences": {}}}',
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 422, (bad, response.status_code)
+        assert response.json()["detail"] == "user_id 非法"
+    print("✓ /api/import 非法 user_id 在解析前 422")
+
+
+def test_import_valid_user_id_still_accepted():
+    """强校验前置不改变合法 ID 的行为（含斜杠外常见变体）。"""
+    client = _client()
+    user_id = _unique_user("web_test_import_valid")
+    try:
+        response = client.post(
+            f"/api/import?user_id={user_id}&dry_run=1",
+            content=b'{"backup": {"preferences": {}}}',
+            headers={"content-type": "application/json"},
+        )
+        # 空备份在解析后被拒绝为 400；关键是不被强校验误判为 422
+        assert response.status_code == 400, response.text
+    finally:
+        _cleanup(user_id)
+    print("✓ /api/import 合法 user_id 正常处理")
+
+
+def test_sessions_list_hides_unaddressable_session_ids():
+    """列表 / total / 归档计数与端点可寻址口径一致：不可寻址 ID 不出现。"""
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_unaddressable")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.add_chat_turn("你好", "在", "s-ok")
+            store.add_chat_turn("hi", "hello", "bad id")
+            store.add_chat_turn("hi2", "hello2", "x" * 65)
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        data = _client().get(f"/api/sessions?user_id={user_id}").json()
+        assert data["total"] == 1, data
+        assert [s["session_id"] for s in data["sessions"]] == ["s-ok"]
+        assert data["archived_count"] == 0
+        # 不可寻址 ID 的直接寻址本就 422：列表口径必须与之对齐
+        assert (
+            _client().get(f"/api/sessions/bad%20id?user_id={user_id}").status_code
+            == 422
+        )
+    finally:
+        _cleanup(user_id)
+    print("✓ 会话列表隐藏不可寻址 session_id")
+
+
+def test_session_cache_evicts_user_fair():
+    """缓存超限按用户公平淘汰：高流量用户不会挤出其他人的空闲会话。"""
+    from types import SimpleNamespace
+
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.max_sessions = 2
+    item = SimpleNamespace(
+        in_use=lambda: False,
+        long_in_use=lambda seconds: False,
+        close=lambda: None,
+    )
+    state.sessions.clear()
+    state.sessions["b\nidle"] = item
+    state.sessions["a\ns1"] = item
+    state.sessions["a\ns2"] = item
+    evicted = []
+    try:
+        with state._sessions_lock:
+            state._evict_over_limit_locked(keep_key="a\ns3", evicted=evicted)
+        assert "b\nidle" in state.sessions, "被淘汰的应是会话数最多的用户"
+        assert len(state.sessions) == 2
+        assert len(evicted) == 1
+    finally:
+        state.sessions.clear()
+        state.close_all()
+    print("✓ 会话缓存按用户公平淘汰")
+
+
+def test_reassert_deleted_keeps_tombstone_capacity():
+    """重新主张墓碑后仍满足 max_tombstones 不变量（与 mark_deleted 同口径）。"""
+    app = create_app(model=UsageTrackingModel(_FakeModel()))
+    state = app.state.aligo
+    state.max_tombstones = 2
+    state.tombstone_ttl_sec = 3600
+    try:
+        state.mark_deleted("u1", "s1")
+        state.mark_deleted("u2", "s1")
+        state.reassert_deleted("u3", "s1", "token-x")
+        assert len(state._deleted_sessions) <= 2
+    finally:
+        state.close_all()
+    print("✓ 重新主张墓碑后容量不变量成立")
+
+
+def test_summary_cache_invalidation_scoped_to_user(monkeypatch):
+    """删除会话只失效本用户的摘要缓存，不清掉其它用户的计算结果。"""
+    from context.memory_manager import MemoryManager
+
+    seen: list[str | None] = []
+    monkeypatch.setattr(
+        MemoryManager,
+        "invalidate_all_summary_caches",
+        classmethod(lambda cls, user_id=None: seen.append(user_id)),
+    )
+    client = _client()
+    user_id = _unique_user("web_test_summary_scope")
+    try:
+        response = client.delete(f"/api/sessions/s-missing?user_id={user_id}")
+        assert response.status_code == 200, response.text
+    finally:
+        _cleanup(user_id)
+    assert seen == [user_id], seen
+    print("✓ 摘要缓存失效按用户收敛")

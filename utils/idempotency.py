@@ -6,10 +6,11 @@
 实现边界：
 - 进程内 TTL + 最大条目数；键为 ``(user_id, session_id, key)``；
 - 超限淘汰按用户公平：先清已过期条目，再只淘汰当前条目数最多的用户
-  自己最旧的一条（并列时取最旧插入者）。单一用户的突发流量不会挤占
-  其他用户的条目；但缓存被多个用户的条目共同占满时，任何新写入仍会
-  淘汰某个用户的最旧条目（含断连回合的 ``__incomplete__`` 标记）——
-  没有每用户配额时无法避免；
+  自己最旧的一条（并列时取最旧插入者）。断连回合的 ``__incomplete__``
+  标记（重试会重复执行并二次落库）在淘汰顺序里排最后：同一 victim 用户
+  内先淘汰普通完成响应，极端情形（缓存全是标记）才淘汰最旧的标记。
+  缓存被多个用户的条目共同占满时，普通响应仍可能被跨用户淘汰——没有
+  每用户配额时无法完全避免，但标记优先保住；
 - 只缓存成功完成的响应；失败不入缓存，允许客户端重试；
 - 读出时深拷贝，调用方修改返回对象不会污染缓存；
 - 多实例部署可把同一接口替换为 Redis 实现（键与 TTL 语义不变）。
@@ -95,10 +96,22 @@ class IdempotencyCache:
         for key in self._entries:
             counts[key[0]] = counts.get(key[0], 0) + 1
         victim_user = max(counts, key=lambda user: counts[user])
-        for key in self._entries:
-            if key[0] == victim_user:
+
+        def _is_incomplete(payload: dict[str, Any]) -> bool:
+            return bool(payload.get("__incomplete__"))
+
+        # 断连回合的 ``__incomplete__`` 标记被淘汰 = 重试会重复执行并二次
+        # 落库；先在同一 victim 用户内淘汰普通完成响应，标记留到最后
+        for key, (_, payload) in self._entries.items():
+            if key[0] == victim_user and not _is_incomplete(payload):
                 self._entries.pop(key)
                 return
+        for key, (_, payload) in self._entries.items():
+            if not _is_incomplete(payload):
+                self._entries.pop(key)
+                return
+        # 极端情形（缓存里全是标记）才淘汰最旧的标记，保证循环收敛
+        self._entries.popitem(last=False)
 
     def put(self, key: IdempotencyKey, payload: dict[str, Any]) -> None:
         """写入完成响应；超上限时按用户公平淘汰最久未使用的条目。"""
