@@ -163,6 +163,7 @@ from utils.usage import add_usage
 from utils.version import APP_VERSION
 from utils.weather import (
     UpstreamQuotaError,
+    WeatherBusyError,
     WeatherError,
     fetch_weather,
     peek_cached_weather,
@@ -1913,8 +1914,9 @@ class AligoWebApp:
             max_keys=rate_limit_max_keys,
             probe_factory=_redis_probe_factory,
         )
-        # 天气接口每次未命中会上游发两次请求；按客户端 IP 限流，
-        # 保护 Open-Meteo 免费额度与共用线程池，不占用对话 / 知识库额度
+        # 天气接口每次未命中通常会上游发两次请求（补查城市名变体时最多三次）；
+        # 按客户端 IP 限流，保护 Open-Meteo 免费额度与共用线程池，
+        # 不占用对话 / 知识库额度
         self.weather_limiter = create_rate_limiter(
             "weather",
             RATE_LIMIT_CONFIG.get("weather_requests", 30),
@@ -5499,6 +5501,17 @@ def create_app(model: Any = None) -> FastAPI:
                 "天气查询过于频繁",
                 state.weather_limiter.limit,
                 exc.retry_after,
+            ) from exc
+        except WeatherBusyError as exc:
+            # 本地排队繁忙（单飞等待耗尽 / 并发闸门超时 / 上游 429）：均未
+            # 完成可复用结果，天然限流应归还刚才占用的 IP 天气桶；响应仍按
+            # 既定重载语义返回 503 + Retry-After，客户端稍后重试
+            await asyncio.to_thread(_refund_weather_rate_limit, state, request)
+            logger.warning("天气查询失败：%s", "本地繁忙")
+            raise HTTPException(
+                status_code=503,
+                detail="天气服务繁忙，请稍后再试",
+                headers={"Retry-After": "5"},
             ) from exc
         except WeatherError as exc:
             message = str(exc)

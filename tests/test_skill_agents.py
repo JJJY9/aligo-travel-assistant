@@ -908,6 +908,27 @@ def test_weather_city_prefers_explicit_clause_city():
     print("✓ 天气分句显式城市优先于行程目的地")
 
 
+def test_weather_city_extraction_foreign_clause_and_absolute_dates():
+    """非内置城市在天气分句里不被别处分句城市顶替；绝对日期不拼进城市。"""
+    agent_class = _load_skill("query-info", "InformationQueryAgent")
+    agent = object.__new__(agent_class)
+    # 天气分句里的境外城市不能被别处（常见城市表里）的城市顶替
+    assert agent._extract_city_from_query("我在北京，伦敦天气怎么样") == "伦敦"
+    assert agent._extract_city_from_query("下周去深圳出差，纽约天气怎么样") == "纽约"
+    assert (
+        agent._extract_city_from_query("从上海出发去北京，纽约天气怎么样")
+        == "纽约"
+    )
+    # 分句内重复城市（带内部标点）仍取目的地
+    assert agent._extract_city_from_query("从北京去纽约，纽约天气如何") == "纽约"
+    # 绝对日期 / 节日写法不能被拼进城市名
+    assert agent._extract_city_from_query("12月纽约天气怎么样") == "纽约"
+    assert agent._extract_city_from_query("十月伦敦天气") == "伦敦"
+    assert agent._extract_city_from_query("春节纽约天气") == "纽约"
+    assert agent._extract_city_from_query("12月份纽约天气") == "纽约"
+    print("✓ 境外城市分句 / 绝对日期提取正常")
+
+
 def test_weather_query_synonyms_and_english_anchor():
     """口语化天气问法与英文问句的城市提取。"""
     agent_class = _load_skill("query-info", "InformationQueryAgent")
@@ -922,6 +943,22 @@ def test_weather_query_synonyms_and_english_anchor():
     ):
         assert agent._is_weather_query(query) is True, query
     assert agent._is_weather_query("推荐一款湿度计") is False
+    # 口语问法：冷吗 / 有雾 / 降温 与英文 rain / cold 同样属于天气查询
+    for query in (
+        "北京冷吗",
+        "明天北京冷吗",
+        "北京有雾吗",
+        "明天降温吗",
+        "Will it rain in Tokyo tomorrow?",
+        "Is it cold in Beijing?",
+    ):
+        assert agent._is_weather_query(query) is True, query
+    # 英文用词边界：train / hotel 不能误判成天气
+    assert agent._is_weather_query("train to Beijing") is False
+    assert agent._is_weather_query("hotel in Tokyo") is False
+    assert agent._extract_city_from_query("北京冷吗") == "北京"
+    assert agent._extract_city_from_query("张掖冷吗") == "张掖"
+    assert agent._extract_city_from_query("明天降温吗") == ""
     assert agent._extract_city_from_query("我在上海，北京多少度") == "北京"
     assert agent._extract_city_from_query("伦敦下雪吗") == "伦敦"
     # 英文问句：以天气词为锚点，句首问候 / 星期名不当城市

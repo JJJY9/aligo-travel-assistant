@@ -159,10 +159,9 @@ def test_web_search_backend_timeout_continues(monkeypatch):
     monkeypatch.setitem(module_globals, "_SEARCH_BACKEND_TIMEOUT_SEC", 0.05)
     _FakeDDGS.behavior = {
         "duckduckgo": lambda: time.sleep(0.3) or [],
-        "google": lambda: [
+        "auto": [
             {"href": "https://example.com/a", "title": "结果", "body": "摘要"}
         ],
-        "auto": [],
     }
     started = time.monotonic()
     agent = _query_agent()
@@ -212,7 +211,7 @@ def test_web_search_all_empty_is_not_failure(monkeypatch):
     """ddgs 9.x 无结果抛 DDGSException：应报「未找到」而不是「搜索失败」。"""
     behavior = {
         backend: Exception("No results found.")
-        for backend in ("duckduckgo", "google", "auto")
+        for backend in ("duckduckgo", "auto")
     }
     result = _run_web_search(monkeypatch, behavior)
     assert result["results"].get("message") == "未找到相关结果", result
@@ -223,7 +222,7 @@ def test_web_search_all_empty_is_not_failure(monkeypatch):
 def test_web_search_all_errors_is_failure(monkeypatch):
     behavior = {
         backend: Exception("network unreachable")
-        for backend in ("duckduckgo", "google", "auto")
+        for backend in ("duckduckgo", "auto")
     }
     result = _run_web_search(monkeypatch, behavior)
     assert "搜索失败" in result["results"].get("error", ""), result
@@ -233,13 +232,82 @@ def test_web_search_all_errors_is_failure(monkeypatch):
 def test_web_search_mixed_empty_and_error_is_not_failure(monkeypatch):
     behavior = {
         "duckduckgo": Exception("No results found."),
-        "google": Exception("network unreachable"),
-        "auto": Exception("No results found."),
+        "auto": Exception("network unreachable"),
     }
     result = _run_web_search(monkeypatch, behavior)
     assert result["results"].get("message") == "未找到相关结果", result
     assert "error" not in result["results"]
     print("✓ 部分后端报错 + 其它后端无结果仍按「未找到」处理")
+
+
+def test_web_search_continues_when_results_all_filtered(monkeypatch):
+    """首个后端结果全被可疑域名过滤：继续下一个后端，不能提前终止。"""
+    behavior = {
+        "duckduckgo": [{"href": "https://spam.tk/a", "title": "x", "body": "y"}],
+        "auto": [
+            {"href": "https://example.com/good", "title": "结果", "body": "摘要"}
+        ],
+    }
+    module_globals = InformationQueryAgent._web_search.__globals__
+    monkeypatch.setitem(module_globals, "DDGS", _FakeDDGS)
+    monkeypatch.setitem(module_globals, "DDGS_AVAILABLE", True)
+    _FakeDDGS.behavior = behavior
+
+    async def _fake_extract(response):
+        return "摘要"
+
+    monkeypatch.setitem(
+        module_globals, "extract_json_from_async_response", _fake_extract
+    )
+    agent = _query_agent()
+    agent.model = _FakeModel()
+    agent.skill_loader = _FakeSkillLoader()
+    result = asyncio.run(agent._web_search("冷门查询"))
+    assert result["query_success"] is True, result
+    assert result["results"]["sources"][0]["url"] == "https://example.com/good"
+    print("✓ 首后端整页被过滤后继续下一个后端")
+
+
+def test_normalize_result_url_rejects_lookalike_hosts(monkeypatch):
+    """DDG 跳转还原按 hostname 精确匹配：仿冒域名不能被当成 DuckDuckGo。"""
+    module_globals = InformationQueryAgent._web_search.__globals__
+    normalize = module_globals["_normalize_result_url"]
+    assert (
+        normalize("//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa")
+        == "https://example.com/a"
+    )
+    assert (
+        normalize("https://www.duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com")
+        == "https://example.com"
+    )
+    lookalike = "https://notduckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fa"
+    assert normalize(lookalike) == lookalike
+    print("✓ 仿冒 DDG 域名不还原跳转目标")
+
+
+def test_search_summary_prompt_is_budget_bounded(monkeypatch):
+    """第三方超长 title / snippet 拼进摘要 prompt 前按字符预算截断。"""
+    agent = _query_agent()
+    model = _FakeModel()
+    agent.model = model
+    agent.skill_loader = _FakeSkillLoader()
+    module_globals = InformationQueryAgent._summarize_search_results.__globals__
+
+    async def _fake_extract(response):
+        return "摘要"
+
+    monkeypatch.setitem(
+        module_globals, "extract_json_from_async_response", _fake_extract
+    )
+    results = [
+        {"title": "标题" * 200, "snippet": "正文" * 5000, "url": "https://x"}
+        for _ in range(5)
+    ]
+    asyncio.run(agent._summarize_search_results("问题", results))
+    prompt = model.prompts[-1]
+    assert len(prompt) < 6000, len(prompt)
+    assert "…" in prompt
+    print("✓ 摘要 prompt 对第三方长文本有字符预算")
 
 
 def test_search_summary_neutralizes_prompt_markers(monkeypatch):

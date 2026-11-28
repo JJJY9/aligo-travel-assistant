@@ -56,6 +56,12 @@ _WEATHER_EXECUTOR = DaemonThreadPoolExecutor(
 # 单次网络搜索后端的总耗时上限：ddgs 内部约 5s/轮，多重试 / 多引擎叠加时
 # 一次查询可占用半分钟以上；超时按该后端失败继续下一个，不拖死整个回合
 _SEARCH_BACKEND_TIMEOUT_SEC = 20.0
+# 第三方 SERP 的 title / 摘要没有长度上限（实测单条 body 可达 3.7k 字符），
+# 5 条直接拼进摘要 prompt 会稀释指令并抬高 token 成本；与 memory-query /
+# ask-question 同口径按字符预算截断（只截 prompt，不改 sources 原文）
+_MAX_SEARCH_TITLE_CHARS = 200
+_MAX_SEARCH_SNIPPET_CHARS = 500
+_MAX_RESULTS_TEXT_CHARS = 4000
 
 # 各搜索后端实际访问的主机：NO_PROXY 排除判定按后端分别进行
 _DDGS_BACKEND_HOSTS = {
@@ -123,7 +129,14 @@ _TIME_WORDS_PATTERN = re.compile(
     r"(?:星期|周)[一二三四五六日天末]|"
     r"未来|这几天|近期|"
     r"(?:[一二三四五六七八九十两\d]+)(?:天|周)(?:以?[后前])?|"
-    r"几天|一周|下个?月|这个?月)"
+    r"几天|一周|下个?月|这个?月|"
+    # 绝对日期 / 节日（此前漏配：残留的「月」会与境外城市拼成「月纽约」
+    # 送地理编码必 404）
+    r"[今明后]年|\d{2,4}年|"
+    r"(?:[一二三四五六七八九十两\d]{1,4}月份?)|"
+    r"(?:[一二三四五六七八九十两\d]{1,3}[日号])|"
+    r"月初|月底|"
+    r"春节|元旦|国庆节?|中秋(?:节)?|端午节?|清明节?|劳动节|五一)"
 )
 # 问句前缀 / 动作词：「搜索一下东京天气」「查东京天气」「帮我规划去东京的行程」
 # 不剥离会把「搜索一下」「规划去东」当成城市名
@@ -143,11 +156,16 @@ _ROUTE_SPLIT_PATTERN = re.compile(r"去|到|飞往|飞(?!机)")
 _WEATHER_WORDS = (
     "天气", "气温", "温度", "下雨", "降雨", "有雨", "下雪", "降雪",
     "预报", "湿度", "多少度", "几度", "热不热", "冷不冷",
+    "冷吗", "冷么", "热吗", "热么", "降温", "升温", "刮风", "大风",
+    "有雾", "雾霾", "紫外线",
 )
 # 商品 / 设备类问句里出现「湿度 / 温度」不是查天气
-_WEATHER_EXCLUDE_WORDS = ("湿度计", "湿度传感器", "加湿器", "除湿机")
+_WEATHER_EXCLUDE_WORDS = ("湿度计", "湿度传感器", "加湿器", "除湿机", "降温贴")
+# 英文问法用词边界：裸 rain 会命中 "train to Beijing"、hot 命中 "hotel"
 _WEATHER_EN_PATTERN = re.compile(
-    r"weather|forecast|temperature|humidity", re.IGNORECASE
+    r"weather|forecast|temperature|humidity|"
+    r"\b(?:rain|snow|sunny|hot|cold|windy)\b",
+    re.IGNORECASE,
 )
 
 
@@ -206,9 +224,14 @@ def _normalize_result_url(href: object) -> str:
         from urllib.parse import parse_qs, urlparse
 
         parsed = urlparse(url)
+        # hostname 已小写并剥离 userinfo / 端口；后缀字符串匹配会把
+        # notduckduckgo.com 这类仿冒域名也当成 DuckDuckGo
+        host = (parsed.hostname or "").lower()
     except ValueError:
         return url
-    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+    if (
+        host == "duckduckgo.com" or host.endswith(".duckduckgo.com")
+    ) and parsed.path.startswith("/l/"):
         target = (parse_qs(parsed.query).get("uddg") or [""])[0].strip()
         if target.startswith("//"):
             target = "https:" + target
@@ -422,7 +445,7 @@ class InformationQueryAgent(AgentBase):
         # （多伦多 / 多哈 / 什邡 / 喀什），单字规则会把真实目的地整条丢弃
         _IMPLAUSIBLE_CHARS = ("哪",)
         _IMPLAUSIBLE_WORDS = (
-            "什么", "怎么", "怎样", "多少", "多久", "多远", "多长",
+            "什么", "怎么", "怎样", "如何", "多少", "多久", "多远", "多长",
             "几点", "几号", "几月", "几天", "哪些", "哪天", "哪里", "哪儿",
         )
         # 时间短语不是城市：「出发当天」这类跟进语送去地理编码必然 404
@@ -482,16 +505,75 @@ class InformationQueryAgent(AgentBase):
             # 2~6 个连续中文字，并去掉方向动词、助词与出行目的后缀
             head = re.split(
                 r"(?:的|天气|气温|温度|湿度|下雨|降雨|有雨|下雪|降雪|预报|"
-                r"多少度|几度|热不热|冷不冷|怎么样|如何|weather|forecast)",
+                r"多少度|几度|热不热|冷不冷|冷吗|冷么|热吗|热么|降温|升温|"
+                r"刮风|大风|有雾|雾霾|紫外线|怎么样|如何|weather|forecast)",
                 dest_text,
                 maxsplit=1,
                 flags=re.IGNORECASE,
             )[0]
             head = _clean_city_head(head)
+            # 「纽约，纽约」这类分句内重复城市：按标点取首个非空片段再校验
+            # （不能先在 dest_text 上切段——「从上海出发，纽约天气」的
+            # dest_text 以「，」开头，会切出空串并回退成出发地）
+            head = next(
+                (
+                    seg
+                    for seg in re.split(r"[，,、；;。.!！？?]", head)
+                    if seg.strip()
+                ),
+                "",
+            )
             if 2 <= len(head) <= 6 and re.fullmatch(r"[一-龥]+", head):
                 if _implausible_city(head):
                     return ""
                 return head
+            return _english_city(head)
+
+        def _generic_city(text: str) -> str:
+            """通用城市提取（非内置城市 / 英文名 / 目的地一侧的兜底）。"""
+            head_parts = re.split(
+                r"(?:的?天气|气温|温度|湿度|下雨|降雨|有雨|下雪|降雪|预报|"
+                r"多少度|几度|热不热|冷不冷|冷吗|冷么|热吗|热么|降温|升温|"
+                r"刮风|大风|有雾|雾霾|紫外线|"
+                r"怎么样|如何|情况|对比|weather|forecast)",
+                text,
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )
+            head = head_parts[0]
+            if not head.strip() and len(head_parts) == 2:
+                # 「weather in London」：城市在天气词之后
+                head = head_parts[1]
+            # 英文问句以天气词为锚点取「in/for/at + 首字母大写词组」：句首的
+            # What's / Hi / Please 不再被当成城市，Friday 这类星期名也不会
+            # 覆盖真实城市（「Weather in Tokyo on Friday」→ Tokyo）
+            if not re.search(r"[一-龥]", text):
+                anchored = re.search(
+                    r"(?:weather|forecast)(?:\s+like)?\s+(?:in|for|at)\s+"
+                    r"([A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*)*)",
+                    text,
+                )
+                if anchored:
+                    candidate = anchored.group(1).strip(" .'-")
+                    if (
+                        len(candidate) >= 2
+                        and candidate.lower() not in _ENGLISH_STOPWORDS
+                    ):
+                        return candidate
+            head = _QUERY_PREFIX_PATTERN.sub("", head)
+            head = _TIME_WORDS_PATTERN.sub("", head)
+            head = _clean_city_head(head)
+            tail = _ROUTE_SPLIT_PATTERN.split(head, maxsplit=1)
+            if len(tail) == 2 and tail[1].strip():
+                head = tail[1]
+            head = re.split(r"和|与|及|、|,|，|的", head, maxsplit=1)[0]
+            head = _clean_city_head(head)
+            match = re.search(r"[一-龥]{2,6}", head)
+            if match:
+                candidate = match.group(0).strip()
+                if _implausible_city(candidate):
+                    return ""
+                return candidate
             return _english_city(head)
 
         # 「从上海出发去北京，杭州天气怎么样」：天气分句自带城市且分句里
@@ -510,6 +592,13 @@ class InformationQueryAgent(AgentBase):
             if clause_hits:
                 clause_hits.sort()
                 return clause_hits[0][2]
+            # 天气分句里不是内置城市（境外城市几乎都不在表里）：只在该分句
+            # 内部通用提取；不提取会退化到整句最早出现的城市（常见是出发地）
+            candidate = _generic_city(
+                re.sub(r"^(?:也|再|顺便|顺带|另外|然后|还)+", "", clause)
+            )
+            if candidate:
+                return candidate
 
         # 「从北京去纽约的天气」：行程问句问的是目的地一侧，按最早出现的
         # 城市会答成出发地（纽约不是内置常见城市时尤其明显）
@@ -551,56 +640,18 @@ class InformationQueryAgent(AgentBase):
             if clause_hits:
                 clause_hits.sort()
                 return clause_hits[0][2]
+            candidate = _generic_city(
+                re.sub(r"^(?:也|再|顺便|顺带|另外|然后|还)+", "", clause)
+            )
+            if candidate:
+                return candidate
 
         # 按在问题中最早出现的位置选择（列表顺序会让「深圳和广州」选成广州）
         hits = [(q.find(city), -len(city), city) for city in common_cities if city in q]
         if hits:
             hits.sort()
             return hits[0][2]
-        # 去掉问句前缀、时间词与对比措辞；「纽约到巴黎」「规划去东京」问的是
-        # 目的地一侧，「东京和大阪」「东京的行程」取第一个城市
-        head_parts = re.split(
-            r"(?:的?天气|气温|温度|湿度|下雨|降雨|有雨|下雪|降雪|预报|"
-            r"多少度|几度|热不热|冷不冷|怎么样|如何|情况|对比|weather|forecast)",
-            q,
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )
-        head = head_parts[0]
-        if not head.strip() and len(head_parts) == 2:
-            # 「weather in London」：城市在天气词之后
-            head = head_parts[1]
-        # 英文问句以天气词为锚点取「in/for/at + 首字母大写词组」：句首的
-        # What's / Hi / Please 不再被当成城市，Friday 这类星期名也不会
-        # 覆盖真实城市（「Weather in Tokyo on Friday」→ Tokyo）
-        if not re.search(r"[一-龥]", q):
-            anchored = re.search(
-                r"(?:weather|forecast)(?:\s+like)?\s+(?:in|for|at)\s+"
-                r"([A-Z][A-Za-z.'-]*(?:\s+[A-Z][A-Za-z.'-]*)*)",
-                q,
-            )
-            if anchored:
-                candidate = anchored.group(1).strip(" .'-")
-                if (
-                    len(candidate) >= 2
-                    and candidate.lower() not in _ENGLISH_STOPWORDS
-                ):
-                    return candidate
-        head = _QUERY_PREFIX_PATTERN.sub("", head)
-        head = _TIME_WORDS_PATTERN.sub("", head)
-        head = _clean_city_head(head)
-        tail = _ROUTE_SPLIT_PATTERN.split(head, maxsplit=1)
-        if len(tail) == 2 and tail[1].strip():
-            head = tail[1]
-        head = re.split(r"和|与|及|、|,|，|的", head, maxsplit=1)[0]
-        head = _clean_city_head(head)
-        match = re.search(r"[一-龥]{2,6}", head)
-        if match:
-            candidate = match.group(0).strip()
-            if _implausible_city(candidate):
-                return ""
-            return candidate
-        return _english_city(head)
+        return _generic_city(q)
 
     async def _web_search(self, query: str) -> dict[str, Any]:
         """
@@ -627,12 +678,16 @@ class InformationQueryAgent(AgentBase):
 
             # 开启安全搜索，多取几条再过滤
             search_results = []
+            # 过滤放在后端循环内：首个后端整页被可疑域名过滤时仍要继续下一个
+            results: list[dict[str, Any]] = []
             backend_errors: list[str] = []
             empty_backends = 0
             loop = asyncio.get_running_loop()
-            # ddgs 新版本已移除 bing 后端（调用会告警并必然失败）；
-            # duckduckgo / google 覆盖主流结果，auto 兜底
-            for backend in ("duckduckgo", "google", "auto"):
+            # ddgs 新版本已移除 bing 后端（调用会告警并必然失败）；ddgs 9.x
+            # 的 google 引擎 disabled=True，请求会静默回退到 auto，当作独立
+            # 后端只会让失败路径把广搜重复一遍。回退链只保留 duckduckgo
+            # 单引擎与 auto 广搜兜底
+            for backend in ("duckduckgo", "auto"):
                 try:
                     def _search(backend_name: str = backend) -> list:
                         # 每个后端用全新 DDGS 实例：共享实例在前两个后端失败后
@@ -665,7 +720,19 @@ class InformationQueryAgent(AgentBase):
                         logger.warning("DDGS backend %s timed out", backend)
                         continue
                     if search_results:
-                        break
+                        for result in search_results:
+                            href = _normalize_result_url(result.get("href", ""))
+                            if _is_suspicious_url(href):
+                                continue
+                            results.append({
+                                "title": result.get("title", ""),
+                                "snippet": result.get("body", ""),
+                                "url": href,
+                            })
+                            if len(results) >= 5:
+                                break
+                        if results:
+                            break
                     empty_backends += 1
                 except Exception as e:
                     # ddgs 9.x 在「正常完成但无结果」时抛 DDGSException
@@ -682,19 +749,6 @@ class InformationQueryAgent(AgentBase):
                         _safe_log_text(redact_paths(e)),
                     )
                     continue
-
-            results = []
-            for result in search_results:
-                href = _normalize_result_url(result.get("href", ""))
-                if _is_suspicious_url(href):
-                    continue
-                results.append({
-                    "title": result.get("title", ""),
-                    "snippet": result.get("body", ""),
-                    "url": href,
-                })
-                if len(results) >= 5:
-                    break
 
             if not results:
                 if not search_results and backend_errors and not empty_backends:
@@ -764,12 +818,21 @@ class InformationQueryAgent(AgentBase):
                 .replace("】", "］")
             )
 
+        def _clip(text: object, limit: int) -> str:
+            value = _neutralize(text)
+            return value if len(value) <= limit else value[:limit] + "…"
+
         results_text = ""
         for i, result in enumerate(results, 1):
-            results_text += (
-                f"\n{i}. {_neutralize(result.get('title'))}\n"
-                f"{_neutralize(result.get('snippet'))}\n"
+            block = (
+                f"\n{i}. {_clip(result.get('title'), _MAX_SEARCH_TITLE_CHARS)}\n"
+                f"{_clip(result.get('snippet'), _MAX_SEARCH_SNIPPET_CHARS)}\n"
             )
+            remaining = _MAX_RESULTS_TEXT_CHARS - len(results_text)
+            if len(block) > remaining:
+                results_text += block[: max(remaining, 0)] + "…"
+                break
+            results_text += block
 
         # 获取当前时间
         from datetime import datetime

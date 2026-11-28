@@ -161,8 +161,12 @@ class WeatherError(Exception):
     """天气查询失败（城市不存在或接口不可用）。"""
 
 
-class _WeatherBusyError(WeatherError):
+class WeatherBusyError(WeatherError):
     """本地排队繁忙（上游并发闸门 / 单飞等待轮次耗尽），不是上游故障。"""
+
+
+# 兼容旧引用：内部历史名与公开名同义
+_WeatherBusyError = WeatherBusyError
 
 
 class UpstreamQuotaError(WeatherError):
@@ -184,7 +188,7 @@ def clear_weather_cache() -> None:
 
 
 def peek_cached_weather(city: str) -> dict[str, Any] | None:
-    """返回 10 分钟内的成功缓存；不访问上游、不消耗任何额度。
+    """返回不访问上游即可返回的结果：10 分钟成功缓存，或 60 秒降级复用。
 
     端点在限流之前先查缓存：缓存命中不产生上游请求，不应占用为保护
     Open-Meteo 额度而设的 IP 桶（此前每轮面板刷新都白扣一次额度）。
@@ -192,7 +196,13 @@ def peek_cached_weather(city: str) -> dict[str, Any] | None:
     name = str(city or "").strip()
     if not name:
         return None
-    return _cache_hit(_cache_key(name))
+    key = _cache_key(name)
+    cached = _cache_hit(key)
+    if cached is not None:
+        return cached
+    # fetch_weather 在降级复用窗口内同样直接返回 stale（零上游请求）；
+    # 端点只认成功缓存会让这些 200 白扣一次天气 IP 桶
+    return _degraded_hit(key)
 
 
 def _cache_key(name: str) -> str:
@@ -206,6 +216,10 @@ def _cache_key(name: str) -> str:
 # 未配置 / 不可用 / 操作失败时退回进程内缓存；操作失败进入 60 秒本地
 # 冷却，避免 Redis 黑洞时每次查天气（侧栏刷新频繁）都等满 socket 超时。
 _SHARED_CACHE_FAILURE_COOLDOWN_SEC = 60.0
+# 信封时刻最多允许读取方墙钟之后的小幅抖动；明显未来的信封按未命中处理
+# ——负年龄被钳 0 回填时，年龄未知的旧快照会被当成「刚抓取」，本地副本
+# 越过共享键 Redis TTL 仍可再存活一个 CACHE_TTL
+_SHARED_FETCHED_AT_MAX_SKEW_SEC = 120.0
 _shared_cache_failed_until = 0.0
 _shared_cache_lock = threading.Lock()
 
@@ -310,7 +324,12 @@ def _shared_cache_get(name: str) -> tuple[float, dict[str, Any]] | None:
     payload = _valid_shared_payload(envelope.get("data"))
     if payload is None:
         return None
-    if time.time() - fetched_at >= CACHE_TTL_SEC:
+    now = time.time()
+    if fetched_at > now + _SHARED_FETCHED_AT_MAX_SKEW_SEC:
+        # 写入实例墙钟明显超前（或单位写错）：按未命中处理，避免把未知
+        # 年龄的旧快照当「刚抓取」回填、借本地新鲜期续命
+        return None
+    if now - fetched_at >= CACHE_TTL_SEC:
         # 本地墙钟看到已超过 10 分钟（Redis TTL 与墙钟的偏差兜底）：
         # 按未命中处理，下一次成功抓取会覆盖共享键
         return None
@@ -535,12 +554,16 @@ def _store_failure(key: str, message: str) -> None:
         _failures[key] = (now, message)
 
 
-def _admit_upstream() -> None:
+def _admit_upstream() -> float:
     """全进程上游额度：滑动窗口内请求数达到上限时直接拒绝。
 
     /api/weather 的按 IP 桶保护不到对话链路（query-info 直接调
     fetch_weather），城市名由用户输入、缓存按城市隔离，轮换城市名即可
     把 Open-Meteo 免费额度打爆——所有用户一起退化为 stale / 503。
+
+    返回本次占用的窗口时间戳 token：随后未真正发出上游请求（并发闸门
+    超时 / 单飞等待耗尽）时用 ``_refund_upstream`` 退还，避免幽灵调用
+    压低真实可用额度。
     """
     now = time.monotonic()
     with _cache_lock:
@@ -557,6 +580,17 @@ def _admit_upstream() -> None:
                 retry_after=max(1, math.ceil(retry_after)),
             )
         _upstream_calls.append(now)
+        return now
+
+
+def _refund_upstream(token: float) -> None:
+    """退还 _admit_upstream 占用的窗口额度（未发出上游请求的本地拒绝）。"""
+    with _cache_lock:
+        try:
+            _upstream_calls.remove(token)
+        except ValueError:
+            # 已被过窗清理：无需处理
+            pass
 
 
 def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
@@ -590,6 +624,7 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
     # event.wait(timeout*2+1) 后重新登记；轮次用尽仍无结果时按「服务繁忙」
     # 报错——绝不能未抢到名额就自行请求上游（慢上游 / DNS 挂起时所有等待
     # 线程会同时重打，把单飞变成惊群并放大上游请求）
+    admitted_token: float | None = None
     for _ in range(_FOLLOWER_WAIT_ROUNDS + 1):
         leader, event = _claim_fetch(key)
         if leader:
@@ -607,7 +642,7 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
                 _finish_fetch(key, event)
                 return degraded
             try:
-                _admit_upstream()
+                admitted_token = _admit_upstream()
             except WeatherError:
                 # 全局额度用尽：先沿用该城市 1 小时内的成功数据。额度是全局
                 # 状态，不能按城市写失败缓存——否则窗口释放后该城市仍被钉住
@@ -633,14 +668,26 @@ def fetch_weather(city: str, timeout: float = 8.0) -> dict[str, Any]:
         if degraded is not None:
             return degraded
     else:
-        message = "天气服务繁忙，请稍后再试"
-        # 本地单飞等待耗尽不是上游故障：不能写 60 秒失败缓存把城市钉住
-        raise _WeatherBusyError(message)
+        # 本地单飞等待耗尽同属「本地繁忙」：与闸门繁忙同口径，有旧数据先沿用；
+        # 仍不写失败缓存（不是上游故障）
+        entry = _stale_entry(key)
+        if entry is not None:
+            _stored_at, stale = entry
+            logger.warning("天气服务繁忙，沿用最近一次成功数据")
+            _store_degraded(key, stale)
+            return stale
+        raise WeatherBusyError("天气服务繁忙，请稍后再试")
     try:
         return _fetch_weather_uncached(name, key, timeout)
-    except _WeatherBusyError:
+    except WeatherBusyError as exc:
         # 上游并发闸门繁忙（本地排队）同样不是上游故障：不写失败缓存，
-        # 否则名额释放后该城市仍被钉住 60 秒；有旧数据则沿用
+        # 否则名额释放后该城市仍被钉住 60 秒；有旧数据则沿用。未发出上游
+        # 请求时退还 _admit_upstream 占用的全局窗口额度（上游 429 是真实
+        # 发出的请求，保留计数）
+        if admitted_token is not None and not getattr(
+            exc, "upstream_request_sent", False
+        ):
+            _refund_upstream(admitted_token)
         entry = _stale_entry(key)
         if entry is not None:
             _stored_at, stale = entry
@@ -727,9 +774,10 @@ def _city_name_variant(name: str) -> str:
 def _geocode(name: str, timeout: float) -> dict[str, Any]:
     """城市名 → 地理编码最优匹配。
 
-    中文名查 zh 索引；别名表里的境外城市同时查 en 索引并优先采用可信的
-    英文结果（zh 索引的境外城市排序/覆盖都不可靠）；国内城市的原名只命中
-    同名村庄 / 零结果时补查「裸名 / X市」变体，并只在可信候选里挑。
+    中文名查 zh 索引；别名表里的境外城市先查 en 索引并以可信英文结果为
+    准（zh 索引的境外城市排序/覆盖都不可靠），en 无可信结果时才回退 zh
+    索引；国内城市的原名只命中同名村庄 / 零结果时补查「裸名 / X市」变体，
+    并只在可信候选里挑。
     """
     raw = name.strip()
     if not _has_cjk(raw):
@@ -738,12 +786,12 @@ def _geocode(name: str, timeout: float) -> dict[str, Any]:
             raise WeatherError(f"未找到城市「{name}」")
         return _best_geocode_match(raw, candidates)
 
-    candidates = _geocode_candidates(raw, "zh", timeout)
     alias = _CITY_ALIASES_ZH_EN.get(raw)
     if alias:
         # 别名表里的中文境外城市一律以 en 索引为准：zh 索引里可能只有同名
         # 小城（「伦敦」→ 加拿大 London，人口 42 万，按人口门槛也会被当成
-        # 可信结果），英文索引才能拿到真正的伦敦 / 纽约 / 罗马
+        # 可信结果），英文索引才能拿到真正的伦敦 / 纽约 / 罗马。先查 en：
+        # 先查 zh 会让它的瞬时失败阻断权威的 en 查询，白耗一次上游请求
         english = [
             item
             for item in _geocode_candidates(alias, "en", timeout)
@@ -751,6 +799,7 @@ def _geocode(name: str, timeout: float) -> dict[str, Any]:
         ]
         if english:
             return _best_geocode_match(alias, english)
+    candidates = _geocode_candidates(raw, "zh", timeout)
     trusted = [item for item in candidates if _is_trusted_location(item)]
     if not trusted:
         variant = _city_name_variant(raw)
@@ -768,7 +817,7 @@ def _fetch_weather_uncached(name: str, key: str, timeout: float) -> dict[str, An
     # 上游并发闸门：Open-Meteo 免费 API 同一客户端超过 5 个并发请求即 429；
     # 等待超过单个请求超时就按繁忙报错，由上层走 stale / 503
     if not _upstream_slots.acquire(timeout=timeout):
-        raise _WeatherBusyError("天气服务繁忙，请稍后再试")
+        raise WeatherBusyError("天气服务繁忙，请稍后再试")
     try:
         try:
             location = _geocode(name, timeout)
@@ -788,6 +837,13 @@ def _fetch_weather_uncached(name: str, key: str, timeout: float) -> dict[str, An
             # requests 的异常文本含完整上游 URL 与查询参数（城市名）：只记
             # 异常类型，原始异常由 raise ... from 保留给调用栈
             logger.warning("天气请求失败：%s", type(exc).__name__)
+            if getattr(getattr(exc, "response", None), "status_code", None) == 429:
+                # 上游限流是「稍后重试」信号，不是本城市失败：不写 60 秒
+                # 失败缓存，有旧数据走 stale，没有则按本地繁忙立即允许重试。
+                # 429 是真实发出的上游请求：标记后不退还窗口额度
+                busy = WeatherBusyError("天气服务繁忙，请稍后再试")
+                busy.upstream_request_sent = True  # type: ignore[attr-defined]
+                raise busy from exc
             raise WeatherError("天气接口暂时不可用") from exc
         except WeatherError:
             raise
