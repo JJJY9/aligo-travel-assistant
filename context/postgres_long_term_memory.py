@@ -2072,12 +2072,14 @@ class PostgresLongTermMemory:
         *,
         max_total: int | None = None,
         created_out: list[bool] | None = None,
+        default_new_purpose: str | None = None,
     ) -> str:
         """保存行程历史，返回 trip_id；同路线 + 同起止日期视为重复记录，更新而不是新增。
 
         ``max_total`` 给出时在会话级 advisory lock 内拒绝新建超过上限
         （调用方锁外先读再写的检查挡不住并发创建）。``created_out`` 给出
         时把锁内确定的「新增 / 更新」追加进去（与 JSON 后端同口径）。
+        ``default_new_purpose`` 只作用于锁内确认新增的记录。
         """
         self._ensure_trip_uid_column()
         # 与 JSON 后端同口径：未提供目的时原样保存（None），不写默认值
@@ -2096,7 +2098,11 @@ class PostgresLongTermMemory:
             if max_total is not None:
                 self._enforce_trip_cap_locked(trip_info, destination, max_total)
             return self._save_trip_history_locked(
-                trip_info, purpose, destination, created_out=created_out
+                trip_info,
+                purpose,
+                destination,
+                created_out=created_out,
+                default_new_purpose=default_new_purpose,
             )
 
     def _enforce_trip_cap_locked(
@@ -2151,6 +2157,7 @@ class PostgresLongTermMemory:
         destination: Any,
         *,
         created_out: list[bool] | None = None,
+        default_new_purpose: str | None = None,
     ) -> str:
         start_conn = getattr(self, "_conn", None)
         start_date = str(trip_info.get("start_date") or "")
@@ -2262,7 +2269,7 @@ class PostgresLongTermMemory:
                 destination,
                 trip_info.get("start_date"),
                 trip_info.get("end_date"),
-                purpose,
+                purpose if purpose is not None else default_new_purpose,
                 trip_info.get("session_id"),
                 # 不可变 UID 标识：调用方传入的非法 / 缺失值一律补发，
                 # 导出端据此生成稳定的日历 UID（编辑行程不换事件身份）

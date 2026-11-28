@@ -45,6 +45,8 @@ from utils.preference_values import (
     is_manageable_pref_type,
     preference_prompt_lines,
     preference_value_problem,
+    shadow_preference_types,
+    visible_preferences,
 )
 from utils.progress import format_progress_event
 from utils.trip_dedupe import trip_id_text
@@ -53,6 +55,7 @@ from utils.session_title import (
     session_title_from_content,
 )
 from utils.timestamps import chronological_key
+from utils.text_search import ci_find as _ci_find
 from utils.turn_meta import attach_turn_meta, build_turn_meta
 from utils.usage import add_usage
 from utils.version import APP_VERSION
@@ -1904,6 +1907,11 @@ class AligoCLI:
             "exported_at": datetime.now().isoformat(),
             **sections,
         }
+        # 与 user-export / Web /api/export 同一可见偏好口径：隐形 / 空值
+        # 偏好不计入导出上限预检（恢复时必被跳过）
+        prefs = data.get("preferences")
+        if isinstance(prefs, dict):
+            data["preferences"] = visible_preferences(prefs)
         # 与 user-export 的落盘口径一致：导出文件固定 LF（newline="\n"），
         # 体积轴按 LF 估算，不再按平台 CRLF 高估
         # 与 user-export / Web /api/export 同一口径：除原始文件形状外还要按
@@ -3912,6 +3920,12 @@ def run_user_export_standalone(
     # 用原始行预检会把含代理项的知识行误判「恢复时会被跳过」（写出后其实
     # 是合法内容），计划体积轴也漏算这些行恢复时的重切分体积。
     data = sanitize_backup_data(data)
+    # 与 Web GET /api/export 同一可见偏好口径：面板 / CLI 无法寻址或空值的
+    # 隐形偏好在恢复时必被导入端跳过，不能计入上限预检、更不能让 CLI 备份
+    # 因「原始行数超 200」中止（同一账号从面板导出却成功）
+    prefs = data.get("preferences")
+    if isinstance(prefs, dict):
+        data["preferences"] = visible_preferences(prefs)
     # 导出文件固定 LF（exporter write_text_atomic newline="\n"）：体积轴
     # 按 LF 估算，CLI 与 Web 导出同字节、同口径。原始备份与「导入空库」
     # 的知识分片计划都要可导入：前者是导入端规划前的硬上限，后者覆盖
@@ -5285,7 +5299,7 @@ def _session_summaries(store, *, needle: str = "") -> list[dict]:
             content = _collapsed_whitespace(raw_text)
             if content:
                 entry.setdefault("_parts", []).append(content)
-                if needle in content.lower():
+                if _ci_find(content, needle) >= 0:
                     entry["_query_hit"] = True
     for entry in grouped.values():
         entry.pop("_query_hit", None)
@@ -5343,7 +5357,7 @@ def run_sessions_list_standalone(
             )
         # 查询内部空白折叠为单空格：双空格 / Tab 与正文单空格不应造成 0
         # 结果（正文已用 _collapsed_whitespace 归一，与 Web 搜索同口径）
-        needle = " ".join(query.split()).lower()
+        needle = " ".join(query.split())
         try:
             summaries = _session_summaries(store, needle=needle)
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
@@ -5359,10 +5373,11 @@ def run_sessions_list_standalone(
         matched = []
         for item in summaries:
             hit = next(
-                (part for part in item["_parts"] if needle in part.lower()), None
+                (part for part in item["_parts"] if _ci_find(part, needle) >= 0),
+                None,
             )
             if hit is not None:
-                position = hit.lower().find(needle)
+                position = _ci_find(hit, needle)
                 start = max(0, position - 20)
                 item["_snippet"] = hit[start : start + 40]
                 matched.append(item)
@@ -5570,17 +5585,19 @@ def run_session_delete_standalone(
     try:
         try:
             exists = bool(store.get_chat_history(session_id=session_id))
+            trip_only = False
             if not exists:
                 # 仅被行程引用的空会话（旧版本删除会话留下的死链）：仍然
                 # 允许「删除」以清空行程链接，与 Web DELETE 行为一致
                 try:
-                    exists = any(
+                    trip_only = any(
                         trip.get("session_id") is not None
                         and str(trip.get("session_id")) == session_id
                         for trip in store.get_trip_history(limit=None)
                     )
                 except Exception:  # noqa: BLE001 - 读取失败按不存在处理
-                    exists = False
+                    trip_only = False
+                exists = trip_only
             metadata_only = False
             if not exists:
                 # 仅剩元数据的幽灵会话（消息已删 / 从未落库，但标题 /
@@ -5600,6 +5617,10 @@ def run_session_delete_standalone(
             return _fail(f"读取会话失败：{exc}")
         if not exists:
             return _fail(f"会话 {session_id} 不存在或没有消息")
+        # 仅被行程引用 / 仅剩元数据的幽灵会话都没有可保护的会话内容：
+        # 删除成功后撤销本进程墓碑，允许 ID 立即复用（与 Web DELETE
+        # 对「已删空会话」的处理一致）；真实删除仍保留共享墓碑
+        no_content_to_protect = trip_only or metadata_only
         # 先写共享墓碑再删库（与 Web DELETE 同一顺序）：删库与写墓碑之间
         # 其它实例的在途落库守卫看不到墓碑，会把已删除的会话写回。
         # 墓碑值用本进程唯一 token：并发 CLI 删除（脚本重试 / 双开）时，
@@ -5626,7 +5647,7 @@ def run_session_delete_standalone(
                     user_id, session_id, source=tombstone_token, force=True
                 )
             return _fail(f"删除会话失败：{exc}")
-        if not metadata_only and not shared_tombstone:
+        if not no_content_to_protect and not shared_tombstone:
             # 并发 CLI 删除时 SET NX 落败、但本进程也删成功了：以本请求
             # token 覆盖共享墓碑（与 Web DELETE 同一语义）。先到者若因
             # 「会话已不存在」回滚，按旧 token 不匹配，不会删掉唯一的
@@ -5634,11 +5655,11 @@ def run_session_delete_standalone(
             shared_tombstone = reassert_session_deleted(
                 user_id, session_id, tombstone_token, force=True
             )
-        if metadata_only and shared_tombstone:
-            # 仅元数据命中的「删除」没有会话可保护：撤销本进程刚写的墓碑，
-            # 允许同一 session_id 立即复用（与 Web DELETE 对「从未存在 /
-            # 已删空会话」的处理一致；只按本 token 撤销，不会误删并发删
-            # 除方 / 其它实例的墓碑）
+        if no_content_to_protect and shared_tombstone:
+            # 仅行程引用 / 仅元数据命中的「删除」没有会话内容可保护：
+            # 撤销本进程刚写的墓碑，允许同一 session_id 立即复用（与
+            # Web DELETE 对「从未存在 / 已删空会话」的处理一致；只按本
+            # token 撤销，不会误删并发删除方 / 其它实例的墓碑）
             unmark_session_deleted(
                 user_id, session_id, source=tombstone_token, force=True
             )
@@ -6110,7 +6131,7 @@ def run_session_export_standalone(
             "",
             f"- 用户：{user_id}",
             f"- 会话：{session_id}",
-            f"- 导出时间：{datetime.now().isoformat(timespec='seconds')}",
+            f"- 导出时间：{datetime.now().astimezone().isoformat(timespec='seconds')}",
             "",
         ]
         for message in messages:
@@ -6934,9 +6955,10 @@ def _parse_trip_update_args(args: list[str]) -> dict[str, Any] | None:
         key = flag[2:]
         if value.startswith("-"):
             return None
-        # 与 Web PUT 一致：origin / purpose 允许空串（清空该字段）；
-        # 目的地 / 日期为空仍是非法输入
-        if not value.strip() and key not in {"origin", "purpose"}:
+        # 与 Web PUT 一致：origin / purpose / end 允许空串（清空该字段，
+        # 其中 --end "" 等价于 Web 的 end_date: null，把多日行程改回单日）；
+        # 目的地 / 出发日期为空仍是非法输入
+        if not value.strip() and key not in {"origin", "purpose", "end"}:
             return None
         values[key] = value.strip()
         index += 1
@@ -6953,7 +6975,7 @@ def _parse_trip_update_args(args: list[str]) -> dict[str, Any] | None:
 def run_trip_update_standalone(
     user_id: str,
     trip_id: str,
-    fields: dict[str, str],
+    fields: dict[str, Any],
     as_json: bool = False,
 ) -> int:
     """按字段更新一条行程（`python cli.py trip-update ... [--json]`）。
@@ -6988,9 +7010,13 @@ def run_trip_update_standalone(
         {"start": "start_date", "end": "end_date"}.get(key, key): value
         for key, value in fields.items()
     }
+    # 空串 --end 表示清空返程日期：与 Web PUT 的 end_date:null 同形落库，
+    # 避免 JSON 后端存 "" 而 PostgreSQL 存 NULL 的新分叉
+    if mapped.get("end_date") == "":
+        mapped["end_date"] = None
     if not mapped:
         return _fail("没有需要更新的字段")
-    if "destination" in mapped and not mapped["destination"].strip():
+    if "destination" in mapped and not str(mapped.get("destination") or "").strip():
         return _fail("目的地不能为空")
     for label, key in (("出发地", "origin"), ("目的地", "destination"), ("目的", "purpose")):
         value = mapped.get(key)
@@ -7046,7 +7072,7 @@ def run_trip_update_standalone(
                 start_dt = parsed
             else:
                 end_dt = parsed
-        if start_dt is None and "end_date" in mapped:
+        if mapped.get("end_date") and start_dt is None:
             return _fail("填写返程日期前请先设置出发日期")
         if start_dt is not None and end_dt is not None and end_dt < start_dt:
             return _fail("结束日期不能早于出发日期")
@@ -7765,17 +7791,26 @@ def run_preference_set_standalone(
             # 已有类型的值更新不受影响；越过上限后面板新增会被 409 挡住
             from utils.user_import import _MAX_PREFERENCES
 
-            existing_prefs = store.get_preference() or {}
+            existing_prefs = visible_preferences(store.get_preference() or {})
+            shadow_keys = shadow_preference_types(existing_prefs, pref_type)
             # 只拦「恰好在上限、本次新增类型」：已越限的历史账号继续
-            # 可用，与存储写层 / 导入基线豁免同口径
+            # 可用，与存储写层 / 导入基线豁免同口径；清理影子键属于替换
             if (
                 pref_type not in existing_prefs
                 and len(existing_prefs) == _MAX_PREFERENCES
+                and not shadow_keys
             ):
                 return _fail(
                     f"偏好条目已达上限（{_MAX_PREFERENCES}），请先删除旧偏好"
                 )
             store.save_preference(pref_type, saved_value)
+            # 写规范键时清掉仅差首尾空白的影子行（历史备份导入保留键）：
+            # 否则面板 / prompt 同时显示两条矛盾的值，还占用类型名额
+            for shadow in shadow_keys:
+                try:
+                    store.delete_preference(shadow)
+                except Exception:  # noqa: BLE001 - 清理失败不阻断本次写入
+                    break
         except Exception as exc:  # noqa: BLE001 - CLI 场景直接展示原因
             return _fail(f"保存偏好失败：{exc}")
         try:

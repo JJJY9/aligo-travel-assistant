@@ -5042,6 +5042,22 @@ def test_preference_put_edits_shadow_key_clears_original():
         assert response.json()["type"] == "home_location", response.json()
         status = client.get("/api/status", params={"user_id": user_id}).json()
         assert status["preferences"] == {"home_location": "上海"}, status["preferences"]
+
+        # 写规范键（不是编辑影子行）同样清理其它入口留下的影子行
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            store.save_preference(" home_location", "旧影子值")
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        canonical = client.put(
+            "/api/preferences/home_location",
+            json={"user_id": user_id, "value": "杭州"},
+        )
+        assert canonical.status_code == 200, canonical.text
+        status = client.get("/api/status", params={"user_id": user_id}).json()
+        assert status["preferences"] == {"home_location": "杭州"}, status["preferences"]
         print("✓ 编辑影子偏好时清掉原键（不并存两份）")
     finally:
         _cleanup(user_id)
@@ -8524,7 +8540,9 @@ def test_create_trip_created_flag_uses_write_lock_result(monkeypatch):
         def get_trip_history(self, limit=None):
             return self.inner.get_trip_history(limit=limit)
 
-        def save_trip_history(self, record, *, max_total=None, created_out=None):
+        def save_trip_history(
+            self, record, *, max_total=None, created_out=None, default_new_purpose=None
+        ):
             # 模拟窗口里另一进程先插入无关行程：长度差口径会误判为新增
             self.inner.save_trip_history(
                 {
@@ -8535,7 +8553,10 @@ def test_create_trip_created_flag_uses_write_lock_result(monkeypatch):
                 }
             )
             return self.inner.save_trip_history(
-                record, max_total=max_total, created_out=created_out
+                record,
+                max_total=max_total,
+                created_out=created_out,
+                default_new_purpose=default_new_purpose,
             )
 
         def close(self):
@@ -8570,6 +8591,198 @@ def test_create_trip_created_flag_uses_write_lock_result(monkeypatch):
         if callable(close):
             close()
         _cleanup(user_id)
+
+
+def test_trip_write_readback_failure_returns_saved_with_warning(monkeypatch):
+    """写入已提交后的重读失败按成功 + warning 返回（与 CLI 同口径）。
+
+    此前 Web 一律 503「添加 / 更新行程失败」，用户重试会重复新增。
+    """
+    from context.storage import create_long_term_memory
+    from webapp import server as server_module
+
+    user_id = _unique_user("web_test_trip_readback")
+
+    class _FlakyStore:
+        def __init__(self, inner):
+            self.inner = inner
+            self.reads = 0
+
+        def get_trip_history(self, limit=None):
+            self.reads += 1
+            if self.reads >= 2:
+                raise RuntimeError("read boom")
+            return self.inner.get_trip_history(limit=limit)
+
+        def save_trip_history(self, record, **kwargs):
+            return self.inner.save_trip_history(record, **kwargs)
+
+        def update_trip(self, trip_id, fields):
+            return self.inner.update_trip(trip_id, fields)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        server_module,
+        "_open_long_term",
+        lambda uid, strict=False, **kwargs: _FlakyStore(
+            create_long_term_memory(uid, str(MEMORY_DIR))
+        ),
+    )
+    client = _client()
+    try:
+        created = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "end_date": "2026-12-02",
+            },
+        )
+        assert created.status_code == 201, created.text
+        body = created.json()
+        assert body["saved"] is True and body["warning"], body
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            trips = store.get_trip_history(limit=None)
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        assert len(trips) == 1, "重读失败不能回滚已提交的行程"
+
+        updated = client.put(
+            f"/api/trips/{body['trip_id']}",
+            json={"user_id": user_id, "purpose": "会议"},
+        )
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["warning"] and updated.json()["trip"]["purpose"] == "会议"
+        print("✓ 行程写后重读失败按成功 + warning 返回（不误报 503）")
+    finally:
+        _cleanup(user_id)
+
+
+def test_trip_and_session_title_limits_measured_after_strip():
+    """与 CLI / 导入同一计量对象：先 strip 再按码点判上限。"""
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user_id = _unique_user("web_test_strip_limits")
+    long_origin = "北" * 100
+    try:
+        created = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "  " + long_origin + "  ",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+            },
+        )
+        assert created.status_code == 201, created.text
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        try:
+            trip = store.get_trip_history(limit=None)[0]
+            store.add_chat_message("user", "hi", session_id="s-title")
+        finally:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
+        assert trip["origin"] == long_origin, trip
+
+        renamed = client.put(
+            "/api/sessions/s-title/title",
+            json={"user_id": user_id, "title": "  " + "长" * 60 + "  "},
+        )
+        assert renamed.status_code == 200, renamed.text
+        assert renamed.json()["title"] == "长" * 60, renamed.json()
+        print("✓ 行程字段 / 会话标题先 strip 再判长度上限")
+    finally:
+        _cleanup(user_id)
+
+
+def test_trip_default_purpose_only_applies_to_insert(monkeypatch):
+    """默认目的只在存储写锁内确认新增时补（锁外预判会覆盖并发改过的目的）。"""
+    from context.storage import create_long_term_memory
+
+    user_id = _unique_user("web_test_default_purpose")
+    store = create_long_term_memory(user_id, str(MEMORY_DIR))
+    try:
+        record = {
+            "origin": "北京",
+            "destination": "上海",
+            "start_date": "2026-12-01",
+            "end_date": "2026-12-02",
+        }
+        trip_id = store.save_trip_history(record, default_new_purpose="出差")
+        saved = next(
+            trip
+            for trip in store.get_trip_history(limit=None)
+            if trip["trip_id"] == trip_id
+        )
+        assert saved["purpose"] == "出差", saved
+        store.update_trip(trip_id, {"purpose": "探亲"})
+        store.save_trip_history(record, default_new_purpose="出差")
+        saved = next(
+            trip
+            for trip in store.get_trip_history(limit=None)
+            if trip["trip_id"] == trip_id
+        )
+        assert saved["purpose"] == "探亲", saved
+        print("✓ 默认目的只作用于新增（更新保留用户设置）")
+    finally:
+        close = getattr(store, "close", None)
+        if callable(close):
+            close()
+        _cleanup(user_id)
+
+
+def test_knowledge_busy_refunds_kb_rate_limit(monkeypatch):
+    """写锁忙 = 零写入：添加 / 更新 / 删除与导入同口径归还 KB 额度。"""
+    from utils.knowledge_admin import KnowledgeBusyError
+    from utils.rate_limit import RateLimiter
+    from webapp import server as server_module
+
+    client = _client()
+    state = client.app.state.aligo
+    user = _unique_user("web_test_kb_busy_refund")
+    try:
+        def _busy(*args, **kwargs):
+            raise KnowledgeBusyError("知识库正在写入（导入 / 编辑 / 删除）")
+
+        monkeypatch.setattr(server_module, "add_document", _busy)
+        monkeypatch.setattr(server_module, "delete_document", _busy)
+        monkeypatch.setattr(server_module, "update_document", _busy)
+        monkeypatch.setattr(server_module, "get_document", _busy)
+        for method, path, payload in (
+            (
+                client.post,
+                "/api/knowledge/documents",
+                {"content": "x", "metadata": {}},
+            ),
+            (
+                client.put,
+                "/api/knowledge/documents/1",
+                {"content": "x", "metadata": {}},
+            ),
+            (client.delete, "/api/knowledge/documents/1", None),
+        ):
+            # 每个请求一条独立额度：请求内记账后归还，事后 check 不应 429
+            state.kb_limiter = RateLimiter(limit=1, window_sec=60)
+            response = (
+                method(path, json=payload) if payload is not None else method(path)
+            )
+            assert response.status_code == 503, response.text[:200]
+            assert "知识库" in response.json()["detail"]
+            assert state.kb_limiter.check("testclient") is None, (
+                "忙拒绝未写入，额度必须归还"
+            )
+        print("✓ 知识库写锁忙 503 归还 KB 额度（与导入同口径）")
+    finally:
+        _cleanup(user)
 
 
 def test_update_trip_api():
@@ -10324,7 +10537,9 @@ def test_group_sessions_normalizes_legacy_ids_and_reserved():
     )
     assert [item["session_id"] for item in sessions] == ["42"], sessions
     assert sessions[0]["archived"] is True
-    assert sessions[0]["pinned"] is False
+    # 归档视图不按置顶排序，但如实报告存储态（与 CLI --archived --json /
+    # PUT pin 读回一致；面板按 archived 过滤掉图钉样式）
+    assert sessions[0]["pinned"] is True
 
     listed = _group_sessions(history, limit=10)
     ids = [item["session_id"] for item in listed]

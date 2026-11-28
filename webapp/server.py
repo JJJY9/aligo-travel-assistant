@@ -116,12 +116,14 @@ from utils.metrics import REQUEST_METRICS
 from utils.paths import default_data_root
 from utils.preference_values import (
     has_preference_value,
-    is_blank_pref_item,
     is_manageable_pref_type,
+    shadow_preference_types,
+    visible_preferences,
 )
 from utils.rate_limit import CapacityRetry, create_rate_limiter
 from utils.session_ids import RESERVED_SESSION_IDS
 from utils.session_title import session_title_from_content
+from utils.text_search import ci_find
 from utils.redis_lock import DistributedLock
 from utils.stored_message import (
     render_stored_message,
@@ -1410,6 +1412,14 @@ class TripPayload(BaseModel):
     # 用户改过的目的重置成模板值（CLI / 对话路径在未提供时不写 purpose）
     purpose: str | None = Field(default=None, max_length=100)
 
+    @field_validator("destination", "origin", "purpose", mode="before")
+    @classmethod
+    def _strip_before_length(cls, value: Any) -> Any:
+        # 与 CLI / 导入同一计量对象：先去首尾空白再按码点判 100 字上限。
+        # 否则「空白填充 + 100 字有效内容」会被 max_length 拒绝，而落库
+        # 本来也会 strip，校验对象与保存对象不一致
+        return value.strip() if isinstance(value, str) else value
+
     @field_validator("destination")
     @classmethod
     def _destination_not_blank(cls, value: str) -> str:
@@ -1461,6 +1471,11 @@ class TripUpdatePayload(BaseModel):
     end_date: str | None = Field(default=None, pattern=_DATE_PATTERN)
     purpose: str | None = Field(default=None, max_length=100)
 
+    @field_validator("destination", "origin", "purpose", mode="before")
+    @classmethod
+    def _strip_before_length(cls, value: Any) -> Any:
+        return value.strip() if isinstance(value, str) else value
+
     @field_validator("destination")
     @classmethod
     def _destination_not_blank(cls, value: str | None) -> str | None:
@@ -1504,6 +1519,12 @@ class TripDedupePayload(BaseModel):
 class SessionTitlePayload(BaseModel):
     user_id: str = Field(pattern=_ID_PATTERN)
     title: str = Field(max_length=60)
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def _strip_before_length(cls, value: Any) -> Any:
+        # 与 CLI session-title 同口径：先 strip 再按码点限 60
+        return value.strip() if isinstance(value, str) else value
 
     @field_validator("title")
     @classmethod
@@ -4391,26 +4412,8 @@ def _strip_markdown_for_snippet(text: str) -> str:
 
 
 def _ci_find(haystack: str, needle: str) -> int:
-    """大小写不敏感查找，返回**原文**下标。
-
-    ``lower()`` 可能改变字符串长度（如土耳其语 ``İ`` 小写后是两个码点），
-    用 lower 串里的下标去切原文会让窗口整体错位；长度变化时改用正则
-    在原文上定位（re.IGNORECASE 返回的就是原文下标）。
-
-    无大小写区分的关键字（中文 / 数字 / 符号）忽略大小写等价于精确查找：
-    直接走 C 层 ``str.find``，不再对每条未命中的消息做 re.escape+re.search
-    （会话搜索逐条扫描时这是主要开销）。
-    """
-    if not needle:
-        return -1
-    if needle == needle.lower() == needle.upper():
-        return haystack.find(needle)
-    lowered = haystack.lower()
-    index = lowered.find(needle.lower())
-    if index >= 0 and len(lowered) == len(haystack):
-        return index
-    match = re.search(re.escape(needle), haystack, re.IGNORECASE)
-    return match.start() if match else -1
+    """大小写不敏感查找，返回原文下标（实现见 utils.text_search，CLI 共用）。"""
+    return ci_find(haystack, needle)
 
 
 def _match_snippet(text: str, needle: str, radius: int = 36) -> str:
@@ -4601,8 +4604,9 @@ def _group_sessions(
         entry["archived"] = entry["session_id"] in archived_ids
     if archived_mode == "only":
         sessions = [entry for entry in sessions if entry["archived"]]
-        for entry in sessions:
-            entry["pinned"] = False
+        # 归档视图不按置顶排序，但如实报告存储态的 pinned（CLI
+        # sessions --archived --json / session-show 与 PUT pin 读回都按
+        # true 报告；面板不画归档行的图钉由前端按 archived 过滤）
     else:
         sessions = [entry for entry in sessions if not entry["archived"]]
         # 稳定排序：置顶会话在前，其余保持最近更新时间倒序
@@ -4642,29 +4646,8 @@ def _safe_usage_int(value: Any) -> int:
 
 
 def _visible_preferences(preferences: dict[str, Any]) -> dict[str, Any]:
-    """面板 / 导出的偏好可见口径：与 CLI 的 has_preference_value 一致。
-
-    过滤 None / 空白串 / 空容器，列表内逐项剔除 null、空白项与 {} / []；
-    全空的列表整体隐藏（此前 [null] / "   " 会原样返回，面板渲染成
-    「东航、null」；空容器会让面板显示「汉庭、{}」且下一次追加时被合并层
-    静默丢弃）。面板 / CLI 无法寻址的键（含 "/"、控制字符、"."/".."、超长）
-    同样隐藏：PostgreSQL 后端加载时不做这类清洗，脏键经 /api/status 进入
-    面板后既改不掉也删不掉，还会占用偏好类型上限（与 JSON 后端加载即丢弃
-    同口径）。
-    """
-    visible: dict[str, Any] = {}
-    for key, value in preferences.items():
-        if not is_manageable_pref_type(key):
-            continue
-        if isinstance(value, list):
-            items = [
-                item for item in value if not is_blank_pref_item(item)
-            ]
-            if items:
-                visible[key] = items
-        elif has_preference_value(value):
-            visible[key] = value
-    return visible
+    """面板 / 导出的偏好可见口径（实现见 utils.preference_values，CLI 共用）。"""
+    return visible_preferences(preferences)
 
 
 def _usage_message_total(usage: dict[str, Any]) -> int:
@@ -6146,6 +6129,10 @@ def create_app(model: Any = None) -> FastAPI:
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             result = cleanup_duplicate_contents(dry_run=payload.dry_run)
+        except KnowledgeBusyError as exc:
+            # 写锁忙 = 零删除：与导入路径同口径归还额度后再 503
+            _refund_kb_rate_limit(state, request)
+            raise _knowledge_unavailable("清理失败", exc) from exc
         except FileNotFoundError as exc:
             raise HTTPException(
                 status_code=503, detail=f"{exc}（先运行初始化脚本）"
@@ -6178,6 +6165,9 @@ def create_app(model: Any = None) -> FastAPI:
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             return add_document(payload.content, payload.metadata)
+        except KnowledgeBusyError as exc:
+            _refund_kb_rate_limit(state, request)
+            raise _knowledge_unavailable("添加失败", exc) from exc
         except AccountCapacityError as exc:
             raise _capacity_conflict(exc) from exc
         except ValueError as exc:
@@ -6225,6 +6215,9 @@ def create_app(model: Any = None) -> FastAPI:
                 expect_group=payload.expect_group,
                 expect_metadata=expect_metadata,
             )
+        except KnowledgeBusyError as exc:
+            _refund_kb_rate_limit(state, request)
+            raise _knowledge_unavailable("更新失败", exc) from exc
         except DocumentConflictError as exc:
             # 并发修改冲突可刷新后重试：不能混进 400 的「内容不合法」口径
             raise HTTPException(
@@ -6280,6 +6273,9 @@ def create_app(model: Any = None) -> FastAPI:
         response.headers.update(_enforce_kb_rate_limit(state, request))
         try:
             removed = delete_document(doc_id, whole_group=group)
+        except KnowledgeBusyError as exc:
+            _refund_kb_rate_limit(state, request)
+            raise _knowledge_unavailable("删除失败", exc) from exc
         except ValueError as exc:
             # 多分片记录不允许单条删除（须整组删除），属于客户端用法错误
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -6553,7 +6549,6 @@ def create_app(model: Any = None) -> FastAPI:
         # 规范化类型：` home_location` / `home_location ` 会落库成与规范键
         # 并存的「影子偏好」——精确键查找（如推断出发地）读不到它，面板却
         # 单独成行并占用类型上限。与对话侧 strip 后落库的口径一致
-        raw_type = pref_type
         pref_type = pref_type.strip()
         if not pref_type:
             raise HTTPException(status_code=422, detail="偏好类型不能为空白")
@@ -6585,9 +6580,8 @@ def create_app(model: Any = None) -> FastAPI:
         try:
             existing = store.get_preference()
             # 编辑影子行时原键会在写入后释放：本次等于替换而非新增，不占新名额
-            shadow_type = (
-                raw_type if raw_type != pref_type and raw_type in existing else None
-            )
+            shadow_keys = shadow_preference_types(existing, pref_type)
+            shadow_type = shadow_keys[0] if shadow_keys else None
             # 面板永远看不到的空值 / 不可寻址条目（旧备份导入 / 旧版本写入 /
             # PG 存量脏键）不渲染、也无法从面板删除，却占用类型上限名额：
             # 写入偏好时顺带释放，409 只在真实可见条目达到上限时出现
@@ -6621,13 +6615,14 @@ def create_app(model: Any = None) -> FastAPI:
             value = store.get_preference(pref_type)
             # 编辑影子行（" home_location" 等首尾空格存量键）时把原键一并
             # 清掉：否则规范键拿到新值、被编辑行仍回显旧值，同一偏好并存
-            # 两份并继续占用名额。best-effort，失败不阻断本次写入
-            if shadow_type:
+            # 两份并继续占用名额。best-effort，失败不阻断本次写入；
+            # 写规范键时同样清理其它入口留下的影子行（不只被编辑的那条）
+            for shadow in shadow_keys:
                 try:
-                    if store.delete_preference(shadow_type):
-                        logger.info("清理影子偏好条目: %s", shadow_type)
+                    if store.delete_preference(shadow):
+                        logger.info("清理影子偏好条目: %s", shadow)
                 except Exception:  # noqa: BLE001 - 清理失败不阻断本次写入
-                    logger.warning("清理影子偏好失败: %s", shadow_type)
+                    logger.warning("清理影子偏好失败: %s", shadow)
         except HTTPException:
             raise
         except ValueError as exc:
@@ -8184,6 +8179,7 @@ def create_app(model: Any = None) -> FastAPI:
         # （恢复后读 PG，行程「凭空消失」，与导入 / 删除的严格语义一致）
         store = _open_long_term(payload.user_id, strict=True)
         conflicts: list[dict[str, Any]] = []
+        trip_id: str | None = None
         try:
             before_trips = store.get_trip_history(limit=None)
             # 未显式提供目的时才套默认值：命中既有行程（同路线 + 同起止
@@ -8197,16 +8193,6 @@ def create_app(model: Any = None) -> FastAPI:
                 "end_date": payload.end_date,
             }
             purpose = payload.purpose or None
-            if purpose is None:
-                from utils.trip_import import trip_identity
-
-                will_update = any(
-                    trip.get("destination")
-                    and trip_identity(trip) == trip_identity(record)
-                    for trip in before_trips
-                )
-                if not will_update:
-                    purpose = "出差"
             if purpose:
                 record["purpose"] = purpose
             # 不在锁外按「存量 >= 上限」预检：存储写锁内只拦「恰好在上限、
@@ -8221,6 +8207,9 @@ def create_app(model: Any = None) -> FastAPI:
                 # 写锁内确定的「新增 / 更新」：锁外按长度差判断会被窗口
                 # 内其它请求的增删污染，误报已添加 / 已更新
                 created_out=created_flag,
+                # 默认目的只在写锁内确认新增时补：锁外按陈旧快照预判
+                # 会把并发期间用户刚设置的 purpose 覆盖成「出差」
+                default_new_purpose="出差",
             )
             trips = store.get_trip_history(limit=None)
             created = (
@@ -8252,8 +8241,21 @@ def create_app(model: Any = None) -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - 写入失败统一提示
-            logger.warning("添加行程失败: %s", redact_paths(exc))
-            raise _storage_failure("添加行程失败", exc) from exc
+            # 写入已提交后的重读失败不能报成 503：用户重试会重复新增
+            # （与 CLI trip-add 的「保存失败 / 读取失败」区分同一口径）
+            if trip_id is None:
+                logger.warning("添加行程失败: %s", redact_paths(exc))
+                raise _storage_failure("添加行程失败", exc) from exc
+            logger.warning("添加行程后读取失败: %s", redact_paths(exc))
+            return _json_safe_value(
+                {
+                    "trip_id": trip_id,
+                    "saved": True,
+                    "created": created_flag[0] if created_flag else None,
+                    "conflicts": [],
+                    "warning": "行程已保存，但暂时无法读取以检查日期重叠",
+                }
+            )
         finally:
             _close_long_term(store)
         # 历史行程字段可能是备份恢复带入的脏数据（孤立代理项等）：
@@ -8455,7 +8457,19 @@ def create_app(model: Any = None) -> FastAPI:
             if not updated:
                 raise HTTPException(status_code=404, detail="行程不存在")
 
-            trips = store.get_trip_history(limit=None)
+            try:
+                trips = store.get_trip_history(limit=None)
+            except Exception as exc:  # noqa: BLE001 - 已提交后的读取失败
+                logger.warning("更新行程后读取失败: %s", redact_paths(exc))
+                return _json_safe_value(
+                    {
+                        "trip_id": trip_id,
+                        "saved": True,
+                        "trip": _aware_trip_view({"trip_id": trip_id, **merged}),
+                        "conflicts": [],
+                        "warning": "行程已保存，但暂时无法读取以检查日期重叠",
+                    }
+                )
             saved = next(
                 (trip for trip in trips if str(trip.get("trip_id")) == trip_id),
                 {"trip_id": trip_id, **merged},

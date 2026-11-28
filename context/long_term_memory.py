@@ -2668,7 +2668,12 @@ class LongTermMemory:
             self._persist()
         return applied
 
-    def _apply_trip_locked(self, trip_info: dict[str, Any]) -> tuple[str, bool]:
+    def _apply_trip_locked(
+        self,
+        trip_info: dict[str, Any],
+        *,
+        default_new_purpose: str | None = None,
+    ) -> tuple[str, bool]:
         """在写锁内保存一条行程，返回 ``(trip_id, 是否新建)``（不落盘）。"""
         existing = self._find_same_trip(trip_info)
         if existing is not None:
@@ -2686,10 +2691,15 @@ class LongTermMemory:
                 existing["trip_id"] = trip_id
             return trip_id, False
 
+        record = dict(trip_info)
+        if default_new_purpose and not record.get("purpose"):
+            # 默认目的只在写锁内确认「本次确属新增」时补：锁外预判会把
+            # 并发期间用户刚设置的 purpose 当成显式更新覆盖掉
+            record["purpose"] = default_new_purpose
         trip_record = {
             "trip_id": self._next_trip_id(),
             "timestamp": datetime.now().isoformat(),
-            **trip_info
+            **record
         }
         # 不可变 UID 标识：发放在 **trip_info 之后，调用方传入的同名字段
         # 不能覆盖；导出端据此生成稳定的日历 UID（编辑行程不换事件身份）
@@ -2715,6 +2725,7 @@ class LongTermMemory:
         *,
         max_total: int | None = None,
         created_out: list[bool] | None = None,
+        default_new_purpose: str | None = None,
     ) -> str:
         """保存行程历史，返回 trip_id。
 
@@ -2741,7 +2752,9 @@ class LongTermMemory:
             # （上限上线前的存量）不再被永久拒绝，与导入侧基线豁免一致
             if current == max_total:
                 raise ValueError(f"行程数量已达上限（{max_total}），请先删除旧行程")
-        trip_id, created = self._apply_trip_locked(trip_info)
+        trip_id, created = self._apply_trip_locked(
+            trip_info, default_new_purpose=default_new_purpose
+        )
         self._persist()
         if created_out is not None:
             # 持久化成功后才登记：落盘失败抛错时不误报结果

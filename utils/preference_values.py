@@ -114,6 +114,50 @@ def is_manageable_pref_type(pref_type: object) -> bool:
     return 0 < len(text) <= 64 and "/" not in text
 
 
+def shadow_preference_types(
+    preferences: dict[str, Any], canonical: str
+) -> list[str]:
+    """返回与 ``canonical`` 仅差首尾空白的存量偏好键（影子键）。
+
+    历史备份导入为防碰撞保留了「 home_location」这类原始键；写入规范键后
+    影子行仍回显旧值、继续占类型名额，面板与 prompt 会同时出现两条互相
+    矛盾的值。写入路径（面板 PUT / CLI pref-set）在保存规范键后应 best-effort
+    删除这些影子键。
+    """
+    return [
+        key
+        for key in preferences
+        if isinstance(key, str)
+        and key != canonical
+        and key.strip() == canonical
+    ]
+
+
+def visible_preferences(preferences: dict[str, Any]) -> dict[str, Any]:
+    """面板 / 导出 / 上限预检共用的偏好可见口径。
+
+    过滤 None / 空白串 / 空容器，列表内逐项剔除 null、空白项与 {} / []；
+    全空的列表整体隐藏（此前 [null] / "   " 会原样返回，面板渲染成
+    「东航、null」；空容器会让面板显示「汉庭、{}」且下一次追加时被合并层
+    静默丢弃）。面板 / CLI 无法寻址的键（含 "/"、控制字符、"."/".."、超长）
+    同样隐藏：PostgreSQL 后端加载时不做这类清洗，脏键经 /api/status 进入
+    面板后既改不掉也删不掉，还会占用偏好类型上限（与 JSON 后端加载即丢弃
+    同口径）。CLI 备份导出与偏好上限预检必须用同一过滤，否则含隐形行的
+    账号会导出一份「导入时必被跳过」的备份、或误报超过 200 上限。
+    """
+    visible: dict[str, Any] = {}
+    for key, value in preferences.items():
+        if not is_manageable_pref_type(key):
+            continue
+        if isinstance(value, list):
+            items = [item for item in value if not _is_blank_item(item)]
+            if items:
+                visible[key] = items
+        elif has_preference_value(value):
+            visible[key] = value
+    return visible
+
+
 # 偏好拼进 LLM prompt 时的预算：单值截断 + 总量截断。偏好单值上限
 # 10000 字符、类型上限 200，全量原样拼接可达约 2MB，任何模型上下文都会
 # 超限：该账号的偏好抽取与每轮意图识别会持续失败（不是单次抖动）。

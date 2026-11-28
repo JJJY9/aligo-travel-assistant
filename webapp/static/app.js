@@ -2879,7 +2879,7 @@ function renderHistoryItem(session) {
     item.classList.add("active");
     item.setAttribute("aria-current", "page");
   }
-  if (session.pinned) item.classList.add("pinned");
+  if (session.pinned && !session.archived) item.classList.add("pinned");
   if (session.archived) item.classList.add("archived");
 
   const name = session.title || "新对话";
@@ -7743,6 +7743,8 @@ async function importKnowledgeFile() {
   els.kbImport.disabled = true;
   let imported = 0;
   let skipped = 0;
+  let invalidSkipped = 0;
+  let duplicateSkipped = 0;
   try {
     const file = els.kbImportFile.files && els.kbImportFile.files[0];
     els.kbImportFile.value = "";
@@ -7832,16 +7834,29 @@ async function importKnowledgeFile() {
       });
       imported += result.imported || 0;
       skipped += result.skipped || 0;
+      invalidSkipped += Number(result.skipped_invalid || 0);
+      duplicateSkipped += Number(result.skipped_duplicate || 0);
       conflictSkipped += Number(result.skipped_conflict || 0);
       done += batch.length;
       els.kbImport.textContent = `导入中… ${done}/${documents.length}`;
     }
-    toast(
-      `已导入 ${imported} 条知识片段${skipped ? `，跳过 ${skipped} 条` : ""}` +
-        (conflictSkipped
-          ? `（其中 ${conflictSkipped} 条因布局冲突未导入，请整份编辑或删除整组后重试）`
-          : ""),
-    );
+    if (
+      imported === 0 &&
+      invalidSkipped > 0 &&
+      duplicateSkipped === 0 &&
+      conflictSkipped === 0
+    ) {
+      // 与 CLI kb-import 同一结论：全部条目无效 = 备份未能恢复，不能与
+      // 「全部已存在」的正常幂等结果共用「已导入 0 条」文案
+      toast(`没有可导入的知识片段（${invalidSkipped} 条无效）：备份未能恢复`);
+    } else {
+      toast(
+        `已导入 ${imported} 条知识片段${skipped ? `，跳过 ${skipped} 条` : ""}` +
+          (conflictSkipped
+            ? `（其中 ${conflictSkipped} 条因布局冲突未导入，请整份编辑或删除整组后重试）`
+            : ""),
+      );
+    }
     // 收尾刷新全部静默：429 / 写锁 503 的 toast 会覆盖刚显示的导入摘要
     await Promise.all([
       refreshKnowledge(),

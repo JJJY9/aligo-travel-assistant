@@ -295,6 +295,28 @@ def _trip_date(value: Any) -> str:
     return parsed.date().isoformat()
 
 
+def _trip_id_occurs_once(history: list[dict[str, Any]], trip_id: Any) -> bool:
+    """``trip_id`` 在同一份历史里是否唯一。
+
+    存储层 ``update_trip`` 按 trip_id 顺序命中第一条即更新：历史里同一
+    trip_id 对应多条不同行程时，按 id 盲更会改到另一条。编排的补齐路径
+    先按内容选中了具体旧行，必须确认该 id 唯一后才能安全按 id 更新。
+    """
+    from utils.trip_dedupe import trip_id_text
+
+    target = trip_id_text(trip_id)
+    if not target:
+        return False
+    return (
+        sum(
+            1
+            for trip in history
+            if trip_id_text(trip.get("trip_id")) == target
+        )
+        == 1
+    )
+
+
 def _agent_error_text(data: dict[str, Any]) -> str:
     """汇总技能返回 JSON 里的错误文本（顶层 / 嵌套 results 两种形状）。
 
@@ -2080,6 +2102,7 @@ class OrchestrationAgent(AgentBase):
                         # 按身份（目的地 + 起止日期）找到旧行补齐 origin。
                         # 否则 origin 不同会被当成新行程再插一条，统计与
                         # 常去目的地翻倍，且两条互相报日期冲突
+                        ambiguous_complement = False
                         if origin:
                             try:
                                 updater = getattr(
@@ -2088,9 +2111,12 @@ class OrchestrationAgent(AgentBase):
                                     None,
                                 )
                                 if callable(updater):
-                                    for old in self.memory_manager.long_term.get_trip_history(
-                                        limit=None
-                                    ):
+                                    history = (
+                                        self.memory_manager.long_term.get_trip_history(
+                                            limit=None
+                                        )
+                                    )
+                                    for old in history:
                                         if (
                                             normalize_city(
                                                 str(old.get("destination") or "")
@@ -2110,6 +2136,18 @@ class OrchestrationAgent(AgentBase):
                                             ).strip()
                                             and old.get("trip_id")
                                         ):
+                                            if not _trip_id_occurs_once(
+                                                history, old.get("trip_id")
+                                            ):
+                                                # 重复 trip_id：按 id 更新会改到
+                                                # 另一条行程；跳过补齐并放弃本次
+                                                # 保存（否则身份没补上仍会插重复行）
+                                                ambiguous_complement = True
+                                                logger.warning(
+                                                    "历史行程存在重复 trip_id，"
+                                                    "跳过补齐出发地与本次保存"
+                                                )
+                                                break
                                             updater(
                                                 str(old["trip_id"]),
                                                 {"origin": origin},
@@ -2163,6 +2201,15 @@ class OrchestrationAgent(AgentBase):
                                             )
                                             and old.get("trip_id")
                                         ):
+                                            if not _trip_id_occurs_once(
+                                                history, old.get("trip_id")
+                                            ):
+                                                ambiguous_complement = True
+                                                logger.warning(
+                                                    "历史行程存在重复 trip_id，"
+                                                    "跳过补齐返程日期与本次保存"
+                                                )
+                                                break
                                             fields = {"end_date": end_date}
                                             # 同一轮既补出发地又补返程日期时，
                                             # 上面的出发地补齐分支按「旧 end
@@ -2196,16 +2243,21 @@ class OrchestrationAgent(AgentBase):
                         # 值），与 trip-add 的修复同口径
                         if purpose:
                             record["purpose"] = purpose
-                        try:
-                            self.memory_manager.long_term.save_trip_history(
-                                record
-                            )
-                            logger.info("Saved trip to long-term memory")
-                        except Exception as exc:  # noqa: BLE001 - 行程写入失败不阻断回复
-                            logger.warning(
-                                "保存行程失败（%s），本轮回答照常返回",
-                                type(exc).__name__,
-                            )
-                            self._last_memory_write_failures.append("行程")
+                        if ambiguous_complement:
+                            # 重复 trip_id 下的补齐危险已记录：不保存本次
+                            # 行程，避免改错既有行或插入重复身份
+                            pass
+                        else:
+                            try:
+                                self.memory_manager.long_term.save_trip_history(
+                                    record
+                                )
+                                logger.info("Saved trip to long-term memory")
+                            except Exception as exc:  # noqa: BLE001 - 行程写入失败不阻断回复
+                                logger.warning(
+                                    "保存行程失败（%s），本轮回答照常返回",
+                                    type(exc).__name__,
+                                )
+                                self._last_memory_write_failures.append("行程")
 
         logger.info("Memory updated after orchestration")

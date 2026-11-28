@@ -1159,6 +1159,16 @@ def test_knowledge_import_skip_summary_distinguishes_conflicts():
     print("✓ 知识导入跳过摘要区分布局冲突")
 
 
+def test_knowledge_import_all_invalid_reports_unrecovered():
+    """全部条目无效（无预览路径）：toast 与 CLI 同结论「备份未能恢复」。"""
+    data = _run_harness("kbImportAllInvalid")
+    assert data["imports"] == 1, data
+    toasts = data["toasts"]
+    assert any("备份未能恢复" in item for item in toasts), toasts
+    assert any("2 条无效" in item for item in toasts), toasts
+    print("✓ 知识导入全部无效时提示备份未能恢复（与 CLI 同口径）")
+
+
 def test_knowledge_delete_legacy_parts_without_group():
     """旧版多分片（有 parts 无 group）单条删除：不能带 group=1（服务端 400）。"""
     data = _run_harness("kbDelete")
@@ -2018,6 +2028,7 @@ if __name__ == "__main__":
     test_panel_fixes_cursor_stale_session_and_import_batches()
     test_reconcile_confirms_after_open_session()
     test_knowledge_import_skip_summary_distinguishes_conflicts()
+    test_knowledge_import_all_invalid_reports_unrecovered()
     test_knowledge_delete_legacy_parts_without_group()
     test_knowledge_group_delete_syncs_local_rows_on_refresh_failure()
     test_kb_dedupe_success_removes_rows_locally()

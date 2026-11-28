@@ -3365,6 +3365,67 @@ def test_update_memory_backfills_origin_on_existing_trip():
     print("✓ 后续补出发地时补齐旧行程（不重复建档）")
 
 
+def test_update_memory_skips_complement_on_ambiguous_trip_id():
+    """历史里同一 trip_id 对应多条行程：按 id 盲更会改错行。
+
+    编排的补齐路径必须先确认 id 唯一；歧义时跳过补齐并放弃本次保存，
+    而不是改到另一条共享 trip_id 的行程或插入重复身份。
+    """
+    memory = _StubMemory()
+    memory.long_term.save_trip_history(
+        {
+            "origin": "",
+            "destination": "杭州",
+            "start_date": "2026-03-11",
+            "end_date": "2026-03-12",
+        }
+    )
+    memory.long_term.save_trip_history(
+        {
+            "origin": "北京",
+            "destination": "成都",
+            "start_date": "2026-04-01",
+            "end_date": "2026-04-02",
+        }
+    )
+    # 历史脏数据：两条不同行程共用同一 trip_id
+    for trip in memory.long_term.data["trip_history"]:
+        trip["trip_id"] = "trip_dup"
+    memory.long_term._persist()
+    orchestrator = OrchestrationAgent(agent_registry={}, memory_manager=memory)
+    results = [
+        {
+            "agent_name": "event_collection",
+            "priority": 1,
+            "result": {
+                "status": "success",
+                "data": {
+                    "origin": "北京",
+                    "destination": "杭州",
+                    "start_date": "2026-03-11",
+                    "end_date": "2026-03-12",
+                },
+            },
+        },
+        {
+            "agent_name": "itinerary_planning",
+            "priority": 2,
+            "result": {
+                "status": "success",
+                "data": {"itinerary": {"title": "trip"}},
+            },
+        },
+    ]
+    orchestrator._update_memory({}, results)
+    trips = memory.long_term.get_trip_history(limit=None)
+    assert len(trips) == 2, f"歧义时不应新增行：{trips}"
+    hangzhou = next(trip for trip in trips if trip["destination"] == "杭州")
+    assert not hangzhou["origin"], "歧义 id 不能被盲更新"
+    chengdu = next(trip for trip in trips if trip["destination"] == "成都")
+    assert chengdu["origin"] == "北京", "另一条共享 id 的行程不能被改"
+    print("✓ 重复 trip_id 时跳过补齐与保存（不改错 / 不插重复行）")
+
+
 def test_agent_load_executors_are_daemon_and_unregistered():
     """技能加载执行器为 daemon 且不登记 atexit join（停服不被冷加载拖住）。"""
     from concurrent.futures.thread import _threads_queues

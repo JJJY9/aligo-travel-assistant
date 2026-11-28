@@ -34,6 +34,8 @@ from utils.json_safe import MAX_JSON_DEPTH
 from utils.preference_values import (
     PREFERENCE_VALUE_MAX_CHARS,
     has_preference_value,
+    is_manageable_pref_type,
+    visible_preferences,
 )
 from utils.timestamps import localize_naive, parse_iso_datetime
 from utils.trip_export import _MAX_ICS_X_ATTR_CHARS, normalized_uid_token
@@ -1679,20 +1681,12 @@ def parse_user_export_data(
         if index > _MAX_PREFERENCES:
             errors.append(f"偏好超过 {_MAX_PREFERENCES} 个，多余条目已跳过")
             break
-        # 键名与 Web /api/preferences/{type} 的 ^[^/]{1,64}$ 同一口径，并
-        # 排除控制字符 / 行分隔符（与 _PREF_TYPE_PATTERN 一致）：不做 strip
-        # ——改名会让「 home」与「home」碰撞互相覆盖，含 ESC/NUL 的键导入
-        # 后面板与 API 都无法编辑或删除。纯空白键会被 JSON 后端加载迁移
-        # 静默丢弃（导入报成功、重启后消失）；"." / ".." 在面板的路径式
-        # 编辑 / 删除里会被 URL 规范化为别的路径，同样无法寻址。
         name = str(key)
-        if (
-            not name
-            or not name.strip()
-            or name in (".", "..")
-            or len(name) > 64
-            or re.search(r"[\x00-\x1F\x7F-\x9F\u2028\u2029/]", name)
-        ):
+        # 键名与面板 / CLI 共用 is_manageable_pref_type（含 "/"、控制字符、
+        # strip 后的 "."/".."、超长）：不做 strip——改名会让「 home」与
+        # 「home」碰撞互相覆盖；原值长度另行判定（"x"+" "×63 这类 strip
+        # 后合法、但加载端按原始长度丢弃的键不能放进来）
+        if not (0 < len(name) <= 64) or not is_manageable_pref_type(name):
             errors.append(f"跳过第 {index} 个偏好：键名非法")
             continue
         if name == "preferences":
@@ -1820,13 +1814,13 @@ def parse_user_export_data(
         # 不受文本截断影响
         truncated_labels = []
         if len(origin.strip()) > _MAX_TRIP_FIELD_CHARS:
-            origin = origin[:_MAX_TRIP_FIELD_CHARS]
+            origin = origin.strip()[:_MAX_TRIP_FIELD_CHARS]
             truncated_labels.append("出发地")
         if len(destination.strip()) > _MAX_TRIP_FIELD_CHARS:
-            destination = destination[:_MAX_TRIP_FIELD_CHARS]
+            destination = destination.strip()[:_MAX_TRIP_FIELD_CHARS]
             truncated_labels.append("目的地")
         if len(purpose.strip()) > _MAX_TRIP_FIELD_CHARS:
-            purpose = purpose[:_MAX_TRIP_FIELD_CHARS]
+            purpose = purpose.strip()[:_MAX_TRIP_FIELD_CHARS]
             truncated_labels.append("目的")
         if truncated_labels:
             errors.append(
@@ -1958,6 +1952,8 @@ def parse_user_export_data(
         if problem:
             errors.append(f"忽略会话 {session_id} 的标题：{problem}")
             continue
+        if len(title) > 60:
+            errors.append(f"会话 {session_id} 的标题超过 60 字，已截断")
         titles[session_id] = title[:60]
     sections["titles"] = titles
 
@@ -2587,15 +2583,20 @@ def _enforce_import_limits(store: Any, sections: dict[str, Any]) -> None:
             except Exception:  # noqa: BLE001 - 读取失败不阻断恢复
                 existing_preferences = None
             if isinstance(existing_preferences, dict):
-                merged = set(existing_preferences) | set(incoming_preferences)
+                # 与 Web PUT / PG 写层 / CLI pref-set 同一可见口径：隐形 /
+                # 空值偏好不占类型名额，否则恢复会在面板毫无可删行的
+                # 情况下被 409「请先删除不用的偏好类型」永久挡住
+                existing_visible = visible_preferences(existing_preferences)
+                incoming_visible = visible_preferences(incoming_preferences)
+                merged = set(existing_visible) | set(incoming_visible)
                 if (
-                    len(existing_preferences) <= _MAX_PREFERENCES
+                    len(existing_visible) <= _MAX_PREFERENCES
                     and len(merged) > _MAX_PREFERENCES
                 ):
                     raise AccountCapacityError(
                         f"恢复后偏好类型将超过上限 {_MAX_PREFERENCES}"
-                        f"（现有 {len(existing_preferences)} + 备份 "
-                        f"{len(incoming_preferences)}，合并后 {len(merged)}），"
+                        f"（现有 {len(existing_visible)} + 备份 "
+                        f"{len(incoming_visible)}，合并后 {len(merged)}），"
                         "请先删除不用的偏好类型后重试"
                     )
 
