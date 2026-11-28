@@ -1234,6 +1234,11 @@ _PREFERENCE_VALUE_MAX_JSON = 10000
 
 _KnowledgeMetaKey = Annotated[str, Field(max_length=METADATA_KEY_MAX_CHARS)]
 _KnowledgeMetaValue = Annotated[str, Field(max_length=METADATA_VALUE_MAX_CHARS)]
+# 更新 / 乐观并发快照只做精确比较与回传，不落库：历史遗留的超长分类 /
+# 元数据（旧 CLI / 导入写入）必须能原样提交，否则该片段在面板上永远 422、
+# 只能删除重建。是否允许落库由 knowledge_admin 按「库内既有键值」判断
+_KnowledgeMetaSnapshotKey = Annotated[str, Field(max_length=8192)]
+_KnowledgeMetaSnapshotValue = Annotated[str, Field(max_length=8192)]
 
 
 class KnowledgeDocumentPayload(BaseModel):
@@ -1275,14 +1280,16 @@ class KnowledgeUpdatePayload(KnowledgeDocumentPayload):
     # 写出）必须能原样保存 / 编辑，否则面板永久 422。键数由
     # knowledge_admin 按「库内已有键集合」判断：保留旧键放行、新增键超限
     # 仍拒绝；新增接口（POST）保持严格的 10 键上限
-    metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] | None = None
+    metadata: dict[_KnowledgeMetaSnapshotKey, _KnowledgeMetaSnapshotValue] | None = None
     # 乐观并发：面板进入编辑时载入的正文 / 分片快照。服务端写锁内比对，
     # 不一致返回 409——并发编辑不会静默覆盖对方修改或删掉未见过的分片
     expect: str | None = Field(default=None, max_length=JOINED_MAX_CHARS)
     expect_parts: int | None = Field(default=None, ge=1, le=100000)
     expect_group: str | None = Field(default=None, max_length=200)
     # 元数据轴的乐观并发快照：另一会话只改分类 / 标题时同样返回 409
-    expect_metadata: dict[_KnowledgeMetaKey, _KnowledgeMetaValue] | None = None
+    expect_metadata: dict[
+        _KnowledgeMetaSnapshotKey, _KnowledgeMetaSnapshotValue
+    ] | None = None
 
     @field_validator("metadata", "expect_metadata", mode="before")
     @classmethod

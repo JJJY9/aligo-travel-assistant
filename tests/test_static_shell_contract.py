@@ -60,3 +60,22 @@ def test_theme_storage_key_shared_and_color_scheme_synced():
     # 首帧 color-scheme 必须由 theme.js 写入，否则深色系统 + 浅色偏好闪帧
     assert "style.colorScheme" in theme_js
     assert "style.colorScheme" in app_js
+
+
+def test_trip_actions_revealed_on_row_focus():
+    """可点击行程行获焦时操作按钮必须可见（键盘用户不能盲按 Tab）。"""
+    normalized = re.sub(r"\s+", " ", _read("style.css"))
+    assert re.search(
+        r"\.trip\.clickable:focus-within\s+\.trip-actions\s*\{[^}]*opacity:\s*1",
+        normalized,
+    ), "缺少可点击行 :focus-within 时显示操作按钮的规则"
+    baseline = normalized.find(".trip-actions { opacity: 0;")
+    focus_rule = normalized.find(".trip.clickable:focus-within .trip-actions")
+    assert baseline >= 0 and focus_rule > baseline, (
+        "焦点规则必须位于 opacity:0 基线之后，否则会被源顺序覆盖"
+    )
+    assert re.search(
+        r"@media \(hover: none\)\s*\{\s*\.trip-actions\s*\{\s*opacity:\s*1;\s*\}\s*\}",
+        normalized,
+    ), "触屏常显兜底不能丢"
+    print("✓ 行程行获焦时操作按钮可见")

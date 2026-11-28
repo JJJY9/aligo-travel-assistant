@@ -1083,6 +1083,9 @@ mark { background: rgba(224, 85, 43, 0.2); color: inherit; border-radius: 3px; p
 }
 .trip-actions { opacity: 0; transition: opacity 0.15s ease; }
 .trip:hover .trip-actions, .trip-actions:focus-within { opacity: 1; }
+/* 可点击行本身可获焦（tabindex=0）：焦点停在行上时按钮组也必须可见，
+   否则键盘用户只能盲按 Tab 才发现编辑 / 日历 / 删除入口 */
+.trip.clickable:focus-within .trip-actions { opacity: 1; }
 .trip-actions button:hover { background: var(--surface-2); color: var(--ink); }
 .trip-actions .icon { width: 14px; height: 14px; }
 
