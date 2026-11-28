@@ -474,6 +474,40 @@ def test_add_update_reject_overlong_metadata(monkeypatch):
     with pytest.raises(ValueError, match="元数据值不能超过 200 字"):
         knowledge_admin.update_document(7, "内容", {"category": "长" * 201})
     print("✓ 超长元数据键值在新增 / 更新时直接拒绝")
+
+
+def test_update_allows_legacy_overlong_metadata_unchanged(monkeypatch):
+    """库内既有超长元数据原样保留时可保存；改成另一个超长值仍拒绝。"""
+    import json
+    from pathlib import Path
+
+    long_value = "长" * 240
+    rows = [
+        {
+            "id": 7,
+            "content": "旧内容",
+            "metadata": json.dumps({"category": long_value}, ensure_ascii=False),
+        }
+    ]
+    fake_client = _FakeMilvusClient(rows)
+    monkeypatch.setattr(knowledge_admin, "_client", lambda: fake_client)
+    monkeypatch.setattr(knowledge_admin, "knowledge_db_path", lambda: Path(__file__))
+
+    captured: dict[str, dict[str, str]] = {}
+
+    class _Agent:
+        def update_document(self, doc_id, content, metadata):
+            captured["metadata"] = dict(metadata)
+            return {"status": "success", "id": doc_id}
+
+    monkeypatch.setattr(knowledge_admin, "_get_agent", lambda: _Agent())
+    result = knowledge_admin.update_document(7, "新内容", {"category": long_value})
+    assert result["status"] == "success", result
+    assert captured["metadata"]["category"] == long_value, "既有超长值必须原样保留"
+
+    with pytest.raises(ValueError, match="元数据值不能超过 200 字"):
+        knowledge_admin.update_document(7, "另一版内容", {"category": "短" * 201})
+    print("✓ 历史超长元数据原样保留可保存，新增超长值仍拒绝")
 def test_update_document_skips_unchanged_save(monkeypatch):
     """原样保存（内容与回填一致、元数据未变）不重切、不写入。"""
     from pathlib import Path
@@ -4501,6 +4535,7 @@ if __name__ == "__main__":
         test_query_errors_propagate,
         test_add_document_requires_initialized_db,
         test_add_update_reject_overlong_metadata,
+        test_update_allows_legacy_overlong_metadata_unchanged,
         test_search_documents_delegates_to_agent,
         test_search_documents_requires_initialized_db,
         test_rag_agent_strict_search_raises_when_uninitialized,

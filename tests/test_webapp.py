@@ -7339,6 +7339,43 @@ def test_knowledge_update_without_metadata_sets_expect_baseline(monkeypatch):
     print("✓ 省略 metadata 的 PUT 带上并发基线")
 
 
+def test_knowledge_update_accepts_legacy_long_expect_metadata(monkeypatch):
+    """更新 / 乐观并发快照的元数据只做精确比较：历史超长值可原样提交。"""
+    from webapp import server as server_module
+
+    captured = {}
+
+    def fake_update(doc_id, content, metadata=None, **kwargs):
+        captured["metadata"] = metadata
+        captured["expect_metadata"] = kwargs.get("expect_metadata")
+        return {"status": "success", "id": doc_id, "parts": 1}
+
+    monkeypatch.setattr(server_module, "update_document", fake_update)
+    long_value = "长" * 240
+    response = _client().put(
+        "/api/knowledge/documents/1",
+        json={
+            "content": "新内容",
+            "metadata": {"category": "短", "title": "旧"},
+            "expect": "旧内容",
+            "expect_parts": 1,
+            "expect_group": "",
+            "expect_metadata": {"category": long_value, "title": "旧"},
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert captured["expect_metadata"]["category"] == long_value, captured
+    assert captured["metadata"]["category"] == "短", captured
+
+    # 新建接口保持严格 200 字上限
+    response = _client().post(
+        "/api/knowledge/documents",
+        json={"content": "x", "metadata": {"category": "长" * 201}},
+    )
+    assert response.status_code == 422, response.text
+    print("✓ 更新快照接受历史超长元数据，新建仍严格")
+
+
 def test_static_assets_no_cache_header():
     """/static/ 响应必须带 Cache-Control: no-cache（发版后不能吃到旧脚本）。"""
     response = _client().get("/static/app.js")

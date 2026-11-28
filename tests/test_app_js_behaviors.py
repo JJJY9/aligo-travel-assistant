@@ -390,6 +390,12 @@ def test_editor_round2_preferences_and_guards():
     assert "infinity" not in finite, "非有限数必须判为格式无效，不能序列化成 null"
     assert finite["normal"] == 4.5, finite
 
+    nested = data["prefNestedNonFinite"]
+    assert "objectOverflow" not in nested, "对象内非有限数必须判为格式无效"
+    assert "arrayOverflow" not in nested, "对象数组内非有限数必须判为格式无效"
+    assert "flatOverflow" not in nested, "对象数组内非有限数必须判为格式无效"
+    assert nested["normal"] == {"a": 2}, nested
+
     blur = data["blurPrompt"]
     assert blur["changed"] is True and blur["unchanged"] is False, blur
     assert blur["newline"] is False, "输入框剥离换行后与原文一致时不算修改"
@@ -465,6 +471,11 @@ def test_frontend_detail_fixes():
     assert data["sidebarExpanded"] == "true", data["sidebarExpanded"]
     assert data["sidebarCollapsed"] == "false", data["sidebarCollapsed"]
     assert data["kbAnnounce"] == ["共 12 条，已显示 5 条"], data["kbAnnounce"]
+    aria = data["ariaCurrent"]
+    assert aria["renderActive"] == "page", aria
+    assert aria["renderOther"] == "", aria
+    assert aria["markActive"] == "page" and aria["markActiveClass"] is True, aria
+    assert aria["markOther"] == "" and aria["markOtherClass"] is False, aria
     print("✓ 前端细节修复（草稿合并 / 待刷新 / 归档 / 行程重编辑）")
 
 
@@ -719,6 +730,10 @@ def test_trip_import_file_decoding_and_size_guard():
     assert pinned_urls[0].endswith("dry_run=1") and "user_id=user-a" in pinned_urls[0]
     assert "dry_run" not in pinned_urls[1] and "user_id=user-a" in pinned_urls[1]
     assert results["user_after"] == "user-b"
+    pinned_toasts = results["pinned_toasts"]
+    assert len(pinned_toasts) == 1, "切号说明必须与导入结果合并成一条提示"
+    assert "已导入 1 条行程" in pinned_toasts[0], pinned_toasts
+    assert "已切换用户：导入结果属于用户 user-a" in pinned_toasts[0], pinned_toasts
     assert results["cancel"]["calls"] == 1
     assert results["cancel"]["confirm_calls"] == 1
     assert results["cancel"]["last_toast"] == "已取消导入"
@@ -1520,7 +1535,9 @@ def test_trip_import_partial_failure_reconciles():
 
     switched = data["switched"]
     assert switched["refreshCalls"] == 0, "切号后不能把旧用户的结果刷进新用户界面"
-    assert any("已切换用户" in item for item in switched["toasts"]), switched
+    assert len(switched["toasts"]) == 1, "切号说明必须合并进同一条结果提示"
+    assert "导入部分失败" in switched["toasts"][0], switched
+    assert "已切换用户：导入结果属于用户 user-a" in switched["toasts"][0], switched
 
     preview = data["previewTimeout"]
     assert preview["refreshCalls"] == 0, "预览超时零写入，无需对账刷新"
@@ -1749,6 +1766,205 @@ def test_theme_boot_matches_apply_theme():
     print("✓ 主题脚本与 applyTheme 共用键并同步 color-scheme")
 
 
+def test_kb_search_debounce_cancelled_on_close():
+    """关闭 / 隐藏记忆面板后，知识库搜索防抖不能再补发整库请求。"""
+    data = _run_harness("kbSearchCloseCancel")
+    closed = data["closed"]
+    assert closed["hidden"] is True, closed
+    assert closed["requests"] == [], "关闭面板后不能补发知识库搜索"
+    assert closed["toasts"] == [], closed
+    assert data["hidden"]["requests"] == 0, "面板隐藏时定时器回调必须早退"
+    assert any("q=baz" in url for url in data["normal"]["requests"]), (
+        "正常防抖路径不能被守卫破坏"
+    )
+    print("✓ 关闭记忆面板后知识库搜索防抖不再补发")
+
+
+def test_load_more_sessions_single_flight():
+    """连点「加载更多」只发一次在途请求，完成后游标与列表正常前进。"""
+    data = _run_harness("loadMoreDoubleClick")
+    assert data["requestsAfterDouble"] == 1, "在途期间第二次点击必须被忽略"
+    assert data["afterFirstPage"] == {"offset": 100, "count": 100}, data
+    assert "offset=100" in data["thirdUrl"], data["thirdUrl"]
+    assert data["final"] == {"offset": 150, "count": 150, "total": 150}, data
+    print("✓ 加载更多会话单飞：连点只发一次请求")
+
+
+def test_memory_sheet_backdrop_drag_does_not_close():
+    """面板内拖选后在卡片外释放不能被当成点击遮罩；点按遮罩仍关闭。"""
+    data = _run_harness("memorySheetBackdrop")
+    assert data["dragOutside"] is False, "拖选文本后释放不能关闭面板"
+    assert data["maskTap"] is True, "真正点按遮罩仍要关闭"
+    assert data["insideClick"] is False, "卡片内点击不能关闭"
+    print("✓ 记忆面板遮罩按 pointerdown 落点判定，拖选不再误关")
+
+
+def test_kb_content_limits_and_legacy_draft():
+    """单分片编辑按 PUT 上限放行；404 保留的长草稿不被 2000 上限锁住。"""
+    data = _run_harness("kbContentLimits")
+    assert data["edit_max"] == 20100, data
+    assert data["reset_max"] == 2000, data
+    assert data["long_edit"] == {"max": 20100, "len": 3000, "editing": 7}, data
+    after = data["after_404"]
+    assert after["max"] == 20100 and after["len"] == 3000, data
+    assert after["editing"] is None, data
+    assert any("可重新添加" in item for item in after["toasts"]), after
+    blocked = data["add_blocked"]
+    assert blocked["post"] == 0, "超长新增必须在发请求前拦截"
+    assert any("最多 2000 字" in item for item in blocked["toasts"]), blocked
+    print("✓ 知识片段编辑/新增的字数上限与保留草稿")
+
+
+def test_ime_confirm_enter_guards():
+    """Safari 选词回车（keyCode 229）不能提前保存偏好 / 重命名会话。"""
+    data = _run_harness("imeConfirmEnter")
+    assert data["prefBefore"] == 0, "229 回车不能发 PUT"
+    assert len(data["prefAfter"]) == 1, data
+    assert data["prefAfter"][0]["url"] == "/api/preferences/hotel_brands", data
+    assert '"汉庭","如家"' in data["prefAfter"][0]["body"], data
+    assert data["renameBefore"] == 1, "229 回车不能提前重命名（只有偏好 PUT）"
+    assert len(data["renameAfter"]) == 2, data
+    assert data["renameAfter"][-1]["url"] == "/api/sessions/s1/title", data
+    assert '"新标题"' in data["renameAfter"][-1]["body"], data
+    print("✓ 行内编辑的输入法选词回车不再提前保存")
+
+
+def test_history_action_labels_include_session_title():
+    """会话行操作按钮的可访问名必须带目标会话标题。"""
+    data = _run_harness("historyActionLabels")
+
+    def by_action(items):
+        return {item["action"]: item for item in items}
+
+    normal = by_action(data["normal"])
+    assert normal["remove"]["label"] == "删除会话 北京出差", normal
+    assert normal["rename"]["label"] == "重命名会话 北京出差", normal
+    assert normal["archive"]["label"] == "归档会话 北京出差", normal
+    assert normal["pin"]["label"] == "置顶会话 北京出差", normal
+    assert normal["remove"]["title"] == "删除会话", "title 工具提示保持固定动作名"
+    pinned = by_action(data["pinned"])
+    assert pinned["pin"]["label"] == "取消置顶 上海出差", pinned
+    archived = by_action(data["archived"])
+    assert archived["restore"]["label"] == "恢复会话 归档会话", archived
+    assert "pin" not in archived and "rename" not in archived, archived
+    untitled = by_action(data["untitled"])
+    assert untitled["remove"]["label"] == "删除会话 新对话", untitled
+    assert normal["remove"]["label"] != pinned["remove"]["label"], (
+        "不同会话的同类操作标签必须可区分"
+    )
+    assert data["current_aria"] == "page", data
+    assert data["other_aria"] == "", data
+    print("✓ 会话操作按钮的可访问名包含目标会话标题")
+
+
+def test_window_batch_button_keeps_keyboard_focus():
+    """补批按钮移除时焦点交给新批次首节点，按钮保留时不移动焦点。"""
+    data = _run_harness("windowBatchFocus")
+    earlier = data["earlier"]
+    assert earlier["afterFirst"]["focused"] == [
+        {"text": "问题 0", "calls": [{"preventScroll": True}]}
+    ], earlier
+    assert earlier["afterFirst"]["buttons"] == 0, earlier
+    two = data["earlierTwo"]
+    assert two["afterFirst"]["focused"] == [], "按钮仍保留时不能移动焦点"
+    assert two["afterFirst"]["buttons"] == 1, two
+    assert two["afterSecond"]["focused"] == [
+        {"text": "问题 0", "calls": [{"preventScroll": True}]}
+    ], two
+    later = _run_harness("windowBatchFocusLater")
+    assert later["first"]["focused"] == [], later
+    assert later["first"]["buttons"] == 1, later
+    assert later["second"]["focused"] == [
+        {"text": "问题 400", "calls": [{"preventScroll": False}]}
+    ], later
+    print("✓ 显示更早/更新消息的末批焦点兜底")
+
+
+def test_delete_row_focus_fallback():
+    """删除偏好行后焦点就近回补，失败保留原按钮，空列表回添加按钮。"""
+    data = _run_harness("deleteRowFocusFallback")
+    assert data["middle"] == {"focus": ["row1"], "removed": True}, data
+    assert data["last"] == {"focus": ["addPref"], "removed": True}, data
+    assert data["failed"] == {"focus": [], "removed": False}, data
+    assert data["tripHelper"] == ["next"], data
+    print("✓ 删除行后的焦点兜底")
+
+
+def test_preference_delete_blocked_while_saving():
+    """偏好保存 PUT 在途时拒绝 DELETE，保存结束后删除照常执行。"""
+    data = _run_harness("preferenceEditThenDelete")
+    blocked = data["blocked"]
+    assert blocked["deletes"] == 0, "保存在途时不能并发发 DELETE"
+    assert blocked["removed"] is False, blocked
+    assert any("正在编辑或保存" in item for item in blocked["toasts"]), blocked
+    assert data["after"] == {"deletes": 1, "removed": True}, data
+    print("✓ 偏好行内保存期间不能被并发删除")
+
+
+def test_network_error_normalized():
+    """浏览器英文网络错误统一中文兜底；HTTP / AbortError / 业务错误不误伤。"""
+    data = _run_harness("networkErrorText")
+    assert data["loadToasts"] == [
+        "加载会话列表失败：无法连接服务器，请检查网络后重试"
+    ], data
+    assert data["direct"]["name"] == "Error", data
+    assert data["direct"]["message"] == "无法连接服务器，请检查网络后重试", data
+    assert "Failed to fetch" not in data["direct"]["message"], data
+    assert data["http"]["message"] == "Failed to fetch upstream", data
+    assert data["http"]["status"] == 500, data
+    assert data["aborted"] == {"name": "AbortError", "message": "aborted"}, data
+    assert data["business"] == {"message": "响应不是 JSON（测试）"}, data
+    assert data["downloaded"] is False, data
+    assert data["downloadToast"] == "下载失败：无法连接服务器，请检查网络后重试", data
+    print("✓ 网络层错误统一中文口径")
+
+
+def test_session_toggle_unknown_outcome_reconciles():
+    """置顶 / 归档响应中断时按服务端对账，确定失败不额外刷新。"""
+    data = _run_harness("sessionToggleUnknown")
+    applied = data["pinApplied"]
+    assert applied["loads"] == 1, applied
+    assert "已置顶会话（响应中断，已按服务端确认）" in applied["toasts"][-1], applied
+    failed = data["pinFailed"]
+    assert failed["loads"] == 1, failed
+    assert failed["toasts"][-1].startswith("置顶失败"), failed
+    assert "请重试" in failed["toasts"][-1], failed
+    rejected = data["pinRejected"]
+    assert rejected["loads"] == 0, "429 等确定失败不额外对账"
+    assert rejected["toasts"][0].startswith("操作失败"), rejected
+    archive = data["archiveApplied"]
+    assert "会话已归档（响应中断，已按服务端确认）" in archive["toasts"][-1], archive
+    assert archive["refreshes"] == 1, archive
+    print("✓ 置顶/归档响应中断按服务端对账")
+
+
+def test_kb_save_keeps_legacy_edit_disabled():
+    """知识保存收尾只恢复本次锁定的按钮，新渲染的旧多分片编辑仍禁用。"""
+    data = _run_harness("kbSaveRestoresLockedRowButtons")
+    assert data == {"legacy": True, "normal": False, "fresh": True, "saving": False}, data
+    print("✓ 知识保存收尾不点亮 legacy 编辑按钮")
+
+
+def test_leave_filtered_view_on_first_send():
+    """从归档 / 搜索视图发首条消息：立即按空查询重载侧栏。"""
+    data = _run_harness("archivedLeaveOnFirstSend")
+    archived = data["archived"]
+    assert archived["calls"][0] == {
+        "query": "",
+        "reset": True,
+        "silentFailure": True,
+    }, archived
+    assert archived["showArchived"] is False, archived
+    search = data["search"]
+    assert search["calls"][0] == {
+        "query": "",
+        "reset": True,
+        "silentFailure": True,
+    }, search
+    assert search["searchValue"] == "" and search["searchQuery"] == "", search
+    print("✓ 首条消息离开归档/搜索视图立即重载侧栏")
+
+
 if __name__ == "__main__":
     import _tmp_registry
 
@@ -1861,4 +2077,17 @@ if __name__ == "__main__":
     test_edit_delete_unknown_outcome_message()
     test_perf_round_probe_and_render_budget()
     test_theme_boot_matches_apply_theme()
+    test_kb_search_debounce_cancelled_on_close()
+    test_load_more_sessions_single_flight()
+    test_memory_sheet_backdrop_drag_does_not_close()
+    test_kb_content_limits_and_legacy_draft()
+    test_ime_confirm_enter_guards()
+    test_history_action_labels_include_session_title()
+    test_window_batch_button_keeps_keyboard_focus()
+    test_delete_row_focus_fallback()
+    test_preference_delete_blocked_while_saving()
+    test_network_error_normalized()
+    test_session_toggle_unknown_outcome_reconciles()
+    test_kb_save_keeps_legacy_edit_disabled()
+    test_leave_filtered_view_on_first_send()
     print("\n全部通过")

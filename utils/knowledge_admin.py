@@ -618,6 +618,7 @@ def _restore_pieces(parts: Any, fallback: str) -> list[str]:
 def _validate_metadata_lengths(
     metadata: dict[str, Any],
     allowed_user_keys: set[str] | None = None,
+    existing_user_meta: dict[str, str] | None = None,
 ) -> None:
     """元数据键 / 值长度与键数上限，超限直接拒绝（不静默截断）。
 
@@ -628,15 +629,22 @@ def _validate_metadata_lengths(
     ``allowed_user_keys`` 是库内已有的用户键集合（更新既有记录时传入）：
     历史遗留的 >10 键记录原样保存不再被锁死，但不允许在此基础上再新增
     键；新增 / 导入仍按严格上限执行。
+
+    ``existing_user_meta`` 是库内该片段的用户元数据键值：历史遗留的超长
+    键 / 值原样保留时跳过长度错误（否则该片段在面板上永远无法保存，只能
+    删除重建）；新增键或改成另一个超长值仍按上限拒绝。
     """
+    preserved = existing_user_meta or {}
     user_keys = 0
     for meta_key, meta_value in metadata.items():
         key_text = str(meta_key)
-        if len(key_text) > METADATA_KEY_MAX_CHARS:
+        value_text = str(meta_value)
+        unchanged = preserved.get(key_text) == value_text
+        if len(key_text) > METADATA_KEY_MAX_CHARS and not unchanged:
             raise ValueError(
                 f"元数据键不能超过 {METADATA_KEY_MAX_CHARS} 字：{key_text[:20]}…"
             )
-        if len(str(meta_value)) > METADATA_VALUE_MAX_CHARS:
+        if len(value_text) > METADATA_VALUE_MAX_CHARS and not unchanged:
             raise ValueError(
                 f"元数据值不能超过 {METADATA_VALUE_MAX_CHARS} 字（键 {key_text}）"
             )
@@ -664,6 +672,7 @@ def _chunk_documents(
     metadata: dict[str, str] | None,
     group_override: str = "",
     allowed_user_keys: set[str] | None = None,
+    existing_user_meta: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
     """长内容按语义边界拆成 ≤400 字的片段（嵌入模型 512 token 截断）。
 
@@ -708,7 +717,11 @@ def _chunk_documents(
         for key, value in (metadata or {}).items()
         if key not in _DERIVED_CHUNK_KEYS
     }
-    _validate_metadata_lengths(base_meta, allowed_user_keys=allowed_user_keys)
+    _validate_metadata_lengths(
+        base_meta,
+        allowed_user_keys=allowed_user_keys,
+        existing_user_meta=existing_user_meta,
+    )
     # 与 Web 写接口同口径：NUL / 孤立代理项入库后，面板每次保存（整份
     # metadata 随请求提交）都会被 422 拒绝，片段从此无法编辑
     problem = _encoding_problem(text)
@@ -1056,6 +1069,7 @@ def update_document(
     # （冷加载可能联网下载数十秒的）嵌入模型；未命中再走完整写路径，
     # 锁内仍以权威快照复核，判定不依赖这次读取的时效性
     existing_user_keys: set[str] | None = None
+    existing_user_meta: dict[str, str] | None = None
     try:
         with _read_lock():
             parts, pre_group = _document_info(client, int(doc_id))
@@ -1075,6 +1089,9 @@ def update_document(
                         for key in pre_snapshot[1]
                         if str(key) not in _INTERNAL_META_KEYS
                     }
+                    # 原样保留的既有超长键值不按新写入上限拒绝：否则历史
+                    # 超长分类 / 元数据让该片段在面板上永远无法保存
+                    existing_user_meta = dict(pre_snapshot[1])
                     if _edit_unchanged(pre_snapshot):
                         return {
                             "status": "success",
@@ -1088,7 +1105,10 @@ def update_document(
 
     agent = _get_agent()
     documents = _chunk_documents(
-        text, metadata, allowed_user_keys=existing_user_keys
+        text,
+        metadata,
+        allowed_user_keys=existing_user_keys,
+        existing_user_meta=existing_user_meta,
     )
     if (
         isinstance(metadata, dict)

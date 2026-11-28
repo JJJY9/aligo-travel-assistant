@@ -67,6 +67,19 @@ function makeNode() {
       const index = registered.indexOf(handler);
       if (index >= 0) registered.splice(index, 1);
     },
+    dispatchEvent(event) {
+      const type = event && event.type;
+      const payload = {
+        target: this,
+        preventDefault() {},
+        stopPropagation() {},
+        ...(event || {}),
+      };
+      for (const handler of listeners[type] || []) {
+        handler.call(this, payload);
+      }
+      return true;
+    },
     focus() {},
     blur() {},
     click() {
@@ -245,6 +258,8 @@ function buildEnv(source) {
     // 覆盖前保留原函数引用：个别场景需要验证真实的渲染 / 编辑入口逻辑
     globalThis.__origRenderUserNode = renderUserNode;
     globalThis.__origRefreshEditButtons = refreshEditButtons;
+    globalThis.__origMarkActiveHistory = markActiveHistory;
+    globalThis.__origGetJSON = getJSON;
     getJSON = (...args) =>
       new Promise((resolve, reject) => {
         __requests.push({ args, resolve, reject });
@@ -969,7 +984,7 @@ async function scenarioDecode(source) {
   run("els.memorySheet.hidden = false; els.shortcutOverlay.hidden = false;");
 
   // 解码 / 请求期间切换用户：导入仍落在选择文件时的用户
-  run("state.userId = 'user-a'; __lastUrl = null; __importCalls = 0; __urls = [];");
+  run("state.userId = 'user-a'; __lastUrl = null; __importCalls = 0; __urls = []; __toasts = [];");
   run(
     "getJSON = (url) => { __importCalls += 1; __lastUrl = url; __urls.push(url); return new Promise((resolve) => { __resolveImport = resolve; }); };"
   );
@@ -989,6 +1004,7 @@ async function scenarioDecode(source) {
   results.pinned_url = run("__lastUrl");
   results.pinned_urls = run("__urls.slice()");
   results.user_after = run("state.userId");
+  results.pinned_toasts = run("__toasts.slice()");
 
   // 预览后取消：只发 dry-run，不写库
   run("state.userId = 'user-c'; __confirmResult = false; __confirmCalls = 0; __importCalls = 0; __urls = [];");
@@ -3719,6 +3735,17 @@ async function scenarioEditorsRound2(source) {
     objectKeep: preferenceOutputValue({ a: 1 }, '{"a":2}'),
     plainList: preferenceOutputValue(["汉庭"], "汉庭、如家"),
   })`);
+  // 对象 / 对象数组内的非有限数（1e999 经 JSON.parse 变成 Infinity）不能
+  // 序列化成 null 落库：与数字标量分支同口径判为格式无效
+  results.prefNestedNonFinite = run(`({
+    objectOverflow: preferenceOutputValue({ a: 1 }, '{"a": 1e999}'),
+    arrayOverflow: preferenceOutputValue(
+      [{ name: "汉庭", level: 1 }],
+      '[{"name":"汉庭","level":1e999}]',
+    ),
+    flatOverflow: preferenceOutputValue([{ name: "汉庭" }], "[1e999]"),
+    normal: preferenceOutputValue({ a: 1 }, '{"a": 2}'),
+  })`);
 
   // 仅分隔符的列表输入：拒绝并提示，不发 PUT
   run(`
@@ -4296,6 +4323,49 @@ async function scenarioFrontendDetailFixes(source) {
     badge: makeBadge("constructor", "done").textContent,
   })`);
 
+  // 活动会话行：renderHistoryItem 与 markActiveHistory 同步 aria-current
+  run(`
+    const origCreateForAria = document.createElement.bind(document);
+    document.createElement = (tag) => {
+      const node = origCreateForAria(tag);
+      node.attrs = {};
+      node.setAttribute = (key, value) => { node.attrs[key] = String(value); };
+      node.removeAttribute = (key) => { delete node.attrs[key]; };
+      return node;
+    };
+    state.sessionId = "s1";
+    globalThis.__activeRow = renderHistoryItem({ session_id: "s1", title: "A" });
+    globalThis.__otherRow = renderHistoryItem({ session_id: "s2", title: "B" });
+    document.createElement = origCreateForAria;
+    globalThis.__makeHistoryRow = (id) => {
+      const row = {
+        dataset: { id },
+        attrs: {},
+        active: false,
+        setAttribute(name, value) { row.attrs[name] = String(value); },
+        removeAttribute(name) { delete row.attrs[name]; },
+        classList: {
+          toggle(name, force) {
+            if (name === "active") row.active = Boolean(force);
+          },
+        },
+      };
+      return row;
+    };
+    globalThis.__historyRows = [__makeHistoryRow("s1"), __makeHistoryRow("s2")];
+    els.history = { querySelectorAll() { return __historyRows; } };
+    markActiveHistory = __origMarkActiveHistory;
+    markActiveHistory();
+  `);
+  const ariaCurrent = run(`({
+    renderActive: __activeRow.attrs["aria-current"] || "",
+    renderOther: __otherRow.attrs["aria-current"] || "",
+    markActive: __historyRows[0].attrs["aria-current"] || "",
+    markActiveClass: __historyRows[0].active,
+    markOther: __historyRows[1].attrs["aria-current"] || "",
+    markOtherClass: __historyRows[1].active,
+  })`);
+
   return {
     merged,
     restored,
@@ -4315,6 +4385,7 @@ async function scenarioFrontendDetailFixes(source) {
     sidebarExpanded,
     sidebarCollapsed,
     kbAnnounce,
+    ariaCurrent,
   };
 }
 
@@ -6024,6 +6095,840 @@ async function scenarioTheme(source) {
   return results;
 }
 
+async function scenarioKbSearchCloseCancel(source) {
+  // 知识库搜索防抖：关闭面板 / 面板隐藏后不能再补发整库请求
+  const results = {};
+  const setup = (env) => {
+    runIn(
+      env,
+      `
+      state.userId = "u1";
+      state.kbQuery = "";
+      els.memorySheet = {
+        hidden: false,
+        contains() { return false; },
+        addEventListener() {},
+      };
+      els.kbSearch = {
+        value: "",
+        handlers: {},
+        addEventListener(type, handler) {
+          (this.handlers[type] ||= []).push(handler);
+        },
+        dispatch(type, event) {
+          for (const handler of this.handlers[type] || []) {
+            handler.call(this, { target: this, preventDefault() {}, stopPropagation() {}, ...(event || {}) });
+          }
+        },
+        focus() {},
+      };
+      refreshStatus = async () => {};
+      bindEvents();
+      `
+    );
+  };
+
+  // (a) 关闭面板清掉挂起的防抖定时器
+  {
+    const env = buildEnv(source);
+    setup(env);
+    runIn(
+      env,
+      'els.kbSearch.value = "foo"; els.kbSearch.dispatch("input", { isComposing: false });'
+    );
+    runIn(env, "closeMemorySheet();");
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    results.closed = runIn(
+      env,
+      `({
+        hidden: els.memorySheet.hidden,
+        requests: __requests.map((request) => String(request.args[0])),
+        toasts: __toasts.slice(),
+      })`
+    );
+  }
+
+  // (b) 定时器已调度但面板已隐藏：applyKnowledgeSearch 必须早退
+  {
+    const env = buildEnv(source);
+    setup(env);
+    runIn(
+      env,
+      `
+      globalThis.__captured = null;
+      globalThis.setTimeout = (fn) => { __captured = fn; return 1; };
+      els.kbSearch.value = "bar";
+      els.kbSearch.dispatch("input", { isComposing: false });
+      els.memorySheet.hidden = true;
+      __captured();
+      `
+    );
+    await tick();
+    results.hidden = runIn(env, "({ requests: __requests.length })");
+  }
+
+  // (c) 正常路径：防抖仍然发出当前查询
+  {
+    const env = buildEnv(source);
+    setup(env);
+    runIn(
+      env,
+      'els.memorySheet.hidden = false; els.kbSearch.value = "baz"; els.kbSearch.dispatch("input", { isComposing: false });'
+    );
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    results.normal = runIn(
+      env,
+      "({ requests: __requests.map((request) => String(request.args[0])) })"
+    );
+    if (env.__requests.length) {
+      env.__requests[0].resolve({ items: [], total: 0 });
+    }
+  }
+  return results;
+}
+
+async function scenarioLoadMoreDoubleClick(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    state.userId = "u1";
+    state.sessionsLoading = false;
+    state.sessions = Array.from({ length: 50 }, (_, index) => ({ session_id: "s" + index }));
+    state.sessionsOffset = 50;
+    state.sessionTotal = 150;
+    state.sessionsLoadedQuery = null;
+    state.sessionsLoadedArchived = null;
+    state.searchQuery = "";
+    state.showArchived = false;
+  `);
+  const first = run("loadMoreSessions()");
+  const second = run("loadMoreSessions()");
+  await tick();
+  const requestsAfterDouble = env.__requests.length;
+  env.__requests[0].resolve({
+    sessions: Array.from({ length: 50 }, (_, index) => ({ session_id: "m" + index })),
+    total: 150,
+  });
+  await Promise.all([first, second]);
+  await tick();
+  const afterFirstPage = run(
+    "({ offset: state.sessionsOffset, count: state.sessions.length })"
+  );
+  const third = run("loadMoreSessions()");
+  await tick();
+  const thirdRequest = env.__requests.length
+    ? env.__requests[env.__requests.length - 1]
+    : null;
+  const thirdUrl = thirdRequest ? String(thirdRequest.args[0]) : "";
+  if (thirdRequest) {
+    thirdRequest.resolve({
+      sessions: Array.from({ length: 50 }, (_, index) => ({ session_id: "n" + index })),
+      total: 150,
+    });
+  }
+  await third;
+  await tick();
+  const final = run(
+    "({ offset: state.sessionsOffset, count: state.sessions.length, total: state.sessionTotal })"
+  );
+  return { requestsAfterDouble, afterFirstPage, thirdUrl, final };
+}
+
+async function scenarioMemorySheetBackdrop(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    globalThis.__sheet = {
+      hidden: false,
+      handlers: {},
+      addEventListener(type, handler) { (this.handlers[type] ||= []).push(handler); },
+      dispatch(type, event) {
+        for (const handler of this.handlers[type] || []) {
+          handler.call(this, { target: this, preventDefault() {}, stopPropagation() {}, ...(event || {}) });
+        }
+      },
+      contains() { return false; },
+    };
+    els.memorySheet = __sheet;
+    refreshStatus = async () => {};
+    bindEvents();
+    globalThis.__child = { tag: "child" };
+  `);
+  const pressAndClick = (pressTarget, clickTarget) => {
+    run("__sheet.hidden = false; memorySheetPressOnMask = false;");
+    run(`__sheet.dispatch("pointerdown", { target: ${pressTarget} });`);
+    run(`__sheet.dispatch("click", { target: ${clickTarget} });`);
+    return run("__sheet.hidden");
+  };
+  return {
+    dragOutside: pressAndClick("__child", "__sheet"),
+    maskTap: pressAndClick("__sheet", "__sheet"),
+    insideClick: pressAndClick("__child", "__child"),
+  };
+}
+
+async function scenarioKbContentLimits(source) {
+  // 单分片编辑与新增共用文案框：编辑上限对齐 PUT，新增仍按 2000 拦
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const results = {};
+  run(`
+    state.kbSaving = false;
+    els.kbContent.setSelectionRange = () => {};
+    els.kbContent.value = "";
+    els.kbCategory.value = "";
+    globalThis.__toasts = [];
+    toast = (message) => __toasts.push(String(message));
+  `);
+  await run('startEditKnowledge({ id: 7, content: "短文", metadata: {} })');
+  results.edit_max = run("els.kbContent.maxLength");
+  run("resetKnowledgeForm()");
+  results.reset_max = run("els.kbContent.maxLength");
+
+  // 404 后保留超长草稿：上限不能被重置回 2000，新增提交按中文提示拦截
+  run(`
+    state.kbSaving = false;
+    state.kbEditingId = null;
+    els.kbContent.value = "";
+    els.kbCategory.value = "";
+    globalThis.__calls = [];
+    getJSON = (url, options) => {
+      const method = (options && options.method) || "GET";
+      __calls.push({ url: String(url), method });
+      if (String(url).endsWith("/group")) {
+        return Promise.resolve({ content: "字".repeat(3000), parts: 3 });
+      }
+      if (String(url).includes("/api/knowledge/documents/")) {
+        return Promise.reject(Object.assign(new Error("知识片段不存在"), { status: 404 }));
+      }
+      return Promise.resolve({});
+    };
+    refreshKnowledge = async () => {};
+    refreshKnowledgeDocuments = async () => {};
+    refreshKnowledgeCategories = async () => {};
+  `);
+  await run(
+    'startEditKnowledge({ id: 7, content: "", metadata: { parts: "3", group: "g1" } })'
+  );
+  results.long_edit = run(
+    "({ max: els.kbContent.maxLength, len: els.kbContent.value.length, editing: state.kbEditingId })"
+  );
+  await run("addKnowledgeDocument({ preventDefault() {} })");
+  results.after_404 = run(
+    "({ max: els.kbContent.maxLength, len: els.kbContent.value.length, editing: state.kbEditingId, toasts: __toasts.slice() })"
+  );
+  await run("addKnowledgeDocument({ preventDefault() {} })");
+  results.add_blocked = run(
+    '({ post: __calls.filter((call) => call.method === "POST").length, toasts: __toasts.slice() })'
+  );
+  return results;
+}
+
+async function scenarioImeConfirmEnter(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    globalThis.__toasts = [];
+    toast = (message) => __toasts.push(String(message));
+    globalThis.__calls = [];
+    getJSON = (url, options) => {
+      __calls.push({
+        url: String(url),
+        method: (options && options.method) || "GET",
+        body: options && options.body,
+      });
+      return Promise.resolve({});
+    };
+    refreshStatus = async () => {};
+    loadSessions = async () => true;
+    state.userId = "u1";
+    globalThis.__created = [];
+    const origCreate = document.createElement.bind(document);
+    document.createElement = (tag) => {
+      const node = origCreate(tag);
+      __created.push(node);
+      return node;
+    };
+    globalThis.__valueEl = { textContent: "", replaceWith() {}, isConnected: true };
+    globalThis.__prefRow = {
+      querySelector(selector) {
+        return selector === ".pref-value" ? __valueEl : null;
+      },
+    };
+  `);
+  run('startEditPreference(__prefRow, "hotel_brands", ["汉庭"])');
+  run('__created[__created.length - 1].value = "汉庭、如家";');
+  run(
+    '__created[__created.length - 1].dispatchEvent({ type: "keydown", key: "Enter", keyCode: 229, isComposing: false });'
+  );
+  const prefBefore = run("__calls.length");
+  run(
+    '__created[__created.length - 1].dispatchEvent({ type: "keydown", key: "Enter", keyCode: 13, isComposing: false });'
+  );
+  await tick();
+  const prefAfter = run("__calls.slice()");
+
+  run(`
+    globalThis.__titleEl = { replaceWith() {}, isConnected: true };
+    globalThis.__item = {
+      querySelector(selector) {
+        return selector === ".hi-title" ? __titleEl : null;
+      },
+      isConnected: true,
+      focus() {},
+    };
+  `);
+  run('startRenameSession(__item, { session_id: "s1", title: "旧标题" })');
+  run('__created[__created.length - 1].value = "新标题";');
+  run(
+    '__created[__created.length - 1].dispatchEvent({ type: "keydown", key: "Enter", keyCode: 229, isComposing: false });'
+  );
+  const renameBefore = run("__calls.length");
+  run(
+    '__created[__created.length - 1].dispatchEvent({ type: "keydown", key: "Enter", keyCode: 13, isComposing: false });'
+  );
+  await tick();
+  const renameAfter = run("__calls.slice()");
+  return { prefBefore, prefAfter, renameBefore, renameAfter };
+}
+
+async function scenarioHistoryActionLabels(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    state.sessionId = "s1";
+    const origCreate = document.createElement.bind(document);
+    document.createElement = (tag) => {
+      const node = origCreate(tag);
+      node.attrs = {};
+      node.setAttribute = (key, value) => { node.attrs[key] = String(value); };
+      node.removeAttribute = (key) => { delete node.attrs[key]; };
+      return node;
+    };
+    globalThis.collect = (session) => {
+      const item = renderHistoryItem(session);
+      const actions = item.children.find((child) => child.className === "hi-actions");
+      return actions.children.map((button) => ({
+        action: button.dataset.action,
+        label: button.attrs["aria-label"],
+        title: button.title,
+      }));
+    };
+  `);
+  return {
+    normal: run('collect({ session_id: "s1", title: "北京出差" })'),
+    pinned: run('collect({ session_id: "s2", title: "上海出差", pinned: true })'),
+    archived: run('collect({ session_id: "s3", title: "归档会话", archived: true })'),
+    untitled: run('collect({ session_id: "s4", title: "" })'),
+    current_aria: run(
+      '(renderHistoryItem({ session_id: "s1", title: "北京出差" }).attrs["aria-current"] || "")'
+    ),
+    other_aria: run(
+      '(renderHistoryItem({ session_id: "s9", title: "其它" }).attrs["aria-current"] || "")'
+    ),
+  };
+}
+
+async function scenarioWindowBatchFocus(source) {
+  const makeMessages = (count) => {
+    const messages = [];
+    for (let index = 0; index < count; index += 1) {
+      if (index % 2 === 0) {
+        messages.push({ role: "user", content: "问题 " + index, timestamp: "" });
+      } else {
+        messages.push({
+          role: "assistant",
+          content: "回答 " + index,
+          timestamp: "",
+          meta: { client_turn_id: "turn-" + index },
+        });
+      }
+    }
+    return messages;
+  };
+  const runCase = async (count, options) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      state.userId = "u1";
+      state.busy = false;
+      state.sessions = [];
+      state.sessionTotal = 1;
+      els.messages = {
+        children: [],
+        set innerHTML(value) { if (value === "") this.children.length = 0; },
+        get innerHTML() { return ""; },
+        get firstChild() { return this.children[0] || null; },
+        appendChild(node) { this.children.push(node); return node; },
+        insertBefore(node, ref) {
+          const index = ref ? this.children.indexOf(ref) : -1;
+          if (index >= 0) this.children.splice(index, 0, node);
+          else this.children.push(node);
+          return node;
+        },
+        querySelectorAll() { return this.children.filter((node) => node.__msg); },
+        querySelector() { return null; },
+      };
+      renderUserNode = (text) => {
+        const node = { __msg: true, role: "user", text, focusCalls: [] };
+        node.focus = (opts) => node.focusCalls.push(opts || {});
+        return node;
+      };
+      renderAssistantNode = (text) => {
+        const node = { __msg: true, role: "assistant", text, focusCalls: [] };
+        node.focus = (opts) => node.focusCalls.push(opts || {});
+        return node;
+      };
+      const originalCreate = document.createElement.bind(document);
+      document.createElement = (tag) => {
+        const node = originalCreate(tag);
+        node.remove = () => {
+          const index = els.messages.children.indexOf(node);
+          if (index >= 0) els.messages.children.splice(index, 1);
+          node.removed = true;
+        };
+        return node;
+      };
+      closeMobileSidebar = () => {};
+      loadSessions = async () => {};
+      refreshStatus = () => {};
+    `);
+    const promise = run(
+      `openSession("s1", ${JSON.stringify(options || {})})`
+    );
+    const request = await waitRequest(env);
+    request.resolve({ messages: makeMessages(count) });
+    await promise;
+    const clickButton = (className) => {
+      run(
+        `document.activeElement = els.messages.children.find((node) => node.className === "${className}");`
+      );
+      run(
+        `els.messages.children.find((node) => node.className === "${className}").click();`
+      );
+    };
+    const focusSnapshot = () =>
+      run(`(() => {
+        const nodes = els.messages.children.filter((node) => node.__msg === true);
+        const focused = nodes.filter((node) => node.focusCalls && node.focusCalls.length);
+        return {
+          focused: focused.map((node) => ({ text: node.text, calls: node.focusCalls })),
+          buttons: els.messages.children.filter((node) => node.className === "earlier-more").length,
+        };
+      })()`);
+    clickButton("earlier-more");
+    const afterFirst = focusSnapshot();
+    let afterSecond = null;
+    if (run('els.messages.children.some((node) => node.className === "earlier-more")')) {
+      run("document.activeElement = null;");
+      clickButton("earlier-more");
+      afterSecond = focusSnapshot();
+    }
+    return { afterFirst, afterSecond };
+  };
+  return {
+    earlier: await runCase(400, {}),
+    earlierTwo: await runCase(600, {}),
+  };
+}
+
+async function scenarioWindowBatchFocusLater(source) {
+  // 「显示更新消息」末批后按钮移除：焦点进入新批次第一个节点
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  const count = 600;
+  const messages = [];
+  for (let index = 0; index < count; index += 1) {
+    if (index % 2 === 0) {
+      messages.push({ role: "user", content: "问题 " + index, timestamp: "" });
+    } else {
+      messages.push({
+        role: "assistant",
+        content: "回答 " + index,
+        timestamp: "",
+        meta: { client_turn_id: "turn-" + index },
+      });
+    }
+  }
+  run(`
+    state.userId = "u1";
+    state.busy = false;
+    state.sessions = [];
+    state.sessionTotal = 1;
+    els.messages = {
+      children: [],
+      set innerHTML(value) { if (value === "") this.children.length = 0; },
+      get innerHTML() { return ""; },
+      get firstChild() { return this.children[0] || null; },
+      appendChild(node) { this.children.push(node); return node; },
+      insertBefore(node, ref) {
+        const index = ref ? this.children.indexOf(ref) : -1;
+        if (index >= 0) this.children.splice(index, 0, node);
+        else this.children.push(node);
+        return node;
+      },
+      querySelectorAll() { return this.children.filter((node) => node.__msg); },
+      querySelector() { return null; },
+    };
+    renderUserNode = (text) => {
+      const node = { __msg: true, role: "user", text, focusCalls: [] };
+      node.focus = (opts) => node.focusCalls.push(opts || {});
+      return node;
+    };
+    renderAssistantNode = (text) => {
+      const node = { __msg: true, role: "assistant", text, focusCalls: [] };
+      node.focus = (opts) => node.focusCalls.push(opts || {});
+      return node;
+    };
+    const originalCreate = document.createElement.bind(document);
+    document.createElement = (tag) => {
+      const node = originalCreate(tag);
+      node.remove = () => {
+        const index = els.messages.children.indexOf(node);
+        if (index >= 0) els.messages.children.splice(index, 1);
+        node.removed = true;
+      };
+      return node;
+    };
+    closeMobileSidebar = () => {};
+    loadSessions = async () => {};
+    refreshStatus = () => {};
+  `);
+  const promise = run('openSession("s1", { matchIndex: 10 })');
+  const request = await waitRequest(env);
+  request.resolve({ messages });
+  await promise;
+  const clickAndSnapshot = () => {
+    run(
+      'document.activeElement = els.messages.children.find((node) => node.className === "earlier-more");'
+    );
+    run(
+      'els.messages.children.find((node) => node.className === "earlier-more").click();'
+    );
+    return run(`(() => {
+      const nodes = els.messages.children.filter((node) => node.__msg === true);
+      return {
+        focused: nodes
+          .filter((node) => node.focusCalls && node.focusCalls.length)
+          .map((node) => ({ text: node.text, calls: node.focusCalls })),
+        buttons: els.messages.children.filter((node) => node.className === "earlier-more").length,
+      };
+    })()`);
+  };
+  const first = clickAndSnapshot();
+  const second = clickAndSnapshot();
+  return { first, second };
+}
+
+async function scenarioDeleteRowFocusFallback(source) {
+  const runCase = async (rowCount, fail) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(
+      `
+      globalThis.__focus = [];
+      globalThis.__mkRow = (name) => {
+        const row = {
+          isConnected: true,
+          removed: false,
+          remove() {
+            row.removed = true;
+            const index = __rows.indexOf(row);
+            if (index >= 0) __rows.splice(index, 1);
+            // 浏览器移除聚焦元素后 activeElement 回到 body：桩环境手动模拟
+            document.activeElement = document.body;
+          },
+          contains(node) { return node === row.deleteBtn; },
+          querySelector(selector) {
+            return selector === 'button[title="删除偏好"]' ? row.deleteBtn : null;
+          },
+          deleteBtn: null,
+        };
+        row.deleteBtn = { title: "删除偏好", focus() { __focus.push(name); } };
+        return row;
+      };
+      globalThis.__rows = Array.from({ length: ${rowCount} }, (_, index) => __mkRow("row" + index));
+      els.overview = {
+        querySelectorAll(selector) {
+          return selector === ".pref-row" ? __rows.slice() : [];
+        },
+      };
+      els.addPrefBtn = { focus() { __focus.push("addPref"); } };
+      globalThis.__target = __rows[0];
+      document.activeElement = __target.deleteBtn;
+      confirm = () => true;
+      getJSON = async () => {
+        ${fail ? 'throw Object.assign(new Error("boom"), { status: 500 });' : "return {};"}
+      };
+      refreshStatus = async () => {};
+      state.userId = "u1";
+      `
+    );
+    await run('deletePreference("hotel_brands", "酒店", __target)');
+    return run("({ focus: __focus.slice(), removed: __target.removed })");
+  };
+  const tripHelper = (() => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    return run(`
+      globalThis.__tripFocus = [];
+      globalThis.__tripRows = [{
+        querySelector(selector) {
+          return selector === 'button[title="删除行程"]'
+            ? { focus() { __tripFocus.push("next"); } }
+            : null;
+        },
+      }];
+      document.activeElement = document.body;
+      focusAfterRowDelete(
+        { querySelectorAll(selector) { return selector === ".trip" ? __tripRows : []; } },
+        ".trip",
+        'button[title="删除行程"]',
+        0,
+        { focus() { __tripFocus.push("addTrip"); } },
+      );
+      __tripFocus.slice()
+    `);
+  })();
+  return {
+    middle: await runCase(2, false),
+    last: await runCase(1, false),
+    failed: await runCase(2, true),
+    tripHelper,
+  };
+}
+
+async function scenarioPreferenceEditThenDelete(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    globalThis.__toasts = [];
+    toast = (message) => __toasts.push(String(message));
+    globalThis.__calls = [];
+    globalThis.__resolvePut = null;
+    getJSON = (url, options) => {
+      const method = (options && options.method) || "GET";
+      __calls.push({ method, url: String(url) });
+      if (method === "PUT") {
+        return new Promise((resolve) => { __resolvePut = resolve; });
+      }
+      return Promise.resolve({});
+    };
+    refreshStatus = async () => {};
+    state.userId = "u1";
+    state.status = { preferences: { home_location: "上海" } };
+    globalThis.__created = [];
+    const origCreate = document.createElement.bind(document);
+    document.createElement = (tag) => {
+      const node = origCreate(tag);
+      __created.push(node);
+      return node;
+    };
+    globalThis.__valueEl = { textContent: "", replaceWith() {}, isConnected: true };
+    globalThis.__activeInput = null;
+    globalThis.__row = {
+      isConnected: true,
+      removed: false,
+      remove() { __row.removed = true; },
+      contains(node) { return node === __activeInput; },
+      querySelector(selector) {
+        if (selector === ".pref-value") return __valueEl;
+        if (selector === ".pref-input") return __activeInput;
+        return null;
+      },
+    };
+    els.overview = { querySelectorAll() { return []; } };
+    els.addPrefBtn = { focus() {} };
+    confirm = () => true;
+  `);
+  run('startEditPreference(__row, "home_location", "上海")');
+  run(
+    '__activeInput = __created[__created.length - 1]; __activeInput.value = "北京"; document.activeElement = __activeInput;'
+  );
+  run('__activeInput.dispatchEvent({ type: "blur" });');
+  await tick();
+  await run('deletePreference("home_location", "常住地", __row)');
+  const blocked = run(
+    "({ deletes: __calls.filter((call) => call.method === 'DELETE').length, toasts: __toasts.slice(), removed: __row.removed })"
+  );
+  run("__resolvePut({})");
+  await tick();
+  await tick();
+  run("__activeInput = null;");
+  await run('deletePreference("home_location", "常住地", __row)');
+  const after = run(
+    "({ deletes: __calls.filter((call) => call.method === 'DELETE').length, removed: __row.removed })"
+  );
+  return { blocked, after };
+}
+
+async function scenarioNetworkErrorText(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    getJSON = __origGetJSON;
+    fetch = async () => { throw new TypeError("Failed to fetch"); };
+  `);
+  await run("loadSessions()");
+  const loadToasts = run("__toasts.slice()");
+  const direct = await run(
+    'getJSON("/api/x").then(() => null, (error) => ({ name: error.name, message: error.message, status: error.status }))'
+  );
+  run(
+    'fetch = async () => ({ ok: false, status: 500, json: async () => ({ detail: "Failed to fetch upstream" }) });'
+  );
+  const http = await run(
+    'getJSON("/api/y").then(() => null, (error) => ({ name: error.name, message: error.message, status: error.status }))'
+  );
+  run(
+    'fetch = async () => { const error = new Error("aborted"); error.name = "AbortError"; throw error; };'
+  );
+  const aborted = await run(
+    'getJSON("/api/z").then(() => null, (error) => ({ name: error.name, message: error.message }))'
+  );
+  run('fetch = async () => { throw new Error("响应不是 JSON（测试）"); };');
+  const business = await run(
+    'getJSON("/api/w").then(() => null, (error) => ({ message: error.message }))'
+  );
+  run('fetch = async () => { throw new TypeError("Load failed"); };');
+  const downloaded = await run('downloadFromApi("/api/d", "x.json")');
+  const downloadToast = run("__toasts.slice(-1)[0]");
+  return { loadToasts, direct, http, aborted, business, downloaded, downloadToast };
+}
+
+async function scenarioSessionToggleUnknown(source) {
+  const runCase = async (action, status, applied) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    const listAfter = applied
+      ? action === "pin"
+        ? '[{ session_id: "A", pinned: true }, { session_id: "B" }]'
+        : '[{ session_id: "B" }]'
+      : '[{ session_id: "A", pinned: false, archived: false }, { session_id: "B" }]';
+    run(`
+      document.querySelector = () => null;
+      globalThis.__loads = 0;
+      globalThis.__refreshes = 0;
+      state.userId = "u1";
+      state.searchQuery = "";
+      state.sessions = [{ session_id: "A", pinned: false, archived: false }, { session_id: "B" }];
+      state.sessionTotal = 2;
+      loadSessions = async () => { __loads += 1; state.sessions = ${listAfter}; return true; };
+      refreshStatus = async () => { __refreshes += 1; };
+    `);
+    const promise = run(
+      action === "pin" ? "togglePin(state.sessions[0])" : "toggleArchive(state.sessions[0])"
+    );
+    const request = await waitRequest(env);
+    request.reject(
+      status
+        ? Object.assign(new Error("请求失败（HTTP " + status + "）"), { status })
+        : new Error("请求超时，请稍后重试")
+    );
+    await promise;
+    return run(
+      "({ loads: __loads, refreshes: __refreshes, toasts: __toasts.slice() })"
+    );
+  };
+  return {
+    pinApplied: await runCase("pin", 0, true),
+    pinFailed: await runCase("pin", 502, false),
+    pinRejected: await runCase("pin", 429, false),
+    archiveApplied: await runCase("archive", 0, true),
+  };
+}
+
+async function scenarioKbSaveRestoresLockedRowButtons(source) {
+  const env = buildEnv(source);
+  const run = (code) => runIn(env, code);
+  run(`
+    state.kbSaving = false;
+    state.kbEditingId = null;
+    els.kbContent.value = "新内容";
+    els.kbCategory.value = "";
+    globalThis.__legacy = { disabled: true };
+    globalThis.__normal = { disabled: false };
+    globalThis.__freshLegacy = { disabled: true };
+    globalThis.__listButtons = [__legacy, __normal];
+    els.kbList = {
+      querySelectorAll() { return __listButtons; },
+    };
+    getJSON = async () => ({ id: 21, parts: 1 });
+    refreshKnowledge = async () => {};
+    refreshKnowledgeDocuments = async () => { __listButtons = [__freshLegacy]; };
+    refreshKnowledgeCategories = async () => {};
+  `);
+  await run("addKnowledgeDocument({ preventDefault() {} })");
+  return run(
+    "({ legacy: __legacy.disabled, normal: __normal.disabled, fresh: __freshLegacy.disabled, saving: state.kbSaving })"
+  );
+}
+
+async function scenarioArchivedLeaveOnFirstSend(source) {
+  const runCase = async (archived, query) => {
+    const env = buildEnv(source);
+    const run = (code) => runIn(env, code);
+    run(`
+      globalThis.__listCalls = [];
+      state.ready = true;
+      state.userId = "u1";
+      state.sessionId = null;
+      state.showArchived = ${archived};
+      state.searchQuery = ${JSON.stringify(query)};
+      state.busy = false;
+      state.sessions = [{ session_id: "arch-1", archived: true, title: "归档会话" }];
+      els.historySearch.value = ${JSON.stringify(query)};
+      document.querySelector = () => null;
+      document.querySelectorAll = () => [];
+      loadSessions = async (value, options) => {
+        __listCalls.push({ query: value, options: options || {} });
+        return true;
+      };
+      refreshStatus = async () => {};
+      closeMobileSidebar = () => {};
+      fetch = async (url) => {
+        if (String(url).includes("/api/chat/stream")) {
+          const line = "data: " + JSON.stringify({
+            type: "done",
+            session_id: "s-new",
+            reply: "好",
+            elapsed: 0.1,
+            persisted: true,
+          }) + String.fromCharCode(10) + String.fromCharCode(10);
+          const bytes = new TextEncoder().encode(line);
+          let sent = false;
+          return {
+            ok: true,
+            status: 200,
+            body: {
+              getReader: () => ({
+                read: async () => {
+                  if (sent) return { done: true, value: undefined };
+                  sent = true;
+                  return { done: false, value: bytes };
+                },
+              }),
+            },
+            json: async () => ({}),
+          };
+        }
+        return { ok: true, status: 200, json: async () => ({ messages: [] }) };
+      };
+    `);
+    const promise = run('sendMessage("你好")');
+    await tick();
+    const during = run(
+      "({ calls: __listCalls.map((call) => ({ query: call.query, reset: call.options.reset, silentFailure: call.options.silentFailure })), showArchived: state.showArchived, searchValue: els.historySearch.value, searchQuery: state.searchQuery })"
+    );
+    await promise;
+    return during;
+  };
+  return {
+    archived: await runCase(true, ""),
+    search: await runCase(false, "foo"),
+  };
+}
+
 async function main() {
   let source = fs.readFileSync(appPath, "utf8");
   const stripped = source.replace(/\ninit\(\);\s*$/, "\n// init() disabled by harness\n");
@@ -6206,6 +7111,34 @@ async function main() {
     payload = await scenarioPanelRound(source);
   } else if (scenario === "theme") {
     payload = await scenarioTheme(source);
+  } else if (scenario === "kbSearchCloseCancel") {
+    payload = await scenarioKbSearchCloseCancel(source);
+  } else if (scenario === "loadMoreDoubleClick") {
+    payload = await scenarioLoadMoreDoubleClick(source);
+  } else if (scenario === "memorySheetBackdrop") {
+    payload = await scenarioMemorySheetBackdrop(source);
+  } else if (scenario === "kbContentLimits") {
+    payload = await scenarioKbContentLimits(source);
+  } else if (scenario === "imeConfirmEnter") {
+    payload = await scenarioImeConfirmEnter(source);
+  } else if (scenario === "historyActionLabels") {
+    payload = await scenarioHistoryActionLabels(source);
+  } else if (scenario === "windowBatchFocus") {
+    payload = await scenarioWindowBatchFocus(source);
+  } else if (scenario === "windowBatchFocusLater") {
+    payload = await scenarioWindowBatchFocusLater(source);
+  } else if (scenario === "deleteRowFocusFallback") {
+    payload = await scenarioDeleteRowFocusFallback(source);
+  } else if (scenario === "preferenceEditThenDelete") {
+    payload = await scenarioPreferenceEditThenDelete(source);
+  } else if (scenario === "networkErrorText") {
+    payload = await scenarioNetworkErrorText(source);
+  } else if (scenario === "sessionToggleUnknown") {
+    payload = await scenarioSessionToggleUnknown(source);
+  } else if (scenario === "kbSaveRestoresLockedRowButtons") {
+    payload = await scenarioKbSaveRestoresLockedRowButtons(source);
+  } else if (scenario === "archivedLeaveOnFirstSend") {
+    payload = await scenarioArchivedLeaveOnFirstSend(source);
   } else {
     throw new Error(`unknown scenario: ${scenario}`);
   }
