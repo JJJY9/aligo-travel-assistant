@@ -929,6 +929,40 @@ class PostgresLongTermMemory:
             self._bump_shared_preference_version()
         return bool(removed)
 
+    def delete_preferences(self, pref_types: set[str] | list[str]) -> set[str]:
+        """批量删除偏好类型（单条 DELETE），返回实际删除的键集合。
+
+        只取用户级偏好写锁（``_preference_cap_lock``），不逐类型加锁：
+        逐键 advisory lock 本身就要 4 次以上往返，批量语义下得不偿失。
+        删除对象是隐形 / 影子键——并发 append 若恰好复活其中一条，它在
+        下一次面板写入时仍会被当作隐形键清掉，不改变可见偏好口径。
+        """
+        keys = sorted({str(pref_type) for pref_type in pref_types})
+        if not keys:
+            return set()
+
+        def run() -> list[str]:
+            with self._conn.cursor() as cursor:
+                cursor.execute(
+                    "DELETE FROM aligo_preferences"
+                    " WHERE user_id = %s AND pref_type = ANY(%s)"
+                    " RETURNING pref_type",
+                    (self.user_id, keys),
+                )
+                return [str(row[0]) for row in cursor.fetchall()]
+
+        with self._preference_cap_lock():
+            # 与 delete_preference 同口径：提交后的断连不能重放成
+            # 「0 行删除 → 偏好仍存在」的假象
+            removed = self._run_with_retry(run, replay_safe=False)
+        removed_set = set(removed)
+        if removed_set:
+            logger.info(
+                "Deleted preferences from PostgreSQL: %s", sorted(removed_set)
+            )
+            self._bump_shared_preference_version()
+        return removed_set
+
     def append_preference(self, pref_type: str, value: Any) -> Any:
         """原子地追加一个偏好值（列表语义），返回合并后的值。
 

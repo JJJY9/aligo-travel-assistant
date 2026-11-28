@@ -8368,3 +8368,72 @@ def test_json_preference_enumeration_sorted_like_pg():
         "seat",
     ]
     print("✓ JSON 偏好枚举按类型升序（与 PG 同口径）")
+
+
+def test_json_delete_preferences_single_persist():
+    """批量删除偏好只重载 + 落盘一次（逐键删除会 N 次整份重写记忆文件）。"""
+    memory = LongTermMemory("u-pref-batch", tempfile.mkdtemp())
+    for key in ("a", "b", "c"):
+        memory.save_preference(key, "v")
+    persist_calls: list[int] = []
+    real_persist = memory._persist
+
+    def counting_persist():
+        persist_calls.append(1)
+        return real_persist()
+
+    memory._persist = counting_persist
+    removed = memory.delete_preferences({"a", "c", "missing"})
+    assert removed == {"a", "c"}
+    assert set(memory.get_preference()) == {"b"}
+    assert len(persist_calls) == 1, persist_calls
+    # 空集合 / 全不存在都不触发落盘
+    assert memory.delete_preferences(set()) == set()
+    assert memory.delete_preferences({"zzz"}) == set()
+    assert len(persist_calls) == 1, persist_calls
+    print("✓ JSON 批量删除偏好只落盘一次")
+
+
+def test_pg_delete_preferences_batches_delete():
+    """PG 批量删除偏好：单条 DELETE ... ANY(...) RETURNING，删除后推进版本。"""
+    import contextlib as _contextlib
+    import types as _types
+
+    from context.postgres_long_term_memory import PostgresLongTermMemory
+
+    memory = object.__new__(PostgresLongTermMemory)
+    memory.user_id = "u-pg-pref-batch"
+    executed: list[tuple[str, object]] = []
+
+    class _Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, sql, params=None):
+            executed.append((" ".join(str(sql).split()), params))
+
+        def fetchall(self):
+            return [("a",), ("c",)]
+
+    memory._conn = _types.SimpleNamespace(cursor=lambda: _Cursor())
+    bumps: list[int] = []
+    memory._run_with_retry = lambda run, replay_safe=True: run()
+    memory._preference_cap_lock = _contextlib.nullcontext
+    memory._bump_shared_preference_version = lambda: bumps.append(1)
+
+    removed = memory.delete_preferences(["c", "a", "a"])
+    assert removed == {"a", "c"}
+    assert bumps == [1]
+    assert len(executed) == 1, executed
+    sql, params = executed[0]
+    assert sql.startswith("DELETE FROM aligo_preferences")
+    assert "ANY(%s)" in sql and "RETURNING pref_type" in sql, sql
+    assert params == ("u-pg-pref-batch", ["a", "c"]), params
+    # 空输入早退：不发语句、不推进版本
+    assert memory.delete_preferences([]) == set()
+    assert len(executed) == 1, executed
+    assert bumps == [1]
+    print("✓ PG 批量删除偏好单条 DELETE 并推进版本")

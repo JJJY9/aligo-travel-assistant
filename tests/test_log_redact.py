@@ -284,6 +284,14 @@ def test_redact_secret_url_scheme_is_bounded_for_linear_time():
     redact_secret("a" * 200_000)
     assert time.perf_counter() - started < 5.0
 
+    # 完全没有 "://" 的大文本（网关 MB 级错误体 / base64）：三条 scheme
+    # 规则被 "://" 子串守卫整体跳过。无守卫时每个起始位置都要尝试 63 个
+    # 单词字符才失配，1MB 约 1.4s；有守卫后约 0.1s
+    started = time.perf_counter()
+    redact_secret("a" * 1_000_000)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0, elapsed
+
     # 前缀密集输入（重复 scheme / 重复 name:）：尾部分支带终止条件时每个
     # 起点都会回扫到串尾，O(n²) 会在这里暴露
     for payload in ("https://" * 2000, "ab:" * 4000):

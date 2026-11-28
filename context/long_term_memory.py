@@ -1931,6 +1931,33 @@ class LongTermMemory:
         return True
 
     @_locked_mutation
+    def delete_preferences(self, pref_types: set[str] | list[str]) -> set[str]:
+        """批量删除偏好类型，返回实际删除的键集合。
+
+        一次重载 + 一次原子写回：面板写入前清理隐形 / 影子键时逐键调用
+        ``delete_preference`` 会让每个键整份重写记忆文件（上限 200 个键
+        即 200 次全量落盘）。
+        """
+        keys = set(pref_types)
+        if not keys:
+            return set()
+        preferences = self.data["preferences"]
+        remaining = []
+        removed: set[str] = set()
+        for pref in preferences:
+            pref_type = pref.get("type")
+            if pref_type in keys:
+                removed.add(pref_type)
+            else:
+                remaining.append(pref)
+        if not removed:
+            return set()
+        self.data["preferences"] = remaining
+        self._persist()
+        logger.info("Deleted preferences: %s", sorted(str(key) for key in removed))
+        return removed
+
+    @_locked_mutation
     def add_hotel_brand(self, brand: str):
         """添加酒店品牌偏好（追加到列表）"""
         # 查找 hotel_brands 偏好

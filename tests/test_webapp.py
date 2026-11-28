@@ -20127,3 +20127,139 @@ def test_sessions_base_cache_invalidated_after_import():
     finally:
         server_module._SESSIONS_BASE_CACHE.clear()
     print("✓ /api/sessions 聚合缓存在导入后失效")
+
+
+def _sessions_cache_test_data(session_id: str = "s1", archived: bool = True):
+    """会话聚合缓存测试的最小数据结构。"""
+    return {
+        "chat_history": [
+            {
+                "role": "user",
+                "content": "甲",
+                "timestamp": "2026-01-01T00:00:00",
+                "session_id": session_id,
+            },
+            {
+                "role": "assistant",
+                "content": "乙",
+                "timestamp": "2026-01-01T00:00:01",
+                "session_id": session_id,
+            },
+        ],
+        "session_titles": {},
+        "pinned_sessions": [],
+        "archived_sessions": [session_id] if archived else [],
+    }
+
+
+def test_cached_archived_count_reuses_sessions_cache(monkeypatch):
+    """/api/status 的归档计数命中会话聚合缓存时不再全量扫描历史。"""
+    from webapp import server as server_module
+
+    user_id = "u-archived-count-cache"
+    data = _sessions_cache_test_data()
+    server_module._SESSIONS_BASE_CACHE.clear()
+    real = server_module._archived_count
+    calls: list[int] = []
+
+    def counting(d, live=None):
+        calls.append(1)
+        return real(d, live)
+
+    monkeypatch.setattr(server_module, "_archived_count", counting)
+    try:
+        _, count = server_module._sessions_base_for_user(user_id, data, "exclude")
+        assert count == 1
+        calls.clear()
+        assert server_module._cached_archived_count(user_id, data) == 1
+        assert calls == [], "命中缓存时不应重新扫描历史"
+        changed = dict(data)
+        changed["chat_history"] = data["chat_history"] + [
+            {
+                "role": "user",
+                "content": "丙",
+                "timestamp": "2026-01-01T00:00:02",
+                "session_id": "s2",
+            }
+        ]
+        assert server_module._cached_archived_count(user_id, changed) == 1
+        assert calls == [1], "指纹不符时回退全量扫描"
+    finally:
+        server_module._SESSIONS_BASE_CACHE.clear()
+    print("✓ status 归档计数复用会话聚合缓存（未命中回退扫描）")
+
+
+def test_sessions_base_cache_ttl_and_budget_eviction(monkeypatch):
+    """会话聚合缓存按空闲 TTL 失效、按总字节预算逐出 LRU 头。"""
+    from webapp import server as server_module
+
+    data_a = _sessions_cache_test_data("s-a", archived=False)
+    data_b = _sessions_cache_test_data("s-b", archived=False)
+    server_module._SESSIONS_BASE_CACHE.clear()
+    try:
+        first, _ = server_module._sessions_base_for_user("u-a", data_a, "exclude")
+        monkeypatch.setattr(server_module, "_SESSIONS_BASE_CACHE_TTL_SEC", -1.0)
+        fresh, _ = server_module._sessions_base_for_user("u-a", data_a, "exclude")
+        assert fresh is not first, "空闲 TTL 过期后必须重新聚合"
+        monkeypatch.setattr(server_module, "_SESSIONS_BASE_CACHE_TTL_SEC", 1800.0)
+        monkeypatch.setattr(server_module, "_SESSIONS_BASE_CACHE_BUDGET_BYTES", 1)
+        server_module._sessions_base_for_user("u-b", data_b, "exclude")
+        assert "u-b" in server_module._SESSIONS_BASE_CACHE
+        assert "u-a" not in server_module._SESSIONS_BASE_CACHE, (
+            "超总预算时应逐出 LRU 头"
+        )
+    finally:
+        server_module._SESSIONS_BASE_CACHE.clear()
+    print("✓ 会话聚合缓存有 TTL 与总字节预算")
+
+
+def test_delete_session_opens_store_once(monkeypatch):
+    """存在性检查与删除复用同一 store：JSON 后端每次打开都整份解析记忆文件。"""
+    from context.storage import create_long_term_memory
+    from webapp import server as server_module
+
+    client = _client()
+    user_id = _unique_user("web_test_del_once")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        store.add_chat_turn("你好", "在", "s-once")
+        real_open = server_module._open_long_term
+        opened: list[str] = []
+
+        def counting_open(uid, *args, **kwargs):
+            opened.append(uid)
+            return real_open(uid, *args, **kwargs)
+
+        monkeypatch.setattr(server_module, "_open_long_term", counting_open)
+        response = client.delete(
+            "/api/sessions/s-once", params={"user_id": user_id}
+        )
+        assert response.status_code == 200, response.text
+        assert opened == [user_id], opened
+    finally:
+        _cleanup(user_id)
+    print("✓ 删除会话只打开一次 store")
+
+
+def test_import_epochs_bounded_and_monotonic(monkeypatch):
+    """恢复纪元映射有界（LRU），纪元由全局计数器分配，淘汰重建不撞旧值。"""
+    import threading as _threading
+
+    from webapp import server as server_module
+
+    state = object.__new__(server_module.AligoWebApp)
+    state._importing_users = set()
+    state._import_seq = 0
+    state._import_epochs = server_module.OrderedDict()
+    state._importing_users_lock = _threading.Lock()
+    monkeypatch.setattr(server_module, "_IMPORT_EPOCH_MAX", 2)
+    for uid in ("u1", "u2", "u3"):
+        state.begin_user_import(uid)
+        state.end_user_import(uid)
+    assert list(state._import_epochs) == ["u2", "u3"]
+    old_epoch = state.export_start_epoch("u2")
+    state.begin_user_import("u2")
+    state.end_user_import("u2")
+    assert state.export_start_epoch("u2") != old_epoch, "重建纪元不得与旧值相同"
+    assert state.export_start_epoch("u-evicted") == 0
+    print("✓ 恢复纪元映射有界且全局单调")

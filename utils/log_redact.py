@@ -175,11 +175,19 @@ def redact_secret(text: object) -> str:
     psycopg 的报错会把整条连接串拼进异常文本：URI 形态、缺 scheme 的
     ``user:pass@host`` 粘贴、``password=`` 关键字形态都要遮蔽。
     """
-    cleaned = _URL_USERINFO.sub(_mask_url_userinfo, str(text))
-    cleaned = _URL_MALFORMED_USERINFO.sub(r"\g<scheme>***@", cleaned)
-    cleaned = _URL_QUERY.sub(_strip_url_query, cleaned)
+    cleaned = str(text)
+    # 三条 scheme 规则的匹配体都必含 "://"：文本里完全没有该子串时（网关
+    # 数百 KB~MB 级的错误体 / base64）跳过，省掉逐位置最多 63 字符的失配
+    # 扫描（1MB 无 URL 文本 1.4s -> 0.13s），输出逐字节不变
+    if "://" in cleaned:
+        cleaned = _URL_USERINFO.sub(_mask_url_userinfo, cleaned)
+        cleaned = _URL_MALFORMED_USERINFO.sub(r"\g<scheme>***@", cleaned)
+        cleaned = _URL_QUERY.sub(_strip_url_query, cleaned)
     cleaned = _LIBPQ_QUOTED_TOKEN.sub(r'\1"***"', cleaned)
-    cleaned = _BARE_USERINFO.sub(_mask_bare_userinfo, cleaned)
+    # _BARE_USERINFO 的回调只在匹配片段含 "@" 时改动输出：整段文本没有
+    # "@" 时全部匹配都是原样返回，直接跳过不改变结果
+    if "@" in cleaned:
+        cleaned = _BARE_USERINFO.sub(_mask_bare_userinfo, cleaned)
     cleaned = _AUTH_HEADER.sub(r"\1***", cleaned)
     cleaned = _ILLEGAL_HEADER_VALUE.sub(r"\1***\3", cleaned)
     cleaned = _KEY_VALUE_QUOTED.sub(r"\1\2***\2", cleaned)
