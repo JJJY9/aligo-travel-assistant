@@ -169,7 +169,9 @@ def preference_value_problem(value: Any) -> str | None:
     面板 / CLI 永远无法编辑的「僵尸值」，还会持续撑大每轮意图 prompt。
     """
     try:
-        serialized = json.dumps(value, ensure_ascii=False)
+        # 与前端 JSON.stringify 同一紧凑分隔符口径：默认的 ", " / ": "
+        # 会让前端按 10000 放行的边界值在服务端被多算空格而 422
+        serialized = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
         return "偏好值不是可序列化的 JSON"
     if len(serialized) > PREFERENCE_VALUE_MAX_CHARS:

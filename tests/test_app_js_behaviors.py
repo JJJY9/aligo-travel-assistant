@@ -151,6 +151,12 @@ def test_frontend_render_helpers():
     assert results["session_device_name"] is True
     assert results["session_export_reserved"] is False
     assert results["session_bad_chars"] is False
+    # 会话 ID 不拼文件名，服务端没有 210 字节上限：53 / 64 个增补平面字母
+    # （212 / 256 字节）都必须与 is_valid_web_session_id 一致可路由
+    assert results["session_astral_53"] is True, (
+        "会话 ID 不应套用用户 ID 的 210 字节文件名预算"
+    )
+    assert results["session_astral_64"] is True, "64 码点会话 ID 服务端合法"
     sentinel = results["sentinel_injection"]
     assert "" not in sentinel and "" not in sentinel, (
         "输入里的私用区占位符必须被剥离"

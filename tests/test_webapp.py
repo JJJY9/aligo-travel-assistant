@@ -19334,6 +19334,270 @@ def test_pending_tombstone_replay_is_single_flight(monkeypatch):
     print("✓ 墓碑补写单飞（并发触发不重复执行）")
 
 
+def test_knowledge_doc_id_rejects_lax_integer_forms(monkeypatch):
+    """知识片段路由的 doc_id 只接受规范十进制，宽松写法不能命中别的记录。"""
+    from webapp import server as server_module
+
+    calls = []
+
+    def fake_delete(doc_id, whole_group=False):
+        calls.append((doc_id, whole_group))
+        return 1
+
+    monkeypatch.setattr(server_module, "delete_document", fake_delete)
+    client = _client()
+    for raw in ("1_0", "1.0", "+1", "%201"):
+        response = client.delete(f"/api/knowledge/documents/{raw}?group=1")
+        assert response.status_code == 422, (raw, response.text[:200])
+    assert not calls, "非法写法不能落到 delete_document（1_0 曾被读成 10）"
+    ok = client.delete("/api/knowledge/documents/10?group=1")
+    assert ok.status_code == 200, ok.text[:200]
+    assert calls == [(10, True)]
+    group = client.get("/api/knowledge/documents/1.0/group")
+    assert group.status_code == 422, group.text[:200]
+    update = client.put(
+        "/api/knowledge/documents/+1", json={"content": "新内容"}
+    )
+    assert update.status_code == 422, update.text[:200]
+    print("✓ 知识片段 doc_id 拒绝 1_0 / 1.0 / +1 等宽松整数")
+
+
+def test_query_int_params_reject_lax_integer_forms():
+    """分页 / top_k 查询参数同样拒绝 1_0、5.00、+2 等非规范写法。"""
+    client = _client()
+    user_id = _unique_user("strict_query_int")
+    for params in ({"limit": "1_0"}, {"offset": "5.00"}, {"limit": "+2"}):
+        response = client.get(
+            "/api/sessions", params={"user_id": user_id, **params}
+        )
+        assert response.status_code == 422, (params, response.text[:200])
+    trips = client.get(
+        "/api/trips", params={"user_id": user_id, "limit": "1_0"}
+    )
+    assert trips.status_code == 422, trips.text[:200]
+    top_k = client.get(
+        "/api/knowledge/search", params={"q": "住宿", "top_k": "1_0"}
+    )
+    assert top_k.status_code == 422, top_k.text[:200]
+    print("✓ limit / offset / top_k 拒绝宽松整数写法")
+
+
+def test_today_query_rejects_epoch_shorthand():
+    """today=0 不能被 pydantic 读成 1970-01-01：三个端点统一 422。"""
+    client = _client()
+    user_id = _unique_user("strict_today")
+    for value in ("0", "0.0", "86400"):
+        for path in ("/api/status", "/api/trips"):
+            response = client.get(
+                path, params={"user_id": user_id, "today": value}
+            )
+            assert response.status_code == 422, (path, value, response.text[:200])
+    export = client.get(
+        "/api/trips/export",
+        params={"user_id": user_id, "today": "0"},
+        headers={"X-Aligo-Client": "web"},
+    )
+    assert export.status_code == 422, export.text[:200]
+    ok = client.get(
+        "/api/status", params={"user_id": user_id, "today": "2026-11-28"}
+    )
+    assert ok.status_code == 200, ok.text[:200]
+    print("✓ today 只接受 YYYY-MM-DD（epoch 简写 422）")
+
+
+def test_import_dry_run_count_limit_returns_409_like_real_run(monkeypatch):
+    """预览与真实执行的条数轴超限同一结论：容量上限统一 409（不是 413）。"""
+    from context.storage import create_long_term_memory
+    from utils import user_import as user_import_module
+
+    monkeypatch.setattr(user_import_module, "_MAX_MESSAGES", 2)
+    user_id = _unique_user("web_test_import_dry_cap")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        store.add_chat_turn("旧问", "旧答", "s1")
+        backup = {
+            "backup": {
+                "chat_history": [
+                    {
+                        "role": "user",
+                        "content": "新问",
+                        "session_id": "s2",
+                        "timestamp": "2026-01-02T00:00:00",
+                    }
+                ]
+            }
+        }
+        client = _client()
+        preview = client.post(
+            "/api/import",
+            params={"user_id": user_id, "dry_run": 1},
+            json=backup,
+        )
+        assert preview.status_code == 409, preview.text[:300]
+        assert "上限" in preview.json()["detail"]
+        real = client.post(
+            "/api/import", params={"user_id": user_id}, json=backup
+        )
+        assert real.status_code == 409, real.text[:300]
+        assert "上限" in real.json()["detail"]
+    finally:
+        _cleanup(user_id)
+    print("✓ 备份导入预览与真实执行对条数超限均返回 409")
+
+
+def test_trip_create_empty_purpose_uses_default_and_preserves_existing():
+    """显式空串 purpose 与省略同义：新行程落「出差」，已存在行程保留原目的。"""
+    client = _client()
+    user_id = _unique_user("web_trip_purpose_empty")
+    try:
+        created = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "上海",
+                "start_date": "2026-12-01",
+                "purpose": "",
+            },
+        )
+        assert created.status_code == 201, created.text[:200]
+        trips = client.get("/api/trips", params={"user_id": user_id}).json()[
+            "trips"
+        ]
+        assert trips[0]["purpose"] == "出差", trips
+        meeting = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": "2026-12-02",
+                "purpose": "会议",
+            },
+        )
+        assert meeting.status_code == 201, meeting.text[:200]
+        again = client.post(
+            "/api/trips",
+            json={
+                "user_id": user_id,
+                "origin": "北京",
+                "destination": "杭州",
+                "start_date": "2026-12-02",
+                "purpose": "   ",
+            },
+        )
+        assert again.status_code == 201, again.text[:200]
+        assert again.json()["created"] is False
+        hangzhou = client.get(
+            "/api/trips", params={"user_id": user_id, "q": "杭州"}
+        ).json()["trips"]
+        assert hangzhou[0]["purpose"] == "会议", hangzhou
+    finally:
+        _cleanup(user_id)
+    print("✓ 空串 purpose：新行程落默认「出差」，已存在行程保留原目的")
+
+
+def test_session_search_collapses_internal_whitespace():
+    """会话搜索折叠查询内部空白：双空格 / Tab 不再把命中会话过滤成 0 结果。"""
+    from context.storage import create_long_term_memory
+
+    client = _client()
+    user_id = _unique_user("web_search_ws")
+    try:
+        store = create_long_term_memory(user_id, str(MEMORY_DIR))
+        store.add_chat_turn("杭州 北京 出差计划", "好的", "s-ws")
+        for query in ("杭州  北京", "杭州\t北京"):
+            response = client.get(
+                "/api/sessions", params={"user_id": user_id, "q": query}
+            )
+            assert response.status_code == 200, response.text[:200]
+            payload = response.json()
+            assert payload["total"] == 1, (query, response.text[:200])
+            assert payload["sessions"][0]["snippet"], query
+    finally:
+        _cleanup(user_id)
+    print("✓ 会话搜索折叠内部空白（双空格 / Tab）")
+
+
+def test_knowledge_list_search_collapses_internal_whitespace(monkeypatch):
+    """知识片段搜索同样折叠查询与正文的内部空白。"""
+    from utils import knowledge_admin
+
+    rows = [{"id": 1, "content": "住宿 标准说明", "metadata": "{}"}]
+    monkeypatch.setattr(
+        knowledge_admin, "_iter_all_rows", lambda client: rows
+    )
+    assert (
+        knowledge_admin._list_documents(None, 20, 0, "住宿  标准", "")["total"]
+        == 1
+    )
+    assert (
+        knowledge_admin._list_documents(None, 20, 0, "住宿\t标准", "")["total"]
+        == 1
+    )
+    print("✓ 知识片段搜索折叠内部空白（双空格 / Tab）")
+
+
+def test_import_accepts_utf16_backup_and_rejects_unknown_encoding():
+    """带 BOM 的 UTF-16 备份与 json.loads 同口径可恢复；未知编码明确 415。"""
+    client = _client()
+    user_id = _unique_user("web_test_import_utf16")
+    try:
+        body = json.dumps(
+            {"backup": {"preferences": {"home_location": "北京"}}},
+            ensure_ascii=False,
+        ).encode("utf-16")
+        response = client.post(
+            "/api/import",
+            params={"user_id": user_id},
+            content=body,
+            headers={"Content-Type": "application/json; charset=utf-16"},
+        )
+        assert response.status_code == 200, response.text[:300]
+        assert response.json()["preferences"] == 1
+    finally:
+        _cleanup(user_id)
+    bad = client.post(
+        "/api/import",
+        params={"user_id": _unique_user("web_test_import_badenc")},
+        content=b'{"backup": {"preferences": {"x": "\x80"}}}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert bad.status_code == 415, bad.text[:300]
+    assert "UTF-8" in bad.json()["detail"]
+    print("✓ /api/import 接受 UTF-16 BOM 备份，未知编码 415")
+
+
+def test_trip_filter_maxlength_matches_backend_q_limit():
+    """行程筛选框 maxlength 必须与后端 q / 字段上限（100 字）一致。"""
+    index_html = (
+        Path(__file__).resolve().parents[1] / "webapp" / "static" / "index.html"
+    ).read_text(encoding="utf-8")
+    assert re.search(r'id="tripFilter"[^>]*maxlength="100"', index_html), (
+        "行程筛选框 maxlength 必须与后端 100 字上限一致"
+    )
+    print("✓ 行程筛选框 maxlength 与后端 q 上限一致")
+
+
+def test_preference_size_limit_uses_compact_json_serialization():
+    """偏好大小按紧凑 JSON 计长：2001 项列表（紧凑 8005）不再被误判超限。"""
+    from utils.preference_values import preference_value_problem
+    from webapp.server import PreferencePayload
+
+    value = ["x"] * 2001
+    compact = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    assert len(compact) == 8005
+    assert len(json.dumps(value, ensure_ascii=False)) > 10000, (
+        "默认分隔符口径会把该值误判为超限"
+    )
+    assert preference_value_problem(value) is None
+    assert PreferencePayload(user_id="u-compact", value=value).value == value
+    assert preference_value_problem(["x"] * 2500) is not None, (
+        "超过 10000 字符的偏好仍须拒绝"
+    )
+    print("✓ 偏好大小校验与前端紧凑 JSON 口径一致")
+
+
 if __name__ == "__main__":
     # 用例常用 tempfile.mkdtemp() 自建记忆目录：直跑没有 pytest 的
     # conftest 回收，登记后在进程退出时统一清理

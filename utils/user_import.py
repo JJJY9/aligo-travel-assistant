@@ -1721,7 +1721,10 @@ def parse_user_export_data(
             )
             continue
         try:
-            value_size = len(json.dumps(value, ensure_ascii=False))
+            # 与 Web / CLI / 前端同一紧凑分隔符口径
+            value_size = len(
+                json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            )
         except (TypeError, ValueError):
             value_size = None
         if value_size is not None and value_size > PREFERENCE_VALUE_MAX_CHARS:

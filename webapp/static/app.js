@@ -250,11 +250,6 @@ function hasValidIdShape(value) {
   // 服务端按码点计数：增补平面字符在 JS 里占两个 UTF-16 单元，按
   // length 判断会把 33 个星形字母这类合法 ID 误拒
   if (!text || Array.from(text).length > 64) return false;
-  // 与服务端 210 字节上限同口径（utils/identifiers.py）：ID 会拼成
-  // .json.lock / .corrupt-* / .migrate-backup / .import.lock 等派生文件名，
-  // 按最长的损坏备份名（id + 42 字节）给 NAME_MAX=255 留余量；
-  // 53 个增补平面字符 = 212 字节会被所有接口 422
-  if (utf8ByteLength(text) > 210) return false;
   try {
     return /^[\p{Alphabetic}\p{M}\p{Nd}\p{Pc}\u200c\u200d-]+$/u.test(text);
   } catch {
@@ -265,6 +260,12 @@ function hasValidIdShape(value) {
 function isValidId(value) {
   const text = String(value || "");
   if (!hasValidIdShape(text)) return false;
+  // 210 字节上限只属于用户 ID（会拼成 .json.lock / .corrupt-* /
+  // .migrate-backup / .import.lock 等派生文件名，与 utils/identifiers.py
+  // 同口径）；会话 ID 不拼文件名，服务端 is_valid_web_session_id 只限
+  // 64 码点、没有字节上限——把用户 ID 的文件名预算套到会话 ID 上会让
+  // 服务端可路由的会话在面板里被静默丢弃
+  if (utf8ByteLength(text) > 210) return false;
   return !RESERVED_DEVICE_NAMES.has(text.toLowerCase());
 }
 
@@ -5568,7 +5569,9 @@ const LIST_PREF_TYPES = new Set(["hotel_brands", "airlines"]);
 
 // 偏好值序列化后的字符上限：与 PUT /api/preferences 的
 // _PREFERENCE_VALUE_MAX_JSON、utils.preference_values.PREFERENCE_VALUE_MAX_CHARS
-// 及存储 / CLI / 导入同一口径（此前前端硬编码 500，长偏好能看不能改）
+// 及存储 / CLI / 导入同一口径（此前前端硬编码 500，长偏好能看不能改）。
+// 服务端与前端都按紧凑分隔符（JSON.stringify / separators=(",", ":")）
+// 计长，边界值不会被默认的 ", " / ": " 空格误判成超限。
 const PREFERENCE_VALUE_MAX_CHARS = 10000;
 
 function preferenceValueTooLarge(value) {
